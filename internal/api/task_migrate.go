@@ -489,8 +489,15 @@ func (m *MigrateTask) importChannel(channel *mgChannelResp) error {
 		Ban:         channel.Ban,
 		Disband:     channel.Disband,
 		Large:       channel.Large,
-		CreatedAt:   &createdAt,
-		UpdatedAt:   &updatedAt,
+		ExpireAt: func() *time.Time {
+			if channel.ExpireAt > 0 {
+				t := time.Unix(channel.ExpireAt, 0)
+				return &t
+			}
+			return nil
+		}(),
+		CreatedAt: &createdAt,
+		UpdatedAt: &updatedAt,
 	})
 	if err != nil {
 		return err
@@ -727,6 +734,7 @@ type mgChannelResp struct {
 	Ban         bool   `json:"ban"`     // 是否被封
 	Disband     bool   `json:"disband"` // 是否解散
 	Large       bool   `json:"large"`   // 是否是超大群
+	ExpireAt    int64  `json:"expire_at"`
 }
 
 type mgChannelRelationResp struct {

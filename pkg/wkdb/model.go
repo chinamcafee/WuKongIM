@@ -162,6 +162,7 @@ type ChannelInfo struct {
 	// 是否允许陌生人发送消息（0.不允许 1.允许）（此配置目前只支持个人频道）
 	// 个人频道：如果AllowStranger为1，则陌生人可以给当前用户发消息
 	AllowStranger bool       `json:"allow_stranger,omitempty"`
+	ExpireAt      *time.Time `json:"expire_at,omitempty"`  // 失效时间
 	CreatedAt     *time.Time `json:"created_at,omitempty"` // 创建时间
 	UpdatedAt     *time.Time `json:"updated_at,omitempty"` // 更新时间
 }

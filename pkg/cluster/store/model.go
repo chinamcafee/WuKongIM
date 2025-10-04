@@ -869,6 +869,13 @@ func EncodeChannelInfo(c wkdb.ChannelInfo, version CmdVersion) ([]byte, error) {
 		enc.WriteUint8(wkutil.BoolToUint8(c.AllowStranger))
 		enc.WriteUint8(wkutil.BoolToUint8(c.SendBan))
 	}
+	if version > 3 {
+		if c.ExpireAt != nil {
+			enc.WriteUint64(uint64(c.ExpireAt.UnixNano()))
+		} else {
+			enc.WriteUint64(0)
+		}
+	}
 	return enc.Bytes(), nil
 }
 
@@ -935,6 +942,17 @@ func (c *CMD) DecodeChannelInfo() (wkdb.ChannelInfo, error) {
 		}
 		channelInfo.AllowStranger = wkutil.Uint8ToBool(allowStranger)
 		channelInfo.SendBan = wkutil.Uint8ToBool(sendBan)
+	}
+
+	if c.version > 3 {
+		var expireAt uint64
+		if expireAt, err = dec.Uint64(); err != nil {
+			return channelInfo, err
+		}
+		if expireAt > 0 {
+			t := time.Unix(int64(expireAt/1e9), int64(expireAt%1e9))
+			channelInfo.ExpireAt = &t
+		}
 	}
 
 	return channelInfo, err

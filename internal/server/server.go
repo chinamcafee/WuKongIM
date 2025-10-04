@@ -570,7 +570,8 @@ func (s *Server) printEnhancedBanner() {
 	if s.opts.Demo.On {
 		fmt.Printf("   ├─ Chat Demo: http://%s\n", s.opts.Demo.Addr)
 	}
-	fmt.Printf("   └─ System Info: http://%s/varz\n", s.opts.HTTPAddr)
+	fmt.Printf("   ├─ System Info: http://%s/varz\n", s.opts.HTTPAddr)
+	fmt.Printf("   └─ Manager Page: http://%s/web\n", s.opts.Manager.Addr)
 
 	fmt.Println()
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")

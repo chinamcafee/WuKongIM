@@ -321,6 +321,7 @@ var TableChannelInfo = struct {
 		UpdatedAt       [2]byte
 		SendBan         [2]byte
 		AllowStranger   [2]byte
+		ExpireAt        [2]byte
 	}
 	Index struct {
 		Channel [2]byte
@@ -335,6 +336,7 @@ var TableChannelInfo = struct {
 		UpdatedAt       [2]byte
 		SendBan         [2]byte
 		AllowStranger   [2]byte
+		ExpireAt        [2]byte
 	}
 }{
 	Id:              [2]byte{0x06, 0x01},
@@ -355,6 +357,7 @@ var TableChannelInfo = struct {
 		UpdatedAt       [2]byte
 		SendBan         [2]byte
 		AllowStranger   [2]byte
+		ExpireAt        [2]byte
 	}{
 		Id:              [2]byte{0x06, 0x01},
 		ChannelId:       [2]byte{0x06, 0x02},
@@ -369,6 +372,7 @@ var TableChannelInfo = struct {
 		UpdatedAt:       [2]byte{0x06, 0x0B},
 		SendBan:         [2]byte{0x06, 0x0C},
 		AllowStranger:   [2]byte{0x06, 0x0D},
+		ExpireAt:        [2]byte{0x06, 0x0E},
 	},
 	Index: struct {
 		Channel [2]byte
@@ -385,6 +389,7 @@ var TableChannelInfo = struct {
 		UpdatedAt       [2]byte
 		SendBan         [2]byte
 		AllowStranger   [2]byte
+		ExpireAt        [2]byte
 	}{
 		Ban:             [2]byte{0x06, 0x01},
 		Disband:         [2]byte{0x06, 0x02},
@@ -395,6 +400,7 @@ var TableChannelInfo = struct {
 		UpdatedAt:       [2]byte{0x06, 0x07},
 		SendBan:         [2]byte{0x06, 0x08},
 		AllowStranger:   [2]byte{0x06, 0x09},
+		ExpireAt:        [2]byte{0x06, 0x0A},
 	},
 }
 

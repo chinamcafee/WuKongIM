@@ -22,11 +22,18 @@ type channelInfoReq struct {
 	// 是否允许陌生人发送消息（0.不允许 1.允许）（此配置目前只支持个人频道）
 	// 个人频道：如果AllowStranger为1，则陌生人可以给当前用户发消息
 	AllowStranger int `json:"allow_stranger"`
+	// 频道失效时间，为 Unix 秒，0 表示不失效
+	ExpireAt int64 `json:"expire_at"`
 }
 
 func (c channelInfoReq) ToChannelInfo() wkdb.ChannelInfo {
 	createdAt := time.Now()
 	updatedAt := time.Now()
+	var expireAt *time.Time
+	if c.ExpireAt > 0 {
+		t := time.Unix(c.ExpireAt, 0)
+		expireAt = &t
+	}
 	return wkdb.ChannelInfo{
 		ChannelId:     c.ChannelID,
 		ChannelType:   c.ChannelType,
@@ -35,6 +42,7 @@ func (c channelInfoReq) ToChannelInfo() wkdb.ChannelInfo {
 		Disband:       c.Disband == 1,
 		SendBan:       c.SendBan == 1,
 		AllowStranger: c.AllowStranger == 1,
+		ExpireAt:      expireAt,
 		CreatedAt:     &createdAt,
 		UpdatedAt:     &updatedAt,
 	}
@@ -58,6 +66,9 @@ func (r channelCreateReq) Check() error {
 	if options.IsSpecialChar(r.ChannelID) {
 		return errors.New("频道ID不能包含特殊字符！")
 	}
+	if r.ExpireAt < 0 {
+		return errors.New("expire_at不能小于0！")
+	}
 	return nil
 }
 
@@ -78,6 +89,45 @@ func (s subscriberAddReq) Check() error {
 	}
 	if stringArrayIsEmpty(s.Subscribers) {
 		return errors.New("订阅者不能为空！")
+	}
+	return nil
+}
+
+type channelExpireUpdateReq struct {
+	ChannelId   string `json:"channel_id"`
+	ChannelType uint8  `json:"channel_type"`
+	// 可选字段：过期时间戳（Unix秒）
+	// 不传或传0：表示取消过期限制（永不过期）
+	// 传正数：表示设置过期时间
+	ExpireAt *int64 `json:"expire_at,omitempty"`
+	// 可选字段：用于个人频道时，指定另一个用户的UID
+	// 如果提供了此字段，则 channel_id 和 to_uid 会被组合成 FakeChannelID
+	ToUid string `json:"to_uid,omitempty"`
+}
+
+func (r channelExpireUpdateReq) Check() error {
+	if strings.TrimSpace(r.ChannelId) == "" {
+		return errors.New("channel_id不能为空！")
+	}
+
+	// 如果指定了 to_uid，说明是通过双方UID指定个人频道，允许不检查特殊字符
+	if r.ToUid == "" {
+		if options.IsSpecialChar(r.ChannelId) {
+			return errors.New("频道ID不能包含特殊字符！")
+		}
+	} else {
+		// 如果使用 to_uid，需要确保两个UID都没有特殊字符
+		if options.IsSpecialChar(r.ChannelId) || options.IsSpecialChar(r.ToUid) {
+			return errors.New("用户ID不能包含特殊字符！")
+		}
+	}
+
+	if r.ChannelType == 0 {
+		return errors.New("频道类型不能为0！")
+	}
+	// 如果传了 expire_at，检查其值不能为负数
+	if r.ExpireAt != nil && *r.ExpireAt < 0 {
+		return errors.New("expire_at不能小于0！")
 	}
 	return nil
 }

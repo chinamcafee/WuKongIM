@@ -622,6 +622,15 @@ func (wk *wukongDB) writeChannelInfo(primaryKey uint64, channelInfo ChannelInfo,
 		return err
 	}
 
+	// expireAt
+	expireAtBytes := make([]byte, 8)
+	if channelInfo.ExpireAt != nil {
+		wk.endian.PutUint64(expireAtBytes, uint64(channelInfo.ExpireAt.UnixNano()))
+	}
+	if err = w.Set(key.NewChannelInfoColumnKey(primaryKey, key.TableChannelInfo.Column.ExpireAt), expireAtBytes, wk.noSync); err != nil {
+		return err
+	}
+
 	// write index
 	if err = wk.writeChannelInfoBaseIndex(channelInfo, w); err != nil {
 		return err
@@ -677,6 +686,12 @@ func (wk *wukongDB) writeChannelInfoBaseIndex(channelInfo ChannelInfo, w pebble.
 		return err
 	}
 
+	if channelInfo.ExpireAt != nil {
+		if err = w.Set(key.NewChannelInfoSecondIndexKey(key.TableChannelInfo.SecondIndex.ExpireAt, uint64(channelInfo.ExpireAt.UnixNano()), primaryKey), nil, wk.noSync); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -719,6 +734,12 @@ func (wk *wukongDB) deleteChannelInfoBaseIndex(channelInfo ChannelInfo, w pebble
 	// allowStranger index
 	if err := w.Delete(key.NewChannelInfoSecondIndexKey(key.TableChannelInfo.SecondIndex.AllowStranger, uint64(wkutil.BoolToInt(channelInfo.AllowStranger)), channelInfo.Id), wk.noSync); err != nil {
 		return err
+	}
+
+	if channelInfo.ExpireAt != nil {
+		if err := w.Delete(key.NewChannelInfoSecondIndexKey(key.TableChannelInfo.SecondIndex.ExpireAt, uint64(channelInfo.ExpireAt.UnixNano()), channelInfo.Id), wk.noSync); err != nil {
+			return err
+		}
 	}
 
 	// // subscriberCount index
@@ -797,6 +818,12 @@ func (wk *wukongDB) iterChannelInfo(iter *pebble.Iterator, iterFnc func(channelI
 			preChannelInfo.SendBan = wkutil.Uint8ToBool(iter.Value()[0])
 		case key.TableChannelInfo.Column.AllowStranger:
 			preChannelInfo.AllowStranger = wkutil.Uint8ToBool(iter.Value()[0])
+		case key.TableChannelInfo.Column.ExpireAt:
+			tm := int64(wk.endian.Uint64(iter.Value()))
+			if tm > 0 {
+				t := time.Unix(tm/1e9, tm%1e9)
+				preChannelInfo.ExpireAt = &t
+			}
 		}
 		hasData = true
 	}

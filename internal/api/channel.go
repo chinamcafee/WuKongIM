@@ -38,6 +38,7 @@ func (ch *channel) route(r *wkhttp.WKHttp) {
 	r.POST("/channel", ch.channelCreateOrUpdate)       // 创建或修改频道
 	r.POST("/channel/info", ch.updateOrAddChannelInfo) // 更新或添加频道基础信息
 	r.POST("/channel/delete", ch.channelDelete)        // 删除频道
+	r.POST("/channel/expire", ch.channelExpireUpdate)  // 更新频道失效时间
 
 	//################### 订阅者 ###################// 删除频道
 	r.POST("/channel/subscriber_add", ch.addSubscriber)       // 添加订阅者
@@ -113,6 +114,107 @@ func (ch *channel) channelCreateOrUpdate(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 
+func (ch *channel) channelExpireUpdate(c *wkhttp.Context) {
+	var req channelExpireUpdateReq
+	bodyBytes, err := BindJSON(&req, c)
+	if err != nil {
+		c.ResponseError(errors.Wrap(err, "数据格式有误！"))
+		return
+	}
+	if err := req.Check(); err != nil {
+		c.ResponseError(err)
+		return
+	}
+
+	// 如果是个人频道且提供了 to_uid，生成 FakeChannelID
+	actualChannelId := req.ChannelId
+	if req.ChannelType == wkproto.ChannelTypePerson && req.ToUid != "" {
+		actualChannelId = options.GetFakeChannelIDWith(req.ChannelId, req.ToUid)
+		ch.Debug("个人频道使用FakeChannelID", zap.String("from", req.ChannelId), zap.String("to", req.ToUid), zap.String("fakeChannelId", actualChannelId))
+	}
+
+	leaderInfo, err := service.Cluster.SlotLeaderOfChannel(actualChannelId, req.ChannelType)
+	if err != nil {
+		ch.Error("获取频道所在节点失败！", zap.Error(err), zap.String("channelID", actualChannelId), zap.Uint8("channelType", req.ChannelType))
+		c.ResponseError(errors.New("获取频道所在节点失败！"))
+		return
+	}
+	if leaderInfo.Id != options.G.Cluster.NodeId {
+		ch.Debug("转发请求：", zap.String("url", fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path)))
+		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
+		return
+	}
+
+	// 查询频道信息
+	channelInfo, err := service.Store.GetChannel(actualChannelId, req.ChannelType)
+	if err != nil {
+		ch.Error("查询频道信息失败！", zap.Error(err), zap.String("channelId", actualChannelId), zap.Uint8("channelType", req.ChannelType))
+		c.ResponseError(errors.New("查询频道信息失败！"))
+		return
+	}
+
+	// 如果频道不存在，自动创建（仅限个人频道）
+	if wkdb.IsEmptyChannelInfo(channelInfo) {
+		if req.ChannelType == wkproto.ChannelTypePerson {
+			// 自动创建个人频道
+			now := time.Now()
+			var expireAt *time.Time
+			// 如果传了 expire_at 且大于0，则设置过期时间
+			if req.ExpireAt != nil && *req.ExpireAt > 0 {
+				t := time.Unix(*req.ExpireAt, 0)
+				expireAt = &t
+			}
+			// 否则 expireAt 保持为 nil，表示永不过期
+
+			channelInfo = wkdb.ChannelInfo{
+				ChannelId:   actualChannelId,
+				ChannelType: req.ChannelType,
+				ExpireAt:    expireAt,
+				CreatedAt:   &now,
+				UpdatedAt:   &now,
+			}
+
+			err = service.Store.AddChannelInfo(channelInfo)
+			if err != nil {
+				ch.Error("创建个人频道失败！", zap.Error(err), zap.String("channelId", actualChannelId), zap.Uint8("channelType", req.ChannelType))
+				c.ResponseError(errors.New("创建个人频道失败！"))
+				return
+			}
+
+			if expireAt != nil {
+				ch.Info("自动创建个人频道（带过期时间）", zap.String("channelId", actualChannelId), zap.Time("expireAt", *expireAt))
+			} else {
+				ch.Info("自动创建个人频道（永不过期）", zap.String("channelId", actualChannelId))
+			}
+			c.ResponseOK()
+			return
+		}
+
+		c.ResponseError(errors.New("频道不存在！"))
+		return
+	}
+
+	// 更新已存在频道的失效时间
+	// 如果传了 expire_at 且大于0，设置过期时间
+	// 如果没传 expire_at 或者传了0，取消过期限制
+	if req.ExpireAt != nil && *req.ExpireAt > 0 {
+		t := time.Unix(*req.ExpireAt, 0)
+		channelInfo.ExpireAt = &t
+	} else {
+		channelInfo.ExpireAt = nil
+	}
+	updatedAt := time.Now()
+	channelInfo.UpdatedAt = &updatedAt
+
+	if err = service.Store.UpdateChannelInfo(channelInfo); err != nil {
+		ch.Error("更新频道失效时间失败！", zap.Error(err), zap.String("channelId", actualChannelId), zap.Uint8("channelType", req.ChannelType))
+		c.ResponseError(errors.New("更新频道失效时间失败！"))
+		return
+	}
+
+	c.ResponseOK()
+}
+
 // 更新或添加频道信息
 func (ch *channel) updateOrAddChannelInfo(c *wkhttp.Context) {
 	var req channelInfoReq
@@ -120,6 +222,10 @@ func (ch *channel) updateOrAddChannelInfo(c *wkhttp.Context) {
 	if err != nil {
 		ch.Error("数据格式有误！", zap.Error(err))
 		c.ResponseError(errors.New("数据格式有误！"))
+		return
+	}
+	if req.ExpireAt < 0 {
+		c.ResponseError(errors.New("expire_at不能小于0！"))
 		return
 	}
 

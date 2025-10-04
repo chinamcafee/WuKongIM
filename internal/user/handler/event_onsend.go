@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
@@ -149,6 +150,9 @@ func (h *Handler) checkGlobalSendPermission(from string) (wkproto.ReasonCode, er
 		return wkproto.ReasonSystemError, err
 	}
 	if channelInfo.SendBan {
+		return wkproto.ReasonSendBan, nil
+	}
+	if channelInfo.ExpireAt != nil && time.Now().After(*channelInfo.ExpireAt) {
 		return wkproto.ReasonSendBan, nil
 	}
 	return wkproto.ReasonSuccess, nil

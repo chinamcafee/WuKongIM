@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -73,6 +74,9 @@ func (p *PermissionService) HasPermissionForChannel(channelId string, channelTyp
 	// 频道已解散
 	if channelInfo.Disband {
 		return wkproto.ReasonDisband, nil
+	}
+	if channelInfo.ExpireAt != nil && time.Now().After(*channelInfo.ExpireAt) {
+		return wkproto.ReasonSendBan, nil
 	}
 	return wkproto.ReasonSuccess, nil
 }
