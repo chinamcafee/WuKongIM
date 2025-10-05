@@ -2,7 +2,7 @@
 import { nextTick, onMounted, onUnmounted, ref, toRaw, toRefs, unref } from 'vue';
 import APIClient from '../services/APIClient'
 import { useRouter } from "vue-router";
-import { WKSDK, Message, MessageText, Channel, ChannelTypePerson, ChannelTypeGroup, MessageStatus, PullMode, MessageContent, ConnectionInfo, WKEventManager, WKEvent, MessageContentType, WKEventListener } from "wukongimjssdk";
+import { WKSDK, Message, MessageText, Channel, ChannelTypePerson, ChannelTypeGroup, MessageStatus, PullMode, MessageContent, ConnectionInfo } from "wukongimjssdk";
 import { ConnectStatus, ConnectStatusListener } from 'wukongimjssdk';
 import { SendackPacket, Setting } from 'wukongimjssdk';
 import { MessageListener, MessageStatusListener } from 'wukongimjssdk';
@@ -59,7 +59,6 @@ title.value = `${uid || ""}(未连接)`
 let connectStatusListener!: ConnectStatusListener
 let messageListener!: MessageListener
 let messageStatusListener!: MessageStatusListener
-let eventListener!: WKEventListener // 事件监听
 
 onMounted(() => {
 
@@ -125,24 +124,6 @@ const connectIM = (addr: string) => {
     }
     WKSDK.shared().chatManager.addMessageListener(messageListener)
 
-    // 流监听
-    eventListener = (event: WKEvent) => {
-        for (const message of messages.value) {
-            if (message.clientMsgNo === event.id) {
-                if (message.contentType === MessageContentType.text) {
-                    message.streamText = (message.streamText || "") + (event.dataText||"")
-                    const textContent = new MessageText(message.streamText || "")
-                    message.content = textContent
-                }
-                break
-            }
-            // 刷新ui
-            messages.value = [...messages.value]
-            scrollBottom()
-        }
-    }
-    WKSDK.shared().eventManager.addEventListener(eventListener)
-
     messageStatusListener = (ack: SendackPacket) => {
         console.log(ack)
         messages.value.forEach((m) => {
@@ -161,7 +142,6 @@ onUnmounted(() => {
     WKSDK.shared().connectManager.removeConnectStatusListener(connectStatusListener)
     WKSDK.shared().chatManager.removeMessageListener(messageListener)
     WKSDK.shared().chatManager.removeMessageStatusListener(messageStatusListener)
-    WKSDK.shared().eventManager.removeEventListener(eventListener)
     WKSDK.shared().disconnect()
 })
 
@@ -410,7 +390,8 @@ const onKeydown = (e: any) => {
                 <div class="message-list" v-on:scroll="handleScroll" ref="chatRef">
                     <template v-for="m in messages">
                         <div class="message right" v-if="m.send" :id="m.clientMsgNo">
-                            <div class="status" v-if="m.status != MessageStatus.Normal">发送中</div>
+                            <div class="status fail" v-if="m.status == MessageStatus.Fail">发送失败</div>
+                            <div class="status" v-else-if="m.status != MessageStatus.Normal">发送中</div>
                             <div class="bubble right">
                                 <MessageUI :message="m"></MessageUI>
                             </div>
@@ -592,7 +573,9 @@ const onKeydown = (e: any) => {
     align-items: center;
 }
 
-
+.message .status.fail {
+    color: red;
+}
 
 
 .footer {

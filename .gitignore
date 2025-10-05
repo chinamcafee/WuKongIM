@@ -45,3 +45,6 @@ wukongim*_data/
 external_ip.txt
 
 wukongim.pid
+
+# 编译产物 - 可执行文件
+/wukongim
