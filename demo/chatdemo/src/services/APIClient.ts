@@ -1,5 +1,5 @@
 import axios, { AxiosResponse } from "axios";
-import { Channel, ChannelTypePerson, Conversation, Message, SyncOptions, WKSDK } from "wukongimjssdk";
+import { Channel, ChannelTypePerson, Conversation, Message, SyncOptions, WKSDK } from "../imSDK";
 import { Convert } from "./convert";
 import { Buffer } from "buffer";
 

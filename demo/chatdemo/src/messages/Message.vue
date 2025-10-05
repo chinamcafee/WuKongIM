@@ -1,6 +1,6 @@
 <script setup lang="ts">
 
-import { Message, MessageContentType } from 'wukongimjssdk';
+import { Message, MessageContentType } from '../imSDK';
 import Text from './Text.vue'
 import CustomMessage from './CustomMessage.vue'
 import { orderMessage } from './CustomMessage'

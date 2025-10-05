@@ -2,10 +2,10 @@
 import { nextTick, onMounted, onUnmounted, ref, toRaw, toRefs, unref } from 'vue';
 import APIClient from '../services/APIClient'
 import { useRouter } from "vue-router";
-import { WKSDK, Message, MessageText, Channel, ChannelTypePerson, ChannelTypeGroup, MessageStatus, PullMode, MessageContent, ConnectionInfo } from "wukongimjssdk";
-import { ConnectStatus, ConnectStatusListener } from 'wukongimjssdk';
-import { SendackPacket, Setting } from 'wukongimjssdk';
-import { MessageListener, MessageStatusListener } from 'wukongimjssdk';
+import { WKSDK, Message, MessageText, Channel, ChannelTypePerson, ChannelTypeGroup, MessageStatus, PullMode, MessageContent, ConnectionInfo } from "../imSDK";
+import { ConnectStatus, ConnectStatusListener } from '../imSDK';
+import { SendackPacket, Setting } from '../imSDK';
+import { MessageListener, MessageStatusListener } from '../imSDK';
 import Conversation from '../components/Conversation/index.vue'
 import { CustomMessage, orderMessage } from '../customessage';
 import MessageUI from '../messages/Message.vue';

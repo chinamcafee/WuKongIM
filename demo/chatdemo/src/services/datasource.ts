@@ -1,4 +1,4 @@
-import { Channel, ChannelInfo, SyncOptions, WKSDK } from "wukongimjssdk"
+import { Channel, ChannelInfo, SyncOptions, WKSDK } from "../imSDK"
 import APIClient from "./APIClient"
 
 

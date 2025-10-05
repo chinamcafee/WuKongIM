@@ -6,7 +6,7 @@ import router from './router/index'
 import { initDataSource } from './services/datasource'
 
 import {orderMessage,CustomMessage}  from "./customessage"
-import WKSDK from 'wukongimjssdk'
+import { WKSDK } from './imSDK'
 
 
 // 注册自定义消息

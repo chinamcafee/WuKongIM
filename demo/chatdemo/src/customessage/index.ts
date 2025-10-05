@@ -1,4 +1,4 @@
-import  { MessageContent } from "wukongimjssdk";
+import  { MessageContent } from "../imSDK";
 
 
  export const orderMessage = 56; // 自定义消息类型，这里随便定义一个数字，不要和已有的消息类型冲突，1000-2000 之间是预设的系统消息类型，不要使用这个范围内的数字
