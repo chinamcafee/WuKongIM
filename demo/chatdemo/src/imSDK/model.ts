@@ -77,7 +77,8 @@ export class MessageHeader {
 export enum MessageStatus {
     Wait,
     Normal,
-    Fail
+    Fail,
+    NotFriend
 }
 
 export class Message {

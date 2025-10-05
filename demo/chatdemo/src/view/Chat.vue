@@ -128,7 +128,7 @@ const connectIM = (addr: string) => {
         console.log(ack)
         messages.value.forEach((m) => {
             if (m.clientSeq == ack.clientSeq) {
-                m.status = ack.reasonCode == 1 ? MessageStatus.Normal : MessageStatus.Fail
+                m.status = ack.reasonCode == 1 ? MessageStatus.Normal : ack.reasonCode == 25 ? MessageStatus.NotFriend : MessageStatus.Fail
                 return
             }
         })
@@ -390,7 +390,8 @@ const onKeydown = (e: any) => {
                 <div class="message-list" v-on:scroll="handleScroll" ref="chatRef">
                     <template v-for="m in messages">
                         <div class="message right" v-if="m.send" :id="m.clientMsgNo">
-                            <div class="status fail" v-if="m.status == MessageStatus.Fail">发送失败</div>
+                            <div class="status fail" v-if="m.status == MessageStatus.NotFriend">不再是好友</div>
+                            <div class="status" v-else-if="m.status == MessageStatus.Fail">发送失败</div>
                             <div class="status" v-else-if="m.status != MessageStatus.Normal">发送中</div>
                             <div class="bubble right">
                                 <MessageUI :message="m"></MessageUI>
