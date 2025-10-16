@@ -2,7 +2,7 @@
 import { nextTick, onMounted, onUnmounted, ref, toRaw, toRefs, unref } from 'vue';
 import APIClient from '../services/APIClient'
 import { useRouter } from "vue-router";
-import { WKSDK, Message, MessageText, Channel, ChannelTypePerson, ChannelTypeGroup, MessageStatus, PullMode, MessageContent, ConnectionInfo } from "../imSDK";
+import { WKSDK, WKEvent, Message, MessageText, Channel, ChannelTypePerson, ChannelTypeGroup, MessageStatus, PullMode, MessageContent, ConnectionInfo, MessageContentType } from "../imSDK";
 import { ConnectStatus, ConnectStatusListener } from '../imSDK';
 import { SendackPacket, Setting } from '../imSDK';
 import { MessageListener, MessageStatusListener } from '../imSDK';
@@ -114,7 +114,6 @@ const connectIM = (addr: string) => {
 
     // 监听消息
     messageListener = (msg) => {
-        console.log("messageListener-->", msg)
         if (!to.value.isEqual(msg.channel)) {
             return
         }
@@ -123,6 +122,28 @@ const connectIM = (addr: string) => {
         scrollBottom()
     }
     WKSDK.shared().chatManager.addMessageListener(messageListener)
+
+    // 流监听
+    eventListener = async (event: WKEvent) => {
+        for (const message of messages.value) {
+            console.log("eventListener--->", event.id, event.type,event.dataText)
+            if (message.clientMsgNo === event.id) {
+                if (message.contentType === MessageContentType.text) {
+                    message.streamText = (message.streamText || "") + (event.dataText || "")
+                    const htmlText = await marked.parse(message.streamText)
+                    const textContent = new MessageText(htmlText || "")
+                    message.content = textContent
+                }
+                // 刷新ui
+                messages.value = [...messages.value]
+                nextTick(() => {
+                    scrollBottom()
+                })
+                break
+            }
+        }
+    }
+    WKSDK.shared().eventManager.addEventListener(eventListener)
 
     messageStatusListener = (ack: SendackPacket) => {
         console.log(ack)
@@ -183,7 +204,8 @@ const pullLast = async () => {
     for (const m of msgs) {
         if (m.setting.streamOn) {
             if (m.streamText && m.streamText.length > 0) {
-                m.content = new MessageText(m.streamText)
+                const htmlText = await marked.parse(m.streamText)
+                m.content = new MessageText(htmlText)
             }
         }
     }
@@ -216,7 +238,8 @@ const pullDown = async () => {
     for (const m of msgs) {
         if (m.setting.streamOn) {
             if (m.streamText && m.streamText.length > 0) {
-                m.content = new MessageText(m.streamText)
+                const htmlText = await marked.parse(m.streamText)
+                m.content = new MessageText(htmlText)
             }
         }
     }
