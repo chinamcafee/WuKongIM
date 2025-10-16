@@ -363,7 +363,7 @@ func New(op ...Option) *Options {
 		ManagerUID:           "____manager",
 		SystemUID:            "____system",
 		SystemDeviceId:       "____device",
-		WhitelistOffOfPerson: true,
+		WhitelistOffOfPerson: false,
 		DeadlockCheck:        false,
 		CustomerService: struct {
 			VisitorsOn     bool
