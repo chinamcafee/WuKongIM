@@ -34,7 +34,7 @@ if channelType != wkproto.ChannelTypePerson {
 
 #### 2. **个人频道**
 - 频道类型是 `wkproto.ChannelTypePerson`
-- 需要配置 `whitelistOffOfPerson: false`（默认为 true，即关闭个人频道白名单验证）
+- 需要配置 `whitelistOffOfPerson: false`（默认为 false，即打开个人频道白名单验证）
 
 权限检查逻辑在 `internal/service/permission.go:256-266`：
 

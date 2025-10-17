@@ -1,6 +1,6 @@
 import { MessageContentType } from "./const";
 import { Guid } from "./guid";
-import { getWKSDK } from "./registry";
+import WKSDK from "./index";
 import { Channel, MediaMessageContent, Message, MessageContent, SyncOptions, MessageSignalContent } from "./model";
 import {  EventPacket, Packet, RecvackPacket, RecvPacket, SendackPacket, SendPacket, Setting, StreamFlag } from "./proto";
 import { Task, MessageTask, TaskStatus } from "./task";
@@ -31,15 +31,15 @@ export class ChatManager {
 
 
     private constructor() {
-        if (getWKSDK().taskManager) {
-            getWKSDK().taskManager.addListener((task: Task) => {
+        if (WKSDK.shared().taskManager) {
+            WKSDK.shared().taskManager.addListener((task: Task) => {
                 if (task.status === TaskStatus.success) {
                     if (task instanceof MessageTask) {
                         const messageTask = task as MessageTask
                         const sendPacket = this.sendingQueues.get(messageTask.message.clientSeq)
                         if (sendPacket) {
                             sendPacket.payload = messageTask.message.content.encode() // content需要重新编码
-                            getWKSDK().connectManager.sendPacket(sendPacket)
+                            WKSDK.shared().connectManager.sendPacket(sendPacket)
                         }
                     }
                 }
@@ -71,7 +71,7 @@ export class ChatManager {
              // 通知消息监听者
             this.notifyMessageListeners(message);
             
-            getWKSDK().channelManager.notifySubscribeIfNeed(message); // 通知指定的订阅者
+            WKSDK.shared().channelManager.notifySubscribeIfNeed(message); // 通知指定的订阅者
         } else if (packet instanceof SendackPacket) {
             const sendack = packet as SendackPacket;
             this.sendingQueues.delete(sendack.clientSeq);
@@ -85,17 +85,17 @@ export class ChatManager {
     }
 
     async syncMessages(channel: Channel, opts: SyncOptions): Promise<Message[]> {
-        if (!getWKSDK().config.provider.syncMessagesCallback) {
-            throw new Error("没有设置 WKSDK config.provider.syncMessagesCallback")
+        if (!WKSDK.shared().config.provider.syncMessagesCallback) {
+            throw new Error("没有设置WKSDK.shared().config.provider.syncMessagesCallback")
         }
-        return getWKSDK().config.provider.syncMessagesCallback!(channel, opts)
+        return WKSDK.shared().config.provider.syncMessagesCallback!(channel, opts)
     }
 
     async syncMessageExtras(channel: Channel, extraVersion: number) {
-        if (!getWKSDK().config.provider.syncMessageExtraCallback) {
-            throw new Error("没有设置 WKSDK config.provider.syncMessageExtraCallback")
+        if (!WKSDK.shared().config.provider.syncMessageExtraCallback) {
+            throw new Error("没有设置WKSDK.shared().config.provider.syncMessageExtraCallback")
         }
-        return getWKSDK().config.provider.syncMessageExtraCallback!(channel, extraVersion, 100)
+        return WKSDK.shared().config.provider.syncMessageExtraCallback!(channel, extraVersion, 100)
     }
 
     sendRecvackPacket(recvPacket: RecvPacket) {
@@ -105,7 +105,7 @@ export class ChatManager {
         packet.reddot = recvPacket.reddot
         packet.messageID = recvPacket.messageID;
         packet.messageSeq = recvPacket.messageSeq;
-        getWKSDK().connectManager.sendPacket(packet)
+        WKSDK.shared().connectManager.sendPacket(packet)
     }
 
     /**
@@ -133,10 +133,10 @@ export class ChatManager {
                 this.sendSendPacket(packet)
             }else {
                 console.log("开始上传")
-                const task = getWKSDK().config.provider.messageUploadTask(message)
+                const task = WKSDK.shared().config.provider.messageUploadTask(message)
                 if (task) {
                     console.log("上传任务添加成功")
-                    getWKSDK().taskManager.addTask(task)
+                    WKSDK.shared().taskManager.addTask(task)
                 }else {
                     console.log("没有实现上传数据源")
                 }
@@ -159,18 +159,18 @@ export class ChatManager {
                 while (this.sendPacketQueue.length > 0) {
                     const packet = this.sendPacketQueue.shift()
                     if(packet) {
-                        const packetData = Array.from(getWKSDK().config.proto.encode(packet))
+                        const packetData = Array.from(WKSDK.shared().config.proto.encode(packet))
                         sendData.push(...packetData)
                     }
                     sendCount++
-                    if(sendCount >= getWKSDK().config.sendCountOfEach) {
+                    if(sendCount >= WKSDK.shared().config.sendCountOfEach) {
                         break
                     }
                 }
                 if(sendData.length > 0) {
-                    getWKSDK().connectManager.send(new Uint8Array(sendData))
+                    WKSDK.shared().connectManager.send(new Uint8Array(sendData))
                 } 
-            }, getWKSDK().config.sendFrequency)
+            }, WKSDK.shared().config.sendFrequency)
         }
     }
     getSendPacket(content: MessageContent, channel: Channel, setting: Setting = new Setting()): SendPacket {
@@ -179,7 +179,7 @@ export class ChatManager {
         packet.reddot = true;
         packet.clientMsgNo = `${Guid.create().toString().replace(/-/gi, "")}3`
         packet.clientSeq = this.getClientSeq()
-        packet.fromUID = getWKSDK().config.uid || '';
+        packet.fromUID = WKSDK.shared().config.uid || '';
         packet.channelID = channel.channelID;
         packet.channelType = channel.channelType
         packet.payload = content.encode()
@@ -192,9 +192,9 @@ export class ChatManager {
         packet.noPersist = opts.noPersist;
         packet.setting = setting
         packet.reddot = true;
-        packet.clientMsgNo = `${Guid.create().toString().replace(/-/gi, "")}_${getWKSDK().config.clientMsgDeviceId}_3`
+        packet.clientMsgNo = `${Guid.create().toString().replace(/-/gi, "")}_${WKSDK.shared().config.clientMsgDeviceId}_3`
         packet.clientSeq = this.getClientSeq()
-        packet.fromUID = getWKSDK().config.uid || '';
+        packet.fromUID = WKSDK.shared().config.uid || '';
         packet.channelID = channel.channelID;
         packet.channelType = channel.channelType
         packet.payload = content.encode()
@@ -294,7 +294,7 @@ export class ChatManager {
             const sendPacket = this.sendingQueues.get(clientSeq);
             if (sendPacket) {
                 console.log("重试消息---->", sendPacket)
-                getWKSDK().connectManager.sendPacket(sendPacket);
+                WKSDK.shared().connectManager.sendPacket(sendPacket);
             }
         }
 

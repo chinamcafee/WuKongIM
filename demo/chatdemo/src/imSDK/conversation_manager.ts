@@ -1,5 +1,5 @@
 import { ChatManager } from "./chat_manager";
-import { getWKSDK } from "./registry";
+import WKSDK from "./index";
 import { Channel, Conversation, ConversationExtra, Message } from "./model";
 
 
@@ -48,7 +48,7 @@ export class ConversationManager {
 
     // 同步最近会话
     sync(filter?: any): Promise<Conversation[]> {
-        const syncProvide = getWKSDK().config.provider.syncConversationsCallback(filter)
+        const syncProvide = WKSDK.shared().config.provider.syncConversationsCallback(filter)
         if (syncProvide) {
             syncProvide.then((conversations) => {
                 this.conversations = conversations
@@ -59,7 +59,7 @@ export class ConversationManager {
                         }
                     }
                 }
-                getWKSDK().reminderManager.sync()
+                WKSDK.shared().reminderManager.sync()
             }).catch((err) => {
                 console.log('同步最近会话失败！', err)
             })
@@ -68,11 +68,11 @@ export class ConversationManager {
     }
 
     async syncExtra(): Promise<ConversationExtra[] | undefined> {
-        if (!getWKSDK().config.provider.syncConversationExtrasCallback) {
+        if (!WKSDK.shared().config.provider.syncConversationExtrasCallback) {
             console.log('syncConversationExtrasCallback没有提供')
             return
         }
-        const conversationExtras = await getWKSDK().config.provider.syncConversationExtrasCallback!(this.maxExtraVersion)
+        const conversationExtras = await WKSDK.shared().config.provider.syncConversationExtrasCallback!(this.maxExtraVersion)
         if (conversationExtras) {
             for (const conversationExtra of conversationExtras) {
                 if (conversationExtra.version > this.maxExtraVersion) {

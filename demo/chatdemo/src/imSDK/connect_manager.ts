@@ -1,4 +1,4 @@
-import { getWKSDK } from "./registry";
+import { WKSDK } from "./index"
 import { ConnackPacket, ConnectPacket, DisconnectPacket, IProto, Packet, PacketType, PingPacket, RecvackPacket, RecvPacket, SendPacket, SubackPacket } from "./proto";
 import { generateKeyPair, sharedKey } from 'curve25519-js';
 import { Md5 } from "md5-typescript";
@@ -92,7 +92,7 @@ export class ConnectManager {
             } else if (self.pingRetryCount > 1) {
                 console.log(`第${self.pingRetryCount}次，尝试ping。`);
             }
-        }, getWKSDK().config.heartbeatInterval);
+        }, WKSDK.shared().config.heartbeatInterval);
     }
 
     connect() {
@@ -106,20 +106,20 @@ export class ConnectManager {
             console.log('已在连接中，不再进行连接.');
             return;
         }
-        if (getWKSDK().config.provider.connectAddrCallback != null) {
-            const connectAddrCallback = getWKSDK().config.provider.connectAddrCallback
+        if (WKSDK.shared().config.provider.connectAddrCallback != null) {
+            const connectAddrCallback = WKSDK.shared().config.provider.connectAddrCallback
             connectAddrCallback((addr: string) => {
                 this.connectWithAddr(addr)
             })
         } else {
-            this.connectWithAddr(getWKSDK().config.addr)
+            this.connectWithAddr(WKSDK.shared().config.addr)
         }
 
     }
 
     connectWithAddr(addr: string) {
         this.status = ConnectStatus.Connecting;
-        this.ws = new WKWebsocket(addr,getWKSDK().config.platform);
+        this.ws = new WKWebsocket(addr,WKSDK.shared().config.platform);
         const self = this;
         this.ws.onopen(() => {
             console.log('onopen...');
@@ -132,19 +132,18 @@ export class ConnectManager {
 
             const connectPacket = new ConnectPacket();
             connectPacket.clientKey = pubKey;
-            connectPacket.version = getWKSDK().config.protoVersion;
-            connectPacket.deviceFlag = getWKSDK().config.deviceFlag;
+            connectPacket.version = WKSDK.shared().config.protoVersion;
+            connectPacket.deviceFlag = WKSDK.shared().config.deviceFlag;
             const deviceID = Guid.create().toString().replace(/-/g, "")
             connectPacket.deviceID = deviceID + "W";
             connectPacket.clientTimestamp = new Date().getTime();
-            connectPacket.uid = getWKSDK().config.uid || '';
-            connectPacket.token = getWKSDK().config.token || '';
+            connectPacket.uid = WKSDK.shared().config.uid || '';
+            connectPacket.token = WKSDK.shared().config.token || '';
             const data = self.getProto().encode(connectPacket);
             self.ws?.send(data);
         })
 
         this.ws.onmessage((data: any) => {
-            console.log('onmessage...',data);
             self.unpacket(new Uint8Array(data), (packets) => {
                 if (packets.length > 0) {
                     for (const packetData of packets) {
@@ -316,9 +315,9 @@ export class ConnectManager {
         if (p.packetType === PacketType.CONNACK) {
             const connackPacket = p as ConnackPacket;
             if (connackPacket.reasonCode === 1) {
-                console.log(`成功连接到节点，使用imSDK[${connackPacket.nodeId}]`);
+                console.log(`成功连接到节点[${connackPacket.nodeId}]`);
 
-                getWKSDK().channelManager.reSubscribe() // 重置订阅状态
+                WKSDK.shared().channelManager.reSubscribe() // 重置订阅状态
                 this.status = ConnectStatus.Connected;
                 this.pingRetryCount = 0;
                 // 连接成功
@@ -337,7 +336,7 @@ export class ConnectManager {
                 } else {
                     SecurityManager.shared().aesIV = connackPacket.salt;
                 }
-                getWKSDK().chatManager.flushSendingQueue() // 将发送队列里的消息flush出去
+                WKSDK.shared().chatManager.flushSendingQueue() // 将发送队列里的消息flush出去
             } else {
                 console.log('连接失败！错误->', connackPacket.reasonCode);
                 this.status = ConnectStatus.ConnectFail;
@@ -358,10 +357,10 @@ export class ConnectManager {
         } else if (p.packetType === PacketType.SUBACK) { // 订阅回执
             const subackPacket = (p as SubackPacket)
             console.log("订阅回执-->",subackPacket.action)
-            getWKSDK().channelManager.handleSuback(subackPacket)
+            WKSDK.shared().channelManager.handleSuback(subackPacket)
         }
 
-        getWKSDK().chatManager.onPacket(p)
+        WKSDK.shared().chatManager.onPacket(p)
 
     }
 
@@ -380,7 +379,7 @@ export class ConnectManager {
     }
 
     getProto(): IProto {
-        return getWKSDK().config.proto
+        return WKSDK.shared().config.proto
     }
 
     // 添加连接状态监听
@@ -446,3 +445,4 @@ export class ConnectManager {
         this.ws?.close();
     }
 }
+

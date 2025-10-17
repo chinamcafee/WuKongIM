@@ -1,4 +1,4 @@
-import { getWKSDK } from "./registry";
+import WKSDK from ".";
 import { Channel, Message } from "./model";
 
 export type MessageReceiptListener = ((channel:Channel,message: Message[]) => void);
@@ -39,8 +39,8 @@ export class ReceiptManager {
     }
 
     private flush(channelKey:string) {
-        if(!getWKSDK().config.provider.messageReadedCallback) {
-            throw new Error("没有设置 WKSDK config.provider.messageReadedCallback")
+        if(!WKSDK.shared().config.provider.messageReadedCallback) {
+            throw new Error("没有设置WKSDK.shared().config.provider.messageReadedCallback")
         }
         const messages = this.channelMessagesMap.get(channelKey)
 
@@ -56,7 +56,7 @@ export class ReceiptManager {
             return
         }
         const channel = Channel.fromChannelKey(channelKey)!
-        getWKSDK().config.provider.messageReadedCallback!(channel,tmpMessages).then(()=>{
+        WKSDK.shared().config.provider.messageReadedCallback!(channel,tmpMessages).then(()=>{
             this.removeCacheWithLength(channelKey,flushCachedLen)
             this.notifyListeners(channel,tmpMessages)
         })

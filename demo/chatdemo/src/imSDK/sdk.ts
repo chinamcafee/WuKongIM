@@ -1,5 +1,5 @@
 
-// export {default as WKSDK} from "./index"
+export {default as WKSDK} from "./index"
 
 export * from "./model";
 export * from "./const";

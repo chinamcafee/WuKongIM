@@ -5,9 +5,17 @@ curl -X POST http://127.0.0.1:5001/channel/expire \
   "channel_id": "123",
   "channel_type": 1,
   "to_uid": "234",
-  "expire_at": 1760552748
+  "expire_at": 1760739707
 }'
 
+curl -X POST http://127.0.0.1:5001/channel/expire \
+-H 'Content-Type: application/json' \
+-d '{
+  "channel_id": "234",
+  "channel_type": 1,
+  "to_uid": "123",
+  "expire_at": 1760739707
+}'
 
 新增用户白名单：
 curl -X POST "http://localhost:5001/channel/whitelist_add" \
@@ -16,6 +24,14 @@ curl -X POST "http://localhost:5001/channel/whitelist_add" \
     "channel_id": "234",
     "channel_type": 1,
     "uids": ["123"]
+  }'
+
+  curl -X POST "http://localhost:5001/channel/whitelist_add" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "channel_id": "123",
+    "channel_type": 1,
+    "uids": ["234"]
   }'
 
 删除白名单

@@ -2,7 +2,7 @@
 import { nextTick, onMounted, onUnmounted, ref, toRaw, toRefs, unref } from 'vue';
 import APIClient from '../services/APIClient'
 import { useRouter } from "vue-router";
-import { WKSDK, WKEvent, Message, MessageText, Channel, ChannelTypePerson, ChannelTypeGroup, MessageStatus, PullMode, MessageContent, ConnectionInfo, MessageContentType } from "../imSDK";
+import { WKSDK, Message, MessageText, Channel, ChannelTypePerson, ChannelTypeGroup, MessageStatus, PullMode, MessageContent, ConnectionInfo, WKEventManager, WKEvent, MessageContentType, WKEventListener } from "../imSDK";
 import { ConnectStatus, ConnectStatusListener } from '../imSDK';
 import { SendackPacket, Setting } from '../imSDK';
 import { MessageListener, MessageStatusListener } from '../imSDK';
@@ -59,6 +59,7 @@ title.value = `${uid || ""}(未连接)`
 let connectStatusListener!: ConnectStatusListener
 let messageListener!: MessageListener
 let messageStatusListener!: MessageStatusListener
+let eventListener!: WKEventListener // 事件监听
 
 onMounted(() => {
 
@@ -163,6 +164,7 @@ onUnmounted(() => {
     WKSDK.shared().connectManager.removeConnectStatusListener(connectStatusListener)
     WKSDK.shared().chatManager.removeMessageListener(messageListener)
     WKSDK.shared().chatManager.removeMessageStatusListener(messageStatusListener)
+    WKSDK.shared().eventManager.removeEventListener(eventListener)
     WKSDK.shared().disconnect()
 })
 
@@ -597,9 +599,7 @@ const onKeydown = (e: any) => {
     align-items: center;
 }
 
-.message .status.fail {
-    color: red;
-}
+
 
 
 .footer {

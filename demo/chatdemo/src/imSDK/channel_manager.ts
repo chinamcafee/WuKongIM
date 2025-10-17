@@ -1,5 +1,5 @@
 import { Channel, ChannelInfo, ChannelTypeData, ListenerState, Message, SubscribeAction, SubscribeContext, SubscribeListener, SubscribeOption, SubscribeOptions, Subscriber, UnsubscribeListener } from "./model";
-import { getWKSDK } from "./registry";
+import WKSDK from "./index";
 import { SubPacket, SubackPacket } from "./proto";
 
 
@@ -55,9 +55,9 @@ export class ChannelManager {
         }
         try {
             this.requestQueueMap.set(channelKey, true);
-            if (getWKSDK().config.provider.channelInfoCallback != null) {
+            if (WKSDK.shared().config.provider.channelInfoCallback != null) {
 
-                const channelInfoModel = await getWKSDK().config.provider.channelInfoCallback(channel);
+                const channelInfoModel = await WKSDK.shared().config.provider.channelInfoCallback(channel);
                 this.channelInfocacheMap[channelKey] = channelInfoModel;
                 if (channelInfoModel) {
                     this.notifyListeners(channelInfoModel);
@@ -86,7 +86,7 @@ export class ChannelManager {
             } else {
                 cacheSubscribers = new Array();
             }
-            const subscribers = await getWKSDK().config.provider.syncSubscribersCallback(channel, version || 0);
+            const subscribers = await WKSDK.shared().config.provider.syncSubscribersCallback(channel, version || 0);
             if (subscribers && subscribers.length > 0) {
                 for (const subscriber of subscribers) {
                     let update = false;
@@ -141,7 +141,7 @@ export class ChannelManager {
         const subscribers = this.subscribeCacheMap.get(channel.getChannelKey());
         if (subscribers) {
             for (const subscriber of subscribers) {
-                if (!subscriber.isDeleted && subscriber.uid === getWKSDK().config.uid) {
+                if (!subscriber.isDeleted && subscriber.uid === WKSDK.shared().config.uid) {
                     return subscriber;
                 }
             }
@@ -409,6 +409,6 @@ export class ChannelManager {
             s.param = JSON.stringify(Object.fromEntries(opts?.param))
         }
 
-        getWKSDK().connectManager.sendPacket(s)
+        WKSDK.shared().connectManager.sendPacket(s)
     }
 }

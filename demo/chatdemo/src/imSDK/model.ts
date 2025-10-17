@@ -1,5 +1,5 @@
 import { EventPacket, RecvPacket, SendPacket, Setting, StreamFlag } from './proto';
-import { getWKSDK } from "./registry";
+import WKSDK from './index';
 import { MessageContentType } from "./const"
 
 
@@ -142,7 +142,7 @@ export class Message {
 
     // 是否是发送的消息
     public get send(): boolean {
-        return this.fromUID === getWKSDK().config.uid
+        return this.fromUID === WKSDK.shared().config.uid
     }
 
     public get contentType(): number {
@@ -341,7 +341,7 @@ export class Conversation {
     simpleReminders = new Array<Reminder>()// 除去重复的type了的reminder
 
     public get channelInfo() {
-        return getWKSDK().channelManager.getChannelInfo(this.channel);
+        return WKSDK.shared().channelManager.getChannelInfo(this.channel);
     }
 
     public isEqual(c: Conversation) {
@@ -418,7 +418,7 @@ export class Conversation {
                 if (mention.all) {
                     this._isMentionMe = true
                 }
-                if (mention.uids && mention.uids.includes(getWKSDK().config.uid || "")) {
+                if (mention.uids && mention.uids.includes(WKSDK.shared().config.uid || "")) {
                     this._isMentionMe = true
                 }
             }
@@ -490,7 +490,7 @@ export class Reply {
         this.rootMessageID = data["root_message_id"]
         if (data["payload"]) {
             const contentType = data["payload"]["type"]
-            const messageContent = getWKSDK().getMessageContent(contentType)
+            const messageContent = WKSDK.shared().getMessageContent(contentType)
             const payload = stringToUint8Array(JSON.stringify(data["payload"]))
             messageContent.decode(payload)
             this.content = messageContent
@@ -709,7 +709,7 @@ export class SystemContent extends MessageContent {
                 for (let i = 0; i <= extraArray.length - 1; i++) {
                     const extrMap = extraArray[i]
                     const name = extrMap["name"] || ""
-                    // if(getWKSDK().config.uid === extrMap["uid"] ) {
+                    // if(WKSDK.shared().config.uid === extrMap["uid"] ) {
                     //     name = "你"
                     // }
                     content = content.replace(`{${i}}`, name)
