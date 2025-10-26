@@ -88,6 +88,10 @@ onMounted(() => {
 // 连接IM
 const connectIM = (addr: string) => {
     console.log("connectIM--->", addr)
+
+    // 先断开旧连接
+    WKSDK.shared().disconnect()
+
     const config = WKSDK.shared().config
     if (uid && token) {
         config.uid = uid;

@@ -89,6 +89,12 @@ func (co *connz) HandleConnz(c *wkhttp.Context) {
 			}
 		}
 
+		// 从数据库读取最新的 DeviceLevel
+		// device, err := service.Store.GetDevice(resultConn.Uid, resultConn.DeviceFlag)
+		// if err == nil && device.Id > 0 {
+		// 	resultConn.DeviceLevel = wkproto.DeviceLevel(device.DeviceLevel)
+		// }
+
 		connInfo := newConnInfo(resultConn)
 
 		proxyType := "未知"

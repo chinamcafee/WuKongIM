@@ -90,7 +90,12 @@ func (h *Handler) handleConnect(event *eventbus.Event) (wkproto.ReasonCode, *wkp
 		}
 		devceLevel = wkproto.DeviceLevel(device.DeviceLevel)
 	} else {
-		devceLevel = wkproto.DeviceLevelSlave // 默认都是slave设备
+		device, err := service.Store.GetDevice(uid, connectPacket.DeviceFlag)
+		if err != nil {
+			h.Error("get device token err", zap.Error(err), zap.String("uid", uid), zap.Uint64("sourceNodeId", event.SourceNodeId))
+			return wkproto.ReasonAuthFail, nil, err
+		}
+		devceLevel = wkproto.DeviceLevel(device.DeviceLevel)
 	}
 
 	// -------------------- ban  --------------------
