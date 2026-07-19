@@ -1218,15 +1218,6 @@ func (wk *wukongDB) iteratorChannelMessagesDirection(iter *pebble.Iterator, limi
 		}
 	}
 	for iter.Valid() {
-		if reverse {
-			if !iter.Prev() {
-				break
-			}
-		} else {
-			if !iter.Next() {
-				break
-			}
-		}
 		messageSeq, coulmnName, err := key.ParseMessageColumnKey(iter.Key())
 		if err != nil {
 			return err
@@ -1285,6 +1276,13 @@ func (wk *wukongDB) iteratorChannelMessagesDirection(iter *pebble.Iterator, limi
 
 		}
 		hasData = true
+		if reverse {
+			if !iter.Prev() {
+				break
+			}
+		} else if !iter.Next() {
+			break
+		}
 	}
 	if lastNeedAppend && hasData {
 		if iterFnc != nil {

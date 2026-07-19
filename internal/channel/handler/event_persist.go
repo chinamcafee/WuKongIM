@@ -1,11 +1,16 @@
 package handler
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
+	"github.com/WuKongIM/WuKongIM/internal/persistreceipt"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/internal/track"
 	"github.com/WuKongIM/WuKongIM/internal/types"
@@ -24,7 +29,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 	}
 
 	// ========== 存储消息 ==========
-	persists := h.toPersistMessages(ctx.ChannelId, ctx.ChannelType, events)
+	persists := h.toIdempotentPersistMessages(ctx.ChannelId, ctx.ChannelType, events)
 	if len(persists) > 0 {
 
 		timeoutCtx, cancel := h.WithTimeout()
@@ -66,6 +71,9 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 			for _, msg := range persists {
 				if event.MessageId == msg.MessageID {
 					event.ReasonCode = reasonCode
+					if reasonCode != wkproto.ReasonSuccess {
+						event.PersistErrorCode = persistreceipt.CodePersistFailed
+					}
 					break
 				}
 			}
@@ -92,7 +100,7 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 	if options.G.WebhookOn(types.EventMsgNotify) {
 		for _, e := range events {
 			sendPacket := e.Frame.(*wkproto.SendPacket)
-			if e.ReasonCode == wkproto.ReasonSuccess && !sendPacket.NoPersist {
+			if e.ReasonCode == wkproto.ReasonSuccess && !sendPacket.NoPersist && !e.Deduplicated {
 				cloneEvent := e.Clone()
 				cloneEvent.Type = eventbus.EventChannelWebhook
 				eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
@@ -102,13 +110,15 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 
 	// ========== 分发 ==========
 	for _, e := range events {
-		if e.ReasonCode != wkproto.ReasonSuccess {
+		if e.ReasonCode != wkproto.ReasonSuccess || e.Deduplicated {
 			continue
 		}
 		cloneEvent := e.Clone()
 		cloneEvent.Type = eventbus.EventChannelDistribute
 		eventbus.Channel.AddEvent(ctx.ChannelId, ctx.ChannelType, cloneEvent)
 	}
+
+	h.resolvePersistReceipts(events)
 
 	eventbus.Channel.Advance(ctx.ChannelId, ctx.ChannelType)
 
@@ -200,33 +210,153 @@ func (h *Handler) toPersistMessages(channelId string, channelType uint8, events 
 	persists := make([]wkdb.Message, 0, len(events))
 	for _, e := range events {
 		sendPacket := e.Frame.(*wkproto.SendPacket)
-		if sendPacket.NoPersist || e.ReasonCode != wkproto.ReasonSuccess || strings.TrimSpace(e.StreamNo) != "" {
+		if sendPacket.NoPersist || e.ReasonCode != wkproto.ReasonSuccess || strings.TrimSpace(e.StreamNo) != "" || e.Deduplicated || e.PersistErrorCode != "" {
+			continue
+		}
+		persists = append(persists, toPersistMessage(channelId, channelType, e))
+	}
+	return persists
+}
+
+type loadMessageByClientMsgNo func(channelId string, channelType uint8, clientMsgNo string) (wkdb.Message, error)
+
+func (h *Handler) toIdempotentPersistMessages(channelId string, channelType uint8, events []*eventbus.Event) []wkdb.Message {
+	return resolveIdempotentPersistMessages(
+		channelId,
+		channelType,
+		events,
+		service.Store.LoadMsgByClientMsgNo,
+		func(clientMsgNo string) {
+			h.Warn("idempotency conflict", zap.String("clientMsgNoHash", shortClientMsgNoHash(clientMsgNo)))
+		},
+	)
+}
+
+func resolveIdempotentPersistMessages(
+	channelId string,
+	channelType uint8,
+	events []*eventbus.Event,
+	load loadMessageByClientMsgNo,
+	onConflict func(clientMsgNo string),
+) []wkdb.Message {
+	persists := make([]wkdb.Message, 0, len(events))
+	seen := make(map[string]wkdb.Message, len(events))
+
+	for _, event := range events {
+		sendPacket := event.Frame.(*wkproto.SendPacket)
+		if sendPacket.NoPersist || event.ReasonCode != wkproto.ReasonSuccess || strings.TrimSpace(event.StreamNo) != "" {
+			continue
+		}
+		clientMsgNo := strings.TrimSpace(sendPacket.ClientMsgNo)
+		if clientMsgNo == "" {
+			event.ReasonCode = wkproto.ReasonMsgKeyError
+			event.PersistErrorCode = persistreceipt.CodeClientMsgNoRequired
 			continue
 		}
 
-		msg := wkdb.Message{
-			RecvPacket: wkproto.RecvPacket{
-				Framer: wkproto.Framer{
-					RedDot:    sendPacket.Framer.RedDot,
-					SyncOnce:  sendPacket.Framer.SyncOnce,
-					NoPersist: sendPacket.Framer.NoPersist,
-				},
-				Setting:     sendPacket.Setting,
-				MessageID:   e.MessageId,
-				MessageSeq:  uint32(e.MessageSeq),
-				ClientMsgNo: sendPacket.ClientMsgNo,
-				ClientSeq:   sendPacket.ClientSeq,
-				FromUID:     e.Conn.Uid,
-				ChannelID:   channelId,
-				ChannelType: channelType,
-				Expire:      sendPacket.Expire,
-				Timestamp:   int32(time.Now().Unix()),
-				Topic:       sendPacket.Topic,
-				StreamNo:    sendPacket.StreamNo,
-				Payload:     sendPacket.Payload,
-			},
+		candidate := toPersistMessage(channelId, channelType, event)
+		if existing, exists := seen[clientMsgNo]; exists {
+			applyIdempotencyDecision(event, existing, candidate, onConflict)
+			continue
 		}
-		persists = append(persists, msg)
+
+		existing, err := load(channelId, channelType, clientMsgNo)
+		switch {
+		case err == nil:
+			seen[clientMsgNo] = existing
+			applyIdempotencyDecision(event, existing, candidate, onConflict)
+		case errors.Is(err, wkdb.ErrNotFound):
+			seen[clientMsgNo] = candidate
+			persists = append(persists, candidate)
+		default:
+			event.ReasonCode = wkproto.ReasonSystemError
+			event.PersistErrorCode = persistreceipt.CodePersistFailed
+		}
 	}
 	return persists
+}
+
+func applyIdempotencyDecision(
+	event *eventbus.Event,
+	existing wkdb.Message,
+	candidate wkdb.Message,
+	onConflict func(clientMsgNo string),
+) {
+	if sameIdempotentMessage(existing, candidate) {
+		event.MessageId = existing.MessageID
+		event.MessageSeq = uint64(existing.MessageSeq)
+		event.Deduplicated = true
+		return
+	}
+	event.ReasonCode = wkproto.ReasonMsgKeyError
+	event.PersistErrorCode = persistreceipt.CodeIdempotencyConflict
+	if onConflict != nil {
+		onConflict(candidate.ClientMsgNo)
+	}
+}
+
+func sameIdempotentMessage(existing, candidate wkdb.Message) bool {
+	return existing.FromUID == candidate.FromUID &&
+		existing.ChannelID == candidate.ChannelID &&
+		existing.ChannelType == candidate.ChannelType &&
+		existing.RedDot == candidate.RedDot &&
+		existing.SyncOnce == candidate.SyncOnce &&
+		existing.NoPersist == candidate.NoPersist &&
+		existing.Setting == candidate.Setting &&
+		existing.Expire == candidate.Expire &&
+		existing.Topic == candidate.Topic &&
+		existing.StreamNo == candidate.StreamNo &&
+		bytes.Equal(existing.Payload, candidate.Payload)
+}
+
+func toPersistMessage(channelId string, channelType uint8, event *eventbus.Event) wkdb.Message {
+	sendPacket := event.Frame.(*wkproto.SendPacket)
+	return wkdb.Message{
+		RecvPacket: wkproto.RecvPacket{
+			Framer: wkproto.Framer{
+				RedDot:    sendPacket.Framer.RedDot,
+				SyncOnce:  sendPacket.Framer.SyncOnce,
+				NoPersist: sendPacket.Framer.NoPersist,
+			},
+			Setting:     sendPacket.Setting,
+			MessageID:   event.MessageId,
+			MessageSeq:  uint32(event.MessageSeq),
+			ClientMsgNo: sendPacket.ClientMsgNo,
+			ClientSeq:   sendPacket.ClientSeq,
+			FromUID:     event.Conn.Uid,
+			ChannelID:   channelId,
+			ChannelType: channelType,
+			Expire:      sendPacket.Expire,
+			Timestamp:   int32(time.Now().Unix()),
+			Topic:       sendPacket.Topic,
+			StreamNo:    sendPacket.StreamNo,
+			Payload:     sendPacket.Payload,
+		},
+	}
+}
+
+func shortClientMsgNoHash(clientMsgNo string) string {
+	digest := sha256.Sum256([]byte(clientMsgNo))
+	return fmt.Sprintf("%x", digest[:6])
+}
+
+func (h *Handler) resolvePersistReceipts(events []*eventbus.Event) {
+	for _, event := range events {
+		if event.ReqId == "" {
+			continue
+		}
+		sendPacket := event.Frame.(*wkproto.SendPacket)
+		errorCode := event.PersistErrorCode
+		if errorCode == "" && event.ReasonCode != wkproto.ReasonSuccess {
+			errorCode = persistreceipt.CodePersistRejected
+		}
+		persistreceipt.Resolve(event.ReqId, persistreceipt.Result{
+			MessageID:    event.MessageId,
+			MessageSeq:   event.MessageSeq,
+			ClientMsgNo:  sendPacket.ClientMsgNo,
+			Deduplicated: event.Deduplicated,
+			ErrorCode:    errorCode,
+			ReasonCode:   uint8(event.ReasonCode),
+		})
+	}
 }

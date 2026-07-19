@@ -129,10 +129,8 @@ func (ch *channel) channelExpireUpdate(c *wkhttp.Context) {
 		return
 	}
 
-	// 如果是个人频道且提供了 to_uid，生成 FakeChannelID
-	actualChannelId := req.ChannelId
-	if req.ChannelType == wkproto.ChannelTypePerson && req.ToUid != "" {
-		actualChannelId = options.GetFakeChannelIDWith(req.ChannelId, req.ToUid)
+	actualChannelId := actualChannelIDForExpire(req)
+	if actualChannelId != req.ChannelId {
 		ch.Debug("个人频道使用FakeChannelID", zap.String("from", req.ChannelId), zap.String("to", req.ToUid), zap.String("fakeChannelId", actualChannelId))
 	}
 
@@ -216,6 +214,13 @@ func (ch *channel) channelExpireUpdate(c *wkhttp.Context) {
 	}
 
 	c.ResponseOK()
+}
+
+func actualChannelIDForExpire(req channelExpireUpdateReq) string {
+	if req.ChannelType == wkproto.ChannelTypePerson && strings.TrimSpace(req.ToUid) != "" {
+		return options.GetFakeChannelIDWith(req.ChannelId, req.ToUid)
+	}
+	return req.ChannelId
 }
 
 // 更新或添加频道信息
@@ -1009,6 +1014,7 @@ func (ch *channel) whitelistAdd(c *wkhttp.Context) {
 		c.ResponseError(errors.New("uids不能为空！"))
 		return
 	}
+	req.UIDs = deduplicateUIDs(req.UIDs)
 
 	leaderInfo, err := service.Cluster.SlotLeaderOfChannel(req.ChannelId, req.ChannelType) // 获取频道的领导节点
 	if err != nil {
@@ -1067,6 +1073,20 @@ func (ch *channel) whitelistAdd(c *wkhttp.Context) {
 
 	c.ResponseOK()
 }
+
+func deduplicateUIDs(uids []string) []string {
+	uniqueUIDs := make([]string, 0, len(uids))
+	seen := make(map[string]struct{}, len(uids))
+	for _, uid := range uids {
+		if _, exists := seen[uid]; exists {
+			continue
+		}
+		seen[uid] = struct{}{}
+		uniqueUIDs = append(uniqueUIDs, uid)
+	}
+	return uniqueUIDs
+}
+
 func (ch *channel) whitelistSet(c *wkhttp.Context) {
 	var req whitelistReq
 	bodyBytes, err := BindJSON(&req, c)

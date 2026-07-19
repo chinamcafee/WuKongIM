@@ -20,16 +20,51 @@ func (wk *wukongDB) AddAllowlist(channelId string, channelType uint8, members []
 		return err
 	}
 
+	uniqueMembers := deduplicateAllowlistMembers(members)
+	if len(uniqueMembers) == 0 {
+		return nil
+	}
+
+	// 串行化同一频道的“查重 + 写入 + count 更新”，避免并发 add 同一 UID 时
+	// 两个调用都把该成员判断为新增。
+	wk.dblock.allowlistCountLock.lock(channelPrimaryId)
+	defer wk.dblock.allowlistCountLock.unlock(channelPrimaryId)
+
+	uids := make([]string, 0, len(uniqueMembers))
+	for _, member := range uniqueMembers {
+		uids = append(uids, member.Uid)
+	}
+	existingMembers, err := wk.getAllowlistByUids(channelId, channelType, uids)
+	if err != nil {
+		return err
+	}
+	existingUIDs := make(map[string]struct{}, len(existingMembers))
+	for _, member := range existingMembers {
+		existingUIDs[member.Uid] = struct{}{}
+	}
+
+	newMembers := make([]Member, 0, len(uniqueMembers))
+	for _, member := range uniqueMembers {
+		if _, exists := existingUIDs[member.Uid]; exists {
+			continue
+		}
+		newMembers = append(newMembers, member)
+	}
+	if len(newMembers) == 0 {
+		wk.permissionCache.BatchSetAllowlistExists(channelId, channelType, uids, true)
+		return nil
+	}
+
 	w := db.NewIndexedBatch()
 	defer w.Close()
-	for _, member := range members {
+	for _, member := range newMembers {
 		member.Id = key.HashWithString(member.Uid)
 		if err := wk.writeAllowlist(channelId, channelType, member, w); err != nil {
 			return err
 		}
 	}
 
-	err = wk.incChannelInfoAllowlistCount(channelPrimaryId, len(members), w)
+	err = wk.incChannelInfoAllowlistCount(channelPrimaryId, len(newMembers), w)
 	if err != nil {
 		wk.Error("incChannelInfoAllowlistCount failed", zap.Error(err))
 		return err
@@ -40,11 +75,8 @@ func (wk *wukongDB) AddAllowlist(channelId string, channelType uint8, members []
 		return err
 	}
 
-	// 更新缓存：将新增的用户设置为在白名单中
-	uids := make([]string, len(members))
-	for i, member := range members {
-		uids[i] = member.Uid
-	}
+	// count 已改变，频道资料缓存必须失效；权限缓存则覆盖本次请求中的全部 UID。
+	wk.channelInfoCache.InvalidateChannelInfo(channelId, channelType)
 	wk.permissionCache.BatchSetAllowlistExists(channelId, channelType, uids, true)
 
 	return nil
@@ -140,13 +172,21 @@ func (wk *wukongDB) RemoveAllowlist(channelId string, channelType uint8, uids []
 	if err != nil {
 		return err
 	}
+	uniqueUIDs := deduplicateAllowlistUIDs(uids)
+	if len(uniqueUIDs) == 0 {
+		return nil
+	}
 
-	members, err := wk.getAllowlistByUids(channelId, channelType, uids)
+	wk.dblock.allowlistCountLock.lock(channelPrimaryId)
+	defer wk.dblock.allowlistCountLock.unlock(channelPrimaryId)
+
+	members, err := wk.getAllowlistByUids(channelId, channelType, uniqueUIDs)
 	if err != nil {
-		if err == pebble.ErrNotFound {
-			return nil
-		}
 		return err
+	}
+	if len(members) == 0 {
+		wk.permissionCache.BatchSetAllowlistExists(channelId, channelType, uniqueUIDs, false)
+		return nil
 	}
 	w := db.NewIndexedBatch()
 	defer w.Close()
@@ -167,8 +207,10 @@ func (wk *wukongDB) RemoveAllowlist(channelId string, channelType uint8, uids []
 		return err
 	}
 
-	// 更新缓存：将移除的用户设置为不在白名单中
-	wk.permissionCache.BatchSetAllowlistExists(channelId, channelType, uids, false)
+	// 更新缓存：将移除的用户设置为不在白名单中，并重新计算频道是否仍有白名单。
+	wk.channelInfoCache.InvalidateChannelInfo(channelId, channelType)
+	wk.permissionCache.BatchSetAllowlistExists(channelId, channelType, uniqueUIDs, false)
+	wk.permissionCache.InvalidateChannelByType(PermissionTypeHasAllowlist, channelId, channelType)
 
 	return nil
 }
@@ -183,6 +225,9 @@ func (wk *wukongDB) RemoveAllAllowlist(channelId string, channelType uint8) erro
 	if err != nil {
 		return err
 	}
+
+	wk.dblock.allowlistCountLock.lock(channelPrimaryId)
+	defer wk.dblock.allowlistCountLock.unlock(channelPrimaryId)
 
 	batch := db.NewIndexedBatch()
 	defer batch.Close()
@@ -212,6 +257,7 @@ func (wk *wukongDB) RemoveAllAllowlist(channelId string, channelType uint8) erro
 	}
 
 	// 清空该频道的所有白名单缓存
+	wk.channelInfoCache.InvalidateChannelInfo(channelId, channelType)
 	wk.permissionCache.InvalidateChannelByType(PermissionTypeAllowlist, channelId, channelType)
 	wk.permissionCache.InvalidateChannelByType(PermissionTypeHasAllowlist, channelId, channelType)
 
@@ -236,26 +282,57 @@ func (wk *wukongDB) removeAllowlist(channelId string, channelType uint8, member 
 }
 
 func (wk *wukongDB) getAllowlistByUids(channelId string, channelType uint8, uids []string) ([]Member, error) {
-	members := make([]Member, 0, len(uids))
+	uniqueUIDs := deduplicateAllowlistUIDs(uids)
+	members := make([]Member, 0, len(uniqueUIDs))
 	db := wk.channelDb(channelId, channelType)
-	for _, uid := range uids {
+	for _, uid := range uniqueUIDs {
 		id := key.HashWithString(uid)
 		iter := db.NewIter(&pebble.IterOptions{
 			LowerBound: key.NewAllowlistColumnKey(channelId, channelType, id, key.MinColumnKey),
 			UpperBound: key.NewAllowlistColumnKey(channelId, channelType, id, key.MaxColumnKey),
 		})
-		defer iter.Close()
-
 		err := wk.iterateAllowlist(iter, func(member Member) bool {
-			members = append(members, member)
+			if member.Uid == uid {
+				members = append(members, member)
+			}
 			return true
 		})
+		closeErr := iter.Close()
 		if err != nil {
 			return nil, err
+		}
+		if closeErr != nil {
+			return nil, closeErr
 		}
 
 	}
 	return members, nil
+}
+
+func deduplicateAllowlistMembers(members []Member) []Member {
+	uniqueMembers := make([]Member, 0, len(members))
+	seen := make(map[string]struct{}, len(members))
+	for _, member := range members {
+		if _, exists := seen[member.Uid]; exists {
+			continue
+		}
+		seen[member.Uid] = struct{}{}
+		uniqueMembers = append(uniqueMembers, member)
+	}
+	return uniqueMembers
+}
+
+func deduplicateAllowlistUIDs(uids []string) []string {
+	uniqueUIDs := make([]string, 0, len(uids))
+	seen := make(map[string]struct{}, len(uids))
+	for _, uid := range uids {
+		if _, exists := seen[uid]; exists {
+			continue
+		}
+		seen[uid] = struct{}{}
+		uniqueUIDs = append(uniqueUIDs, uid)
+	}
+	return uniqueUIDs
 }
 
 func (wk *wukongDB) writeAllowlist(channelId string, channelType uint8, member Member, w pebble.Writer) error {
@@ -361,8 +438,6 @@ func (wk *wukongDB) iterateAllowlist(iter *pebble.Iterator, iterFnc func(member 
 
 // 增加频道白名单数量
 func (wk *wukongDB) incChannelInfoAllowlistCount(id uint64, count int, db *pebble.Batch) error {
-	wk.dblock.allowlistCountLock.lock(id)
-	defer wk.dblock.allowlistCountLock.unlock(id)
 	return wk.incChannelInfoColumnCount(id, key.TableChannelInfo.Column.AllowlistCount, key.TableChannelInfo.SecondIndex.AllowlistCount, count, db)
 }
 

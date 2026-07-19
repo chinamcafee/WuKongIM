@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strconv"
@@ -619,18 +620,19 @@ func (w *Webhook) loopOnlineStatus() {
 
 func (w *Webhook) sendWebhookForHttp(event string, data []byte) error {
 	eventURL := fmt.Sprintf("%s?event=%s", options.G.Webhook.HTTPAddr, event)
+	webhookAddrForLog := webhookURLForLog(options.G.Webhook.HTTPAddr)
 	startTime := time.Now().UnixNano() / 1000 / 1000
-	w.Debug("webhook开始请求", zap.String("eventURL", eventURL))
+	w.Debug("webhook开始请求", zap.String("eventURL", webhookURLForLog(eventURL)))
 	resp, err := w.httpClient.Post(eventURL, "application/json", bytes.NewBuffer(data))
 	w.Debug("webhook请求结束 耗时", zap.Int64("mill", time.Now().UnixNano()/1000/1000-startTime))
 	if err != nil {
-		w.Warn("调用第三方消息通知失败！", zap.String("Webhook", options.G.Webhook.HTTPAddr), zap.Error(err))
+		w.Warn("调用第三方消息通知失败！", zap.String("Webhook", webhookAddrForLog), zap.Error(err))
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		w.Warn("第三方消息通知接口返回状态错误！", zap.Int("status", resp.StatusCode), zap.String("Webhook", options.G.Webhook.HTTPAddr))
+		w.Warn("第三方消息通知接口返回状态错误！", zap.Int("status", resp.StatusCode), zap.String("Webhook", webhookAddrForLog))
 		return errors.New("第三方消息通知接口返回状态错误！")
 	}
 	return nil
@@ -641,21 +643,31 @@ func (w *Webhook) sendAgentWebhookForHttp(event string, data []byte) error {
 	// The correct configuration option could not be determined automatically.
 	agentWebhookAddr := options.G.Agent.Webhook.HTTPAddr
 	eventURL := fmt.Sprintf("%s?event=%s", agentWebhookAddr, event)
+	agentWebhookAddrForLog := webhookURLForLog(agentWebhookAddr)
 	startTime := time.Now().UnixNano() / 1000 / 1000
-	w.Debug("agent webhook开始请求", zap.String("eventURL", eventURL))
+	w.Debug("agent webhook开始请求", zap.String("eventURL", webhookURLForLog(eventURL)))
 	resp, err := w.httpClient.Post(eventURL, "application/json", bytes.NewBuffer(data))
 	w.Debug("agent webhook请求结束 耗时", zap.Int64("mill", time.Now().UnixNano()/1000/1000-startTime))
 	if err != nil {
-		w.Warn("调用第三方agent消息通知失败！", zap.String("Webhook", agentWebhookAddr), zap.Error(err))
+		w.Warn("调用第三方agent消息通知失败！", zap.String("Webhook", agentWebhookAddrForLog), zap.Error(err))
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		w.Warn("第三方agent消息通知接口返回状态错误！", zap.Int("status", resp.StatusCode), zap.String("Webhook", agentWebhookAddr))
+		w.Warn("第三方agent消息通知接口返回状态错误！", zap.Int("status", resp.StatusCode), zap.String("Webhook", agentWebhookAddrForLog))
 		return errors.New("第三方agent消息通知接口返回状态错误！")
 	}
 	return nil
+}
+
+func webhookURLForLog(rawURL string) string {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return "<invalid-webhook-url>"
+	}
+	parsedURL.User = nil
+	return parsedURL.String()
 }
 
 func (w *Webhook) sendWebhookForGRPC(event string, data []byte) error {

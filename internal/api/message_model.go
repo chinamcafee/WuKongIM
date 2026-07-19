@@ -9,22 +9,36 @@ import (
 
 // messageSendReq 消息发送请求
 type messageSendReq struct {
-	Header      types.MessageHeader `json:"header"`        // 消息头
-	ClientMsgNo string              `json:"client_msg_no"` // 客户端消息编号（相同编号，客户端只会显示一条）
-	StreamNo    string              `json:"stream_no"`     // 消息流编号
-	FromUID     string              `json:"from_uid"`      // 发送者UID
-	ChannelID   string              `json:"channel_id"`    // 频道ID
-	ChannelType uint8               `json:"channel_type"`  // 频道类型
-	Expire      uint32              `json:"expire"`        // 消息过期时间
-	Subscribers []string            `json:"subscribers"`   // 订阅者 如果此字段有值，表示消息只发给指定的订阅者
-	Payload     []byte              `json:"payload"`       // 消息内容
-	TagKey      string              `json:"tag_key"`       // tagKey
+	Header           types.MessageHeader `json:"header"`             // 消息头
+	ClientMsgNo      string              `json:"client_msg_no"`      // 客户端消息编号（相同编号，客户端只会显示一条）
+	StreamNo         string              `json:"stream_no"`          // 消息流编号
+	FromUID          string              `json:"from_uid"`           // 发送者UID
+	ChannelID        string              `json:"channel_id"`         // 频道ID
+	ChannelType      uint8               `json:"channel_type"`       // 频道类型
+	Expire           uint32              `json:"expire"`             // 消息过期时间
+	Subscribers      []string            `json:"subscribers"`        // 订阅者 如果此字段有值，表示消息只发给指定的订阅者
+	Payload          []byte              `json:"payload"`            // 消息内容
+	TagKey           string              `json:"tag_key"`            // tagKey
+	WaitForPersist   int                 `json:"wait_for_persist"`   // 是否等待消息持久化完成（仅内部少量消息使用）
+	PersistTimeoutMS int                 `json:"persist_timeout_ms"` // 等待持久化的有界超时
 }
 
 // Check 检查输入
 func (m messageSendReq) Check() error {
 	if m.Payload == nil || len(m.Payload) <= 0 {
 		return errors.New("payload不能为空！")
+	}
+	if m.Header.NoPersist == 0 && strings.TrimSpace(m.ClientMsgNo) == "" {
+		return errors.New("持久消息的client_msg_no不能为空！")
+	}
+	if m.WaitForPersist != 0 && m.WaitForPersist != 1 {
+		return errors.New("wait_for_persist只能为0或1")
+	}
+	if m.WaitForPersist == 0 && m.PersistTimeoutMS != 0 {
+		return errors.New("persist_timeout_ms仅在wait_for_persist=1时有效")
+	}
+	if m.WaitForPersist == 1 && m.Header.NoPersist != 0 {
+		return errors.New("非持久消息不能等待持久化回执")
 	}
 	return nil
 }

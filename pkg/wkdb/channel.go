@@ -512,13 +512,9 @@ func (wk *wukongDB) GetChannelAppliedIndex(channelId string, channelType uint8) 
 	return wk.endian.Uint64(data), nil
 }
 
-// 增加频道属性数量 id为频道信息的唯一主键 count为math.MinInt 表示重置为0
+// 增加频道属性数量。count 为 0 表示重置为 0；其余值作为增量。
 func (wk *wukongDB) incChannelInfoColumnCount(id uint64, columnName, indexName [2]byte, count int, batch *pebble.Batch) error {
 	countKey := key.NewChannelInfoColumnKey(id, columnName)
-	if count == 0 { //
-		return batch.Set(countKey, []byte{0x00, 0x00, 0x00, 0x00}, wk.noSync)
-	}
-
 	countBytes, closer, err := batch.Get(countKey)
 	if err != nil && err != pebble.ErrNotFound {
 		return err
@@ -533,8 +529,19 @@ func (wk *wukongDB) incChannelInfoColumnCount(id uint64, columnName, indexName [
 	} else {
 		countBytes = make([]byte, 4)
 	}
-	count += int(oldCount)
-	wk.endian.PutUint32(countBytes, uint32(count))
+	newCount := 0
+	if count != 0 {
+		newCount = int(oldCount) + count
+		if newCount < 0 {
+			newCount = 0
+		}
+	}
+	wk.endian.PutUint32(countBytes, uint32(newCount))
+
+	// count 是二级索引的一部分，更新前必须删除旧索引，否则同一频道会残留多个 count 索引。
+	if err = batch.Delete(key.NewChannelInfoSecondIndexKey(indexName, uint64(oldCount), id), wk.noSync); err != nil {
+		return err
+	}
 
 	// 设置数量
 	err = batch.Set(countKey, countBytes, wk.noSync)
@@ -542,7 +549,7 @@ func (wk *wukongDB) incChannelInfoColumnCount(id uint64, columnName, indexName [
 		return err
 	}
 	// 设置数量对应的索引
-	secondIndexKey := key.NewChannelInfoSecondIndexKey(indexName, uint64(count), id)
+	secondIndexKey := key.NewChannelInfoSecondIndexKey(indexName, uint64(newCount), id)
 	err = batch.Set(secondIndexKey, nil, wk.noSync)
 	if err != nil {
 		return err

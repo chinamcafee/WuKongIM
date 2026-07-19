@@ -10,6 +10,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/ingress"
 	"github.com/WuKongIM/WuKongIM/internal/options"
+	"github.com/WuKongIM/WuKongIM/internal/persistreceipt"
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/internal/track"
 	"github.com/WuKongIM/WuKongIM/internal/types"
@@ -24,6 +25,12 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sendgrid/rest"
 	"go.uber.org/zap"
+)
+
+const (
+	defaultPersistTimeoutMS = 3000
+	minPersistTimeoutMS     = 100
+	maxPersistTimeoutMS     = 10000
 )
 
 type message struct {
@@ -64,7 +71,8 @@ func (m *message) route(r *wkhttp.WKHttp) {
 
 func (m *message) send(c *wkhttp.Context) {
 	var req messageSendReq
-	if err := c.BindJSON(&req); err != nil {
+	bodyBytes, err := BindJSON(&req, c)
+	if err != nil {
 		m.Error("数据格式有误！", zap.Error(err))
 		c.ResponseError(err)
 		return
@@ -81,22 +89,30 @@ func (m *message) send(c *wkhttp.Context) {
 	channelId := req.ChannelID
 	channelType := req.ChannelType
 
-	m.Debug("发送消息内容：", zap.String("msg", wkutil.ToJSON(req)))
+	m.Debug("发送消息", zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.Bool("waitForPersist", req.WaitForPersist == 1))
 	if strings.TrimSpace(channelId) == "" && len(req.Subscribers) == 0 { //指定了频道 才能正常发送
-		m.Error("无法处理发送消息请求！", zap.Any("req", req))
+		m.Error("无法处理发送消息请求：频道和订阅者均为空")
 		c.ResponseError(errors.New("无法处理发送消息请求！"))
 		return
 	}
 
 	if len(req.Subscribers) > 0 && req.Header.SyncOnce != 1 {
-		m.Error("subscribers有值的情况下，消息必须是syncOnce消息", zap.Any("req", req))
+		m.Error("subscribers有值的情况下，消息必须是syncOnce消息", zap.Int("subscriberCount", len(req.Subscribers)))
 		c.ResponseError(errors.New("无法处理发送消息请求！"))
 		return
 	}
 
 	if strings.TrimSpace(channelId) != "" && len(req.Subscribers) > 0 {
-		m.Error("channelId和subscribers不能同时存在！", zap.Any("req", req))
+		m.Error("channelId和subscribers不能同时存在！", zap.Uint8("channelType", channelType), zap.Int("subscriberCount", len(req.Subscribers)))
 		c.ResponseError(errors.New("无法处理发送消息请求！"))
+		return
+	}
+	if len(req.Subscribers) > 0 && req.WaitForPersist == 1 {
+		c.ResponseError(errors.New("subscribers模式不支持等待持久化回执"))
+		return
+	}
+	if err := normalizePersistTimeout(&req); err != nil {
+		c.ResponseError(err)
 		return
 	}
 
@@ -151,9 +167,12 @@ func (m *message) send(c *wkhttp.Context) {
 
 		}
 
-		clientMsgNo := fmt.Sprintf("%s0", wkutil.GenUUID())
+		clientMsgNo := req.ClientMsgNo
+		if strings.TrimSpace(clientMsgNo) == "" {
+			clientMsgNo = fmt.Sprintf("%s0", wkutil.GenUUID())
+		}
 		// 发送消息
-		_, err := sendMessageToChannel(req, tmpChannelId, tmpChannelType, clientMsgNo, wkproto.StreamFlagIng)
+		_, err := sendMessageToChannel(req, tmpChannelId, tmpChannelType, clientMsgNo, wkproto.StreamFlagIng, "")
 		if err != nil {
 			c.ResponseError(err)
 			return
@@ -168,16 +187,120 @@ func (m *message) send(c *wkhttp.Context) {
 		clientMsgNo = fmt.Sprintf("%s0", wkutil.GenUUID())
 	}
 
+	if req.WaitForPersist == 1 {
+		fakeChannelID := fakeChannelIDForMessage(req, channelId, channelType)
+		leaderInfo, err := service.Cluster.SlotLeaderOfChannel(fakeChannelID, channelType)
+		if err != nil {
+			m.Error("获取持久消息所在节点失败", zap.Error(err), zap.String("fakeChannelId", fakeChannelID), zap.Uint8("channelType", channelType))
+			c.ResponseError(errors.New("获取消息持久化节点失败"))
+			return
+		}
+		if forwardURL, shouldForward := persistWaitForwardURL(leaderInfo.Id, options.G.Cluster.NodeId, leaderInfo.ApiServerAddr, c.Request.URL.Path); shouldForward {
+			c.ForwardWithBody(forwardURL, bodyBytes)
+			return
+		}
+	}
+
+	requestID := ""
+	var receiptC <-chan persistreceipt.Result
+	if req.WaitForPersist == 1 {
+		requestID = wkutil.GenUUID()
+		receiptC = persistreceipt.Register(requestID)
+		defer persistreceipt.Cancel(requestID)
+	}
+
 	// 发送消息
-	messageId, err := sendMessageToChannel(req, channelId, channelType, clientMsgNo, wkproto.StreamFlagIng)
+	messageId, err := sendMessageToChannel(req, channelId, channelType, clientMsgNo, wkproto.StreamFlagIng, requestID)
 	if err != nil {
 		c.ResponseError(err)
+		return
+	}
+	if req.WaitForPersist == 1 {
+		awaitPersistReceipt(c, receiptC, time.Duration(req.PersistTimeoutMS)*time.Millisecond)
 		return
 	}
 	c.ResponseOKWithData(map[string]interface{}{
 		"message_id":    messageId,
 		"client_msg_no": clientMsgNo,
 	})
+}
+
+func normalizePersistTimeout(req *messageSendReq) error {
+	if req.WaitForPersist != 1 {
+		return nil
+	}
+	if req.PersistTimeoutMS == 0 {
+		req.PersistTimeoutMS = defaultPersistTimeoutMS
+	}
+	if req.PersistTimeoutMS < minPersistTimeoutMS || req.PersistTimeoutMS > maxPersistTimeoutMS {
+		return fmt.Errorf("persist_timeout_ms必须在%d到%d之间", minPersistTimeoutMS, maxPersistTimeoutMS)
+	}
+	return nil
+}
+
+func persistWaitForwardURL(leaderID, localNodeID uint64, leaderAPIAddr, requestPath string) (string, bool) {
+	if leaderID == localNodeID {
+		return "", false
+	}
+	return fmt.Sprintf("%s%s", leaderAPIAddr, requestPath), true
+}
+
+func awaitPersistReceipt(c *wkhttp.Context, receiptC <-chan persistreceipt.Result, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case receipt := <-receiptC:
+		respondPersistReceipt(c, receipt)
+	case <-timer.C:
+		c.JSON(http.StatusGatewayTimeout, gin.H{
+			"status":    http.StatusGatewayTimeout,
+			"code":      "persist_timeout",
+			"msg":       "消息持久化确认超时",
+			"retryable": true,
+		})
+	case <-c.Request.Context().Done():
+	}
+}
+
+func respondPersistReceipt(c *wkhttp.Context, receipt persistreceipt.Result) {
+	if receipt.ErrorCode == "" {
+		deduplicated := 0
+		if receipt.Deduplicated {
+			deduplicated = 1
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"status":        http.StatusOK,
+			"message_id":    fmt.Sprintf("%d", receipt.MessageID),
+			"message_seq":   receipt.MessageSeq,
+			"client_msg_no": receipt.ClientMsgNo,
+			"deduplicated":  deduplicated,
+		})
+		return
+	}
+
+	switch receipt.ErrorCode {
+	case persistreceipt.CodeIdempotencyConflict:
+		c.JSON(http.StatusConflict, gin.H{
+			"status":    http.StatusConflict,
+			"code":      receipt.ErrorCode,
+			"msg":       "client_msg_no已被不同消息使用",
+			"retryable": false,
+		})
+	case persistreceipt.CodeClientMsgNoRequired:
+		c.JSON(http.StatusBadRequest, gin.H{
+			"status":    http.StatusBadRequest,
+			"code":      receipt.ErrorCode,
+			"msg":       "持久消息的client_msg_no不能为空",
+			"retryable": false,
+		})
+	default:
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status":    http.StatusServiceUnavailable,
+			"code":      receipt.ErrorCode,
+			"msg":       "消息持久化失败",
+			"retryable": true,
+		})
+	}
 }
 
 // 请求临时频道设置订阅者
@@ -212,7 +335,7 @@ func (m *message) requestSetSubscribersForTmpChannel(tmpChannelId string, uids [
 	return nil
 }
 
-func sendMessageToChannel(req messageSendReq, channelId string, channelType uint8, clientMsgNo string, streamFlag wkproto.StreamFlag) (int64, error) {
+func sendMessageToChannel(req messageSendReq, channelId string, channelType uint8, clientMsgNo string, streamFlag wkproto.StreamFlag, requestID string) (int64, error) {
 
 	// m.s.monitor.SendPacketInc(req.Header.NoPersist != 1)
 	// m.s.monitor.SendSystemMsgInc()
@@ -223,16 +346,7 @@ func sendMessageToChannel(req messageSendReq, channelId string, channelType uint
 		return 0, errors.New("频道ID不合法！")
 	}
 
-	fakeChannelId := channelId
-	if channelType == wkproto.ChannelTypePerson {
-		fakeChannelId = options.GetFakeChannelIDWith(req.FromUID, channelId)
-	} else if channelType == wkproto.ChannelTypeAgent {
-		fakeChannelId = options.GetAgentChannelIDWith(req.FromUID, channelId)
-	}
-
-	if req.Header.SyncOnce == 1 && !options.G.IsOnlineCmdChannel(channelId) && channelType != wkproto.ChannelTypeTemp { // 命令消息，将原频道转换为cmd频道
-		fakeChannelId = options.G.OrginalConvertCmdChannel(fakeChannelId)
-	}
+	fakeChannelId := fakeChannelIDForMessage(req, channelId, channelType)
 
 	var setting wkproto.Setting
 	if len(strings.TrimSpace(req.StreamNo)) > 0 {
@@ -275,12 +389,26 @@ func sendMessageToChannel(req messageSendReq, channelId string, channelType uint
 		Track: track.Message{
 			PreStart: time.Now(),
 		},
+		ReqId: requestID,
 	}
 	eventbus.Channel.SendMessage(fakeChannelId, channelType, event)
 	event.Track.Record(track.PositionStart)
 	eventbus.Channel.Advance(fakeChannelId, channelType)
 
 	return messageId, nil
+}
+
+func fakeChannelIDForMessage(req messageSendReq, channelId string, channelType uint8) string {
+	fakeChannelId := channelId
+	if channelType == wkproto.ChannelTypePerson {
+		fakeChannelId = options.GetFakeChannelIDWith(req.FromUID, channelId)
+	} else if channelType == wkproto.ChannelTypeAgent {
+		fakeChannelId = options.GetAgentChannelIDWith(req.FromUID, channelId)
+	}
+	if req.Header.SyncOnce == 1 && !options.G.IsOnlineCmdChannel(channelId) && channelType != wkproto.ChannelTypeTemp {
+		fakeChannelId = options.G.OrginalConvertCmdChannel(fakeChannelId)
+	}
+	return fakeChannelId
 }
 
 func (m *message) sendBatch(c *wkhttp.Context) {
@@ -317,7 +445,7 @@ func (m *message) sendBatch(c *wkhttp.Context) {
 			ChannelID:   subscriber,
 			ChannelType: wkproto.ChannelTypePerson,
 			Payload:     req.Payload,
-		}, subscriber, wkproto.ChannelTypePerson, clientMsgNo, wkproto.StreamFlagIng)
+		}, subscriber, wkproto.ChannelTypePerson, clientMsgNo, wkproto.StreamFlagIng, "")
 		if err != nil {
 			failUids = append(failUids, subscriber)
 			reasons = append(reasons, err.Error())

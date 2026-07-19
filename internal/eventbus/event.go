@@ -99,27 +99,32 @@ type Event struct {
 	ChannelId    string   // 频道ID
 	ChannelType  uint8    // 频道类型
 	ReqId        string   // 请求ID(非必填)(jsonrpc)
+	// 以下字段只在频道 leader 本地持久化流程中使用，不参与跨节点编码。
+	Deduplicated     bool
+	PersistErrorCode string
 }
 
 func (e *Event) Clone() *Event {
 	return &Event{
-		Type:         e.Type,
-		Conn:         e.Conn,
-		Frame:        e.Frame,
-		MessageId:    e.MessageId,
-		MessageSeq:   e.MessageSeq,
-		StreamNo:     e.StreamNo,
-		StreamFlag:   e.StreamFlag,
-		ReasonCode:   e.ReasonCode,
-		TagKey:       e.TagKey,
-		ToUid:        e.ToUid,
-		SourceNodeId: e.SourceNodeId,
-		Track:        e.Track.Clone(),
-		Index:        e.Index,
-		OfflineUsers: e.OfflineUsers,
-		ChannelId:    e.ChannelId,
-		ChannelType:  e.ChannelType,
-		ReqId:        e.ReqId,
+		Type:             e.Type,
+		Conn:             e.Conn,
+		Frame:            e.Frame,
+		MessageId:        e.MessageId,
+		MessageSeq:       e.MessageSeq,
+		StreamNo:         e.StreamNo,
+		StreamFlag:       e.StreamFlag,
+		ReasonCode:       e.ReasonCode,
+		TagKey:           e.TagKey,
+		ToUid:            e.ToUid,
+		SourceNodeId:     e.SourceNodeId,
+		Track:            e.Track.Clone(),
+		Index:            e.Index,
+		OfflineUsers:     e.OfflineUsers,
+		ChannelId:        e.ChannelId,
+		ChannelType:      e.ChannelType,
+		ReqId:            e.ReqId,
+		Deduplicated:     e.Deduplicated,
+		PersistErrorCode: e.PersistErrorCode,
 	}
 }
 
