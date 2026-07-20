@@ -3,6 +3,8 @@
 *.dll
 *.so
 *.dylib
+/wukongimv2
+/wkcli
 
 # Test binary, build with `go test -c`
 *.test
@@ -46,5 +48,26 @@ external_ip.txt
 
 wukongim.pid
 
-# 编译产物 - 可执行文件
-/wukongim
+.worktrees/
+
+WuKongIM-v2/
+
+.docker-data
+.cluster-dev-data
+
+.agents/
+_bmad/
+_bmad-output
+.claude/
+.superpowers/
+
+learn_project/
+wukongim.conf
+.devdata/
+docker/dev-cluster/
+docker/dev-sim/
+docker/dev-observability/
+docs/development/perf-runs/
+tmp/
+node_modules/
+data/

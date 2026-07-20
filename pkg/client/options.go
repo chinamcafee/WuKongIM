@@ -1,161 +1,124 @@
 package client
 
 import (
+	"context"
+	"net"
 	"time"
 
-	wkproto "github.com/WuKongIM/WuKongIMGoProto"
+	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
 )
 
-// Options Options
-type Options struct {
-	ProtoVersion   uint8  // 协议版本
-	UID            string // 用户uid
-	Token          string // 连接IM的token
-	AutoReconn     bool   //是否开启自动重连
-	DefaultBufSize int    // The size of the bufio reader/writer on top of the socket.
+const (
+	defaultOperationTimeout      = 5 * time.Second
+	defaultAckTimeout            = 5 * time.Second
+	defaultSendQueueCapacity     = 8192
+	defaultMaxInflight           = 8192
+	defaultBatchMaxRecords       = 512
+	defaultBatchMaxBytes         = 512 * 1024
+	defaultBatchMaxWait          = time.Millisecond
+	defaultReadBufferSize        = 4096
+	defaultInboundFrameBuffer    = 1024
+	defaultPoolBalanceRoundRobin = "round_robin"
+)
 
-	// ReconnectBufSize is the size of the backing bufio during reconnect.
-	// Once this has been exhausted publish operations will return an error.
-	// Defaults to 8388608 bytes (8MB).
-	ReconnectBufSize int
-
-	// FlusherTimeout is the maximum time to wait for write operations
-	// to the underlying connection to complete (including the flusher loop).
-	FlusherTimeout time.Duration
-
-	// Timeout sets the timeout for a Dial operation on a connection.
-	Timeout time.Duration
-
-	PingInterval time.Duration
-
-	MaxPingCount int // 最大ping的次数
-
-	// ReconnectJitter sets the upper bound for a random delay added to
-	// ReconnectWait during a reconnect when no TLS is used.
-	ReconnectJitter time.Duration
-
-	// ReconnectWait sets the time to backoff after attempting a reconnect
-	// to a server that we were already connected to previously.
-	ReconnectWait time.Duration
+// Dialer opens TCP connections for Client.
+type Dialer interface {
+	DialContext(context.Context, string, string) (net.Conn, error)
 }
 
-// NewOptions 创建默认配置
-func NewOptions() *Options {
-	return &Options{
-		ProtoVersion:     wkproto.LatestVersion,
-		AutoReconn:       false,
-		DefaultBufSize:   1024 * 1024 * 3,
-		ReconnectBufSize: 8 * 1024 * 1024,
-		Timeout:          2 * time.Second,
-		PingInterval:     2 * time.Minute,
-		MaxPingCount:     2,
-		ReconnectJitter:  100 * time.Millisecond,
-		ReconnectWait:    2 * time.Second,
+// Config controls one WKProto client session.
+type Config struct {
+	// Addr is the target WKProto TCP address.
+	Addr string
+	// Token is the default CONNECT token when ConnectOptions omits one.
+	Token string
+	// Dialer opens network connections; nil uses net.Dialer.
+	Dialer Dialer
+	// OperationTimeout bounds connect, write, and close operations.
+	OperationTimeout time.Duration
+	// AckTimeout bounds waiting for SENDACK after a SEND is accepted.
+	AckTimeout time.Duration
+	// SendQueueCapacity is the local outbound SEND queue size.
+	SendQueueCapacity int
+	// MaxInflight is the maximum number of SENDs waiting for SENDACK.
+	MaxInflight int
+	// BatchMaxRecords is the maximum SEND frame count per writer batch.
+	BatchMaxRecords int
+	// BatchMaxBytes is the maximum encoded byte count per writer batch.
+	BatchMaxBytes int
+	// BatchMaxWait bounds the time spent collecting nearby SEND frames.
+	BatchMaxWait time.Duration
+	// ReadBufferSize is the socket read buffer size used by the reader loop.
+	ReadBufferSize int
+	// InboundFrameBufferSize is the inbound RECV queue size.
+	InboundFrameBufferSize int
+	// AutoRecvAck makes the client automatically acknowledge RECV frames.
+	AutoRecvAck bool
+	// GenerateClientMsgNo generates ClientMsgNo for messages that omit it.
+	GenerateClientMsgNo bool
+	// Observer receives optional low-cardinality observations.
+	Observer Observer
+}
+
+// ConnectOptions controls the WKProto CONNECT packet.
+type ConnectOptions struct {
+	// UID is the session user id.
+	UID string
+	// DeviceID is the stable client device id.
+	DeviceID string
+	// DeviceFlag is the WuKong protocol device category.
+	DeviceFlag frame.DeviceFlag
+	// Token is the CONNECT token; empty falls back to Config.Token.
+	Token string
+}
+
+// PoolConfig controls a set of WKProto sessions.
+type PoolConfig struct {
+	// Addrs is the set of target WKProto TCP addresses.
+	Addrs []string
+	// Balance selects how sessions are assigned across Addrs.
+	Balance string
+	// Client is the base config copied into each session.
+	Client Config
+	// ConnectRatePerSecond limits pool startup connection attempts.
+	ConnectRatePerSecond int
+}
+
+func normalizeConfig(cfg Config) (Config, error) {
+	if cfg.Addr == "" {
+		return Config{}, ErrMissingAddr
 	}
-}
-
-// Option 参数项
-type Option func(*Options) error
-
-// WithProtoVersion 设置协议版本
-func WithProtoVersion(version uint8) Option {
-	return func(opts *Options) error {
-		opts.ProtoVersion = version
-		return nil
+	if cfg.Dialer == nil {
+		cfg.Dialer = &net.Dialer{}
 	}
-}
-
-// WithUID 用户UID
-func WithUID(uid string) Option {
-	return func(opts *Options) error {
-		opts.UID = uid
-		return nil
+	if cfg.OperationTimeout <= 0 {
+		cfg.OperationTimeout = defaultOperationTimeout
 	}
-}
-
-// WithToken 用户token
-func WithToken(token string) Option {
-	return func(opts *Options) error {
-		opts.Token = token
-		return nil
+	if cfg.AckTimeout <= 0 {
+		cfg.AckTimeout = defaultAckTimeout
 	}
-}
-
-// WithAutoReconn WithAutoReconn
-func WithAutoReconn(autoReconn bool) Option {
-	return func(opts *Options) error {
-		opts.AutoReconn = autoReconn
-		return nil
+	if cfg.SendQueueCapacity <= 0 {
+		cfg.SendQueueCapacity = defaultSendQueueCapacity
 	}
-}
-
-// SendOptions SendOptions
-type SendOptions struct {
-	NoPersist   bool // 是否不存储 默认 false
-	SyncOnce    bool // 是否同步一次（写模式） 默认 false
-	Flush       bool // 是否io flush 默认true
-	RedDot      bool // 是否显示红点 默认true
-	NoEncrypt   bool // 是否不需要加密
-	ClientMsgNo string
-}
-
-// NewSendOptions NewSendOptions
-func NewSendOptions() *SendOptions {
-	return &SendOptions{
-		NoPersist: false,
-		SyncOnce:  false,
-		Flush:     true,
-		RedDot:    true,
+	if cfg.MaxInflight <= 0 {
+		cfg.MaxInflight = defaultMaxInflight
 	}
-}
-
-// SendOption 参数项
-type SendOption func(*SendOptions) error
-
-// SendOptionWithNoPersist 是否不存储
-func SendOptionWithNoPersist(noPersist bool) SendOption {
-	return func(opts *SendOptions) error {
-		opts.NoPersist = noPersist
-		return nil
+	if cfg.BatchMaxRecords <= 0 {
+		cfg.BatchMaxRecords = defaultBatchMaxRecords
 	}
-}
-
-// SendOptionWithSyncOnce 是否只同步一次（写模式）
-func SendOptionWithSyncOnce(syncOnce bool) SendOption {
-	return func(opts *SendOptions) error {
-		opts.SyncOnce = syncOnce
-		return nil
+	if cfg.BatchMaxBytes <= 0 {
+		cfg.BatchMaxBytes = defaultBatchMaxBytes
 	}
-}
-
-// SendOptionWithFlush 是否 io flush
-func SendOptionWithFlush(flush bool) SendOption {
-	return func(opts *SendOptions) error {
-		opts.Flush = flush
-		return nil
+	if cfg.BatchMaxWait == 0 {
+		cfg.BatchMaxWait = defaultBatchMaxWait
+	} else if cfg.BatchMaxWait < 0 {
+		cfg.BatchMaxWait = 0
 	}
-}
-
-// SendOptionWithRedDot 是否显示红点
-func SendOptionWithRedDot(redDot bool) SendOption {
-	return func(opts *SendOptions) error {
-		opts.RedDot = redDot
-		return nil
+	if cfg.ReadBufferSize <= 0 {
+		cfg.ReadBufferSize = defaultReadBufferSize
 	}
-}
-
-// SendOptionWithClientMsgNo 是否显示红点
-func SendOptionWithClientMsgNo(clientMsgNo string) SendOption {
-	return func(opts *SendOptions) error {
-		opts.ClientMsgNo = clientMsgNo
-		return nil
+	if cfg.InboundFrameBufferSize <= 0 {
+		cfg.InboundFrameBufferSize = defaultInboundFrameBuffer
 	}
-}
-
-// SendOptionWithNoEncrypt 是否不需要加密
-func SendOptionWithNoEncrypt(noEncrypt bool) SendOption {
-	return func(opts *SendOptions) error {
-		opts.NoEncrypt = noEncrypt
-		return nil
-	}
+	return cfg, nil
 }

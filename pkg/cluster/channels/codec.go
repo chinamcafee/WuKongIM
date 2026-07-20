@@ -1,0 +1,1763 @@
+package channels
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"time"
+
+	ch "github.com/WuKongIM/WuKongIM/pkg/channel"
+	channeltransport "github.com/WuKongIM/WuKongIM/pkg/channel/transport"
+)
+
+const (
+	legacyCodecVersionV3 = uint8(3)
+	legacyCodecVersionV4 = uint8(4)
+	legacyCodecVersionV5 = uint8(5)
+	legacyCodecVersionV6 = uint8(6)
+	codecVersion         = uint8(7)
+)
+
+var errInvalidCodecFrame = errors.New("channels: invalid frame")
+
+const (
+	kindPull uint8 = iota + 1
+	kindPullResponse
+	kindAck
+	kindPullHint
+	kindNotify
+	kindAppend
+	kindAppendResponse
+	kindAppendBatch
+	kindAppendBatchResponse
+	kindPullBatch
+	kindPullBatchResponse
+	kindPullHintBatch
+	kindPullHintBatchResponse
+	kindLastVisible
+	kindLastVisibleResponse
+)
+
+// EncodePullRequest encodes a Channel pull request.
+func EncodePullRequest(req channeltransport.PullRequest) ([]byte, error) {
+	return encodePullRequestVersion(req, codecVersion)
+}
+
+func encodePullRequestVersion(req channeltransport.PullRequest, version uint8) ([]byte, error) {
+	return encodeRequestFrame(version, kindPull, appendPullRequest(nil, req))
+}
+
+// DecodePullRequest decodes a Channel pull request.
+func DecodePullRequest(data []byte) (channeltransport.PullRequest, error) {
+	payload, err := decodeFrame(data, kindPull)
+	if err != nil {
+		return channeltransport.PullRequest{}, err
+	}
+	req, offset, err := readPullRequest(payload, 0)
+	if err != nil {
+		return channeltransport.PullRequest{}, err
+	}
+	if offset != len(payload) {
+		return channeltransport.PullRequest{}, fmt.Errorf("channels: trailing pull request bytes")
+	}
+	return req, nil
+}
+
+func encodePullResponse(resp channeltransport.PullResponse) ([]byte, error) {
+	return encodeRPCResult(kindPullResponse, resp, nil)
+}
+func decodePullResponse(data []byte) (channeltransport.PullResponse, error) {
+	var resp channeltransport.PullResponse
+	return resp, decodeRPCResult(data, kindPullResponse, &resp)
+}
+func encodePullBatchRequest(req channeltransport.PullBatchRequest) ([]byte, error) {
+	return encodePullBatchRequestVersion(req, codecVersion)
+}
+func encodePullBatchRequestVersion(req channeltransport.PullBatchRequest, version uint8) ([]byte, error) {
+	return encodeRequestFrame(version, kindPullBatch, appendPullBatchRequest(nil, req))
+}
+func decodePullBatchRequest(data []byte) (channeltransport.PullBatchRequest, error) {
+	payload, err := decodeFrame(data, kindPullBatch)
+	if err != nil {
+		return channeltransport.PullBatchRequest{}, err
+	}
+	req, offset, err := readPullBatchRequest(payload, 0)
+	if err != nil {
+		return channeltransport.PullBatchRequest{}, err
+	}
+	if offset != len(payload) {
+		return channeltransport.PullBatchRequest{}, fmt.Errorf("channels: trailing pull batch request bytes")
+	}
+	return req, nil
+}
+func encodePullBatchResponse(resp channeltransport.PullBatchResponse) ([]byte, error) {
+	return encodeRPCResult(kindPullBatchResponse, resp, nil)
+}
+func decodePullBatchResponse(data []byte) (channeltransport.PullBatchResponse, error) {
+	var resp channeltransport.PullBatchResponse
+	return resp, decodeRPCResult(data, kindPullBatchResponse, &resp)
+}
+func encodeAckRequest(req channeltransport.AckRequest) ([]byte, error) {
+	return encodeAckRequestVersion(req, codecVersion)
+}
+func encodeAckRequestVersion(req channeltransport.AckRequest, version uint8) ([]byte, error) {
+	return encodeRequestFrame(version, kindAck, appendAckRequest(nil, req))
+}
+func decodeAckRequest(data []byte) (channeltransport.AckRequest, error) {
+	payload, err := decodeFrame(data, kindAck)
+	if err != nil {
+		return channeltransport.AckRequest{}, err
+	}
+	req, offset, err := readAckRequest(payload, 0)
+	if err != nil {
+		return channeltransport.AckRequest{}, err
+	}
+	if offset != len(payload) {
+		return channeltransport.AckRequest{}, fmt.Errorf("channels: trailing ack request bytes")
+	}
+	return req, nil
+}
+func encodePullHintRequest(req channeltransport.PullHintRequest) ([]byte, error) {
+	return encodePullHintRequestVersion(req, codecVersion)
+}
+func encodePullHintRequestVersion(req channeltransport.PullHintRequest, version uint8) ([]byte, error) {
+	return encodeRequestFrame(version, kindPullHint, appendPullHintRequest(nil, req))
+}
+func decodePullHintRequest(data []byte) (channeltransport.PullHintRequest, error) {
+	payload, err := decodeFrame(data, kindPullHint)
+	if err != nil {
+		return channeltransport.PullHintRequest{}, err
+	}
+	req, offset, err := readPullHintRequest(payload, 0)
+	if err != nil {
+		return channeltransport.PullHintRequest{}, err
+	}
+	if offset != len(payload) {
+		return channeltransport.PullHintRequest{}, fmt.Errorf("channels: trailing pull hint request bytes")
+	}
+	return req, nil
+}
+func encodePullHintBatchRequest(req channeltransport.PullHintBatchRequest) ([]byte, error) {
+	return encodePullHintBatchRequestVersion(req, codecVersion)
+}
+func encodePullHintBatchRequestVersion(req channeltransport.PullHintBatchRequest, version uint8) ([]byte, error) {
+	return encodeRequestFrame(version, kindPullHintBatch, appendPullHintBatchRequest(nil, req))
+}
+func decodePullHintBatchRequest(data []byte) (channeltransport.PullHintBatchRequest, error) {
+	payload, err := decodeFrame(data, kindPullHintBatch)
+	if err != nil {
+		return channeltransport.PullHintBatchRequest{}, err
+	}
+	req, offset, err := readPullHintBatchRequest(payload, 0)
+	if err != nil {
+		return channeltransport.PullHintBatchRequest{}, err
+	}
+	if offset != len(payload) {
+		return channeltransport.PullHintBatchRequest{}, fmt.Errorf("channels: trailing pull hint batch request bytes")
+	}
+	return req, nil
+}
+func encodePullHintBatchResponse(resp channeltransport.PullHintBatchResponse) ([]byte, error) {
+	return encodeRPCResult(kindPullHintBatchResponse, resp, nil)
+}
+func decodePullHintBatchResponse(data []byte) (channeltransport.PullHintBatchResponse, error) {
+	var resp channeltransport.PullHintBatchResponse
+	return resp, decodeRPCResult(data, kindPullHintBatchResponse, &resp)
+}
+func encodeNotifyRequest(req channeltransport.NotifyRequest) ([]byte, error) {
+	return encodeNotifyRequestVersion(req, codecVersion)
+}
+func encodeNotifyRequestVersion(req channeltransport.NotifyRequest, version uint8) ([]byte, error) {
+	return encodeRequestFrame(version, kindNotify, appendNotifyRequest(nil, req))
+}
+func decodeNotifyRequest(data []byte) (channeltransport.NotifyRequest, error) {
+	payload, err := decodeFrame(data, kindNotify)
+	if err != nil {
+		return channeltransport.NotifyRequest{}, err
+	}
+	req, offset, err := readNotifyRequest(payload, 0)
+	if err != nil {
+		return channeltransport.NotifyRequest{}, err
+	}
+	if offset != len(payload) {
+		return channeltransport.NotifyRequest{}, fmt.Errorf("channels: trailing notify request bytes")
+	}
+	return req, nil
+}
+func encodeAppendRequest(req ch.AppendRequest) ([]byte, error) {
+	return encodeAppendRequestVersion(req, codecVersion)
+}
+func encodeAppendRequestVersion(req ch.AppendRequest, version uint8) ([]byte, error) {
+	return encodeRequestFrame(version, kindAppend, appendAppendRequest(nil, req, version))
+}
+func decodeAppendRequest(data []byte) (ch.AppendRequest, error) {
+	version, payload, err := decodeFrameWithVersion(data, kindAppend)
+	if err != nil {
+		return ch.AppendRequest{}, err
+	}
+	req, offset, err := readAppendRequest(payload, 0, version)
+	if err != nil {
+		return ch.AppendRequest{}, err
+	}
+	if offset != len(payload) {
+		return ch.AppendRequest{}, fmt.Errorf("channels: trailing append request bytes")
+	}
+	return req, nil
+}
+func encodeAppendResponse(resp ch.AppendResult) ([]byte, error) {
+	return encodeRPCResult(kindAppendResponse, resp, nil)
+}
+func decodeAppendResponse(data []byte) (ch.AppendResult, error) {
+	var resp ch.AppendResult
+	return resp, decodeRPCResult(data, kindAppendResponse, &resp)
+}
+func encodeAppendBatchRequest(req ch.AppendBatchRequest) ([]byte, error) {
+	return encodeAppendBatchRequestVersion(req, codecVersion)
+}
+func encodeAppendBatchRequestVersion(req ch.AppendBatchRequest, version uint8) ([]byte, error) {
+	return encodeRequestFrame(version, kindAppendBatch, appendAppendBatchRequest(nil, req, version))
+}
+func decodeAppendBatchRequest(data []byte) (ch.AppendBatchRequest, error) {
+	version, payload, err := decodeFrameWithVersion(data, kindAppendBatch)
+	if err != nil {
+		return ch.AppendBatchRequest{}, err
+	}
+	req, offset, err := readAppendBatchRequest(payload, 0, version)
+	if err != nil {
+		return ch.AppendBatchRequest{}, err
+	}
+	if offset != len(payload) {
+		return ch.AppendBatchRequest{}, fmt.Errorf("channels: trailing append batch request bytes")
+	}
+	return req, nil
+}
+func encodeAppendBatchResponse(resp ch.AppendBatchResult) ([]byte, error) {
+	return encodeRPCResult(kindAppendBatchResponse, resp, nil)
+}
+func decodeAppendBatchResponse(data []byte) (ch.AppendBatchResult, error) {
+	var resp ch.AppendBatchResult
+	return resp, decodeRPCResult(data, kindAppendBatchResponse, &resp)
+}
+func encodeLastVisibleRequest(req LastVisibleRequest) ([]byte, error) {
+	return encodeLastVisibleRequestVersion(req, codecVersion)
+}
+func encodeLastVisibleRequestVersion(req LastVisibleRequest, version uint8) ([]byte, error) {
+	return encodeRequestFrame(version, kindLastVisible, appendLastVisibleRequest(nil, req))
+}
+func decodeLastVisibleRequest(data []byte) (LastVisibleRequest, error) {
+	payload, err := decodeFrame(data, kindLastVisible)
+	if err != nil {
+		return LastVisibleRequest{}, err
+	}
+	req, offset, err := readLastVisibleRequest(payload, 0)
+	if err != nil {
+		return LastVisibleRequest{}, err
+	}
+	if offset != len(payload) {
+		return LastVisibleRequest{}, fmt.Errorf("channels: trailing last visible request bytes")
+	}
+	return req, nil
+}
+func encodeLastVisibleResponse(resp LastVisibleResponse) ([]byte, error) {
+	return encodeRPCResult(kindLastVisibleResponse, resp, nil)
+}
+func decodeLastVisibleResponse(data []byte) (LastVisibleResponse, error) {
+	var resp LastVisibleResponse
+	return resp, decodeRPCResult(data, kindLastVisibleResponse, &resp)
+}
+
+// rpcApplicationError is the compact cross-node form for sentinel errors.
+type rpcApplicationError struct {
+	Code    string
+	Message string
+}
+
+const (
+	rpcErrorUnknown         = "unknown"
+	rpcErrorInvalidConfig   = "invalid_config"
+	rpcErrorBackpressured   = "backpressured"
+	rpcErrorNotLeader       = "not_leader"
+	rpcErrorNotReady        = "not_ready"
+	rpcErrorStaleMeta       = "stale_meta"
+	rpcErrorChannelNotFound = "channel_not_found"
+	rpcErrorNotReplica      = "not_replica"
+	rpcErrorClosed          = "closed"
+	rpcErrorTooManyChannels = "too_many_channels"
+)
+
+const (
+	rpcResultOK uint8 = iota
+	rpcResultErr
+)
+
+func encodeRPCResult(kind uint8, payload any, err error) ([]byte, error) {
+	return encodeRPCResultVersion(codecVersion, kind, payload, err)
+}
+
+func encodeRPCResultVersion(version uint8, kind uint8, payload any, err error) ([]byte, error) {
+	if version != legacyCodecVersionV5 && version != legacyCodecVersionV6 && version != codecVersion {
+		return nil, errInvalidCodecFrame
+	}
+	if err != nil {
+		dst := []byte{rpcResultErr}
+		dst = appendRPCApplicationError(dst, rpcApplicationError{Code: rpcErrorCode(err), Message: err.Error()})
+		return encodeFrameVersion(version, kind, dst), nil
+	}
+	dst := []byte{rpcResultOK}
+	if payload != nil {
+		var ok bool
+		dst, ok = appendRPCPayload(dst, payload, version)
+		if !ok {
+			return nil, fmt.Errorf("channels: unsupported rpc result payload %T", payload)
+		}
+	}
+	return encodeFrameVersion(version, kind, dst), nil
+}
+
+func decodeRPCResult(data []byte, kind uint8, payload any) error {
+	version, body, err := decodeFrameWithVersion(data, kind)
+	if err != nil {
+		return err
+	}
+	if len(body) == 0 {
+		return fmt.Errorf("channels: missing result status")
+	}
+	status := body[0]
+	offset := 1
+	if status == rpcResultErr {
+		appErr, next, err := readRPCApplicationError(body, offset)
+		if err != nil {
+			return err
+		}
+		if next != len(body) {
+			return fmt.Errorf("channels: trailing result error bytes")
+		}
+		return decodeRPCApplicationError(appErr)
+	}
+	if status != rpcResultOK {
+		return fmt.Errorf("channels: invalid result status")
+	}
+	if payload == nil {
+		if offset != len(body) {
+			return fmt.Errorf("channels: trailing empty result bytes")
+		}
+		return nil
+	}
+	offset, err = readRPCPayload(body, offset, payload, version)
+	if err != nil {
+		return err
+	}
+	if offset != len(body) {
+		return fmt.Errorf("channels: trailing result payload bytes")
+	}
+	return nil
+}
+
+func encodeFrame(kind uint8, payload []byte) []byte {
+	return encodeFrameVersion(codecVersion, kind, payload)
+}
+
+func encodeFrameVersion(version uint8, kind uint8, payload []byte) []byte {
+	out := make([]byte, 0, 2+len(payload))
+	out = append(out, version, kind)
+	return append(out, payload...)
+}
+
+func encodeRequestFrame(version uint8, kind uint8, payload []byte) ([]byte, error) {
+	if version != legacyCodecVersionV5 && version != legacyCodecVersionV6 && version != codecVersion {
+		return nil, errInvalidCodecFrame
+	}
+	return encodeFrameVersion(version, kind, payload), nil
+}
+
+func decodeFrame(data []byte, wantKind uint8) ([]byte, error) {
+	_, payload, err := decodeFrameWithVersion(data, wantKind)
+	return payload, err
+}
+
+func decodeFrameWithVersion(data []byte, wantKind uint8) (uint8, []byte, error) {
+	if len(data) < 2 || data[1] != wantKind {
+		return 0, nil, errInvalidCodecFrame
+	}
+	version := data[0]
+	if version != legacyCodecVersionV3 && version != legacyCodecVersionV4 && version != legacyCodecVersionV5 && version != legacyCodecVersionV6 && version != codecVersion {
+		return 0, nil, errInvalidCodecFrame
+	}
+	return version, data[2:], nil
+}
+
+func responseCodecVersion(request []byte) uint8 {
+	if len(request) > 0 && (request[0] == legacyCodecVersionV5 || request[0] == legacyCodecVersionV6) {
+		return request[0]
+	}
+	return codecVersion
+}
+
+func appendRPCPayload(dst []byte, payload any, version uint8) ([]byte, bool) {
+	switch v := payload.(type) {
+	case channeltransport.PullResponse:
+		return appendPullResponse(dst, v, version), true
+	case channeltransport.PullBatchResponse:
+		return appendPullBatchResponse(dst, v, version), true
+	case channeltransport.PullHintBatchResponse:
+		return appendPullHintBatchResponse(dst, v), true
+	case ch.AppendResult:
+		return appendAppendResult(dst, v, version), true
+	case ch.AppendBatchResult:
+		return appendAppendBatchResult(dst, v, version), true
+	case LastVisibleResponse:
+		return appendLastVisibleResponse(dst, v, version), true
+	default:
+		return dst, false
+	}
+}
+
+func readRPCPayload(body []byte, offset int, payload any, version uint8) (int, error) {
+	var err error
+	switch v := payload.(type) {
+	case *channeltransport.PullResponse:
+		*v, offset, err = readPullResponse(body, offset, version)
+	case *channeltransport.PullBatchResponse:
+		*v, offset, err = readPullBatchResponse(body, offset, version)
+	case *channeltransport.PullHintBatchResponse:
+		*v, offset, err = readPullHintBatchResponse(body, offset)
+	case *ch.AppendResult:
+		*v, offset, err = readAppendResult(body, offset, version)
+	case *ch.AppendBatchResult:
+		*v, offset, err = readAppendBatchResult(body, offset, version)
+	case *LastVisibleResponse:
+		*v, offset, err = readLastVisibleResponse(body, offset, version)
+	default:
+		return offset, fmt.Errorf("channels: unsupported rpc result target %T", payload)
+	}
+	return offset, err
+}
+
+func appendPullRequest(dst []byte, req channeltransport.PullRequest) []byte {
+	dst = appendChannelKey(dst, req.ChannelKey)
+	dst = appendChannelID(dst, req.ChannelID)
+	dst = appendUvarint(dst, req.Epoch)
+	dst = appendUvarint(dst, req.LeaderEpoch)
+	dst = appendUvarint(dst, uint64(req.Follower))
+	dst = appendUvarint(dst, req.NextOffset)
+	dst = appendUvarint(dst, req.AckOffset)
+	dst = appendVarint(dst, int64(req.MaxBytes))
+	dst = appendBool(dst, req.NeedMeta)
+	return dst
+}
+
+func readPullRequest(body []byte, offset int) (channeltransport.PullRequest, int, error) {
+	var req channeltransport.PullRequest
+	var err error
+	if req.ChannelKey, offset, err = readChannelKey(body, offset); err != nil {
+		return channeltransport.PullRequest{}, offset, err
+	}
+	if req.ChannelID, offset, err = readChannelID(body, offset); err != nil {
+		return channeltransport.PullRequest{}, offset, err
+	}
+	if req.Epoch, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.PullRequest{}, offset, err
+	}
+	if req.LeaderEpoch, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.PullRequest{}, offset, err
+	}
+	var follower uint64
+	if follower, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.PullRequest{}, offset, err
+	}
+	req.Follower = ch.NodeID(follower)
+	if req.NextOffset, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.PullRequest{}, offset, err
+	}
+	if req.AckOffset, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.PullRequest{}, offset, err
+	}
+	if req.MaxBytes, offset, err = readInt(body, offset, "pull max bytes"); err != nil {
+		return channeltransport.PullRequest{}, offset, err
+	}
+	if req.NeedMeta, offset, err = readBool(body, offset, "pull need meta"); err != nil {
+		return channeltransport.PullRequest{}, offset, err
+	}
+	return req, offset, nil
+}
+
+func appendPullResponse(dst []byte, resp channeltransport.PullResponse, version uint8) []byte {
+	dst = appendChannelKey(dst, resp.ChannelKey)
+	dst = appendUvarint(dst, resp.Epoch)
+	dst = appendUvarint(dst, resp.LeaderEpoch)
+	dst = appendUvarint(dst, resp.LeaderHW)
+	dst = appendUvarint(dst, resp.LeaderLEO)
+	dst = appendUvarint(dst, resp.ActivityVersion)
+	dst = appendVarint(dst, int64(resp.NextPullAfter))
+	dst = append(dst, byte(resp.Control))
+	dst = appendMetaPtr(dst, resp.Meta, version)
+	dst = appendRecords(dst, resp.Records, version)
+	return dst
+}
+
+func readPullResponse(body []byte, offset int, version uint8) (channeltransport.PullResponse, int, error) {
+	var resp channeltransport.PullResponse
+	var err error
+	if resp.ChannelKey, offset, err = readChannelKey(body, offset); err != nil {
+		return channeltransport.PullResponse{}, offset, err
+	}
+	if resp.Epoch, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.PullResponse{}, offset, err
+	}
+	if resp.LeaderEpoch, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.PullResponse{}, offset, err
+	}
+	if resp.LeaderHW, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.PullResponse{}, offset, err
+	}
+	if resp.LeaderLEO, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.PullResponse{}, offset, err
+	}
+	if resp.ActivityVersion, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.PullResponse{}, offset, err
+	}
+	var nextPullAfter int64
+	if nextPullAfter, offset, err = readVarint(body, offset); err != nil {
+		return channeltransport.PullResponse{}, offset, err
+	}
+	resp.NextPullAfter = time.Duration(nextPullAfter)
+	var control byte
+	if control, offset, err = readByte(body, offset, "pull response control"); err != nil {
+		return channeltransport.PullResponse{}, offset, err
+	}
+	resp.Control = channeltransport.PullControl(control)
+	if resp.Meta, offset, err = readMetaPtr(body, offset, version); err != nil {
+		return channeltransport.PullResponse{}, offset, err
+	}
+	if resp.Records, offset, err = readRecords(body, offset, version); err != nil {
+		return channeltransport.PullResponse{}, offset, err
+	}
+	return resp, offset, nil
+}
+
+func appendPullBatchRequest(dst []byte, req channeltransport.PullBatchRequest) []byte {
+	dst = appendUvarint(dst, uint64(len(req.Items)))
+	for _, item := range req.Items {
+		dst = appendPullRequest(dst, item)
+	}
+	return dst
+}
+
+func readPullBatchRequest(body []byte, offset int) (channeltransport.PullBatchRequest, int, error) {
+	count, next, err := readUvarint(body, offset)
+	if err != nil {
+		return channeltransport.PullBatchRequest{}, offset, err
+	}
+	length, err := readCollectionLen(count, len(body)-next, "pull batch items")
+	if err != nil {
+		return channeltransport.PullBatchRequest{}, offset, err
+	}
+	offset = next
+	items := make([]channeltransport.PullRequest, length)
+	for i := range items {
+		items[i], offset, err = readPullRequest(body, offset)
+		if err != nil {
+			return channeltransport.PullBatchRequest{}, offset, err
+		}
+	}
+	return channeltransport.PullBatchRequest{Items: items}, offset, nil
+}
+
+func appendPullBatchResponse(dst []byte, resp channeltransport.PullBatchResponse, version uint8) []byte {
+	dst = appendUvarint(dst, uint64(len(resp.Items)))
+	for _, item := range resp.Items {
+		dst = appendOptionalRPCApplicationError(dst, item.Err)
+		if item.Err == nil {
+			dst = appendPullResponse(dst, item.Response, version)
+		}
+	}
+	return dst
+}
+
+func readPullBatchResponse(body []byte, offset int, version uint8) (channeltransport.PullBatchResponse, int, error) {
+	count, next, err := readUvarint(body, offset)
+	if err != nil {
+		return channeltransport.PullBatchResponse{}, offset, err
+	}
+	length, err := readCollectionLen(count, len(body)-next, "pull batch result items")
+	if err != nil {
+		return channeltransport.PullBatchResponse{}, offset, err
+	}
+	offset = next
+	items := make([]channeltransport.PullBatchItemResult, length)
+	for i := range items {
+		items[i].Err, offset, err = readOptionalRPCApplicationError(body, offset)
+		if err != nil {
+			return channeltransport.PullBatchResponse{}, offset, err
+		}
+		if items[i].Err != nil {
+			continue
+		}
+		items[i].Response, offset, err = readPullResponse(body, offset, version)
+		if err != nil {
+			return channeltransport.PullBatchResponse{}, offset, err
+		}
+	}
+	return channeltransport.PullBatchResponse{Items: items}, offset, nil
+}
+
+func appendAckRequest(dst []byte, req channeltransport.AckRequest) []byte {
+	dst = appendChannelKey(dst, req.ChannelKey)
+	dst = appendUvarint(dst, req.Epoch)
+	dst = appendUvarint(dst, req.LeaderEpoch)
+	dst = appendUvarint(dst, uint64(req.Follower))
+	dst = appendUvarint(dst, req.MatchOffset)
+	dst = appendUvarint(dst, req.ActivityVersion)
+	dst = appendBool(dst, req.Stopped)
+	return dst
+}
+
+func readAckRequest(body []byte, offset int) (channeltransport.AckRequest, int, error) {
+	var req channeltransport.AckRequest
+	var err error
+	if req.ChannelKey, offset, err = readChannelKey(body, offset); err != nil {
+		return channeltransport.AckRequest{}, offset, err
+	}
+	if req.Epoch, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.AckRequest{}, offset, err
+	}
+	if req.LeaderEpoch, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.AckRequest{}, offset, err
+	}
+	var follower uint64
+	if follower, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.AckRequest{}, offset, err
+	}
+	req.Follower = ch.NodeID(follower)
+	if req.MatchOffset, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.AckRequest{}, offset, err
+	}
+	if req.ActivityVersion, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.AckRequest{}, offset, err
+	}
+	if req.Stopped, offset, err = readBool(body, offset, "ack stopped"); err != nil {
+		return channeltransport.AckRequest{}, offset, err
+	}
+	return req, offset, nil
+}
+
+func appendPullHintRequest(dst []byte, req channeltransport.PullHintRequest) []byte {
+	dst = appendChannelKey(dst, req.ChannelKey)
+	dst = appendChannelID(dst, req.ChannelID)
+	dst = appendUvarint(dst, req.Epoch)
+	dst = appendUvarint(dst, req.LeaderEpoch)
+	dst = appendUvarint(dst, uint64(req.Leader))
+	dst = appendUvarint(dst, req.LeaderLEO)
+	dst = appendUvarint(dst, req.ActivityVersion)
+	dst = append(dst, byte(req.Reason))
+	return dst
+}
+
+func readPullHintRequest(body []byte, offset int) (channeltransport.PullHintRequest, int, error) {
+	var req channeltransport.PullHintRequest
+	var err error
+	if req.ChannelKey, offset, err = readChannelKey(body, offset); err != nil {
+		return channeltransport.PullHintRequest{}, offset, err
+	}
+	if req.ChannelID, offset, err = readChannelID(body, offset); err != nil {
+		return channeltransport.PullHintRequest{}, offset, err
+	}
+	if req.Epoch, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.PullHintRequest{}, offset, err
+	}
+	if req.LeaderEpoch, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.PullHintRequest{}, offset, err
+	}
+	var leader uint64
+	if leader, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.PullHintRequest{}, offset, err
+	}
+	req.Leader = ch.NodeID(leader)
+	if req.LeaderLEO, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.PullHintRequest{}, offset, err
+	}
+	if req.ActivityVersion, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.PullHintRequest{}, offset, err
+	}
+	var reason byte
+	if reason, offset, err = readByte(body, offset, "pull hint reason"); err != nil {
+		return channeltransport.PullHintRequest{}, offset, err
+	}
+	req.Reason = channeltransport.PullHintReason(reason)
+	return req, offset, nil
+}
+
+func appendPullHintBatchRequest(dst []byte, req channeltransport.PullHintBatchRequest) []byte {
+	dst = appendUvarint(dst, uint64(len(req.Items)))
+	for _, item := range req.Items {
+		dst = appendPullHintRequest(dst, item)
+	}
+	return dst
+}
+
+func readPullHintBatchRequest(body []byte, offset int) (channeltransport.PullHintBatchRequest, int, error) {
+	count, next, err := readUvarint(body, offset)
+	if err != nil {
+		return channeltransport.PullHintBatchRequest{}, offset, err
+	}
+	length, err := readCollectionLen(count, len(body)-next, "pull hint batch items")
+	if err != nil {
+		return channeltransport.PullHintBatchRequest{}, offset, err
+	}
+	offset = next
+	items := make([]channeltransport.PullHintRequest, length)
+	for i := range items {
+		items[i], offset, err = readPullHintRequest(body, offset)
+		if err != nil {
+			return channeltransport.PullHintBatchRequest{}, offset, err
+		}
+	}
+	return channeltransport.PullHintBatchRequest{Items: items}, offset, nil
+}
+
+func appendPullHintBatchResponse(dst []byte, resp channeltransport.PullHintBatchResponse) []byte {
+	dst = appendUvarint(dst, uint64(len(resp.Items)))
+	for _, item := range resp.Items {
+		dst = appendOptionalRPCApplicationError(dst, item.Err)
+	}
+	return dst
+}
+
+func readPullHintBatchResponse(body []byte, offset int) (channeltransport.PullHintBatchResponse, int, error) {
+	count, next, err := readUvarint(body, offset)
+	if err != nil {
+		return channeltransport.PullHintBatchResponse{}, offset, err
+	}
+	length, err := readCollectionLen(count, len(body)-next, "pull hint batch result items")
+	if err != nil {
+		return channeltransport.PullHintBatchResponse{}, offset, err
+	}
+	offset = next
+	items := make([]channeltransport.PullHintBatchItemResult, length)
+	for i := range items {
+		items[i].Err, offset, err = readOptionalRPCApplicationError(body, offset)
+		if err != nil {
+			return channeltransport.PullHintBatchResponse{}, offset, err
+		}
+	}
+	return channeltransport.PullHintBatchResponse{Items: items}, offset, nil
+}
+
+func appendNotifyRequest(dst []byte, req channeltransport.NotifyRequest) []byte {
+	dst = appendChannelKey(dst, req.ChannelKey)
+	dst = appendChannelID(dst, req.ChannelID)
+	dst = appendUvarint(dst, req.Epoch)
+	dst = appendUvarint(dst, req.LeaderEpoch)
+	dst = appendUvarint(dst, uint64(req.Leader))
+	dst = appendUvarint(dst, req.LeaderLEO)
+	return dst
+}
+
+func readNotifyRequest(body []byte, offset int) (channeltransport.NotifyRequest, int, error) {
+	var req channeltransport.NotifyRequest
+	var err error
+	if req.ChannelKey, offset, err = readChannelKey(body, offset); err != nil {
+		return channeltransport.NotifyRequest{}, offset, err
+	}
+	if req.ChannelID, offset, err = readChannelID(body, offset); err != nil {
+		return channeltransport.NotifyRequest{}, offset, err
+	}
+	if req.Epoch, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.NotifyRequest{}, offset, err
+	}
+	if req.LeaderEpoch, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.NotifyRequest{}, offset, err
+	}
+	var leader uint64
+	if leader, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.NotifyRequest{}, offset, err
+	}
+	req.Leader = ch.NodeID(leader)
+	if req.LeaderLEO, offset, err = readUvarint(body, offset); err != nil {
+		return channeltransport.NotifyRequest{}, offset, err
+	}
+	return req, offset, nil
+}
+
+func appendAppendRequest(dst []byte, req ch.AppendRequest, version uint8) []byte {
+	dst = appendChannelID(dst, req.ChannelID)
+	dst = appendMessage(dst, req.Message, version)
+	dst = append(dst, byte(req.CommitMode))
+	dst = appendUvarint(dst, req.ExpectedChannelEpoch)
+	dst = appendUvarint(dst, req.ExpectedLeaderEpoch)
+	return dst
+}
+
+func readAppendRequest(body []byte, offset int, version uint8) (ch.AppendRequest, int, error) {
+	var req ch.AppendRequest
+	var err error
+	if req.ChannelID, offset, err = readChannelID(body, offset); err != nil {
+		return ch.AppendRequest{}, offset, err
+	}
+	if req.Message, offset, err = readMessage(body, offset, version); err != nil {
+		return ch.AppendRequest{}, offset, err
+	}
+	var commitMode byte
+	if commitMode, offset, err = readByte(body, offset, "append commit mode"); err != nil {
+		return ch.AppendRequest{}, offset, err
+	}
+	req.CommitMode = ch.CommitMode(commitMode)
+	if req.ExpectedChannelEpoch, offset, err = readUvarint(body, offset); err != nil {
+		return ch.AppendRequest{}, offset, err
+	}
+	if req.ExpectedLeaderEpoch, offset, err = readUvarint(body, offset); err != nil {
+		return ch.AppendRequest{}, offset, err
+	}
+	return req, offset, nil
+}
+
+func appendAppendResult(dst []byte, result ch.AppendResult, version uint8) []byte {
+	dst = appendUvarint(dst, result.MessageID)
+	dst = appendUvarint(dst, result.MessageSeq)
+	dst = appendMessage(dst, result.Message, version)
+	return dst
+}
+
+func readAppendResult(body []byte, offset int, version uint8) (ch.AppendResult, int, error) {
+	var result ch.AppendResult
+	var err error
+	if result.MessageID, offset, err = readUvarint(body, offset); err != nil {
+		return ch.AppendResult{}, offset, err
+	}
+	if result.MessageSeq, offset, err = readUvarint(body, offset); err != nil {
+		return ch.AppendResult{}, offset, err
+	}
+	if result.Message, offset, err = readMessage(body, offset, version); err != nil {
+		return ch.AppendResult{}, offset, err
+	}
+	return result, offset, nil
+}
+
+func appendAppendBatchRequest(dst []byte, req ch.AppendBatchRequest, version uint8) []byte {
+	dst = appendChannelID(dst, req.ChannelID)
+	dst = appendMessages(dst, req.Messages, version)
+	dst = appendString(dst, req.TraceID)
+	dst = appendChannelKey(dst, ch.ChannelKey(req.ChannelKey))
+	dst = appendVarint(dst, int64(req.Attempt))
+	dst = append(dst, byte(req.CommitMode))
+	dst = appendUvarint(dst, req.ExpectedChannelEpoch)
+	dst = appendUvarint(dst, req.ExpectedLeaderEpoch)
+	dst = appendBool(dst, req.OmitResultPayload)
+	return dst
+}
+
+func readAppendBatchRequest(body []byte, offset int, version uint8) (ch.AppendBatchRequest, int, error) {
+	var req ch.AppendBatchRequest
+	var err error
+	if req.ChannelID, offset, err = readChannelID(body, offset); err != nil {
+		return ch.AppendBatchRequest{}, offset, err
+	}
+	if req.Messages, offset, err = readMessages(body, offset, version); err != nil {
+		return ch.AppendBatchRequest{}, offset, err
+	}
+	if req.TraceID, offset, err = readString(body, offset); err != nil {
+		return ch.AppendBatchRequest{}, offset, err
+	}
+	var channelKey ch.ChannelKey
+	if channelKey, offset, err = readChannelKey(body, offset); err != nil {
+		return ch.AppendBatchRequest{}, offset, err
+	}
+	req.ChannelKey = string(channelKey)
+	if req.Attempt, offset, err = readInt(body, offset, "append batch attempt"); err != nil {
+		return ch.AppendBatchRequest{}, offset, err
+	}
+	var commitMode byte
+	if commitMode, offset, err = readByte(body, offset, "append batch commit mode"); err != nil {
+		return ch.AppendBatchRequest{}, offset, err
+	}
+	req.CommitMode = ch.CommitMode(commitMode)
+	if req.ExpectedChannelEpoch, offset, err = readUvarint(body, offset); err != nil {
+		return ch.AppendBatchRequest{}, offset, err
+	}
+	if req.ExpectedLeaderEpoch, offset, err = readUvarint(body, offset); err != nil {
+		return ch.AppendBatchRequest{}, offset, err
+	}
+	if req.OmitResultPayload, offset, err = readBool(body, offset, "append batch omit result payload"); err != nil {
+		return ch.AppendBatchRequest{}, offset, err
+	}
+	return req, offset, nil
+}
+
+func appendLastVisibleRequest(dst []byte, req LastVisibleRequest) []byte {
+	dst = appendChannelID(dst, req.ChannelID)
+	dst = appendUvarint(dst, req.VisibleAfterSeq)
+	dst = appendUvarint(dst, uint64(req.ExpectedLeader))
+	dst = appendUvarint(dst, req.ExpectedChannelEpoch)
+	return appendUvarint(dst, req.ExpectedLeaderEpoch)
+}
+
+func readLastVisibleRequest(body []byte, offset int) (LastVisibleRequest, int, error) {
+	var req LastVisibleRequest
+	var err error
+	var expectedLeader uint64
+	if req.ChannelID, offset, err = readChannelID(body, offset); err != nil {
+		return LastVisibleRequest{}, offset, err
+	}
+	if req.VisibleAfterSeq, offset, err = readUvarint(body, offset); err != nil {
+		return LastVisibleRequest{}, offset, err
+	}
+	if expectedLeader, offset, err = readUvarint(body, offset); err != nil {
+		return LastVisibleRequest{}, offset, err
+	}
+	req.ExpectedLeader = ch.NodeID(expectedLeader)
+	if req.ExpectedChannelEpoch, offset, err = readUvarint(body, offset); err != nil {
+		return LastVisibleRequest{}, offset, err
+	}
+	if req.ExpectedLeaderEpoch, offset, err = readUvarint(body, offset); err != nil {
+		return LastVisibleRequest{}, offset, err
+	}
+	return req, offset, nil
+}
+
+func appendAppendBatchResult(dst []byte, result ch.AppendBatchResult, version uint8) []byte {
+	dst = appendSliceHeader(dst, len(result.Items), result.Items == nil)
+	for _, item := range result.Items {
+		dst = appendOptionalRPCApplicationError(dst, item.Err)
+		dst = appendUvarint(dst, item.MessageID)
+		dst = appendUvarint(dst, item.MessageSeq)
+		dst = appendMessage(dst, item.Message, version)
+	}
+	return dst
+}
+
+func readAppendBatchResult(body []byte, offset int, version uint8) (ch.AppendBatchResult, int, error) {
+	nilSlice, count, next, err := readSliceHeader(body, offset, "append batch result")
+	if err != nil {
+		return ch.AppendBatchResult{}, offset, err
+	}
+	offset = next
+	if nilSlice {
+		return ch.AppendBatchResult{}, offset, nil
+	}
+	items := make([]ch.AppendBatchItemResult, count)
+	for i := range items {
+		if items[i].Err, offset, err = readOptionalRPCApplicationError(body, offset); err != nil {
+			return ch.AppendBatchResult{}, offset, err
+		}
+		if items[i].MessageID, offset, err = readUvarint(body, offset); err != nil {
+			return ch.AppendBatchResult{}, offset, err
+		}
+		if items[i].MessageSeq, offset, err = readUvarint(body, offset); err != nil {
+			return ch.AppendBatchResult{}, offset, err
+		}
+		if items[i].Message, offset, err = readMessage(body, offset, version); err != nil {
+			return ch.AppendBatchResult{}, offset, err
+		}
+	}
+	return ch.AppendBatchResult{Items: items}, offset, nil
+}
+
+func appendLastVisibleResponse(dst []byte, resp LastVisibleResponse, version uint8) []byte {
+	dst = appendBool(dst, resp.Found)
+	if resp.Found {
+		dst = appendMessage(dst, resp.Message, version)
+	}
+	return dst
+}
+
+func readLastVisibleResponse(body []byte, offset int, version uint8) (LastVisibleResponse, int, error) {
+	var resp LastVisibleResponse
+	var err error
+	if resp.Found, offset, err = readBool(body, offset, "last visible found"); err != nil {
+		return LastVisibleResponse{}, offset, err
+	}
+	if resp.Found {
+		if resp.Message, offset, err = readMessage(body, offset, version); err != nil {
+			return LastVisibleResponse{}, offset, err
+		}
+	}
+	return resp, offset, nil
+}
+
+func appendChannelKey(dst []byte, key ch.ChannelKey) []byte {
+	return appendString(dst, string(key))
+}
+
+func readChannelKey(body []byte, offset int) (ch.ChannelKey, int, error) {
+	value, next, err := readString(body, offset)
+	return ch.ChannelKey(value), next, err
+}
+
+func appendChannelID(dst []byte, id ch.ChannelID) []byte {
+	dst = appendString(dst, id.ID)
+	return append(dst, id.Type)
+}
+
+func readChannelID(body []byte, offset int) (ch.ChannelID, int, error) {
+	id, next, err := readString(body, offset)
+	if err != nil {
+		return ch.ChannelID{}, offset, err
+	}
+	offset = next
+	channelType, next, err := readByte(body, offset, "channel type")
+	if err != nil {
+		return ch.ChannelID{}, offset, err
+	}
+	return ch.ChannelID{ID: id, Type: channelType}, next, nil
+}
+
+func appendMessage(dst []byte, msg ch.Message, version uint8) []byte {
+	dst = appendUvarint(dst, msg.MessageID)
+	dst = appendUvarint(dst, msg.MessageSeq)
+	dst = appendString(dst, msg.ChannelID)
+	dst = append(dst, msg.ChannelType)
+	dst = appendString(dst, msg.FromUID)
+	dst = appendString(dst, msg.ClientMsgNo)
+	dst = appendVarint(dst, msg.ServerTimestampMS)
+	dst = append(dst, msg.Setting)
+	if version >= codecVersion {
+		dst = appendString(dst, msg.Topic)
+		dst = appendUvarint(dst, uint64(msg.Expire))
+		dst = appendBool(dst, msg.RedDot)
+	}
+	dst = appendString(dst, msg.TraceID)
+	dst = appendChannelKey(dst, ch.ChannelKey(msg.ChannelKey))
+	dst = appendOptionalBytes(dst, msg.Payload)
+	return dst
+}
+
+func readMessage(body []byte, offset int, version uint8) (ch.Message, int, error) {
+	var msg ch.Message
+	var err error
+	if msg.MessageID, offset, err = readUvarint(body, offset); err != nil {
+		return ch.Message{}, offset, err
+	}
+	if msg.MessageSeq, offset, err = readUvarint(body, offset); err != nil {
+		return ch.Message{}, offset, err
+	}
+	if msg.ChannelID, offset, err = readString(body, offset); err != nil {
+		return ch.Message{}, offset, err
+	}
+	if msg.ChannelType, offset, err = readByte(body, offset, "message channel type"); err != nil {
+		return ch.Message{}, offset, err
+	}
+	if msg.FromUID, offset, err = readString(body, offset); err != nil {
+		return ch.Message{}, offset, err
+	}
+	if msg.ClientMsgNo, offset, err = readString(body, offset); err != nil {
+		return ch.Message{}, offset, err
+	}
+	switch version {
+	case legacyCodecVersionV3:
+		return readMessageV3LegacyRemainder(body, offset, msg)
+	case legacyCodecVersionV4:
+		return readMessageV4Remainder(body, offset, msg)
+	case legacyCodecVersionV5, legacyCodecVersionV6:
+		return readMessageV5Remainder(body, offset, msg)
+	case codecVersion:
+		return readMessageV7Remainder(body, offset, msg)
+	default:
+		return ch.Message{}, offset, fmt.Errorf("channels: unsupported message codec version %d", version)
+	}
+}
+
+func readMessageV7Remainder(body []byte, offset int, msg ch.Message) (ch.Message, int, error) {
+	var err error
+	if msg.ServerTimestampMS, offset, err = readInt64(body, offset, "message server timestamp ms"); err != nil {
+		return ch.Message{}, offset, err
+	}
+	if msg.Setting, offset, err = readByte(body, offset, "message setting"); err != nil {
+		return ch.Message{}, offset, err
+	}
+	if msg.Topic, offset, err = readString(body, offset); err != nil {
+		return ch.Message{}, offset, err
+	}
+	var expire uint64
+	if expire, offset, err = readUvarint(body, offset); err != nil {
+		return ch.Message{}, offset, err
+	}
+	msg.Expire = uint32(expire)
+	if msg.RedDot, offset, err = readBool(body, offset, "message red dot"); err != nil {
+		return ch.Message{}, offset, err
+	}
+	if msg.TraceID, offset, err = readString(body, offset); err != nil {
+		return ch.Message{}, offset, err
+	}
+	return readMessageV3AfterTrace(body, offset, msg)
+}
+
+func readMessageV5Remainder(body []byte, offset int, msg ch.Message) (ch.Message, int, error) {
+	var err error
+	if msg.ServerTimestampMS, offset, err = readInt64(body, offset, "message server timestamp ms"); err != nil {
+		return ch.Message{}, offset, err
+	}
+	if msg.Setting, offset, err = readByte(body, offset, "message setting"); err != nil {
+		return ch.Message{}, offset, err
+	}
+	if msg.TraceID, offset, err = readString(body, offset); err != nil {
+		return ch.Message{}, offset, err
+	}
+	return readMessageV3AfterTrace(body, offset, msg)
+}
+
+func readMessageV4Remainder(body []byte, offset int, msg ch.Message) (ch.Message, int, error) {
+	var err error
+	if msg.ServerTimestampMS, offset, err = readInt64(body, offset, "message server timestamp ms"); err != nil {
+		return ch.Message{}, offset, err
+	}
+	if msg.TraceID, offset, err = readString(body, offset); err != nil {
+		return ch.Message{}, offset, err
+	}
+	return readMessageV3AfterTrace(body, offset, msg)
+}
+
+// readMessageV3LegacyRemainder decodes the original v3 message tail used before
+// ServerTimestampMS was inserted, which keeps rolling upgrades from misreading
+// old v3 frames.
+func readMessageV3LegacyRemainder(body []byte, offset int, msg ch.Message) (ch.Message, int, error) {
+	var err error
+	if msg.TraceID, offset, err = readString(body, offset); err != nil {
+		return ch.Message{}, offset, err
+	}
+	return readMessageV3AfterTrace(body, offset, msg)
+}
+
+func readMessageV3AfterTrace(body []byte, offset int, msg ch.Message) (ch.Message, int, error) {
+	var err error
+	var channelKey ch.ChannelKey
+	if channelKey, offset, err = readChannelKey(body, offset); err != nil {
+		return ch.Message{}, offset, err
+	}
+	msg.ChannelKey = string(channelKey)
+	if msg.Payload, offset, err = readOptionalBytes(body, offset, "message payload"); err != nil {
+		return ch.Message{}, offset, err
+	}
+	return msg, offset, nil
+}
+
+func appendMessages(dst []byte, messages []ch.Message, version uint8) []byte {
+	dst = appendSliceHeader(dst, len(messages), messages == nil)
+	for _, msg := range messages {
+		dst = appendMessage(dst, msg, version)
+	}
+	return dst
+}
+
+func readMessages(body []byte, offset int, version uint8) ([]ch.Message, int, error) {
+	nilSlice, count, next, err := readSliceHeader(body, offset, "messages")
+	if err != nil {
+		return nil, offset, err
+	}
+	offset = next
+	if nilSlice {
+		return nil, offset, nil
+	}
+	messages := make([]ch.Message, count)
+	for i := range messages {
+		if messages[i], offset, err = readMessage(body, offset, version); err != nil {
+			return nil, offset, err
+		}
+	}
+	return messages, offset, nil
+}
+
+func appendMetaPtr(dst []byte, meta *ch.Meta, version uint8) []byte {
+	if meta == nil {
+		return append(dst, 0)
+	}
+	dst = append(dst, 1)
+	return appendMeta(dst, *meta, version)
+}
+
+func readMetaPtr(body []byte, offset int, version uint8) (*ch.Meta, int, error) {
+	present, next, err := readByte(body, offset, "meta presence")
+	if err != nil {
+		return nil, offset, err
+	}
+	offset = next
+	if present == 0 {
+		return nil, offset, nil
+	}
+	if present != 1 {
+		return nil, offset, fmt.Errorf("channels: invalid meta presence")
+	}
+	meta, next, err := readMeta(body, offset, version)
+	if err != nil {
+		return nil, offset, err
+	}
+	return &meta, next, nil
+}
+
+func appendMeta(dst []byte, meta ch.Meta, version uint8) []byte {
+	dst = appendChannelKey(dst, meta.Key)
+	dst = appendChannelID(dst, meta.ID)
+	dst = appendUvarint(dst, meta.Epoch)
+	dst = appendUvarint(dst, meta.LeaderEpoch)
+	dst = appendUvarint(dst, uint64(meta.Leader))
+	dst = appendNodeIDs(dst, meta.Replicas)
+	dst = appendNodeIDs(dst, meta.ISR)
+	dst = appendVarint(dst, int64(meta.MinISR))
+	dst = appendTime(dst, meta.LeaseUntil)
+	dst = append(dst, byte(meta.Status))
+	if version == codecVersion {
+		dst = appendUvarint(dst, meta.RetentionThroughSeq)
+		dst = appendString(dst, meta.WriteFence.Token)
+		dst = appendUvarint(dst, meta.WriteFence.Version)
+		dst = append(dst, byte(meta.WriteFence.Reason))
+		dst = appendTime(dst, meta.WriteFence.Until)
+	}
+	return dst
+}
+
+func readMeta(body []byte, offset int, version uint8) (ch.Meta, int, error) {
+	var meta ch.Meta
+	var err error
+	if meta.Key, offset, err = readChannelKey(body, offset); err != nil {
+		return ch.Meta{}, offset, err
+	}
+	if meta.ID, offset, err = readChannelID(body, offset); err != nil {
+		return ch.Meta{}, offset, err
+	}
+	if meta.Epoch, offset, err = readUvarint(body, offset); err != nil {
+		return ch.Meta{}, offset, err
+	}
+	if meta.LeaderEpoch, offset, err = readUvarint(body, offset); err != nil {
+		return ch.Meta{}, offset, err
+	}
+	var leader uint64
+	if leader, offset, err = readUvarint(body, offset); err != nil {
+		return ch.Meta{}, offset, err
+	}
+	meta.Leader = ch.NodeID(leader)
+	if meta.Replicas, offset, err = readNodeIDs(body, offset); err != nil {
+		return ch.Meta{}, offset, err
+	}
+	if meta.ISR, offset, err = readNodeIDs(body, offset); err != nil {
+		return ch.Meta{}, offset, err
+	}
+	if meta.MinISR, offset, err = readInt(body, offset, "meta min isr"); err != nil {
+		return ch.Meta{}, offset, err
+	}
+	if meta.LeaseUntil, offset, err = readTime(body, offset); err != nil {
+		return ch.Meta{}, offset, err
+	}
+	var status byte
+	if status, offset, err = readByte(body, offset, "meta status"); err != nil {
+		return ch.Meta{}, offset, err
+	}
+	meta.Status = ch.Status(status)
+	if version != codecVersion {
+		return meta, offset, nil
+	}
+	if meta.RetentionThroughSeq, offset, err = readUvarint(body, offset); err != nil {
+		return ch.Meta{}, offset, err
+	}
+	if meta.WriteFence.Token, offset, err = readString(body, offset); err != nil {
+		return ch.Meta{}, offset, err
+	}
+	if meta.WriteFence.Version, offset, err = readUvarint(body, offset); err != nil {
+		return ch.Meta{}, offset, err
+	}
+	var reason byte
+	if reason, offset, err = readByte(body, offset, "meta write fence reason"); err != nil {
+		return ch.Meta{}, offset, err
+	}
+	meta.WriteFence.Reason = ch.WriteFenceReason(reason)
+	if meta.WriteFence.Until, offset, err = readTime(body, offset); err != nil {
+		return ch.Meta{}, offset, err
+	}
+	return meta, offset, nil
+}
+
+func appendNodeIDs(dst []byte, ids []ch.NodeID) []byte {
+	dst = appendSliceHeader(dst, len(ids), ids == nil)
+	for _, id := range ids {
+		dst = appendUvarint(dst, uint64(id))
+	}
+	return dst
+}
+
+func readNodeIDs(body []byte, offset int) ([]ch.NodeID, int, error) {
+	nilSlice, count, next, err := readSliceHeader(body, offset, "node ids")
+	if err != nil {
+		return nil, offset, err
+	}
+	offset = next
+	if nilSlice {
+		return nil, offset, nil
+	}
+	ids := make([]ch.NodeID, count)
+	for i := range ids {
+		var value uint64
+		if value, offset, err = readUvarint(body, offset); err != nil {
+			return nil, offset, err
+		}
+		ids[i] = ch.NodeID(value)
+	}
+	return ids, offset, nil
+}
+
+func appendRecords(dst []byte, records []ch.Record, version uint8) []byte {
+	dst = appendSliceHeader(dst, len(records), records == nil)
+	for _, record := range records {
+		dst = appendRecord(dst, record, version)
+	}
+	return dst
+}
+
+func readRecords(body []byte, offset int, version uint8) ([]ch.Record, int, error) {
+	nilSlice, count, next, err := readSliceHeader(body, offset, "records")
+	if err != nil {
+		return nil, offset, err
+	}
+	offset = next
+	if nilSlice {
+		return nil, offset, nil
+	}
+	records := make([]ch.Record, count)
+	for i := range records {
+		if records[i], offset, err = readRecord(body, offset, version); err != nil {
+			return nil, offset, err
+		}
+	}
+	return records, offset, nil
+}
+
+func appendRecord(dst []byte, record ch.Record, version uint8) []byte {
+	dst = appendUvarint(dst, record.ID)
+	dst = appendUvarint(dst, record.Index)
+	dst = appendUvarint(dst, record.Epoch)
+	dst = appendString(dst, record.FromUID)
+	dst = appendString(dst, record.ClientMsgNo)
+	dst = appendVarint(dst, record.ServerTimestampMS)
+	dst = append(dst, record.Setting)
+	if version >= codecVersion {
+		dst = appendString(dst, record.Topic)
+		dst = appendUvarint(dst, uint64(record.Expire))
+		dst = appendBool(dst, record.RedDot)
+	}
+	dst = appendOptionalBytes(dst, record.Payload)
+	dst = appendVarint(dst, int64(record.SizeBytes))
+	return dst
+}
+
+func readRecord(body []byte, offset int, version uint8) (ch.Record, int, error) {
+	var record ch.Record
+	var err error
+	if record.ID, offset, err = readUvarint(body, offset); err != nil {
+		return ch.Record{}, offset, err
+	}
+	if record.Index, offset, err = readUvarint(body, offset); err != nil {
+		return ch.Record{}, offset, err
+	}
+	if record.Epoch, offset, err = readUvarint(body, offset); err != nil {
+		return ch.Record{}, offset, err
+	}
+	switch version {
+	case legacyCodecVersionV3:
+		return readRecordV3LegacyRemainder(body, offset, record)
+	case legacyCodecVersionV4:
+		return readRecordV4Remainder(body, offset, record)
+	case legacyCodecVersionV5, legacyCodecVersionV6:
+		return readRecordV5Remainder(body, offset, record)
+	case codecVersion:
+		return readRecordV7Remainder(body, offset, record)
+	default:
+		return ch.Record{}, offset, fmt.Errorf("channels: unsupported record codec version %d", version)
+	}
+}
+
+func readRecordV7Remainder(body []byte, offset int, record ch.Record) (ch.Record, int, error) {
+	var err error
+	if record.FromUID, offset, err = readString(body, offset); err != nil {
+		return ch.Record{}, offset, err
+	}
+	if record.ClientMsgNo, offset, err = readString(body, offset); err != nil {
+		return ch.Record{}, offset, err
+	}
+	if record.ServerTimestampMS, offset, err = readInt64(body, offset, "record server timestamp ms"); err != nil {
+		return ch.Record{}, offset, err
+	}
+	if record.Setting, offset, err = readByte(body, offset, "record setting"); err != nil {
+		return ch.Record{}, offset, err
+	}
+	if record.Topic, offset, err = readString(body, offset); err != nil {
+		return ch.Record{}, offset, err
+	}
+	var expire uint64
+	if expire, offset, err = readUvarint(body, offset); err != nil {
+		return ch.Record{}, offset, err
+	}
+	record.Expire = uint32(expire)
+	if record.RedDot, offset, err = readBool(body, offset, "record red dot"); err != nil {
+		return ch.Record{}, offset, err
+	}
+	return readRecordV3PayloadAndSize(body, offset, record)
+}
+
+func readRecordV5Remainder(body []byte, offset int, record ch.Record) (ch.Record, int, error) {
+	var err error
+	if record.FromUID, offset, err = readString(body, offset); err != nil {
+		return ch.Record{}, offset, err
+	}
+	if record.ClientMsgNo, offset, err = readString(body, offset); err != nil {
+		return ch.Record{}, offset, err
+	}
+	if record.ServerTimestampMS, offset, err = readInt64(body, offset, "record server timestamp ms"); err != nil {
+		return ch.Record{}, offset, err
+	}
+	if record.Setting, offset, err = readByte(body, offset, "record setting"); err != nil {
+		return ch.Record{}, offset, err
+	}
+	return readRecordV3PayloadAndSize(body, offset, record)
+}
+
+func readRecordV4Remainder(body []byte, offset int, record ch.Record) (ch.Record, int, error) {
+	var err error
+	if record.FromUID, offset, err = readString(body, offset); err != nil {
+		return ch.Record{}, offset, err
+	}
+	if record.ClientMsgNo, offset, err = readString(body, offset); err != nil {
+		return ch.Record{}, offset, err
+	}
+	if record.ServerTimestampMS, offset, err = readInt64(body, offset, "record server timestamp ms"); err != nil {
+		return ch.Record{}, offset, err
+	}
+	return readRecordV3PayloadAndSize(body, offset, record)
+}
+
+// readRecordV3LegacyRemainder decodes the original v3 record tail used before
+// conversation display fields were inserted, so old pull responses stay valid
+// during rolling upgrades.
+func readRecordV3LegacyRemainder(body []byte, offset int, record ch.Record) (ch.Record, int, error) {
+	return readRecordV3PayloadAndSize(body, offset, record)
+}
+
+func readRecordV3PayloadAndSize(body []byte, offset int, record ch.Record) (ch.Record, int, error) {
+	var err error
+	if record.Payload, offset, err = readOptionalBytes(body, offset, "record payload"); err != nil {
+		return ch.Record{}, offset, err
+	}
+	if record.SizeBytes, offset, err = readInt(body, offset, "record size bytes"); err != nil {
+		return ch.Record{}, offset, err
+	}
+	return record, offset, nil
+}
+
+func appendRPCApplicationError(dst []byte, err rpcApplicationError) []byte {
+	dst = appendString(dst, err.Code)
+	return appendString(dst, err.Message)
+}
+
+func readRPCApplicationError(body []byte, offset int) (rpcApplicationError, int, error) {
+	var err rpcApplicationError
+	var readErr error
+	if err.Code, offset, readErr = readString(body, offset); readErr != nil {
+		return rpcApplicationError{}, offset, readErr
+	}
+	if err.Message, offset, readErr = readString(body, offset); readErr != nil {
+		return rpcApplicationError{}, offset, readErr
+	}
+	return err, offset, nil
+}
+
+func appendOptionalRPCApplicationError(dst []byte, err error) []byte {
+	if err == nil {
+		return append(dst, 0)
+	}
+	dst = append(dst, 1)
+	return appendRPCApplicationError(dst, rpcApplicationError{Code: rpcErrorCode(err), Message: err.Error()})
+}
+
+func readOptionalRPCApplicationError(body []byte, offset int) (error, int, error) {
+	present, next, err := readByte(body, offset, "application error presence")
+	if err != nil {
+		return nil, offset, err
+	}
+	offset = next
+	if present == 0 {
+		return nil, offset, nil
+	}
+	if present != 1 {
+		return nil, offset, fmt.Errorf("channels: invalid application error presence")
+	}
+	appErr, next, err := readRPCApplicationError(body, offset)
+	if err != nil {
+		return nil, offset, err
+	}
+	return decodeRPCApplicationError(appErr), next, nil
+}
+
+func rpcErrorCode(err error) string {
+	switch {
+	case errors.Is(err, ch.ErrInvalidConfig):
+		return rpcErrorInvalidConfig
+	case errors.Is(err, ch.ErrBackpressured):
+		return rpcErrorBackpressured
+	case errors.Is(err, ch.ErrNotLeader):
+		return rpcErrorNotLeader
+	case errors.Is(err, ch.ErrNotReady):
+		return rpcErrorNotReady
+	case errors.Is(err, ch.ErrStaleMeta):
+		return rpcErrorStaleMeta
+	case errors.Is(err, ch.ErrChannelNotFound):
+		return rpcErrorChannelNotFound
+	case errors.Is(err, ch.ErrNotReplica):
+		return rpcErrorNotReplica
+	case errors.Is(err, ch.ErrClosed):
+		return rpcErrorClosed
+	case errors.Is(err, ch.ErrTooManyChannels):
+		return rpcErrorTooManyChannels
+	default:
+		return rpcErrorUnknown
+	}
+}
+
+func decodeRPCApplicationError(err rpcApplicationError) error {
+	switch err.Code {
+	case rpcErrorInvalidConfig:
+		return wrapRPCApplicationError(ch.ErrInvalidConfig, err.Message)
+	case rpcErrorBackpressured:
+		return wrapRPCApplicationError(ch.ErrBackpressured, err.Message)
+	case rpcErrorNotLeader:
+		return wrapRPCApplicationError(ch.ErrNotLeader, err.Message)
+	case rpcErrorNotReady:
+		return wrapRPCApplicationError(ch.ErrNotReady, err.Message)
+	case rpcErrorStaleMeta:
+		return wrapRPCApplicationError(ch.ErrStaleMeta, err.Message)
+	case rpcErrorChannelNotFound:
+		return wrapRPCApplicationError(ch.ErrChannelNotFound, err.Message)
+	case rpcErrorNotReplica:
+		return wrapRPCApplicationError(ch.ErrNotReplica, err.Message)
+	case rpcErrorClosed:
+		return wrapRPCApplicationError(ch.ErrClosed, err.Message)
+	case rpcErrorTooManyChannels:
+		return wrapRPCApplicationError(ch.ErrTooManyChannels, err.Message)
+	default:
+		if err.Message != "" {
+			return errors.New(err.Message)
+		}
+		return errors.New("channels: remote application error")
+	}
+}
+
+func wrapRPCApplicationError(sentinel error, message string) error {
+	if message == "" {
+		return sentinel
+	}
+	detail := ch.TrimErrorMessagePrefix(message, sentinel)
+	if detail == "" {
+		return sentinel
+	}
+	return fmt.Errorf("%w: %s", sentinel, detail)
+}
+
+func appendSliceHeader(dst []byte, length int, nilSlice bool) []byte {
+	if nilSlice {
+		return append(dst, 0)
+	}
+	dst = append(dst, 1)
+	return appendUvarint(dst, uint64(length))
+}
+
+func readSliceHeader(body []byte, offset int, label string) (bool, int, int, error) {
+	present, next, err := readByte(body, offset, label+" presence")
+	if err != nil {
+		return false, 0, offset, err
+	}
+	offset = next
+	if present == 0 {
+		return true, 0, offset, nil
+	}
+	if present != 1 {
+		return false, 0, offset, fmt.Errorf("channels: invalid %s presence", label)
+	}
+	count, next, err := readUvarint(body, offset)
+	if err != nil {
+		return false, 0, offset, err
+	}
+	length, err := readCollectionLen(count, len(body)-next, label)
+	if err != nil {
+		return false, 0, offset, err
+	}
+	return false, length, next, nil
+}
+
+func appendOptionalBytes(dst []byte, value []byte) []byte {
+	if value == nil {
+		return append(dst, 0)
+	}
+	dst = append(dst, 1)
+	return appendBytes(dst, value)
+}
+
+func readOptionalBytes(body []byte, offset int, label string) ([]byte, int, error) {
+	present, next, err := readByte(body, offset, label+" presence")
+	if err != nil {
+		return nil, offset, err
+	}
+	offset = next
+	if present == 0 {
+		return nil, offset, nil
+	}
+	if present != 1 {
+		return nil, offset, fmt.Errorf("channels: invalid %s presence", label)
+	}
+	return readBytesCopy(body, offset, label)
+}
+
+func appendTime(dst []byte, value time.Time) []byte {
+	if value.IsZero() {
+		return append(dst, 0)
+	}
+	dst = append(dst, 1)
+	return appendVarint(dst, value.UnixNano())
+}
+
+func readTime(body []byte, offset int) (time.Time, int, error) {
+	present, next, err := readByte(body, offset, "time presence")
+	if err != nil {
+		return time.Time{}, offset, err
+	}
+	offset = next
+	if present == 0 {
+		return time.Time{}, offset, nil
+	}
+	if present != 1 {
+		return time.Time{}, offset, fmt.Errorf("channels: invalid time presence")
+	}
+	nanos, next, err := readVarint(body, offset)
+	if err != nil {
+		return time.Time{}, offset, err
+	}
+	return time.Unix(0, nanos), next, nil
+}
+
+func appendBool(dst []byte, value bool) []byte {
+	if value {
+		return append(dst, 1)
+	}
+	return append(dst, 0)
+}
+
+func readBool(body []byte, offset int, label string) (bool, int, error) {
+	value, next, err := readByte(body, offset, label)
+	if err != nil {
+		return false, offset, err
+	}
+	switch value {
+	case 0:
+		return false, next, nil
+	case 1:
+		return true, next, nil
+	default:
+		return false, offset, fmt.Errorf("channels: invalid %s bool", label)
+	}
+}
+
+func appendString(dst []byte, value string) []byte {
+	dst = appendUvarint(dst, uint64(len(value)))
+	return append(dst, value...)
+}
+
+func readString(body []byte, offset int) (string, int, error) {
+	value, next, err := readBytes(body, offset, "string")
+	if err != nil {
+		return "", offset, err
+	}
+	return string(value), next, nil
+}
+
+func appendBytes(dst []byte, value []byte) []byte {
+	dst = appendUvarint(dst, uint64(len(value)))
+	return append(dst, value...)
+}
+
+func readBytesCopy(body []byte, offset int, label string) ([]byte, int, error) {
+	value, next, err := readBytes(body, offset, label)
+	if err != nil {
+		return nil, offset, err
+	}
+	return append([]byte(nil), value...), next, nil
+}
+
+func readBytes(body []byte, offset int, label string) ([]byte, int, error) {
+	length, next, err := readUvarint(body, offset)
+	if err != nil {
+		return nil, offset, err
+	}
+	offset = next
+	end := offset + int(length)
+	if end < offset || end > len(body) {
+		return nil, offset, fmt.Errorf("channels: short %s bytes", label)
+	}
+	return body[offset:end], end, nil
+}
+
+func appendUvarint(dst []byte, value uint64) []byte {
+	var buf [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(buf[:], value)
+	return append(dst, buf[:n]...)
+}
+
+func readUvarint(body []byte, offset int) (uint64, int, error) {
+	if offset >= len(body) {
+		return 0, offset, fmt.Errorf("channels: short uvarint")
+	}
+	value, n := binary.Uvarint(body[offset:])
+	if n <= 0 {
+		return 0, offset, fmt.Errorf("channels: invalid uvarint")
+	}
+	return value, offset + n, nil
+}
+
+func appendVarint(dst []byte, value int64) []byte {
+	var buf [binary.MaxVarintLen64]byte
+	n := binary.PutVarint(buf[:], value)
+	return append(dst, buf[:n]...)
+}
+
+func readVarint(body []byte, offset int) (int64, int, error) {
+	if offset >= len(body) {
+		return 0, offset, fmt.Errorf("channels: short varint")
+	}
+	value, n := binary.Varint(body[offset:])
+	if n <= 0 {
+		return 0, offset, fmt.Errorf("channels: invalid varint")
+	}
+	return value, offset + n, nil
+}
+
+func readInt(body []byte, offset int, label string) (int, int, error) {
+	value, next, err := readVarint(body, offset)
+	if err != nil {
+		return 0, offset, err
+	}
+	maxInt := int64(int(^uint(0) >> 1))
+	minInt := -maxInt - 1
+	if value > maxInt || value < minInt {
+		return 0, offset, fmt.Errorf("channels: %s overflows int", label)
+	}
+	return int(value), next, nil
+}
+
+func readInt64(body []byte, offset int, _ string) (int64, int, error) {
+	value, next, err := readVarint(body, offset)
+	if err != nil {
+		return 0, offset, err
+	}
+	return value, next, nil
+}
+
+func readByte(body []byte, offset int, label string) (byte, int, error) {
+	if offset >= len(body) {
+		return 0, offset, fmt.Errorf("channels: short %s", label)
+	}
+	return body[offset], offset + 1, nil
+}
+
+func readCollectionLen(count uint64, remaining int, label string) (int, error) {
+	maxInt := uint64(^uint(0) >> 1)
+	if count > maxInt {
+		return 0, fmt.Errorf("channels: %s count overflows int", label)
+	}
+	if count > uint64(remaining) {
+		return 0, fmt.Errorf("channels: %s count exceeds remaining bytes", label)
+	}
+	return int(count), nil
+}

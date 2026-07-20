@@ -2,7 +2,7 @@
 import { ref } from 'vue'
 import APIClient from '../services/APIClient'
 import { useRouter, useRoute } from "vue-router";
-import { WKSDK } from '../imSDK';
+import { WKSDK } from 'wukongimjssdk';
 const router = useRouter();
 
 
@@ -17,7 +17,7 @@ var apiurl = getUrlParam("apiurl")
 
 
 if (!apiurl || apiurl?.trim() == "") {
-  apiurl = "http://127.0.0.1:5001"
+  apiurl = import.meta.env.DEV ? "http://127.0.0.1:5001" : window.location.origin
 } else {
   // 去掉 apiurl后的 “/”
   if (apiurl && apiurl.endsWith("/")) {
@@ -38,15 +38,13 @@ const password = ref('')
 const login = () => {
   APIClient.shared.config.apiURL = apiAddr.value
   // 注意：这里的登录接口是悟空IM的演示接口，仅供演示使用，这些接口不应该暴露给前端，应该由后端封装后提供给前端
-
-  console.log("开始登录================ device_flag:0,device_level:1", )
   APIClient.shared.post('/user/token', {
     uid: username.value, // 第三方服务端的用户唯一uid
     token: password.value || "default111111", // 第三方服务端的用户的token
     device_flag: 1, // 设备标识  0.app 1.web （相同用户相同设备标记的主设备登录会互相踢，从设备将共存）
-    device_level: 1,  // 设备等级 0.为从设备 1.为主设备
+    device_level: 0,  // 设备等级 0.为从设备 1.为主设备
   }).then((res) => {
-    console.log("登录结果=======",res)
+    console.log(res)
     router.push({ path: '/chat', query: { uid: username.value, token: password.value } })
   }).catch((err) => {
     alert(err.msg)

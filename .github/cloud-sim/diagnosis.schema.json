@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wukongim.example/schemas/cloud-simulation-diagnosis-v1.json",
+  "title": "WuKongIM Cloud Simulation Diagnosis Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "run_identity", "analyzed_window", "verdict", "severity", "confidence",
+    "root_cause_scope", "summary", "observation_references", "supporting_signals",
+    "contradictory_signals", "unresolved_signals", "remediation_eligibility",
+    "proposed_regression_coverage", "cloud_revalidation_required"
+  ],
+  "properties": {
+    "schema": {"type": "string", "const": "wukongim/cloud-simulation-diagnosis/v1"},
+    "run_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "source_sha", "scenario_digest"],
+      "properties": {
+        "run_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "source_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "scenario_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "analyzed_window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end"],
+      "properties": {
+        "start": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"},
+        "end": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"}
+      }
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["healthy", "product_defect", "infrastructure_interrupted", "scenario_invalid", "insufficient_evidence"]
+    },
+    "severity": {
+      "type": "string",
+      "description": "Use none for healthy or insufficient_evidence; causal verdicts require low, medium, high, or critical.",
+      "enum": ["none", "low", "medium", "high", "critical"]
+    },
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "root_cause_scope": {
+      "type": "string",
+      "description": "Match the verdict: none for healthy, unknown for insufficient_evidence, otherwise product, infrastructure, or scenario.",
+      "enum": ["none", "product", "infrastructure", "scenario", "unknown"]
+    },
+    "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+    "observation_references": {
+      "type": "array", "maxItems": 32,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["tool", "node", "observed_at", "window", "complete", "state", "status", "note"],
+        "properties": {
+          "tool": {"type": "string", "minLength": 1, "maxLength": 64, "description": "Analysis MCP tool that produced this observation."},
+          "node": {"type": "string", "minLength": 1, "maxLength": 64},
+          "observed_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"},
+          "window": {"type": "string", "maxLength": 256},
+          "complete": {"type": "boolean"},
+          "state": {"type": ["string", "null"], "enum": ["in_progress", "completed", null], "description": "Workload lifecycle state for workload_inspect; null for every other tool."},
+          "status": {"type": ["string", "null"], "enum": ["passed", "failed", null], "description": "Workload result for workload_inspect; null for every other tool."},
+          "note": {"type": ["string", "null"], "maxLength": 500}
+        }
+      }
+    },
+    "supporting_signals": {"$ref": "#/$defs/signals"},
+    "contradictory_signals": {"$ref": "#/$defs/signals"},
+    "unresolved_signals": {"$ref": "#/$defs/signals"},
+    "remediation_eligibility": {
+      "type": "object", "additionalProperties": false,
+      "required": ["eligible", "reason", "repository_attributable", "testable"],
+      "properties": {
+        "eligible": {"type": "boolean"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "repository_attributable": {"type": "boolean"},
+        "testable": {"type": "boolean"}
+      }
+    },
+    "proposed_regression_coverage": {
+      "type": "array", "maxItems": 12,
+      "items": {"type": "string", "minLength": 1, "maxLength": 500}
+    },
+    "cloud_revalidation_required": {"type": "boolean"}
+  },
+  "$defs": {
+    "signals": {
+      "type": "array", "maxItems": 24,
+      "items": {"type": "string", "minLength": 1, "maxLength": 500}
+    }
+  }
+}

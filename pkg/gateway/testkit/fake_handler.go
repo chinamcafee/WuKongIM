@@ -1,0 +1,170 @@
+package testkit
+
+import (
+	"context"
+	"sync"
+
+	"github.com/WuKongIM/WuKongIM/pkg/gateway"
+	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
+)
+
+type ListenerError struct {
+	Listener string
+	Err      error
+}
+
+type RecordingHandler struct {
+	mu sync.Mutex
+
+	// frameChanged wakes tests waiting for an OnFrame observation.
+	frameChanged chan struct{}
+
+	CallOrder      []string
+	ListenerErrors []ListenerError
+	SessionErrors  []error
+	CloseReasons   []gateway.CloseReason
+	ReplyTokens    []string
+	Frames         []frame.Frame
+	Contexts       []gateway.Context
+
+	OnSessionOpenErr  error
+	OnFrameErr        error
+	OnSessionCloseErr error
+}
+
+func NewRecordingHandler() *RecordingHandler {
+	return &RecordingHandler{}
+}
+
+func (h *RecordingHandler) OnListenerError(listener string, err error) {
+	if h == nil {
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.CallOrder = append(h.CallOrder, "listener_error")
+	h.ListenerErrors = append(h.ListenerErrors, ListenerError{Listener: listener, Err: err})
+}
+
+func (h *RecordingHandler) OnSessionOpen(ctx gateway.Context) error {
+	if h == nil {
+		return nil
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.CallOrder = append(h.CallOrder, "open")
+	h.Contexts = append(h.Contexts, ctx)
+	return h.OnSessionOpenErr
+}
+
+func (h *RecordingHandler) OnFrame(ctx gateway.Context, f frame.Frame) error {
+	if h == nil {
+		return nil
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.CallOrder = append(h.CallOrder, "frame")
+	h.Contexts = append(h.Contexts, ctx)
+	h.ReplyTokens = append(h.ReplyTokens, ctx.ReplyToken)
+	h.CloseReasons = append(h.CloseReasons, ctx.CloseReason)
+	h.Frames = append(h.Frames, f)
+	h.notifyFrameChangedLocked()
+	return h.OnFrameErr
+}
+
+func (h *RecordingHandler) OnSessionClose(ctx gateway.Context) error {
+	if h == nil {
+		return nil
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.CallOrder = append(h.CallOrder, "close")
+	h.Contexts = append(h.Contexts, ctx)
+	h.CloseReasons = append(h.CloseReasons, ctx.CloseReason)
+	return h.OnSessionCloseErr
+}
+
+func (h *RecordingHandler) OnSessionError(ctx gateway.Context, err error) {
+	if h == nil {
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.CallOrder = append(h.CallOrder, "error")
+	h.Contexts = append(h.Contexts, ctx)
+	h.CloseReasons = append(h.CloseReasons, ctx.CloseReason)
+	h.SessionErrors = append(h.SessionErrors, err)
+}
+
+func (h *RecordingHandler) FrameCount() int {
+	if h == nil {
+		return 0
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return len(h.Frames)
+}
+
+// WaitForFrameCount blocks until at least count frames have been recorded or ctx is done.
+func (h *RecordingHandler) WaitForFrameCount(ctx context.Context, count int) bool {
+	if count <= 0 {
+		return true
+	}
+	if h == nil {
+		return false
+	}
+
+	for {
+		h.mu.Lock()
+		if len(h.Frames) >= count {
+			h.mu.Unlock()
+			return true
+		}
+		if h.frameChanged == nil {
+			h.frameChanged = make(chan struct{})
+		}
+		changed := h.frameChanged
+		h.mu.Unlock()
+
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
+func (h *RecordingHandler) notifyFrameChangedLocked() {
+	if h.frameChanged == nil {
+		return
+	}
+	close(h.frameChanged)
+	h.frameChanged = nil
+}
+
+func (h *RecordingHandler) Protocols() []string {
+	if h == nil {
+		return nil
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	out := make([]string, 0, len(h.Contexts))
+	for _, ctx := range h.Contexts {
+		out = append(out, ctx.Protocol)
+	}
+	return out
+}

@@ -1,12 +1,13 @@
 import { createApp } from 'vue'
 import './style.css'
+import 'highlight.js/styles/default.css'
 import App from './App.vue'
 
 import router from './router/index'
 import { initDataSource } from './services/datasource'
 
 import {orderMessage,CustomMessage}  from "./customessage"
-import WKSDK from './imSDK'
+import WKSDK from 'wukongimjssdk'
 
 
 // 注册自定义消息
@@ -17,5 +18,4 @@ appVue.use(router)
 appVue.mount('#app')
 
 initDataSource()
-
 

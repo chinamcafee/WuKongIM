@@ -1,824 +1,897 @@
 package client
 
 import (
-	"encoding/base64"
+	"context"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
+	"math"
 	"net"
 	"strconv"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/WuKongIM/WuKongIM/pkg/wklog"
-	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
-	wkproto "github.com/WuKongIM/WuKongIMGoProto"
-	"go.uber.org/atomic"
-	"go.uber.org/zap"
+	"github.com/WuKongIM/WuKongIM/pkg/protocol/codec"
+	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
+	"github.com/WuKongIM/WuKongIM/pkg/protocol/wkprotoenc"
 )
 
-// OnRecv 收到消息事件
-type OnRecv func(recv *wkproto.RecvPacket) error
-type OnSendack func(sendackPacket *wkproto.SendackPacket)
+var errStaleRecvSnapshot = errors.New("client: stale recv snapshot")
 
+// Client is one WKProto TCP session.
 type Client struct {
-	Statistics
-	wklog.Log
+	cfg    Config
+	proto  codec.Protocol
+	crypto *cryptoState
+	seq    atomic.Uint64
 
-	aesKey string // aes密钥
-	salt   string // 安全码
-
-	clientIDGen atomic.Uint64
-
-	addr   string
-	writer *limWriter
-	reader *limReader
-	opts   *Options
-	status Status
-
-	abortReconnect bool // 是否终止重连
-
-	conn net.Conn
-
-	pingOut           int // 发送ping次数
-	pingIntervalTimer *time.Timer
-	flusherExitChan   chan struct{}
-
-	reconnQuitCh chan struct{}
-
-	clientPrivKey [32]byte
-
-	wg sync.WaitGroup
-	mu sync.RWMutex
-
-	proto *wkproto.WKProto
-	pongs []chan struct{}
-
-	onRecv    OnRecv
-	onSendack OnSendack
-
-	err error
-
-	lastSendMsgTime time.Time // 最后发送消息时间
+	// connectMu serializes CONNECT handshakes so session state is published atomically.
+	connectMu  sync.Mutex
+	sendMu     sync.Mutex
+	closeOnce  sync.Once
+	writerOnce sync.Once
+	mu         sync.Mutex
+	conn       net.Conn
+	session    *wkprotoenc.SessionCrypto
+	closed     bool
+	writeCh    chan writeRequest
+	closeCh    chan struct{}
+	// inflight limits SENDs that have been admitted and are waiting for SENDACK.
+	inflight chan struct{}
+	// pending tracks SEND requests waiting for SENDACK frames from the reader loop.
+	pending *pendingTracker
+	// recvMu protects bounded overwrite semantics for recvCh.
+	recvMu sync.Mutex
+	// recvCh buffers inbound RECV frames for future public receive APIs.
+	recvCh chan *frame.RecvPacket
+	// recvNotify closes when the current receive session becomes unavailable.
+	recvNotify chan struct{}
+	// recvErr records why Recv waiters should stop waiting for the current session.
+	recvErr    error
+	readerDone chan struct{}
+	writerDone chan struct{}
 }
 
-func New(addr string, opt ...Option) *Client {
-	var opts = NewOptions()
-	for _, op := range opt {
-		if op != nil {
-			if err := op(opts); err != nil {
-				panic(err)
-			}
-		}
-	}
-	c := &Client{
-		addr:  addr,
-		opts:  opts,
-		proto: wkproto.New(),
-		Log:   wklog.NewWKLog(fmt.Sprintf("IMClient[%s]", opts.UID)),
-		writer: &limWriter{
-			limit:  opts.DefaultBufSize,
-			plimit: opts.ReconnectBufSize,
-		},
-		reader: &limReader{
-			buf: make([]byte, opts.DefaultBufSize),
-			off: -1,
-		},
-	}
-
-	return c
-}
-
-// Connect 连接到IM
-func (c *Client) Connect() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	_, err := c.createConn()
-	if err != nil {
-		return err
-	}
-	c.setup()
-	err = c.processConnectInit()
-	if err != nil {
-		c.mu.Unlock()
-		c.close(DISCONNECTED, err)
-		c.mu.Lock()
-	}
-
-	if err != nil && c.opts.AutoReconn {
-		c.setup()
-		c.status = RECONNECTING
-		c.writer.switchToPending()
-		go c.doReconnect()
-		err = nil
-	}
-	return err
-
-}
-
-// SetOnRecv 设置收消息事件
-func (c *Client) SetOnRecv(onRecv OnRecv) {
-	c.onRecv = onRecv
-}
-
-func (c *Client) SetOnSendack(onSendack OnSendack) {
-	c.onSendack = onSendack
-}
-
-func (c *Client) close(status Status, err error) {
-	c.mu.Lock()
-
-	if c.isClosed() {
-		c.status = status
-		c.mu.Unlock()
-		return
-	}
-	c.status = CLOSED
-
-	// Kick the Go routines so they fall out.
-	c.kickFlusher()
-
-	// If the reconnect timer is waiting between a reconnect attempt,
-	// this will kick it out.
-	if c.reconnQuitCh != nil {
-		close(c.reconnQuitCh)
-		c.reconnQuitCh = nil
-	}
-
-	// Stop ping timer if set.
-	c.stopPingTimer()
-	c.pingIntervalTimer = nil
-
-	// Need to close and set TCP conn to nil if reconnect loop has stopped,
-	// otherwise we would incorrectly invoke Disconnect handler (if set)
-	// down below.
-	if c.abortReconnect && c.conn != nil {
-		c.conn.Close()
-		c.conn = nil
-	} else if c.conn != nil {
-		// Go ahead and make sure we have flushed the outbound
-		c.writer.flush()
-		defer c.conn.Close()
-	}
-
-	c.status = status
-
-	c.mu.Unlock()
-}
-
-func (c *Client) isClosed() bool {
-	return c.status == CLOSED
-}
-
-func (c *Client) setup() {
-	c.reconnQuitCh = make(chan struct{})
-	c.flusherExitChan = make(chan struct{}, 1)
-	c.pongs = make([]chan struct{}, 0, 8)
-
-}
-
-func (c *Client) processConnectInit() error {
-	c.conn.SetDeadline(time.Now().Add(c.opts.Timeout))
-	defer c.conn.SetDeadline(time.Time{})
-	c.status = CONNECTING
-
-	var err error
-	if err = c.sendConnect(); err != nil {
-		return err
-	}
-	c.pingOut = 0
-	if c.opts.PingInterval > 0 {
-		if c.pingIntervalTimer == nil {
-			c.pingIntervalTimer = time.AfterFunc(c.opts.PingInterval, c.processPingTimer)
-		} else {
-			c.pingIntervalTimer.Reset(c.opts.PingInterval)
-		}
-	}
-
-	c.wg.Add(2)
-	go c.readLoop()
-	go c.flusher()
-
-	c.reader.doneWithConnect()
-
-	return nil
-}
-
-func (c *Client) kickFlusher() {
-	if c.writer != nil {
-		select {
-		case c.flusherExitChan <- struct{}{}:
-		default:
-		}
-	}
-}
-
-func (c *Client) processPingTimer() {
-	c.mu.Lock()
-	if c.status != CONNECTED {
-		c.mu.Unlock()
-		return
-	}
-	c.pingOut++
-
-	if c.pingOut > c.opts.MaxPingCount {
-		c.mu.Unlock()
-		c.processOpErr(ErrStaleConnection)
-		return
-	}
-	c.sendPing(nil)
-	c.pingIntervalTimer.Reset(c.opts.PingInterval)
-	c.mu.Unlock()
-}
-
-// 重连
-func (c *Client) doReconnect() {
-	// We want to make sure we have the other watchers shutdown properly
-	// here before we proceed past this point.
-	c.waitForExits()
-
-	c.mu.Lock()
-	c.err = nil
-	waitForGoRoutines := false
-
-	for {
-
-		c.mu.Unlock()
-
-		var jitter = c.opts.ReconnectJitter
-		var st = c.opts.ReconnectWait
-		if jitter > 0 {
-			st += time.Duration(rand.Int63n(int64(jitter)))
-		}
-		var rt = time.NewTimer(st)
-		select {
-		case <-c.reconnQuitCh:
-			rt.Stop()
-		case <-rt.C:
-		}
-
-		if waitForGoRoutines {
-			c.waitForExits()
-			waitForGoRoutines = false
-		}
-		c.mu.Lock()
-
-		// Check if we have been closed first.
-		if c.isClosed() {
-			break
-		}
-		// Try to create a new connection
-		_, err := c.createConn()
-		if err != nil {
-			c.err = nil
-			continue
-		}
-		c.Reconnects.Inc()
-
-		// Process connect logic
-		if c.err = c.processConnectInit(); c.err != nil {
-			// Check if we should abort reconnect. If so, break out
-			// of the loop and connection will be closed.
-			if c.abortReconnect {
-				break
-			}
-			c.status = RECONNECTING
-			continue
-		}
-		c.err = c.flushReconnectPendingItems()
-		if c.err != nil {
-			c.status = RECONNECTING
-			// Stop the ping timer (if set)
-			c.stopPingTimer()
-			// Since processConnectInit() returned without error, the
-			// go routines were started, so wait for them to return
-			// on the next iteration (after releasing the lock).
-			waitForGoRoutines = true
-			continue
-		}
-		// Done with the pending buffer
-		c.writer.doneWithPending()
-
-		// This is where we are truly connected.
-		c.status = CONNECTED
-
-		c.mu.Unlock()
-
-		// Make sure to flush everything
-		c.Flush()
-
-		return
-	}
-	if c.err == nil {
-		c.err = ErrNoServers
-	}
-	c.mu.Unlock()
-	c.close(CLOSED, nil)
-
-}
-
-// Flush will perform a round trip to the server and return when it
-// receives the internal reply.
-func (c *Client) Flush() error {
-	return c.FlushTimeout(10 * time.Second)
-}
-
-// FlushTimeout allows a Flush operation to have an associated timeout.
-func (c *Client) FlushTimeout(timeout time.Duration) (err error) {
-
-	if timeout <= 0 {
-		return ErrBadTimeout
-	}
-	c.mu.Lock()
-	if c.isClosed() {
-		c.mu.Unlock()
-		return ErrConnectionClosed
-	}
-	t := globalTimerPool.Get(timeout)
-	defer globalTimerPool.Put(t)
-
-	// Create a buffered channel to prevent chan send to block
-	// in processPong() if this code here times out just when
-	// PONG was received.
-	ch := make(chan struct{}, 1)
-	_ = c.sendPing(ch) // 注意这里flush是发送ping请求 因为sendPing执行了writer.flush 同时发送ping请求如果有pong响应则说明消息一定发送成功了
-	c.mu.Unlock()
-
-	select {
-	case _, ok := <-ch:
-		if !ok {
-			err = ErrConnectionClosed
-		} else {
-			close(ch)
-		}
-	case <-t.C:
-		err = ErrTimeout
-	}
-
-	if err != nil {
-		c.removeFlushEntry(ch)
-	}
-	return
-
-}
-
-func (c *Client) LastSendMsgTime() time.Time {
-	return c.lastSendMsgTime
-}
-
-// FIXME: This is a hack
-// removeFlushEntry is needed when we need to discard queued up responses
-// for our pings as part of a flush call. This happens when we have a flush
-// call outstanding and we call close.
-func (c *Client) removeFlushEntry(ch chan struct{}) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.pongs == nil {
-		return false
-	}
-	for i, cp := range c.pongs {
-		if cp == ch {
-			c.pongs[i] = nil
-			return true
-		}
-	}
-	return false
-}
-
-func (c *Client) flushReconnectPendingItems() error {
-	return c.writer.flushPendingBuffer()
-}
-
-func (c *Client) waitForExits() {
-	// Kick old flusher forcefully.
-	select {
-	case c.flusherExitChan <- struct{}{}:
-	default:
-	}
-
-	// Wait for any previous go routines.
-	c.wg.Wait()
-}
-
-func (c *Client) processOpErr(err error) {
-	c.mu.Lock()
-	if c.isConnecting() || c.isClosed() || c.isReconnecting() {
-		c.mu.Unlock()
-		return
-	}
-
-	if c.opts.AutoReconn && c.status == CONNECTED {
-		// Set our new status
-		c.status = RECONNECTING
-		c.stopPingTimer()
-		if c.conn != nil {
-			c.conn.Close()
-			c.conn = nil
-		}
-
-		// Create pending buffer before reconnecting.
-		c.writer.switchToPending()
-		go c.doReconnect()
-		c.mu.Unlock()
-		return
-	}
-	c.status = DISCONNECTED
-	c.err = err
-	c.mu.Unlock()
-	c.close(CLOSED, nil)
-}
-
-func (c *Client) stopPingTimer() {
-	if c.pingIntervalTimer != nil {
-		c.pingIntervalTimer.Stop()
-	}
-}
-
-func (c *Client) sendPing(ch chan struct{}) error {
-
-	c.pongs = append(c.pongs, ch)
-	data, err := c.proto.EncodeFrame(&wkproto.PingPacket{}, c.opts.ProtoVersion)
-	if err != nil {
-		return err
-	}
-	err = c.writer.appendBufs(data)
-	if err != nil {
-		return err
-	}
-	c.writer.flush()
-
-	return nil
-}
-
-func (c *Client) readLoop() {
-	defer c.wg.Done()
-	// Create a parseState if needed.
-	c.mu.Lock()
-	conn := c.conn
-	br := c.reader
-	c.mu.Unlock()
-
-	if conn == nil {
-		return
-	}
-	var remainingData []byte
-	var packetData []byte
-	tmpBuff := make([]byte, 0)
-	for !c.isClosed() {
-		buf, err := br.Read()
-		if err == nil {
-			// With websocket, it is possible that there is no error but
-			// also no buffer returned (either WS control message or read of a
-			// partial compressed message). We could call parse(buf) which
-			// would ignore an empty buffer, but simply go back to top of the loop.
-			if len(buf) == 0 {
-				continue
-			}
-			tmpBuff = append(tmpBuff, buf...)
-			packetData, remainingData, err = parse(tmpBuff)
-			if remainingData == nil {
-				tmpBuff = make([]byte, 0)
-			} else {
-				tmpBuff = remainingData
-			}
-			if len(packetData) > 0 {
-				err = c.handlePacketDatas(packetData)
-			}
-
-		}
-		if err != nil {
-			// fmt.Println("readLoop--err--->", err)
-			c.processOpErr(err)
-			break
-		}
-
-	}
-}
-
-func (c *Client) handlePacketDatas(packetData []byte) error {
-	packets := make([]wkproto.Frame, 0)
-	offset := 0
-	var err error
-	for len(packetData) > offset {
-		packet, size, err := c.proto.DecodeFrame(packetData[offset:], c.opts.ProtoVersion)
-		if err != nil { //
-			return err
-		}
-		packets = append(packets, packet)
-		offset += size
-	}
-
-	if len(packets) > 0 {
-		for _, packet := range packets {
-			err = c.handlePacket(packet)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func (c *Client) handlePacket(frame wkproto.Frame) error {
-
-	c.InBytes.Add(uint64(frame.GetFrameSize()))
-	c.InMsgs.Inc()
-
-	switch frame.GetFrameType() {
-	case wkproto.SENDACK: // 发送回执
-		c.handleSendackPacket(frame.(*wkproto.SendackPacket))
-	case wkproto.RECV: // 收到消息
-		c.handleRecvPacket(frame.(*wkproto.RecvPacket))
-	case wkproto.PONG: // pong
-		c.handlePong()
-	}
-	return nil
-}
-
-func (c *Client) handleSendackPacket(packet *wkproto.SendackPacket) {
-	if c.onSendack != nil {
-		c.onSendack(packet)
-	}
-}
-
-// 处理接受包
-func (c *Client) handleRecvPacket(packet *wkproto.RecvPacket) {
-	var err error
-	var payload []byte
-	if c.onRecv != nil {
-		if !packet.Setting.IsSet(wkproto.SettingNoEncrypt) {
-			payload, err = wkutil.AesDecryptPkcs7Base64(packet.Payload, []byte(c.aesKey), []byte(c.salt))
-			if err != nil {
-				c.Panic("解密消息payload失败！", zap.Error(err), zap.String("payload", string(packet.Payload)), zap.String("aesKey", c.aesKey), zap.String("salt", c.salt))
-			}
-			packet.Payload = payload
-		}
-		err = c.onRecv(packet)
-	}
-	if err == nil {
-		c.sendPacket(&wkproto.RecvackPacket{
-			Framer:     packet.Framer,
-			MessageID:  packet.MessageID,
-			MessageSeq: packet.MessageSeq,
-		})
-	}
-}
-
-func (c *Client) handlePong() {
-	var ch chan struct{}
-	c.mu.Lock()
-	if len(c.pongs) > 0 {
-		ch = c.pongs[0]
-		c.pongs = append(c.pongs[:0], c.pongs[1:]...)
-	}
-	c.pingOut = 0
-	c.mu.Unlock()
-	if ch != nil {
-		ch <- struct{}{}
-	}
-}
-
-func (c *Client) SendMessage(channel *Channel, payload []byte, opt ...SendOption) error {
-	opts := NewSendOptions()
-	if len(opt) > 0 {
-		for _, op := range opt {
-			_ = op(opts)
-		}
-	}
-	var err error
-	var setting wkproto.Setting
-	newPayload := payload
-	if !opts.NoEncrypt {
-		// 加密消息内容
-		newPayload, err = wkutil.AesEncryptPkcs7Base64(payload, []byte(c.aesKey), []byte(c.salt))
-		if err != nil {
-			c.Error("加密消息payload失败！", zap.Error(err), zap.String("aesKey", c.aesKey), zap.String("salt", c.salt))
-			return err
-		}
-	} else {
-		setting.Set(wkproto.SettingNoEncrypt)
-	}
-
-	clientMsgNo := opts.ClientMsgNo
-	if clientMsgNo == "" {
-		clientMsgNo = wkutil.GenUUID() // TODO: uuid生成非常耗性能
-	}
-	clientSeq := c.clientIDGen.Add(1)
-	packet := &wkproto.SendPacket{
-		Framer: wkproto.Framer{
-			NoPersist: opts.NoPersist,
-			SyncOnce:  opts.SyncOnce,
-			RedDot:    opts.RedDot,
-		},
-		Setting:     setting,
-		ClientSeq:   clientSeq,
-		ClientMsgNo: clientMsgNo,
-		ChannelID:   channel.ChannelID,
-		ChannelType: channel.ChannelType,
-		Payload:     newPayload,
-	}
-	packet.RedDot = true
-
-	// 加密消息通道
-	if !opts.NoEncrypt {
-		signStr := packet.VerityString()
-		actMsgKey, err := wkutil.AesEncryptPkcs7Base64([]byte(signStr), []byte(c.aesKey), []byte(c.salt))
-		if err != nil {
-			c.Error("加密数据失败！", zap.Error(err))
-			return err
-		}
-		packet.MsgKey = wkutil.MD5(string(actMsgKey))
-	}
-	c.lastSendMsgTime = time.Now()
-	return c.appendPacket(packet)
-}
-func (c *Client) Close() {
-	c.close(CLOSED, nil)
-}
-func (c *Client) flusher() {
-	defer c.wg.Done()
-
-	c.mu.Lock()
-	bw := c.writer
-	conn := c.conn
-	fch := c.flusherExitChan
-	c.mu.Unlock()
-
-	if conn == nil || bw == nil {
-		return
-	}
-	for {
-		if _, ok := <-fch; !ok {
-			return
-		}
-		c.mu.Lock()
-
-		// Check to see if we should bail out.
-		if !c.isConnected() || c.isConnecting() || conn != c.conn {
-			c.mu.Unlock()
-			return
-		}
-		if bw.buffered() > 0 {
-			if err := bw.flush(); err != nil {
-				if c.err == nil {
-					c.err = err
-				}
-			}
-		}
-		c.mu.Unlock()
-	}
-}
-
-func (c *Client) sendConnect() error {
-	var clientPubKey [32]byte
-	c.clientPrivKey, clientPubKey = wkutil.GetCurve25519KeypPair() // 生成服务器的DH密钥对
-	packet := &wkproto.ConnectPacket{
-		Version:         c.opts.ProtoVersion,
-		DeviceID:        wkutil.GenUUID(),
-		DeviceFlag:      wkproto.APP,
-		ClientKey:       base64.StdEncoding.EncodeToString(clientPubKey[:]),
-		ClientTimestamp: time.Now().Unix(),
-		UID:             c.opts.UID,
-		Token:           c.opts.Token,
-	}
-	err := c.sendPacket(packet)
-	if err != nil {
-		return err
-	}
-	f, err := c.proto.DecodePacketWithConn(c.conn, c.opts.ProtoVersion)
-	if err != nil {
-		c.Info("解析返回包失败！", zap.Error(err))
-		return err
-	}
-	connack, ok := f.(*wkproto.ConnackPacket)
-	if !ok {
-		return errors.New("返回包类型有误！不是连接回执包！")
-	}
-	if connack.ReasonCode != wkproto.ReasonSuccess {
-		return errors.New("连接失败！")
-	}
-	c.salt = connack.Salt
-
-	serverKey, err := base64.StdEncoding.DecodeString(connack.ServerKey)
-	if err != nil {
-		return err
-	}
-	var serverPubKey [32]byte
-	copy(serverPubKey[:], serverKey[:32])
-
-	shareKey := wkutil.GetCurve25519Key(c.clientPrivKey, serverPubKey) // 共享key
-	c.aesKey = wkutil.MD5(base64.StdEncoding.EncodeToString(shareKey[:]))[:16]
-	c.status = CONNECTED
-
-	return nil
-}
-
-// 发送包
-func (c *Client) sendPacket(packet wkproto.Frame) error {
-	data, err := c.proto.EncodeFrame(packet, c.opts.ProtoVersion)
-	if err != nil {
-		return err
-	}
-	c.OutBytes.Add(uint64(len(data)))
-	c.OutMsgs.Inc()
-	err = c.writer.writeDirect(data)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (c *Client) appendPacket(packet wkproto.Frame) error {
-
-	data, err := c.proto.EncodeFrame(packet, c.opts.ProtoVersion)
-	if err != nil {
-		return err
-	}
-	c.OutBytes.Add(uint64(len(data)))
-	c.OutMsgs.Inc()
-
-	if err := c.writer.appendBufs(data); err != nil {
-		return err
-	}
-
-	if len(c.flusherExitChan) == 0 {
-		c.kickFlusher()
-	}
-	return nil
-}
-
-func (c *Client) createConn() (net.Conn, error) {
-	network, address, _ := parseAddr(c.addr)
-	conn, err := net.DialTimeout(network, address, c.opts.Timeout)
+// New creates a WKProto client with normalized configuration defaults.
+func New(cfg Config) (*Client, error) {
+	cfg, err := normalizeConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
+	crypto, err := newCryptoState()
+	if err != nil {
+		return nil, err
+	}
+	c := &Client{
+		cfg:      cfg,
+		proto:    codec.New(),
+		crypto:   crypto,
+		writeCh:  make(chan writeRequest, cfg.SendQueueCapacity),
+		closeCh:  make(chan struct{}),
+		inflight: make(chan struct{}, cfg.MaxInflight),
+		pending:  newPendingTracker(),
+		recvCh:   make(chan *frame.RecvPacket, cfg.InboundFrameBufferSize),
+	}
+	c.recvNotify = closedNotify()
+	c.recvErr = ErrNotConnected
+	return c, nil
+}
+
+// Connect opens a TCP session and completes the WKProto CONNECT handshake.
+func (c *Client) Connect(ctx context.Context, opts ConnectOptions) (*frame.ConnackPacket, error) {
+	started := time.Now()
+	if opts.Token == "" {
+		opts.Token = c.cfg.Token
+	}
+
+	c.connectMu.Lock()
+	defer c.connectMu.Unlock()
+
+	ctx, cancel := c.withDefaultTimeout(ctx)
+	defer cancel()
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		err := ErrClosed
+		c.observeConnect(opts, time.Since(started), err)
+		return nil, err
+	}
+	c.mu.Unlock()
+
+	conn, err := c.cfg.Dialer.DialContext(ctx, "tcp", c.cfg.Addr)
+	if err != nil {
+		c.observeConnect(opts, time.Since(started), err)
+		return nil, err
+	}
+	if err = ctx.Err(); err != nil {
+		_ = conn.Close()
+		c.observeConnect(opts, time.Since(started), err)
+		return nil, err
+	}
+
+	packet := c.crypto.connectPacket(opts)
+	if err = c.writeFrameSync(ctx, conn, packet); err != nil {
+		_ = conn.Close()
+		c.observeConnect(opts, time.Since(started), err)
+		return nil, err
+	}
+
+	f, err := c.readFrameSync(ctx, conn)
+	if err != nil {
+		_ = conn.Close()
+		c.observeConnect(opts, time.Since(started), err)
+		return nil, err
+	}
+	ack, ok := f.(*frame.ConnackPacket)
+	if !ok {
+		_ = conn.Close()
+		err = fmt.Errorf("client: expected CONNACK, got %s", f.GetFrameType())
+		c.observeConnect(opts, time.Since(started), err)
+		return nil, err
+	}
+	if ack.ReasonCode != frame.ReasonSuccess {
+		_ = conn.Close()
+		err = fmt.Errorf("client: connack reason=%s", ack.ReasonCode)
+		c.observeConnect(opts, time.Since(started), err)
+		return nil, err
+	}
+	if err = c.crypto.applyConnack(ack); err != nil {
+		_ = conn.Close()
+		c.observeConnect(opts, time.Since(started), err)
+		return nil, err
+	}
+
+	var oldConn net.Conn
+	var oldPending *pendingTracker
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		_ = conn.Close()
+		err = ErrClosed
+		c.observeConnect(opts, time.Since(started), err)
+		return nil, err
+	}
+	oldConn = c.conn
+	oldPending = c.pending
+	oldRecvNotify := c.recvNotify
+	oldRecvActive := c.recvErr == nil
 	c.conn = conn
-	c.bindToNewConn(conn)
-	return conn, nil
-}
+	c.session = c.crypto.currentSession()
+	c.pending = newPendingTracker()
+	c.recvCh = make(chan *frame.RecvPacket, c.cfg.InboundFrameBufferSize)
+	c.recvNotify = make(chan struct{})
+	c.recvErr = nil
+	c.startLoops(conn, c.pending, c.session)
+	c.mu.Unlock()
 
-func (c *Client) newWriter(conn net.Conn) io.Writer {
-	var w io.Writer = conn
-	if c.opts.FlusherTimeout > 0 {
-		w = &timeoutWriter{conn: conn, timeout: c.opts.FlusherTimeout}
+	if oldRecvActive && oldRecvNotify != nil {
+		close(oldRecvNotify)
 	}
-	return w
-}
-func (c *Client) bindToNewConn(conn net.Conn) {
-	bw := c.writer
-	bw.w, bw.bufs = c.newWriter(conn), nil
-	br := c.reader
-	br.r, br.n, br.off = conn, 0, -1
+	if oldPending != nil {
+		oldPending.close(ErrClosed)
+	}
+	if oldConn != nil {
+		_ = oldConn.Close()
+	}
+
+	c.observeConnect(opts, time.Since(started), nil)
+	return ack, nil
 }
 
-// Test if Conn is connected or connecting.
-func (c *Client) isConnected() bool {
-	return c.status == CONNECTED
+// Close closes the client connection.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return ErrClosed
+	}
+	c.closed = true
+	conn := c.conn
+	c.conn = nil
+	c.session = nil
+	c.recvCh = make(chan *frame.RecvPacket, c.cfg.InboundFrameBufferSize)
+	pending := c.pending
+	c.signalRecvUnavailableLocked(ErrClosed)
+	c.mu.Unlock()
+
+	c.closeOnce.Do(func() {
+		close(c.closeCh)
+	})
+	if pending != nil {
+		pending.close(ErrClosed)
+	}
+	if conn != nil {
+		return conn.Close()
+	}
+	return nil
 }
 
-func (c *Client) IsConnected() bool {
-	return c.isConnected()
+func (c *Client) startLoops(conn net.Conn, pending *pendingTracker, session *wkprotoenc.SessionCrypto) {
+	readerDone := make(chan struct{})
+	writerDone := make(chan struct{})
+	c.readerDone = readerDone
+	c.writerOnce.Do(func() {
+		c.writerDone = writerDone
+		go func() {
+			defer close(writerDone)
+			c.writerLoop()
+		}()
+	})
+	go func() {
+		defer close(readerDone)
+		c.readerLoop(conn, pending, session)
+	}()
 }
 
-// Test if Conn is in the process of connecting
-func (c *Client) isConnecting() bool {
-	return c.status == CONNECTING
+func (c *Client) writerLoop() {
+	c.runWriterLoop()
 }
 
-// Test if Conn is being reconnected.
-func (c *Client) isReconnecting() bool {
-	return c.status == RECONNECTING
+// Send sends one message and waits for its SENDACK.
+func (c *Client) Send(ctx context.Context, msg Message) (SendResult, error) {
+	results, err := c.SendBatch(ctx, []Message{msg})
+	if err != nil {
+		if len(results) > 0 {
+			return results[0], err
+		}
+		return SendResult{}, err
+	}
+	if len(results) == 0 {
+		return SendResult{}, nil
+	}
+	return results[0], nil
 }
 
-// Channel Channel
-type Channel struct {
-	ChannelID   string
-	ChannelType uint8
+// SendBatch sends messages and returns SENDACK results in input order.
+func (c *Client) SendBatch(ctx context.Context, msgs []Message) ([]SendResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(msgs) == 0 {
+		return nil, nil
+	}
+
+	prepared := make([]preparedSend, len(msgs))
+	for i := range msgs {
+		item, err := c.prepareSend(msgs[i])
+		if err != nil {
+			return nil, err
+		}
+		prepared[i] = item
+	}
+	waiter := newSendBatchWaiter(len(prepared))
+	if err := c.admitPreparedBatch(ctx, prepared, waiter); err != nil {
+		return nil, err
+	}
+	return waiter.wait(ctx)
 }
 
-// NewChannel 创建频道
-func NewChannel(channelID string, channelType uint8) *Channel {
-	return &Channel{
-		ChannelID:   channelID,
-		ChannelType: channelType,
+// SendAsync queues one message and returns a future resolved by the matching SENDACK.
+func (c *Client) SendAsync(ctx context.Context, msg Message) (*SendFuture, error) {
+	if c == nil {
+		return nil, ErrClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	item, err := c.prepareSend(msg)
+	if err != nil {
+		return nil, err
+	}
+	futures, err := c.admitPreparedSends(ctx, []preparedSend{item})
+	if err != nil {
+		return nil, err
+	}
+	return futures[0], nil
+}
+
+// ReadFrame waits for the next inbound data frame exposed by this client.
+func (c *Client) ReadFrame(ctx context.Context) (frame.Frame, error) {
+	if c == nil {
+		return nil, ErrClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	for {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return nil, ErrClosed
+		}
+		if c.conn == nil {
+			err := c.recvErr
+			if err == nil {
+				err = ErrNotConnected
+			}
+			c.mu.Unlock()
+			return nil, err
+		}
+		recvCh := c.recvCh
+		recvNotify := c.recvNotify
+		c.mu.Unlock()
+
+		f, err := c.readFrameFromSnapshot(ctx, recvCh, recvNotify)
+		if errors.Is(err, errStaleRecvSnapshot) {
+			continue
+		}
+		return f, err
 	}
 }
 
-func parseAddr(addr string) (network, address string, port int) {
-	network = "tcp"
-	address = strings.ToLower(addr)
-	if strings.Contains(address, "://") {
-		pair := strings.Split(address, "://")
-		network = pair[0]
-		address = pair[1]
-		pair2 := strings.Split(address, ":")
-		portStr := pair2[1]
-		portInt64, _ := strconv.ParseInt(portStr, 10, 64)
-		port = int(portInt64)
+func (c *Client) readFrameFromSnapshot(ctx context.Context, recvCh <-chan *frame.RecvPacket, recvNotify <-chan struct{}) (frame.Frame, error) {
+	for {
+		select {
+		case pkt := <-recvCh:
+			if pkt == nil {
+				return nil, ErrClosed
+			}
+			if !c.isCurrentRecvSnapshot(recvCh) {
+				return nil, c.staleRecvSnapshotError()
+			}
+			return pkt, nil
+		default:
+		}
+
+		select {
+		case pkt := <-recvCh:
+			if pkt == nil {
+				return nil, ErrClosed
+			}
+			if !c.isCurrentRecvSnapshot(recvCh) {
+				return nil, c.staleRecvSnapshotError()
+			}
+			return pkt, nil
+		case <-recvNotify:
+			if !c.isCurrentRecvSnapshot(recvCh) {
+				return nil, c.staleRecvSnapshotError()
+			}
+			return nil, c.recvUnavailableError()
+		case <-c.closeCh:
+			return nil, ErrClosed
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
-	return
+}
+
+func (c *Client) isCurrentRecvSnapshot(recvCh <-chan *frame.RecvPacket) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.closed && sameRecvChannel(c.recvCh, recvCh)
+}
+
+func (c *Client) recvUnavailableError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return ErrClosed
+	}
+	err := c.recvErr
+	if err == nil {
+		err = ErrNotConnected
+	}
+	return err
+}
+
+func (c *Client) staleRecvSnapshotError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return ErrClosed
+	}
+	return errStaleRecvSnapshot
+}
+
+func sameRecvChannel(a chan *frame.RecvPacket, b <-chan *frame.RecvPacket) bool {
+	return (<-chan *frame.RecvPacket)(a) == b
+}
+
+// Recv waits for the next inbound RECV packet.
+func (c *Client) Recv(ctx context.Context) (*frame.RecvPacket, error) {
+	f, err := c.ReadFrame(ctx)
+	if err != nil {
+		return nil, err
+	}
+	recv, ok := f.(*frame.RecvPacket)
+	if !ok {
+		return nil, fmt.Errorf("client: expected *frame.RecvPacket, got %T", f)
+	}
+	return recv, nil
+}
+
+// RecvAck sends a RECVACK control frame for one received message.
+func (c *Client) RecvAck(ctx context.Context, messageID int64, messageSeq uint64) error {
+	return c.writeControl(ctx, &frame.RecvackPacket{MessageID: messageID, MessageSeq: messageSeq})
+}
+
+// Ping sends a PING control frame.
+func (c *Client) Ping(ctx context.Context) error {
+	return c.writeControl(ctx, &frame.PingPacket{})
+}
+
+func (c *Client) writeControl(ctx context.Context, f frame.Frame) error {
+	if c == nil {
+		return ErrClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return ErrClosed
+	}
+	conn := c.conn
+	if conn == nil {
+		c.mu.Unlock()
+		return ErrNotConnected
+	}
+	c.mu.Unlock()
+
+	return c.writeControlToConn(ctx, f, conn, true)
+}
+
+func (c *Client) writeControlToConn(ctx context.Context, f frame.Frame, conn net.Conn, wait bool) error {
+	if conn == nil {
+		return ErrNotConnected
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	var result chan error
+	if wait {
+		result = make(chan error, 1)
+	}
+	req := writeRequest{
+		kind:   writeKindFrame,
+		frame:  f,
+		result: result,
+		ctx:    ctx,
+		conn:   conn,
+	}
+	if !wait {
+		select {
+		case c.writeCh <- req:
+			return nil
+		case <-c.closeCh:
+			return ErrClosed
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return ErrSendQueueFull
+		}
+	}
+
+	select {
+	case c.writeCh <- req:
+	case <-c.closeCh:
+		return ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-result:
+		return err
+	case <-c.closeCh:
+		return ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func closedNotify() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+func (c *Client) signalRecvUnavailableLocked(err error) {
+	if err == nil {
+		err = net.ErrClosed
+	}
+	if c.recvErr != nil {
+		return
+	}
+	c.recvErr = err
+	close(c.recvNotify)
+}
+
+type preparedSend struct {
+	msg Message
+	pkt *frame.SendPacket
+	key pendingKey
+}
+
+func (c *Client) prepareSend(msg Message) (preparedSend, error) {
+	assignedSeq, err := c.nextClientSeq(msg.ClientSeq)
+	if err != nil {
+		return preparedSend{}, err
+	}
+	msg.ClientSeq = assignedSeq
+	if c.cfg.GenerateClientMsgNo && msg.ClientMsgNo == "" {
+		msg.ClientMsgNo = generatedClientMsgNo(assignedSeq)
+	}
+	pkt, err := buildSendPacket(msg, assignedSeq)
+	if err != nil {
+		return preparedSend{}, err
+	}
+	return preparedSend{
+		msg: msg,
+		pkt: pkt,
+		key: pendingKey{ClientSeq: pkt.ClientSeq, ClientMsgNo: pkt.ClientMsgNo},
+	}, nil
+}
+
+func (c *Client) admitPreparedSends(ctx context.Context, prepared []preparedSend) ([]*SendFuture, error) {
+	if len(prepared) == 0 {
+		return nil, nil
+	}
+
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, ErrClosed
+	}
+	conn := c.conn
+	pending := c.pending
+	session := c.session
+	if conn == nil || pending == nil {
+		c.mu.Unlock()
+		return nil, ErrNotConnected
+	}
+	c.mu.Unlock()
+
+	if len(c.writeCh)+len(prepared) > cap(c.writeCh) {
+		c.observeSendQueue("full")
+		return nil, ErrSendQueueFull
+	}
+	reserved, err := c.reserveInflight(ctx, len(prepared))
+	if err != nil {
+		c.releaseInflightN(reserved)
+		if err == ErrSendQueueFull {
+			c.observeSendQueue("full")
+		}
+		return nil, err
+	}
+
+	futures := make([]*SendFuture, len(prepared))
+	reqs := make([]writeRequest, len(prepared))
+	for i, item := range prepared {
+		entry, err := pending.addWithFinish(item.key, c.cfg.AckTimeout, c.releaseInflight)
+		if err != nil {
+			for _, req := range reqs[:i] {
+				pending.fail(req.entry, err)
+			}
+			c.releaseInflightN(len(prepared) - i)
+			return nil, err
+		}
+		reqs[i] = writeRequest{
+			kind:    writeKindSend,
+			msg:     item.msg,
+			pkt:     item.pkt,
+			entry:   entry,
+			ctx:     ctx,
+			conn:    conn,
+			pending: pending,
+			session: session,
+		}
+		futures[i] = &SendFuture{done: entry.done}
+	}
+
+	if err := ctx.Err(); err != nil {
+		for _, req := range reqs {
+			pending.fail(req.entry, err)
+		}
+		return nil, err
+	}
+
+	for _, req := range reqs {
+		select {
+		case c.writeCh <- req:
+		case <-c.closeCh:
+			for _, failed := range reqs {
+				pending.fail(failed.entry, ErrClosed)
+			}
+			return nil, ErrClosed
+		case <-ctx.Done():
+			for _, failed := range reqs {
+				pending.fail(failed.entry, ctx.Err())
+			}
+			return nil, ctx.Err()
+		}
+	}
+	for range reqs {
+		c.observeSendQueue("accepted")
+	}
+	return futures, nil
+}
+
+func (c *Client) admitPreparedBatch(ctx context.Context, prepared []preparedSend, waiter *sendBatchWaiter) error {
+	if len(prepared) == 0 {
+		return nil
+	}
+
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return ErrClosed
+	}
+	conn := c.conn
+	pending := c.pending
+	session := c.session
+	if conn == nil || pending == nil {
+		c.mu.Unlock()
+		return ErrNotConnected
+	}
+	c.mu.Unlock()
+
+	if len(c.writeCh)+len(prepared) > cap(c.writeCh) {
+		c.observeSendQueue("full")
+		return ErrSendQueueFull
+	}
+	reserved, err := c.reserveInflight(ctx, len(prepared))
+	if err != nil {
+		c.releaseInflightN(reserved)
+		if err == ErrSendQueueFull {
+			c.observeSendQueue("full")
+		}
+		return err
+	}
+
+	reqs := make([]writeRequest, len(prepared))
+	for i, item := range prepared {
+		entry, err := pending.addBatch(item.key, c.cfg.AckTimeout, waiter, i, c.releaseInflight)
+		if err != nil {
+			for _, req := range reqs[:i] {
+				pending.fail(req.entry, err)
+			}
+			c.releaseInflightN(len(prepared) - i)
+			return err
+		}
+		reqs[i] = writeRequest{
+			kind:    writeKindSend,
+			msg:     item.msg,
+			pkt:     item.pkt,
+			entry:   entry,
+			ctx:     ctx,
+			conn:    conn,
+			pending: pending,
+			session: session,
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		for _, req := range reqs {
+			pending.fail(req.entry, err)
+		}
+		return err
+	}
+
+	for _, req := range reqs {
+		select {
+		case c.writeCh <- req:
+		case <-c.closeCh:
+			for _, failed := range reqs {
+				pending.fail(failed.entry, ErrClosed)
+			}
+			return ErrClosed
+		case <-ctx.Done():
+			for _, failed := range reqs {
+				pending.fail(failed.entry, ctx.Err())
+			}
+			return ctx.Err()
+		}
+	}
+	for range reqs {
+		c.observeSendQueue("accepted")
+	}
+	return nil
+}
+
+func (c *Client) reserveInflight(ctx context.Context, n int) (int, error) {
+	if n == 0 {
+		return 0, nil
+	}
+	if n > cap(c.inflight) {
+		return 0, ErrSendQueueFull
+	}
+
+	acquired := 0
+	for acquired < n {
+		select {
+		case c.inflight <- struct{}{}:
+			acquired++
+		case <-c.closeCh:
+			return acquired, ErrClosed
+		case <-ctx.Done():
+			return acquired, ctx.Err()
+		}
+	}
+	return acquired, nil
+}
+
+func (c *Client) releaseInflight() {
+	select {
+	case <-c.inflight:
+	default:
+	}
+}
+
+func (c *Client) releaseInflightN(n int) {
+	for i := 0; i < n; i++ {
+		c.releaseInflight()
+	}
+}
+
+func (c *Client) nextClientSeq(explicit uint64) (uint64, error) {
+	if explicit != 0 {
+		if explicit > math.MaxUint32 {
+			return 0, ErrClientSeqExhausted
+		}
+		return explicit, nil
+	}
+	next := c.seq.Add(1)
+	if next > math.MaxUint32 {
+		return 0, ErrClientSeqExhausted
+	}
+	return next, nil
+}
+
+func generatedClientMsgNo(seq uint64) string {
+	return "wkclient-" + strconv.FormatUint(seq, 10)
+}
+
+func (c *Client) withDefaultTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(ctx, c.cfg.OperationTimeout)
+}
+
+func (c *Client) currentConn() (net.Conn, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil, ErrClosed
+	}
+	if c.conn == nil {
+		return nil, ErrNotConnected
+	}
+	return c.conn, nil
+}
+
+func (c *Client) writeFrameSync(ctx context.Context, conn net.Conn, f frame.Frame) error {
+	data, err := c.proto.EncodeFrame(f, frame.LatestVersion)
+	if err != nil {
+		return err
+	}
+	return c.withDeadline(ctx, conn.SetWriteDeadline, func() error {
+		for len(data) > 0 {
+			n, err := conn.Write(data)
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				return io.ErrShortWrite
+			}
+			data = data[n:]
+		}
+		return nil
+	})
+}
+
+func (c *Client) readFrameSync(ctx context.Context, conn net.Conn) (frame.Frame, error) {
+	var f frame.Frame
+	err := c.withDeadline(ctx, conn.SetReadDeadline, func() error {
+		var err error
+		f, err = codec.New().DecodePacketWithConn(conn, frame.LatestVersion)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+func (c *Client) operationDeadline(ctx context.Context) time.Time {
+	deadline := time.Now().Add(c.cfg.OperationTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		return ctxDeadline
+	}
+	return deadline
+}
+
+func (c *Client) withDeadline(ctx context.Context, setDeadline func(time.Time) error, op func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := setDeadline(c.operationDeadline(ctx)); err != nil {
+		return err
+	}
+
+	done := make(chan struct{})
+	var deadlineWG sync.WaitGroup
+	deadlineWG.Add(1)
+	go func() {
+		defer deadlineWG.Done()
+		select {
+		case <-ctx.Done():
+			_ = setDeadline(time.Now())
+		case <-done:
+		}
+	}()
+
+	err := op()
+	close(done)
+	deadlineWG.Wait()
+	_ = setDeadline(time.Time{})
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+	}
+	return err
+}
+
+func (c *Client) observeConnect(opts ConnectOptions, elapsed time.Duration, err error) {
+	if c.cfg.Observer == nil {
+		return
+	}
+	c.cfg.Observer.OnConnect(ConnectEvent{
+		Addr:    c.cfg.Addr,
+		UID:     opts.UID,
+		Elapsed: elapsed,
+		Err:     err,
+	})
+}
+
+func (c *Client) observeSendQueue(result string) {
+	if c.cfg.Observer == nil {
+		return
+	}
+	c.cfg.Observer.OnSendQueue(SendQueueEvent{
+		Depth:    len(c.writeCh),
+		Capacity: cap(c.writeCh),
+		Result:   result,
+	})
+}
+
+func (c *Client) observeSendBatch(records int, bytes int, elapsed time.Duration, err error) {
+	if c.cfg.Observer == nil {
+		return
+	}
+	c.cfg.Observer.OnSendBatch(SendBatchEvent{
+		Records: records,
+		Bytes:   bytes,
+		Elapsed: elapsed,
+		Err:     err,
+	})
 }

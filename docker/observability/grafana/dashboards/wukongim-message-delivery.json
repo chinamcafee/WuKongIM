@@ -1,0 +1,1225 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(wukongim_message_append_total{node_name=~\"$node_name\"}[$__rate_interval])) by (path,result)",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Message append rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_message_append_duration_seconds_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le,path,result))",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Message append p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(wukongim_message_meta_refresh_total{node_name=~\"$node_name\"}[$__rate_interval])) by (result)",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Meta refresh rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 6
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_message_meta_refresh_duration_seconds_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le,result))",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Meta refresh p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 6
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(wukongim_message_committed_dispatch_queue_depth{node_name=~\"$node_name\"}) by (shard)",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Dispatch queue depth",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 6
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(wukongim_message_committed_dispatch_enqueue_total{node_name=~\"$node_name\"}[$__rate_interval])) by (result)",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Dispatch enqueue rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 12
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(wukongim_message_committed_dispatch_overflow_total{node_name=~\"$node_name\"}[$__rate_interval])) by (shard)",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Dispatch overflow rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 12
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "max(wukongim_message_committed_replay_lag_messages{node_name=~\"$node_name\"}) by (channel_type)",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Replay lag",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 12
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_message_committed_replay_pass_duration_seconds_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le,result))",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Replay pass p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 18
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(wukongim_delivery_resolve_pages_total{node_name=~\"$node_name\"}[$__rate_interval])) by (channel_type,result)",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Delivery resolve pages",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 18
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(wukongim_delivery_resolve_routes_total{node_name=~\"$node_name\"}[$__rate_interval])) by (channel_type,result)",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Delivery resolve routes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 18
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_delivery_resolve_duration_seconds_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le,channel_type,result))",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Delivery resolve p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 24
+      },
+      "id": 13,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(wukongim_delivery_push_rpc_total{node_name=~\"$node_name\"}[$__rate_interval])) by (target_node,result)",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Delivery push RPC rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 24
+      },
+      "id": 14,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(wukongim_delivery_push_rpc_routes_total{node_name=~\"$node_name\"}[$__rate_interval])) by (target_node,result)",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Delivery push RPC routes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 24
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_delivery_push_rpc_duration_seconds_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le,target_node,result))",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Delivery push RPC p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 30
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(wukongim_delivery_actor_inflight_routes{node_name=~\"$node_name\"})",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Delivery inflight routes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 30
+      },
+      "id": 17,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(wukongim_delivery_ack_bindings{node_name=~\"$node_name\"})",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Delivery ack bindings",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 30
+      },
+      "id": 18,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(wukongim_delivery_route_expired_total{node_name=~\"$node_name\"}[$__rate_interval])) by (channel_type)",
+          "legendFormat": "{{result}}{{path}}{{channel_type}}{{target_node}}{{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Delivery route expiry",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 36
+      },
+      "id": 19,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(wukongim_conversation_list_total{node_name=~\"$node_name\"}[$__rate_interval])) by (result, more)",
+          "legendFormat": "list {{result}} more={{more}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_conversation_list_duration_seconds_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le, result, more))",
+          "legendFormat": "p95 {{result}} more={{more}}",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_conversation_list_returned_items_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le, result, more))",
+          "legendFormat": "returned p95 {{result}}",
+          "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_conversation_list_sparse_items_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le, result, more))",
+          "legendFormat": "sparse p95 {{result}}",
+          "refId": "D"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_conversation_list_last_message_loads_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le, result, more))",
+          "legendFormat": "last loads p95 {{result}}",
+          "refId": "E"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_conversation_list_last_message_errors_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le, result, more))",
+          "legendFormat": "last errors p95 {{result}}",
+          "refId": "F"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_conversation_list_active_index_stale_skips_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le, result, more))",
+          "legendFormat": "stale skips p95 {{result}}",
+          "refId": "G"
+        }
+      ],
+      "title": "Conversation list requests",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 43
+      },
+      "id": 22,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(wukongim_conversation_authority_admit_total{node_name=~\"$node_name\"}[$__rate_interval])) by (result)",
+          "legendFormat": "admit {{result}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(wukongim_conversation_authority_cache_pressure_total{node_name=~\"$node_name\"}[$__rate_interval])) by (phase, result)",
+          "legendFormat": "pressure {{phase}} {{result}}",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(wukongim_conversation_authority_list_total{node_name=~\"$node_name\"}[$__rate_interval])) by (result)",
+          "legendFormat": "list {{result}}",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(rate(wukongim_conversation_authority_handoff_total{node_name=~\"$node_name\"}[$__rate_interval])) by (result)",
+          "legendFormat": "handoff {{result}}",
+          "refId": "D"
+        },
+        {
+          "expr": "sum(rate(wukongim_authority_sender_route_total{node_name=~\"$node_name\"}[$__rate_interval])) by (result)",
+          "legendFormat": "sender route {{result}}",
+          "refId": "E"
+        },
+        {
+          "expr": "sum(rate(wukongim_authority_recipient_queue_total{node_name=~\"$node_name\"}[$__rate_interval])) by (result)",
+          "legendFormat": "recipient queue {{result}}",
+          "refId": "F"
+        },
+        {
+          "expr": "sum(rate(wukongim_authority_recipient_dispatch_total{node_name=~\"$node_name\"}[$__rate_interval])) by (phase, result)",
+          "legendFormat": "recipient dispatch {{phase}} {{result}}",
+          "refId": "G"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_authority_recipient_dispatch_duration_seconds_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le, phase, result))",
+          "legendFormat": "recipient dispatch p95 {{phase}} {{result}}",
+          "refId": "H"
+        }
+      ],
+      "title": "Conversation authority",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 50
+      },
+      "id": 23,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (method, result) (rate(wukongim_plugin_hook_enqueue_total{node_name=~\"$node_name\"}[$__rate_interval]))",
+          "legendFormat": "enqueue {{method}} {{result}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_plugin_hook_enqueue_wait_seconds_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le, method, result))",
+          "legendFormat": "enqueue wait p95 {{method}} {{result}}",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (method, result) (rate(wukongim_plugin_hook_invoke_total{node_name=~\"$node_name\"}[$__rate_interval]))",
+          "legendFormat": "invoke {{method}} {{result}}",
+          "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_plugin_hook_invoke_duration_seconds_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le, method, result))",
+          "legendFormat": "invoke p95 {{method}} {{result}}",
+          "refId": "D"
+        }
+      ],
+      "title": "Plugin Hook Runtime",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 57},
+      "id": 24,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "expr": "sum(rate(wukongim_message_event_append_total{node_name=~\"$node_name\"}[$__rate_interval])) by (path,event_type,result)",
+          "legendFormat": "append {{path}} {{event_type}} {{result}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(wukongim_message_event_propose_total{node_name=~\"$node_name\"}[$__rate_interval])) by (path,result)",
+          "legendFormat": "propose {{path}} {{result}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Message event append / propose rate",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 57},
+      "id": 25,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_message_event_append_duration_seconds_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le,path,event_type,result))",
+          "legendFormat": "append p95 {{path}} {{event_type}} {{result}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_message_event_append_stage_duration_seconds_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le,path,result,stage))",
+          "legendFormat": "append stage p95 {{path}} {{stage}} {{result}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Message event append latency p95",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 57},
+      "id": 26,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_message_event_propose_duration_seconds_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le,path,result))",
+          "legendFormat": "propose p95 {{path}} {{result}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_message_event_propose_stage_duration_seconds_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le,path,result,stage))",
+          "legendFormat": "propose stage p95 {{path}} {{stage}} {{result}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Message event proposal latency p95",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 64},
+      "id": 27,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(wukongim_message_event_propose_batch_events_bucket{node_name=~\"$node_name\"}[$__rate_interval])) by (le,path,result))",
+          "legendFormat": "batch p95 {{path}} {{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Message event proposal batch size p95",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 64},
+      "id": 28,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {"expr": "sum(wukongim_message_event_stream_cache_sessions{node_name=~\"$node_name\"})", "legendFormat": "sessions", "refId": "A"},
+        {"expr": "sum(wukongim_message_event_stream_cache_open_lanes{node_name=~\"$node_name\"})", "legendFormat": "open lanes", "refId": "B"},
+        {"expr": "sum(wukongim_message_event_stream_cache_max_sessions{node_name=~\"$node_name\"})", "legendFormat": "max sessions", "refId": "C"}
+      ],
+      "title": "Message event stream cache pressure",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 64},
+      "id": 29,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {"expr": "sum(wukongim_message_event_stream_cache_payload_bytes{node_name=~\"$node_name\"})", "legendFormat": "payload", "refId": "A"}
+      ],
+      "title": "Message event stream cache payload",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": [
+    "wukongim",
+    "message",
+    "delivery"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": ".*",
+          "value": ".*"
+        },
+        "datasource": "Prometheus",
+        "definition": "label_values(wukongim_gateway_connections_active, node_name)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Node",
+        "multi": false,
+        "name": "node_name",
+        "options": [],
+        "query": {
+          "query": "label_values(wukongim_gateway_connections_active, node_name)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "WuKongIM Message / Delivery Performance",
+  "uid": "wukongim-message-delivery",
+  "version": 1,
+  "weekStart": ""
+}

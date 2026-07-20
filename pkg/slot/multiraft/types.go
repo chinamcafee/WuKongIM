@@ -1,0 +1,288 @@
+package multiraft
+
+import (
+	"context"
+	"time"
+
+	"github.com/WuKongIM/WuKongIM/pkg/goroutine"
+	"github.com/WuKongIM/WuKongIM/pkg/wklog"
+	"go.etcd.io/raft/v3/raftpb"
+)
+
+type SlotID uint64
+type NodeID uint64
+
+type Options struct {
+	NodeID       NodeID
+	TickInterval time.Duration
+	Workers      int
+	Transport    Transport
+	Logger       wklog.Logger
+	Raft         RaftOptions
+	// Observer receives low-cardinality scheduler pressure observations.
+	// The same observer can implement ApplyPipelineObserver for async apply queue observations.
+	Observer SchedulerObserver
+	// Goroutines is the optional goroutine registry for lifecycle tracking.
+	Goroutines *goroutine.Registry
+}
+
+// SchedulerObserver receives low-cardinality Slot scheduler pressure observations.
+// Implementations are called synchronously from scheduler and worker paths and should be concurrency-safe and non-blocking.
+type SchedulerObserver interface {
+	SetSchedulerWorkers(workers int)
+	SetSchedulerInflight(inflight int)
+	SetSchedulerState(event SchedulerStateEvent)
+	ObserveSchedulerAdmission(result string)
+	ObserveSchedulerTask(task string, d time.Duration)
+}
+
+// ApplyPipelineObserver receives async apply pipeline observations.
+// ObserveSlotApplyQueue reports enqueue-time queue depth, while ObserveSlotApplyTask reports task completion latency.
+// Implementations should not expose slotID as a high-cardinality metrics label.
+// Implementations are called from slot and apply worker paths and should be concurrency-safe and non-blocking.
+type ApplyPipelineObserver interface {
+	ObserveSlotApplyQueue(slotID SlotID, queueDepth int)
+	ObserveSlotApplyTask(slotID SlotID, d time.Duration)
+}
+
+// ProposalObserver receives completed Slot proposal latency observations.
+type ProposalObserver interface {
+	ObserveSlotProposal(slotID SlotID, d time.Duration)
+}
+
+// LeaderChangeObserver receives observed Slot leader changes.
+type LeaderChangeObserver interface {
+	ObserveSlotLeaderChange(slotID SlotID, from, to NodeID)
+}
+
+// LeaderChangeCause identifies why a non-zero Slot leader changed.
+type LeaderChangeCause string
+
+const (
+	// LeaderChangeCauseElection is used when a change cannot be matched to a planned transfer.
+	LeaderChangeCauseElection LeaderChangeCause = "election"
+	// LeaderChangeCausePlannedTransfer is used for changes matching an expected leadership transfer.
+	LeaderChangeCausePlannedTransfer LeaderChangeCause = "planned_transfer"
+)
+
+// LeaderChangeCauseObserver receives observed Slot leader changes with cause metadata.
+type LeaderChangeCauseObserver interface {
+	ObserveSlotLeaderChangeWithCause(slotID SlotID, from, to NodeID, cause LeaderChangeCause)
+}
+
+// ApplyStateObserver receives committed/applied index snapshots for Slot Raft groups.
+type ApplyStateObserver interface {
+	SetSlotApplyState(slotID SlotID, commitIndex, appliedIndex uint64)
+}
+
+// ProposalClass identifies the admission priority of a Slot proposal.
+type ProposalClass string
+
+const (
+	// ProposalClassForeground is the default class for user-facing metadata writes.
+	ProposalClassForeground ProposalClass = "foreground"
+	// ProposalClassBackground is used for retryable projection and maintenance writes.
+	ProposalClassBackground ProposalClass = "background"
+)
+
+// ProposalAdmissionObserver receives low-cardinality proposal admission decisions.
+type ProposalAdmissionObserver interface {
+	ObserveSlotProposalAdmission(slotID SlotID, class ProposalClass, result string)
+}
+
+// SchedulerStateEvent reports aggregate Slot scheduler queue state.
+type SchedulerStateEvent struct {
+	// Depth is the number of runnable Slot IDs queued in the dispatch channel.
+	Depth int
+	// Capacity is the dispatch channel capacity.
+	Capacity int
+	// Pending is the number of Slot IDs waiting behind a full dispatch channel.
+	Pending int
+	// Queued is the number of Slot IDs marked queued.
+	Queued int
+	// Processing is the number of Slot IDs currently being processed.
+	Processing int
+	// Dirty is the number of processing Slot IDs marked for another pass.
+	Dirty int
+}
+
+type RaftOptions struct {
+	ElectionTick  int
+	HeartbeatTick int
+	PreVote       bool
+	CheckQuorum   bool
+	MaxSizePerMsg uint64
+	MaxInflight   int
+	// MaxQueuedRequests bounds inbound Raft messages buffered per Slot before
+	// scheduler processing catches up. Zero uses a conservative default.
+	MaxQueuedRequests int
+	// MaxQueuedControls bounds locally submitted control actions per Slot,
+	// including proposals and membership changes. Zero uses a conservative default.
+	MaxQueuedControls int
+	// MaxQueuedBackgroundControls bounds queued background proposals per Slot.
+	// Zero uses a conservative default derived from MaxQueuedControls.
+	MaxQueuedBackgroundControls int
+	// MaxApplyingTasks bounds async apply tasks accepted per Slot. When the
+	// limit is reached, the Slot applies the current Ready synchronously to
+	// convert overload into backpressure instead of unbounded heap growth.
+	MaxApplyingTasks int
+	// LogCompaction controls local Slot Raft snapshot compaction.
+	LogCompaction LogCompactionConfig
+}
+
+type SlotOptions struct {
+	ID           SlotID
+	Storage      Storage
+	StateMachine StateMachine
+}
+
+type BootstrapSlotRequest struct {
+	Slot SlotOptions
+	// Voters is the initial Raft voter set installed on every replica.
+	Voters []NodeID
+	// Campaign asks this local voter to campaign after the initial membership is durably applied.
+	Campaign bool
+}
+
+type Envelope struct {
+	SlotID  SlotID
+	Message raftpb.Message
+}
+
+type Future interface {
+	Wait(ctx context.Context) (Result, error)
+}
+
+type Result struct {
+	Index uint64
+	Term  uint64
+	Data  []byte
+}
+
+type Status struct {
+	SlotID   SlotID
+	NodeID   NodeID
+	LeaderID NodeID
+	// CurrentVoters is the Raft voter set currently observed by this runtime.
+	CurrentVoters []NodeID
+	// CurrentLearners is the Raft learner set currently observed by this runtime.
+	CurrentLearners []NodeID
+	// ConfState is the full Raft membership state currently observed by this runtime.
+	ConfState raftpb.ConfState
+	// ConfigAppliedIndex is the latest applied Raft entry index that changed membership.
+	ConfigAppliedIndex uint64
+	// Progress is the leader's per-peer replication progress, keyed by node ID.
+	Progress     map[NodeID]PeerProgress
+	Term         uint64
+	CommitIndex  uint64
+	AppliedIndex uint64
+	Role         Role
+}
+
+// PeerProgress exposes the replication state tracked by the current Slot leader.
+type PeerProgress struct {
+	// Match is the highest log index known to be replicated on the peer.
+	Match uint64
+	// Next is the next log index the leader will send to the peer.
+	Next uint64
+	// State is the Raft tracker state used for peer replication.
+	State string
+}
+
+type Transport interface {
+	Send(ctx context.Context, batch []Envelope) error
+}
+
+// ReadyMessagePayloadOwner marks transports that consume or encode Ready
+// message payload bytes before Send returns.
+type ReadyMessagePayloadOwner interface {
+	// OwnsReadyMessagePayloads reports whether Send synchronously owns payload bytes.
+	OwnsReadyMessagePayloads() bool
+}
+
+type Storage interface {
+	InitialState(ctx context.Context) (BootstrapState, error)
+	Entries(ctx context.Context, lo, hi, maxSize uint64) ([]raftpb.Entry, error)
+	Term(ctx context.Context, index uint64) (uint64, error)
+	FirstIndex(ctx context.Context) (uint64, error)
+	LastIndex(ctx context.Context) (uint64, error)
+	Snapshot(ctx context.Context) (raftpb.Snapshot, error)
+
+	Save(ctx context.Context, st PersistentState) error
+	MarkApplied(ctx context.Context, index uint64) error
+}
+
+// ConfigAppliedIndexStorage persists the latest applied Raft membership entry index.
+// Storage implementations that compact applied log entries should implement this
+// so Status.ConfigAppliedIndex can be restored after the original entry is gone.
+type ConfigAppliedIndexStorage interface {
+	MarkConfigApplied(ctx context.Context, index uint64) error
+}
+
+type BootstrapState struct {
+	HardState raftpb.HardState
+	ConfState raftpb.ConfState
+	// AppliedIndex is the latest entry durably applied to the state machine.
+	AppliedIndex uint64
+	// ConfigAppliedIndex is the latest applied Raft entry index that changed membership.
+	ConfigAppliedIndex uint64
+}
+
+type PersistentState struct {
+	HardState *raftpb.HardState
+	Entries   []raftpb.Entry
+	Snapshot  *raftpb.Snapshot
+}
+
+type StateMachine interface {
+	Apply(ctx context.Context, cmd Command) ([]byte, error)
+	Restore(ctx context.Context, snap Snapshot) error
+	Snapshot(ctx context.Context) (Snapshot, error)
+}
+
+// BatchStateMachine extends StateMachine with batched apply support.
+// When implemented, processReady will collect contiguous normal entries
+// and apply them in a single call, amortizing fsync cost.
+type BatchStateMachine interface {
+	StateMachine
+	ApplyBatch(ctx context.Context, cmds []Command) ([][]byte, error)
+}
+
+type Command struct {
+	SlotID   SlotID
+	HashSlot uint16
+	Index    uint64
+	Term     uint64
+	// Data is read-only and valid until Apply or ApplyBatch returns. State
+	// machines that retain command bytes beyond the call must copy them.
+	Data []byte
+}
+
+type Snapshot struct {
+	Index uint64
+	Term  uint64
+	Data  []byte
+}
+
+type ConfigChange struct {
+	Type    ChangeType
+	NodeID  NodeID
+	Context []byte
+}
+
+type ChangeType uint8
+
+const (
+	AddVoter ChangeType = iota + 1
+	RemoveVoter
+	AddLearner
+	PromoteLearner
+)
+
+type Role uint8
+
+const (
+	RoleFollower Role = iota + 1
+	RoleCandidate
+	RoleLeader
+)

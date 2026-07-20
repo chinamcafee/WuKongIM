@@ -1,22 +1,46 @@
-import { fileURLToPath, URL } from 'node:url'
+import path from "node:path"
 
-import { defineConfig } from 'vite'
-import vue from '@vitejs/plugin-vue'
+import tailwindcss from "@tailwindcss/vite"
+import react from "@vitejs/plugin-react"
+import { defineConfig, loadEnv, type ConfigEnv, type UserConfig } from "vite"
 
-// https://vitejs.dev/config/
-export default defineConfig({
-  plugins: [
-    vue(),
-  ],
-  resolve: {
-    alias: {
-      '@': fileURLToPath(new URL('./src', import.meta.url))
-    }
-  },
-  base: '/web',
-  server: {
-    fs: {
-      strict: false
-    }
+const defaultManagerProxyTarget = "http://127.0.0.1:5311"
+
+function getManagerProxyTarget(env: Record<string, string | undefined>) {
+  const raw = env.VITE_MANAGER_API_TARGET?.trim() ?? ""
+  if (!raw) {
+    return defaultManagerProxyTarget
   }
-})
+
+  return raw.replace(/\/+$/, "")
+}
+
+export function createViteConfig(
+  configEnv: Pick<ConfigEnv, "mode">,
+  env?: Record<string, string | undefined>,
+): UserConfig {
+  const resolvedEnv = env ?? { ...loadEnv(configEnv.mode, process.cwd(), ""), ...process.env }
+
+  return {
+    plugins: [react(), tailwindcss()],
+    build: {
+      outDir: path.resolve(__dirname, "../internal/access/manager/webui/dist"),
+      emptyOutDir: true,
+    },
+    server: {
+      proxy: {
+        "/manager": {
+          target: getManagerProxyTarget(resolvedEnv),
+          changeOrigin: true,
+        },
+      },
+    },
+    resolve: {
+      alias: {
+        "@": path.resolve(__dirname, "./src"),
+      },
+    },
+  }
+}
+
+export default defineConfig((configEnv) => createViteConfig(configEnv))

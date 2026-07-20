@@ -1,0 +1,438 @@
+import { useCallback, useEffect, useMemo, useState } from "react"
+import { CircleHelp } from "lucide-react"
+import { useIntl } from "react-intl"
+
+import { MonitorNodeSelector } from "@/components/manager/monitor-node-selector"
+import { ResourceState } from "@/components/manager/resource-state"
+import { Button } from "@/components/ui/button"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import { PageContainer } from "@/components/shell/page-container"
+import { PageHeader } from "@/components/shell/page-header"
+import { ManagerApiError, getNodes, getRuntimeWorkqueues } from "@/lib/manager-api"
+import type {
+  ManagerRuntimeWorkqueueItem,
+  ManagerRuntimeWorkqueuesResponse,
+  ManagerNodesResponse,
+} from "@/lib/manager-api.types"
+
+type WindowValue = "10s" | "30s" | "1m"
+
+type WorkqueuesState = {
+  response: ManagerRuntimeWorkqueuesResponse | null
+  loading: boolean
+  refreshing: boolean
+  error: Error | null
+}
+
+type WorkqueueColumn = {
+  key: string
+  labelId: string
+  helpId: string
+}
+
+const windowOptions: WindowValue[] = ["10s", "30s", "1m"]
+const abnormalLevels = new Set(["busy", "degraded", "critical"])
+const workqueueColumns: WorkqueueColumn[] = [
+  { key: "level", labelId: "workqueues.table.level", helpId: "workqueues.tableHelp.level" },
+  { key: "component", labelId: "workqueues.table.component", helpId: "workqueues.tableHelp.component" },
+  { key: "pool", labelId: "workqueues.table.pool", helpId: "workqueues.tableHelp.pool" },
+  { key: "queue", labelId: "workqueues.table.queue", helpId: "workqueues.tableHelp.queue" },
+  { key: "depth", labelId: "workqueues.table.depth", helpId: "workqueues.tableHelp.depth" },
+  { key: "inflight", labelId: "workqueues.table.inflight", helpId: "workqueues.tableHelp.inflight" },
+  { key: "wait", labelId: "workqueues.table.wait", helpId: "workqueues.tableHelp.wait" },
+  { key: "task", labelId: "workqueues.table.task", helpId: "workqueues.tableHelp.task" },
+  { key: "admission", labelId: "workqueues.table.admission", helpId: "workqueues.tableHelp.admission" },
+  { key: "hint", labelId: "workqueues.table.hint", helpId: "workqueues.tableHelp.hint" },
+]
+
+function emptyState(): WorkqueuesState {
+  return {
+    response: null,
+    loading: true,
+    refreshing: false,
+    error: null,
+  }
+}
+
+function mapErrorKind(error: Error | null) {
+  if (!(error instanceof ManagerApiError)) {
+    return "error" as const
+  }
+  if (error.status === 403) {
+    return "forbidden" as const
+  }
+  if (error.status === 503) {
+    return "unavailable" as const
+  }
+  return "error" as const
+}
+
+function isAbnormal(item: ManagerRuntimeWorkqueueItem) {
+  return abnormalLevels.has(item.level)
+}
+
+function formatDepth(item: ManagerRuntimeWorkqueueItem) {
+  return `${item.depth} / ${item.capacity}`
+}
+
+function formatInflight(item: ManagerRuntimeWorkqueueItem) {
+  return `${item.inflight} / ${item.workers > 0 ? item.workers : "-"}`
+}
+
+function formatMs(value: number) {
+  return value > 0 ? `${value.toFixed(1)} ms` : "-"
+}
+
+function formatRate(value: number) {
+  return value > 0 ? `${value.toFixed(2)}/s` : "-"
+}
+
+function formatHottest(response: ManagerRuntimeWorkqueuesResponse | null) {
+  const hottest = response?.summary.hottest
+  if (!hottest) {
+    return "-"
+  }
+  return `${hottest.component} / ${hottest.pool}`
+}
+
+function levelClassName(level: string) {
+  if (level === "critical") {
+    return "border-red-500/40 bg-red-500/10 text-red-500"
+  }
+  if (level === "degraded") {
+    return "border-amber-500/40 bg-amber-500/10 text-amber-500"
+  }
+  if (level === "busy") {
+    return "border-sky-500/40 bg-sky-500/10 text-sky-500"
+  }
+  return "border-emerald-500/35 bg-emerald-500/10 text-emerald-500"
+}
+
+function LevelPill({ level }: { level: string }) {
+  return (
+    <span className={`inline-flex rounded-md border px-2 py-0.5 text-xs font-medium ${levelClassName(level)}`}>
+      {level}
+    </span>
+  )
+}
+
+function ColumnHeader({ description, label }: { description: string; label: string }) {
+  const intl = useIntl()
+  const [open, setOpen] = useState(false)
+
+  return (
+    <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+      <span>{label}</span>
+      <Tooltip onOpenChange={setOpen} open={open}>
+        <TooltipTrigger asChild>
+          <button
+            aria-expanded={open}
+            aria-label={intl.formatMessage({ id: "workqueues.tableHelp.aria" }, { label })}
+            className="inline-flex size-5 items-center justify-center rounded-full text-muted-foreground transition hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            onClick={(event) => {
+              event.preventDefault()
+              setOpen(true)
+            }}
+            type="button"
+          >
+            <CircleHelp aria-hidden="true" className="size-3.5" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-72 text-left normal-case leading-5" side="top" sideOffset={6}>
+          {description}
+        </TooltipContent>
+      </Tooltip>
+    </span>
+  )
+}
+
+function SummaryStripItem({ label, value }: { label: string; value: number | string }) {
+  return (
+    <div className="border-b border-border px-3 py-3 last:border-b-0 sm:border-r sm:last:border-r-0 xl:border-b-0">
+      <div className="text-xs font-medium text-muted-foreground">{label}</div>
+      <div className="mt-2 truncate text-sm font-semibold text-foreground">{value}</div>
+    </div>
+  )
+}
+
+export function WorkqueuesPage() {
+  const intl = useIntl()
+  const [windowValue, setWindowValue] = useState<WindowValue>("10s")
+  const [nodes, setNodes] = useState<ManagerNodesResponse | null>(null)
+  const [selectedNodeId, setSelectedNodeId] = useState<number | null>(null)
+  const [autoRefresh, setAutoRefresh] = useState(false)
+  const [abnormalOnly, setAbnormalOnly] = useState(false)
+  const [component, setComponent] = useState("")
+  const [state, setState] = useState<WorkqueuesState>(emptyState)
+
+  const title = intl.formatMessage({ id: "workqueues.title" })
+
+  const loadWorkqueues = useCallback(async (
+    refreshing = false,
+    options?: { window?: WindowValue; nodeId?: number | null },
+  ) => {
+    const nextWindow = options?.window ?? windowValue
+    const nextNodeId = options && "nodeId" in options ? options.nodeId : selectedNodeId
+    setState((current) => ({
+      ...current,
+      loading: !refreshing,
+      refreshing,
+      error: null,
+    }))
+    try {
+      const response = await getRuntimeWorkqueues({
+        window: nextWindow,
+        limit: 100,
+        ...(nextNodeId ? { nodeId: nextNodeId } : {}),
+      })
+      setState({ response, loading: false, refreshing: false, error: null })
+    } catch (error) {
+      setState({
+        response: null,
+        loading: false,
+        refreshing: false,
+        error: error instanceof Error ? error : new Error("runtime workqueue request failed"),
+      })
+    }
+  }, [selectedNodeId, windowValue])
+
+  const handleNodeChange = useCallback((nodeId: number | null) => {
+    setSelectedNodeId(nodeId)
+    setComponent("")
+    void loadWorkqueues(false, { nodeId })
+  }, [loadWorkqueues])
+
+  useEffect(() => {
+    let cancelled = false
+    getNodes()
+      .then((response) => {
+        if (!cancelled) {
+          setNodes(response)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setNodes(null)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadWorkqueues(false, { window: "10s" })
+    // Initial load intentionally uses the default window.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    if (!autoRefresh) {
+      return
+    }
+    const timer = window.setInterval(() => {
+      void loadWorkqueues(true)
+    }, 5000)
+    return () => window.clearInterval(timer)
+  }, [autoRefresh, loadWorkqueues])
+
+  const response = state.response
+  const allItems = response?.items ?? []
+  const components = useMemo(() => (
+    Array.from(new Set(allItems.map((item) => item.component))).sort()
+  ), [allItems])
+
+  const filteredItems = useMemo(() => allItems.filter((item) => {
+    if (component && item.component !== component) {
+      return false
+    }
+    if (abnormalOnly && !isAbnormal(item)) {
+      return false
+    }
+    return true
+  }), [abnormalOnly, allItems, component])
+
+  const abnormalCount = (response?.summary.busy ?? 0) + (response?.summary.degraded ?? 0) + (response?.summary.critical ?? 0)
+  const sampleCount = response?.sources.collector.sample_count ?? 0
+  const nodeLabel = response ? `${response.scope.node_name || response.scope.node_id} (#${response.scope.node_id})` : "-"
+  const emptyDescription = allItems.length > 0
+    ? intl.formatMessage({ id: "workqueues.filteredEmpty" })
+    : intl.formatMessage({ id: "workqueues.empty" })
+
+  return (
+    <PageContainer>
+      <PageHeader
+        actions={!state.loading && !state.error ? (
+          <Button disabled={state.refreshing} onClick={() => void loadWorkqueues(true)} size="sm" type="button" variant="outline">
+            {state.refreshing ? intl.formatMessage({ id: "common.refreshing" }) : intl.formatMessage({ id: "common.refresh" })}
+          </Button>
+        ) : undefined}
+        description={intl.formatMessage({ id: "workqueues.description" })}
+        eyebrow={intl.formatMessage({ id: "nav.group.globalCluster" })}
+        title={title}
+      />
+
+      {state.loading ? (
+        <ResourceState kind="loading" title={title} />
+      ) : state.error ? (
+        <ResourceState
+          kind={mapErrorKind(state.error)}
+          onRetry={() => void loadWorkqueues(false)}
+          title={title}
+        />
+      ) : (
+      <div className="space-y-4">
+        <div
+          className="rounded-lg border border-border bg-card p-3"
+          data-testid="workqueues-query-toolbar"
+        >
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+            <div className="self-end">
+              <MonitorNodeSelector
+                allNodesLabelId="workqueues.controls.allNodes"
+                labelId="workqueues.controls.node"
+                nodes={nodes}
+                onNodeChange={handleNodeChange}
+                selectedNodeId={selectedNodeId}
+              />
+            </div>
+            <label className="text-sm font-medium text-foreground">
+              {intl.formatMessage({ id: "workqueues.controls.window" })}
+              <select
+                aria-label={intl.formatMessage({ id: "workqueues.controls.window" })}
+                className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 text-sm"
+                onChange={(event) => setWindowValue(event.target.value as WindowValue)}
+                value={windowValue}
+              >
+                {windowOptions.map((option) => <option key={option} value={option}>{option}</option>)}
+              </select>
+            </label>
+            <label className="text-sm font-medium text-foreground">
+              {intl.formatMessage({ id: "workqueues.controls.component" })}
+              <select
+                aria-label={intl.formatMessage({ id: "workqueues.controls.component" })}
+                className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 text-sm"
+                onChange={(event) => setComponent(event.target.value)}
+                value={component}
+              >
+                <option value="">{intl.formatMessage({ id: "workqueues.controls.allComponents" })}</option>
+                {components.map((option) => <option key={option} value={option}>{option}</option>)}
+              </select>
+            </label>
+            <label className="flex items-center gap-2 self-end text-sm font-medium text-foreground">
+              <input
+                checked={autoRefresh}
+                className="size-4 rounded border-border"
+                onChange={(event) => setAutoRefresh(event.target.checked)}
+                type="checkbox"
+              />
+              {intl.formatMessage({ id: "workqueues.controls.autoRefresh" })}
+            </label>
+            <label className="flex items-center gap-2 self-end text-sm font-medium text-foreground">
+              <input
+                checked={abnormalOnly}
+                className="size-4 rounded border-border"
+                onChange={(event) => setAbnormalOnly(event.target.checked)}
+                type="checkbox"
+              />
+              {intl.formatMessage({ id: "workqueues.controls.abnormalOnly" })}
+            </label>
+          </div>
+          <div
+            className="mt-3 flex flex-wrap items-center gap-3 border-t border-border pt-3 text-xs text-muted-foreground"
+            data-testid="workqueues-metadata-row"
+          >
+            <span>{intl.formatMessage({ id: "workqueues.scope.node" })}: {nodeLabel}</span>
+            <span>{intl.formatMessage({ id: "workqueues.scope.samples" })}: {sampleCount}</span>
+          </div>
+        </div>
+
+        {response ? (
+          <div
+            className="grid overflow-hidden rounded-md border border-border bg-card sm:grid-cols-2 xl:grid-cols-5"
+            data-testid="workqueues-status-strip"
+          >
+            <SummaryStripItem
+              label={intl.formatMessage({ id: "workqueues.summary.level" })}
+              value={intl.formatMessage({ id: "workqueues.summary.overallValue" }, { level: response.summary.overall_level })}
+            />
+            <SummaryStripItem
+              label={intl.formatMessage({ id: "workqueues.summary.total" })}
+              value={response.summary.total}
+            />
+            <SummaryStripItem
+              label={intl.formatMessage({ id: "workqueues.summary.degraded" })}
+              value={abnormalCount}
+            />
+            <SummaryStripItem
+              label={intl.formatMessage({ id: "workqueues.summary.hottest" })}
+              value={formatHottest(response)}
+            />
+            <SummaryStripItem
+              label={intl.formatMessage({ id: "workqueues.summary.window" })}
+              value={`${response.window_seconds}s`}
+            />
+          </div>
+        ) : null}
+
+        {filteredItems.length === 0 ? (
+          <ResourceState kind="empty" title={title} description={emptyDescription} />
+        ) : (
+          <section
+            className="rounded-md border border-border bg-card"
+            data-workqueues-surface="inventory"
+          >
+            <div className="overflow-x-auto">
+              <table
+                aria-label={title}
+                className="w-full min-w-[1080px] border-collapse text-left text-sm"
+              >
+                <thead className="text-xs uppercase text-muted-foreground">
+                  <tr>
+                    {workqueueColumns.map((column) => {
+                      const label = intl.formatMessage({ id: column.labelId })
+                      return (
+                        <th className="px-3 py-3" key={column.key}>
+                          <ColumnHeader
+                            description={intl.formatMessage({ id: column.helpId })}
+                            label={label}
+                          />
+                        </th>
+                      )
+                    })}
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredItems.map((item) => (
+                    <WorkqueueRow item={item} key={`${item.component}-${item.pool}-${item.queue}-${item.priority}`} />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
+      </div>
+      )}
+    </PageContainer>
+  )
+}
+
+function WorkqueueRow({ item }: { item: ManagerRuntimeWorkqueueItem }) {
+  return (
+    <tr className="border-t border-border">
+      <td className="px-3 py-3"><LevelPill level={item.level} /></td>
+      <td className="px-3 py-3 text-sm font-medium text-foreground">{item.component}</td>
+      <td className="px-3 py-3 text-sm text-foreground">{item.pool}</td>
+      <td className="px-3 py-3 text-sm text-muted-foreground">{item.queue}</td>
+      <td className="px-3 py-3 text-sm text-muted-foreground">{formatDepth(item)}</td>
+      <td className="px-3 py-3 text-sm text-muted-foreground">{formatInflight(item)}</td>
+      <td className="px-3 py-3 text-sm text-muted-foreground">{formatMs(item.wait_p99_ms)}</td>
+      <td className="px-3 py-3 text-sm text-muted-foreground">{formatMs(item.task_p99_ms)}</td>
+      <td className="px-3 py-3 text-sm text-muted-foreground">{formatRate(item.admission_error_per_sec)}</td>
+      <td className="max-w-[260px] px-3 py-3 text-sm text-muted-foreground">
+        <span className="block truncate">{item.hint || "-"}</span>
+      </td>
+    </tr>
+  )
+}

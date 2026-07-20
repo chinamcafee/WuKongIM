@@ -1,0 +1,608 @@
+package nodeops
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/WuKongIM/WuKongIM/cmd/wkcli/internal/command"
+	contextcmd "github.com/WuKongIM/WuKongIM/cmd/wkcli/internal/context"
+)
+
+func TestNodeListCommandPrintsLifecycleAndHealthEvidence(t *testing.T) {
+	manager := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want GET", r.Method)
+		}
+		if r.URL.Path != "/manager/nodes" {
+			t.Fatalf("path = %s, want /manager/nodes", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"items":[{"node_id":4,"name":"node-4","membership":{"join_state":"joining","schedulable":false},"health":{"fresh":true,"freshness":"fresh","status":"alive","runtime_ready":true,"observed_control_revision":7}}],"total":1}`))
+	}))
+	defer manager.Close()
+
+	stdout, stderr, err := executeNodeCommand("ls", "--server", manager.URL)
+	if err != nil {
+		t.Fatalf("node ls error = %v stdout %q stderr %q", err, stdout, stderr)
+	}
+	for _, want := range []string{
+		"node-4",
+		"node=4",
+		"join_state=joining",
+		"schedulable=false",
+		"health=fresh/alive",
+		"fresh=true",
+		"runtime_ready=true",
+		"control_rev=7",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("node ls stdout missing %q: %q", want, stdout)
+		}
+	}
+}
+
+func TestNodeScaleInStatusCommandPrintsRootCauseBlockers(t *testing.T) {
+	manager := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want GET", r.Method)
+		}
+		if r.URL.Path != "/manager/nodes/4/scale-in/status" {
+			t.Fatalf("path = %s, want /manager/nodes/4/scale-in/status", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{
+			"node_id":4,
+			"join_state":"leaving",
+			"state_revision":88,
+			"safe_to_proceed":false,
+			"safe_to_remove":false,
+			"blocked_by_missing_node":true,
+			"blocked_by_join_state":true,
+			"blocked_by_controller_role":true,
+			"blocked_by_data_role":true,
+			"blocked_by_health":true,
+			"blocked_by_runtime_drain":true,
+			"blocked_by_stale_revision":true,
+			"blocked_by_control_revision":true,
+			"blocked_by_slots":true,
+			"blocked_by_slot_leadership":true,
+			"blocked_by_slot_runtime":true,
+			"blocked_by_tasks":true,
+			"blocked_by_channels":true,
+			"unknown_runtime":true,
+			"unknown_control_revision":true,
+			"unknown_channel_inventory":true,
+			"health_fresh":false,
+			"health_freshness":"stale",
+			"health_status":"alive",
+			"health_report_age_ms":1234,
+			"health_report_ttl_ms":5000,
+			"observed_control_revision":80,
+			"required_control_revision":88,
+			"blocked_reasons":["target_health_stale","gateway_sessions_present"],
+			"slot_replica_count":12,
+			"slot_leader_count":1,
+			"active_task_count":3,
+			"failed_task_count":1,
+			"channel_leader_count":5,
+			"channel_replica_count":9,
+			"channel_isr_count":8,
+			"gateway_draining":true,
+			"accepting_new_sessions":false,
+			"gateway_sessions":2,
+			"active_online":2,
+			"closing_online":1,
+			"total_online":3,
+			"pending_activations":4
+		}`))
+	}))
+	defer manager.Close()
+
+	stdout, stderr, err := executeNodeCommand("scale-in", "status", "4", "--server", manager.URL)
+	if err != nil {
+		t.Fatalf("node scale-in status error = %v stdout %q stderr %q", err, stdout, stderr)
+	}
+	for _, want := range []string{
+		"node=4",
+		"join_state=leaving",
+		"state_revision=88",
+		"safe_to_proceed=false",
+		"safe_to_remove=false",
+		"target_health_stale",
+		"gateway_sessions_present",
+		"health=stale/alive",
+		"fresh=false",
+		"control_rev=80/88",
+		"slots replicas=12 leaders=1",
+		"tasks active=3 failed=1",
+		"channels leader=5 replica=9 isr=8",
+		"gateway draining=true accepting_new_sessions=false gateway_sessions=2 active_online=2 closing_online=1 total_online=3 pending_activations=4",
+		"missing_node=true",
+		"join_state_blocked=true",
+		"controller_role=true",
+		"data_role=true",
+		"blocked_by_health=true",
+		"blocked_by_runtime_drain=true",
+		"blocked_by_stale_revision=true",
+		"blocked_by_control_revision=true",
+		"blocked_by_slots=true",
+		"blocked_by_slot_leadership=true",
+		"blocked_by_slot_runtime=true",
+		"blocked_by_tasks=true",
+		"blocked_by_channels=true",
+		"unknown_runtime=true",
+		"unknown_control_revision=true",
+		"unknown_channel_inventory=true",
+		"health_report_age_ms=1234",
+		"health_report_ttl_ms=5000",
+		"total_online=3",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("scale-in status stdout missing %q: %q", want, stdout)
+		}
+	}
+}
+
+func TestNodeDiagnoseCommandPrintsRootCauseSummary(t *testing.T) {
+	manager := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want GET", r.Method)
+		}
+		if r.URL.Path != "/manager/nodes/4/diagnostics" {
+			t.Fatalf("path = %s, want /manager/nodes/4/diagnostics", r.URL.Path)
+		}
+		if r.URL.RawQuery != "audit_limit=10&slot_limit=256&task_limit=20" {
+			t.Fatalf("query = %q, want audit_limit=10&slot_limit=256&task_limit=20", r.URL.RawQuery)
+		}
+		_, _ = w.Write([]byte(`{
+			"node_id":4,
+			"node":{"membership":{"join_state":"leaving"}},
+			"summary":{
+				"safe_to_remove":false,
+				"recommended_next_action":"inspect_controller_task",
+				"active_task_count":1
+			},
+			"active_tasks":[
+				{
+					"task_id":"slot-7-replica-move-4-to-2",
+					"kind":"slot_replica_move",
+					"step":"remove_voter",
+					"status":"running",
+					"phase_index":3,
+					"observed_config_index":101,
+					"observed_voters":[1,2,4],
+					"observed_learners":[3]
+				}
+			],
+			"task_audits":[
+				{
+					"task_id":"slot-7-replica-move-4-to-2",
+					"last_reason":"waiting for source leadership transfer"
+				}
+			],
+			"slots":[
+				{
+					"slot_id":7,
+					"desired_peers":[1,2,4],
+					"preferred_leader":1
+				}
+			],
+			"warnings":["controller task has not advanced since last audit"]
+		}`))
+	}))
+	defer manager.Close()
+
+	stdout, stderr, err := executeNodeCommand("diagnose", "4", "--server", manager.URL)
+	if err != nil {
+		t.Fatalf("node diagnose error = %v stdout %q stderr %q", err, stdout, stderr)
+	}
+	for _, want := range []string{
+		"node=4",
+		"join_state=leaving",
+		"safe_to_remove=false",
+		"recommended_next_action=inspect_controller_task",
+		"active_tasks=1",
+		"task=slot-7-replica-move-4-to-2 kind=slot_replica_move step=remove_voter status=running phase_index=3 observed_config_index=101 observed_voters=[1 2 4] observed_learners=[3]",
+		"audit=slot-7-replica-move-4-to-2 last_reason=waiting for source leadership transfer",
+		"slot=7 desired_peers=[1 2 4] preferred_leader=1",
+		"warning=controller task has not advanced since last audit",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("node diagnose stdout missing %q: %q", want, stdout)
+		}
+	}
+}
+
+func TestNodeDiagnoseCommandRendersJSON(t *testing.T) {
+	manager := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want GET", r.Method)
+		}
+		if r.URL.Path != "/manager/nodes/4/diagnostics" {
+			t.Fatalf("path = %s, want /manager/nodes/4/diagnostics", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{
+			"node_id":4,
+			"state_revision":9007199254740993,
+			"summary":{"recommended_next_action":"inspect_controller_task"},
+			"manager_extra":"kept"
+		}`))
+	}))
+	defer manager.Close()
+
+	stdout, stderr, err := executeNodeCommand("diagnose", "4", "--server", manager.URL, "--json")
+	if err != nil {
+		t.Fatalf("node diagnose --json error = %v stdout %q stderr %q", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, `"manager_extra": "kept"`) {
+		t.Fatalf("node diagnose --json did not preserve manager_extra: %q", stdout)
+	}
+	if !strings.Contains(stdout, `"state_revision": 9007199254740993`) {
+		t.Fatalf("node diagnose --json did not preserve exact state_revision: %q", stdout)
+	}
+	if strings.Contains(stdout, "9007199254740992") || strings.Contains(stdout, "9.007199254740992e+15") {
+		t.Fatalf("node diagnose --json rounded state_revision: %q", stdout)
+	}
+}
+
+func TestNodeDiagnoseCommandRejectsInvalidLimits(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "task zero",
+			args:    []string{"diagnose", "4", "--task-limit", "0"},
+			wantErr: "--task-limit must be between 1 and 50",
+		},
+		{
+			name:    "audit over max",
+			args:    []string{"diagnose", "4", "--audit-limit", "21"},
+			wantErr: "--audit-limit must be between 1 and 20",
+		},
+		{
+			name:    "slot negative",
+			args:    []string{"diagnose", "4", "--slot-limit", "-1"},
+			wantErr: "--slot-limit must be between 1 and 256",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			called := false
+			manager := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+				http.Error(w, "must not be called", http.StatusInternalServerError)
+			}))
+			defer manager.Close()
+
+			args := append(tt.args, "--server", manager.URL)
+			stdout, stderr, err := executeNodeCommand(args...)
+			if err == nil {
+				t.Fatalf("node diagnose error = nil stdout %q stderr %q", stdout, stderr)
+			}
+			if called {
+				t.Fatal("manager was called; want local validation failure")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("node diagnose error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestNodeActivateCommandPostsManagerRoute(t *testing.T) {
+	manager := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/manager/nodes/4/activate" {
+			t.Fatalf("path = %s, want /manager/nodes/4/activate", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"node_id":4,"changed":true,"join_state":"active","revision":20}`))
+	}))
+	defer manager.Close()
+
+	stdout, stderr, err := executeNodeCommand("activate", "4", "--server", manager.URL)
+	if err != nil {
+		t.Fatalf("node activate error = %v stdout %q stderr %q", err, stdout, stderr)
+	}
+	for _, want := range []string{"node=4", "join_state=active", "changed=true", "revision=20"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("node activate stdout missing %q: %q", want, stdout)
+		}
+	}
+}
+
+func TestNodeActivateCommandJSONPreservesManagerFields(t *testing.T) {
+	manager := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/manager/nodes/4/activate" {
+			t.Fatalf("path = %s, want /manager/nodes/4/activate", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"node_id":4,"changed":true,"join_state":"active","revision":20,"state_revision":9007199254740993,"manager_extra":"kept"}`))
+	}))
+	defer manager.Close()
+
+	stdout, stderr, err := executeNodeCommand("activate", "4", "--server", manager.URL, "--json")
+	if err != nil {
+		t.Fatalf("node activate --json error = %v stdout %q stderr %q", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, `"manager_extra": "kept"`) {
+		t.Fatalf("node activate --json did not preserve manager_extra: %q", stdout)
+	}
+	if !strings.Contains(stdout, `"state_revision": 9007199254740993`) {
+		t.Fatalf("node activate --json did not preserve exact state_revision: %q", stdout)
+	}
+	if strings.Contains(stdout, "9007199254740992") || strings.Contains(stdout, "9.007199254740992e+15") {
+		t.Fatalf("node activate --json rounded state_revision: %q", stdout)
+	}
+}
+
+func TestNodeScaleInRemoveReturnsConflictWithBody(t *testing.T) {
+	manager := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/manager/nodes/4/scale-in/remove" {
+			t.Fatalf("path = %s, want /manager/nodes/4/scale-in/remove", r.URL.Path)
+		}
+		http.Error(w, `{"error":"blocked_by_channels"}`, http.StatusConflict)
+	}))
+	defer manager.Close()
+
+	stdout, stderr, err := executeNodeCommand("scale-in", "remove", "4", "--server", manager.URL)
+	if err == nil {
+		t.Fatalf("node scale-in remove error = nil stdout %q stderr %q", stdout, stderr)
+	}
+	if !strings.Contains(err.Error(), "blocked_by_channels") {
+		t.Fatalf("node scale-in remove error missing manager body: %v", err)
+	}
+}
+
+func TestNodeOnboardingStartPostsBoundedMoveRequest(t *testing.T) {
+	manager := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/manager/nodes/4/onboarding/start" {
+			t.Fatalf("path = %s, want /manager/nodes/4/onboarding/start", r.URL.Path)
+		}
+		assertJSONBody(t, r.Body, map[string]any{"max_slot_moves": float64(1)})
+		_, _ = w.Write([]byte(`{"node_id":4,"state_revision":9007199254740993,"operator_note":"kept"}`))
+	}))
+	defer manager.Close()
+
+	stdout, stderr, err := executeNodeCommand("onboarding", "start", "4", "--server", manager.URL, "--max-slot-moves", "1")
+	if err != nil {
+		t.Fatalf("node onboarding start error = %v stdout %q stderr %q", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, `"operator_note": "kept"`) {
+		t.Fatalf("node onboarding start stdout missing manager JSON: %q", stdout)
+	}
+	if !strings.Contains(stdout, `"state_revision": 9007199254740993`) {
+		t.Fatalf("node onboarding start stdout rounded manager number: %q", stdout)
+	}
+}
+
+func TestNodeScaleInAdvancePostsBoundedMoveRequest(t *testing.T) {
+	manager := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/manager/nodes/4/scale-in/advance" {
+			t.Fatalf("path = %s, want /manager/nodes/4/scale-in/advance", r.URL.Path)
+		}
+		assertJSONBody(t, r.Body, map[string]any{"max_slot_moves": float64(1)})
+		_, _ = w.Write([]byte(`{"node_id":4,"advanced":true,"moves":[{"slot":1}]}`))
+	}))
+	defer manager.Close()
+
+	stdout, stderr, err := executeNodeCommand("scale-in", "advance", "4", "--server", manager.URL, "--max-slot-moves", "1")
+	if err != nil {
+		t.Fatalf("node scale-in advance error = %v stdout %q stderr %q", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, `"advanced": true`) || !strings.Contains(stdout, `"slot": 1`) {
+		t.Fatalf("node scale-in advance stdout missing manager JSON: %q", stdout)
+	}
+}
+
+func TestNodeMoveCommandRejectsMaxSlotMovesBeforeSending(t *testing.T) {
+	called := false
+	manager := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		http.Error(w, "must not be called", http.StatusInternalServerError)
+	}))
+	defer manager.Close()
+
+	stdout, stderr, err := executeNodeCommand("onboarding", "plan", "4", "--server", manager.URL, "--max-slot-moves", "6")
+	if err == nil {
+		t.Fatalf("node onboarding plan error = nil stdout %q stderr %q", stdout, stderr)
+	}
+	if called {
+		t.Fatal("manager was called; want local validation failure")
+	}
+	if !strings.Contains(err.Error(), "--max-slot-moves must be between 1 and 5") {
+		t.Fatalf("node onboarding plan error = %v, want max-slot-moves validation", err)
+	}
+}
+
+func TestNodeScaleInDrainPostsRequestAndPrintsCounters(t *testing.T) {
+	manager := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/manager/nodes/4/scale-in/drain" {
+			t.Fatalf("path = %s, want /manager/nodes/4/scale-in/drain", r.URL.Path)
+		}
+		assertJSONBody(t, r.Body, map[string]any{"draining": true})
+		_, _ = w.Write([]byte(`{
+			"draining":true,
+			"accepting_new_sessions":false,
+				"gateway_sessions":2,
+				"active_online":3,
+				"closing_online":1,
+				"total_online":4,
+				"pending_activations":4,
+				"unknown":false,
+				"ignored_extra":"kept"
+			}`))
+	}))
+	defer manager.Close()
+
+	stdout, stderr, err := executeNodeCommand("scale-in", "drain", "4", "--server", manager.URL, "--draining=true")
+	if err != nil {
+		t.Fatalf("node scale-in drain error = %v stdout %q stderr %q", err, stdout, stderr)
+	}
+	for _, want := range []string{
+		"draining=true",
+		"accepting_new_sessions=false",
+		"gateway_sessions=2",
+		"active_online=3",
+		"closing_online=1",
+		"total_online=4",
+		"pending_activations=4",
+		"unknown=false",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("node scale-in drain stdout missing %q: %q", want, stdout)
+		}
+	}
+}
+
+func TestNodeScaleInDrainDoesNotRenderMissingRuntimeCountersAsZero(t *testing.T) {
+	manager := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/manager/nodes/4/scale-in/drain" {
+			t.Fatalf("path = %s, want /manager/nodes/4/scale-in/drain", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"draining":true,"unknown":true}`))
+	}))
+	defer manager.Close()
+
+	stdout, stderr, err := executeNodeCommand("scale-in", "drain", "4", "--server", manager.URL, "--draining=true")
+	if err != nil {
+		t.Fatalf("node scale-in drain error = %v stdout %q stderr %q", err, stdout, stderr)
+	}
+	for _, want := range []string{
+		"draining=true",
+		"unknown=true",
+		"accepting_new_sessions=-",
+		"gateway_sessions=-",
+		"active_online=-",
+		"closing_online=-",
+		"total_online=-",
+		"pending_activations=-",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("node scale-in drain stdout missing %q: %q", want, stdout)
+		}
+	}
+}
+
+func TestNodeCommandUsesFirstContextServerAndPrintsEvidence(t *testing.T) {
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want GET", r.Method)
+		}
+		if r.URL.Path != "/manager/nodes" {
+			t.Fatalf("path = %s, want /manager/nodes", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"items":[],"total":0}`))
+	}))
+	defer first.Close()
+
+	secondCalled := false
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondCalled = true
+		http.Error(w, "second server must not be called", http.StatusInternalServerError)
+	}))
+	defer second.Close()
+
+	contextDir := t.TempDir()
+	store := contextcmd.NewStore(contextDir)
+	if err := store.Save(contextcmd.Context{Name: "ops", Servers: []string{first.URL, second.URL}}); err != nil {
+		t.Fatalf("save context: %v", err)
+	}
+	if err := store.Select("ops"); err != nil {
+		t.Fatalf("select context: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd := NewCommand(command.Deps{Stdout: &stdout, Stderr: &stderr, ContextDir: &contextDir})
+	cmd.SetArgs([]string{"ls"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("node ls error = %v stdout %q stderr %q", err, stdout.String(), stderr.String())
+	}
+	if secondCalled {
+		t.Fatal("second context server was called; want only first server")
+	}
+	wantEvidence := fmt.Sprintf("using first manager server from context ops: %s", first.URL)
+	if !strings.Contains(stderr.String(), wantEvidence) {
+		t.Fatalf("stderr missing %q: %q", wantEvidence, stderr.String())
+	}
+}
+
+func TestNodeCommandJSONPreservesDecodedManagerFields(t *testing.T) {
+	manager := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/manager/nodes":
+			_, _ = w.Write([]byte(`{"items":[],"total":0,"manager_extra":"kept"}`))
+		case "/manager/nodes/4/scale-in/status":
+			_, _ = w.Write([]byte(`{"node_id":4,"state_revision":9007199254740993,"safe_to_remove":false,"operator_note":"kept"}`))
+		default:
+			t.Fatalf("path = %s, want node read endpoint", r.URL.Path)
+		}
+	}))
+	defer manager.Close()
+
+	stdout, stderr, err := executeNodeCommand("ls", "--server", manager.URL, "--json")
+	if err != nil {
+		t.Fatalf("node ls --json error = %v stdout %q stderr %q", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, `"manager_extra": "kept"`) {
+		t.Fatalf("node ls --json did not preserve manager_extra: %q", stdout)
+	}
+
+	stdout, stderr, err = executeNodeCommand("scale-in", "status", "4", "--server", manager.URL, "--json")
+	if err != nil {
+		t.Fatalf("node scale-in status --json error = %v stdout %q stderr %q", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, `"operator_note": "kept"`) {
+		t.Fatalf("node scale-in status --json did not preserve operator_note: %q", stdout)
+	}
+	if !strings.Contains(stdout, `"state_revision": 9007199254740993`) {
+		t.Fatalf("node scale-in status --json did not preserve exact state_revision: %q", stdout)
+	}
+	if strings.Contains(stdout, "9007199254740992") || strings.Contains(stdout, "9.007199254740992e+15") {
+		t.Fatalf("node scale-in status --json rounded state_revision: %q", stdout)
+	}
+}
+
+func executeNodeCommand(args ...string) (string, string, error) {
+	var stdout, stderr bytes.Buffer
+	cmd := NewCommand(command.Deps{Stdout: &stdout, Stderr: &stderr})
+	cmd.SetArgs(args)
+	err := cmd.Execute()
+	return stdout.String(), stderr.String(), err
+}
+
+func assertJSONBody(t *testing.T, body io.Reader, want map[string]any) {
+	t.Helper()
+	var got map[string]any
+	if err := json.NewDecoder(body).Decode(&got); err != nil {
+		t.Fatalf("decode request body: %v", err)
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("request body = %#v, want %#v", got, want)
+	}
+}

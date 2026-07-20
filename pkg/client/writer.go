@@ -1,0 +1,449 @@
+package client
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net"
+	"reflect"
+	"sync"
+	"time"
+
+	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
+	"github.com/WuKongIM/WuKongIM/pkg/protocol/wkprotoenc"
+)
+
+type writeKind uint8
+
+const (
+	writeKindSend writeKind = iota + 1
+	writeKindFrame
+	writeKindClose
+)
+
+const maxPooledWriteBufferCapacity = 1 << 20
+
+var writeBufferPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
+
+// writeRequest is one item accepted by the single socket writer pump.
+type writeRequest struct {
+	// kind selects whether this request is a SEND, control frame, or close marker.
+	kind writeKind
+	// msg carries the high-level SEND payload before it is encoded as a frame.
+	msg Message
+	// pkt is the immutable SEND packet captured when the request was admitted.
+	pkt *frame.SendPacket
+	// frame carries non-SEND control frames such as PING or RECVACK.
+	frame frame.Frame
+	// entry tracks the pending SENDACK future for SEND requests.
+	entry *pendingEntry
+	// result receives the terminal write result for synchronous control requests.
+	result chan error
+	// ctx bounds waiting and socket writes for this request.
+	ctx context.Context
+	// conn is the TCP stream captured when the request was admitted.
+	conn net.Conn
+	// pending is the tracker that owns entry for this request's session.
+	pending *pendingTracker
+	// session is the crypto snapshot for this request's session.
+	session *wkprotoenc.SessionCrypto
+}
+
+// batchLimits bounds how many ready writer requests can be coalesced.
+type batchLimits struct {
+	// maxRecords caps the number of SEND records in one writer batch.
+	maxRecords int
+	// maxBytes caps the approximate payload bytes in one writer batch.
+	maxBytes int
+	// maxWait bounds collection time in the writer pump.
+	maxWait time.Duration
+}
+
+// writeBatchCollector builds contiguous SEND batches without crossing control frames.
+type writeBatchCollector struct {
+	limits batchLimits
+}
+
+func newWriteBatchCollector(limits batchLimits) *writeBatchCollector {
+	return &writeBatchCollector{limits: limits}
+}
+
+func (c *writeBatchCollector) collect(reqs []writeRequest) ([]writeRequest, []writeRequest) {
+	if len(reqs) == 0 {
+		return nil, nil
+	}
+
+	first := reqs[0]
+	if first.kind != writeKindSend {
+		return reqs[:1], reqs[1:]
+	}
+
+	maxRecords := c.limits.maxRecords
+	if maxRecords <= 0 {
+		maxRecords = 1
+	}
+
+	var totalBytes int
+	for i, req := range reqs {
+		if req.kind != writeKindSend {
+			return reqs[:i], reqs[i:]
+		}
+		if i > 0 && req.conn != first.conn {
+			return reqs[:i], reqs[i:]
+		}
+		if i >= maxRecords {
+			return reqs[:i], reqs[i:]
+		}
+
+		nextBytes := requestPayloadBytes(req)
+		if c.limits.maxBytes > 0 && i > 0 && totalBytes+nextBytes > c.limits.maxBytes {
+			return reqs[:i], reqs[i:]
+		}
+		totalBytes += nextBytes
+	}
+
+	return reqs, nil
+}
+
+func requestPayloadBytes(req writeRequest) int {
+	if req.kind != writeKindSend {
+		return 0
+	}
+	if req.pkt != nil {
+		return len(req.pkt.Payload)
+	}
+	if len(req.msg.Payload) > 0 {
+		return len(req.msg.Payload)
+	}
+	send, ok := req.frame.(*frame.SendPacket)
+	if !ok || send == nil {
+		return 0
+	}
+	return len(send.Payload)
+}
+
+func (c *Client) runWriterLoop() {
+	collector := newWriteBatchCollector(batchLimits{
+		maxRecords: c.cfg.BatchMaxRecords,
+		maxBytes:   c.cfg.BatchMaxBytes,
+		maxWait:    c.cfg.BatchMaxWait,
+	})
+
+	var backlog []writeRequest
+	for {
+		if len(backlog) == 0 {
+			select {
+			case req := <-c.writeCh:
+				if req.kind == writeKindClose {
+					return
+				}
+				backlog = append(backlog, req)
+			case <-c.closeCh:
+				return
+			}
+		}
+
+		backlog = c.collectWriterBacklog(backlog, collector)
+		batch, rest := collector.collect(backlog)
+		if len(batch) == 0 {
+			backlog = rest
+			continue
+		}
+		if batch[0].kind == writeKindClose {
+			return
+		}
+		select {
+		case <-c.closeCh:
+			c.finishWriteBatch(batch, ErrClosed)
+			return
+		default:
+		}
+
+		started := time.Now()
+		ready := c.filterCanceledBatch(batch)
+		if len(ready) > 0 {
+			bytesWritten, err := c.writeBatch(ready)
+			c.finishWriteBatch(ready, err)
+			c.observeSendBatch(countSendRequests(ready), bytesWritten, time.Since(started), err)
+		}
+		backlog = rest
+	}
+}
+
+func (c *Client) collectWriterBacklog(backlog []writeRequest, collector *writeBatchCollector) []writeRequest {
+	if len(backlog) == 0 {
+		return backlog
+	}
+	first := backlog[0]
+	if first.kind != writeKindSend {
+		return backlog
+	}
+
+	maxWait := collector.limits.maxWait
+	if maxWait <= 0 {
+		for {
+			batch, rest := collector.collect(backlog)
+			if len(rest) > 0 {
+				return backlog
+			}
+			select {
+			case req := <-c.writeCh:
+				backlog = append(backlog, req)
+			default:
+				_ = batch
+				return backlog
+			}
+		}
+	}
+
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+	for {
+		batch, rest := collector.collect(backlog)
+		if len(rest) > 0 || len(batch) >= effectiveMaxRecords(collector.limits.maxRecords) {
+			return backlog
+		}
+
+		select {
+		case req := <-c.writeCh:
+			backlog = append(backlog, req)
+		case <-c.closeCh:
+			return backlog
+		case <-timer.C:
+			return backlog
+		}
+	}
+}
+
+func effectiveMaxRecords(maxRecords int) int {
+	if maxRecords <= 0 {
+		return 1
+	}
+	return maxRecords
+}
+
+func (c *Client) writeBatch(batch []writeRequest) (int, error) {
+	if len(batch) == 0 {
+		return 0, nil
+	}
+
+	conn := batch[0].conn
+	if conn == nil {
+		var err error
+		conn, err = c.currentConn()
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	buf := acquireWriteBuffer(writeBatchSizeHint(batch))
+	defer releaseWriteBuffer(buf)
+	for _, req := range batch {
+		switch req.kind {
+		case writeKindSend:
+			pkt := req.pkt
+			if pkt == nil {
+				var err error
+				pkt, err = buildSendPacket(req.msg, req.msg.ClientSeq)
+				if err != nil {
+					return buf.Len(), err
+				}
+			}
+			sealed, err := sealSendWithSession(pkt, req.session)
+			if err != nil {
+				return buf.Len(), err
+			}
+			if err := c.proto.WriteFrame(buf, sealed, frame.LatestVersion); err != nil {
+				return buf.Len(), err
+			}
+		case writeKindFrame:
+			if req.frame == nil {
+				return buf.Len(), ErrInvalidMessage
+			}
+			if err := c.proto.WriteFrame(buf, req.frame, frame.LatestVersion); err != nil {
+				return buf.Len(), err
+			}
+		case writeKindClose:
+			return buf.Len(), ErrClosed
+		}
+	}
+
+	data := buf.Bytes()
+	bytesWritten := buf.Len()
+	writeCtx, cancel := writeContextForBatch(batch)
+	defer cancel()
+	err := c.withDeadline(writeCtx, conn.SetWriteDeadline, func() error {
+		for len(data) > 0 {
+			n, err := conn.Write(data)
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				return io.ErrShortWrite
+			}
+			data = data[n:]
+		}
+		return nil
+	})
+	if err != nil {
+		return bytesWritten, err
+	}
+	return bytesWritten, nil
+}
+
+func writeContextForBatch(batch []writeRequest) (context.Context, context.CancelFunc) {
+	var earliest time.Time
+	var hasDeadline bool
+	var doneChans []<-chan struct{}
+	for _, req := range batch {
+		if req.ctx == nil {
+			continue
+		}
+		if deadline, ok := req.ctx.Deadline(); ok && (!hasDeadline || deadline.Before(earliest)) {
+			earliest = deadline
+			hasDeadline = true
+		}
+		done := req.ctx.Done()
+		if done != nil {
+			doneChans = appendUniqueDone(doneChans, done)
+		}
+	}
+	if !hasDeadline && len(doneChans) == 0 {
+		return context.Background(), func() {}
+	}
+
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if hasDeadline {
+		ctx, cancel = context.WithDeadline(context.Background(), earliest)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
+	}
+	switch len(doneChans) {
+	case 0:
+	case 1:
+		done := doneChans[0]
+		go func() {
+			select {
+			case <-done:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	default:
+		go func() {
+			waitAnyDone(doneChans, ctx.Done())
+			cancel()
+		}()
+	}
+	return ctx, cancel
+}
+
+func (c *Client) finishWriteBatch(batch []writeRequest, err error) {
+	for _, req := range batch {
+		c.finishWriteRequest(req, err)
+	}
+}
+
+func (c *Client) finishWriteRequest(req writeRequest, err error) {
+	if req.kind == writeKindSend && err != nil {
+		if req.pending != nil {
+			req.pending.fail(req.entry, err)
+		}
+	}
+	if req.result != nil {
+		select {
+		case req.result <- err:
+		default:
+		}
+	}
+}
+
+func (c *Client) filterCanceledBatch(batch []writeRequest) []writeRequest {
+	ready := batch[:0]
+	for _, req := range batch {
+		if req.ctx != nil {
+			if err := req.ctx.Err(); err != nil {
+				c.finishWriteRequest(req, err)
+				continue
+			}
+		}
+		ready = append(ready, req)
+	}
+	return ready
+}
+
+func acquireWriteBuffer(hint int) *bytes.Buffer {
+	buf := writeBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	if hint > 0 {
+		buf.Grow(hint)
+	}
+	return buf
+}
+
+func releaseWriteBuffer(buf *bytes.Buffer) {
+	if buf == nil {
+		return
+	}
+	if buf.Cap() > maxPooledWriteBufferCapacity {
+		return
+	}
+	buf.Reset()
+	writeBufferPool.Put(buf)
+}
+
+func writeBatchSizeHint(batch []writeRequest) int {
+	var total int
+	for _, req := range batch {
+		total += writeRequestEncodedSizeHint(req)
+	}
+	return total
+}
+
+func writeRequestEncodedSizeHint(req writeRequest) int {
+	switch req.kind {
+	case writeKindSend:
+		pkt := req.pkt
+		if pkt == nil {
+			return 64 + len(req.msg.Payload) + len(req.msg.ClientMsgNo) + len(req.msg.ChannelID) + len(req.msg.Topic)
+		}
+		return 64 + len(pkt.Payload) + len(pkt.ClientMsgNo) + len(pkt.ChannelID) + len(pkt.MsgKey) + len(pkt.Topic) + len(pkt.StreamNo)
+	case writeKindFrame:
+		return 64
+	default:
+		return 0
+	}
+}
+
+func appendUniqueDone(doneChans []<-chan struct{}, done <-chan struct{}) []<-chan struct{} {
+	for _, existing := range doneChans {
+		if existing == done {
+			return doneChans
+		}
+	}
+	return append(doneChans, done)
+}
+
+func waitAnyDone(doneChans []<-chan struct{}, stop <-chan struct{}) {
+	cases := make([]reflect.SelectCase, 0, len(doneChans)+1)
+	for _, done := range doneChans {
+		cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(done)})
+	}
+	cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(stop)})
+	reflect.Select(cases)
+}
+
+func countSendRequests(batch []writeRequest) int {
+	var n int
+	for _, req := range batch {
+		if req.kind == writeKindSend {
+			n++
+		}
+	}
+	return n
+}

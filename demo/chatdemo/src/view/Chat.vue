@@ -2,16 +2,18 @@
 import { nextTick, onMounted, onUnmounted, ref, toRaw, toRefs, unref } from 'vue';
 import APIClient from '../services/APIClient'
 import { useRouter } from "vue-router";
-import { WKSDK, Message, MessageText, Channel, ChannelTypePerson, ChannelTypeGroup, MessageStatus, PullMode, MessageContent, ConnectionInfo, WKEventManager, WKEvent, MessageContentType, WKEventListener } from "../imSDK";
-import { ConnectStatus, ConnectStatusListener } from '../imSDK';
-import { SendackPacket, Setting } from '../imSDK';
-import { MessageListener, MessageStatusListener } from '../imSDK';
+import { WKSDK, Message, MessageText, Channel, ChannelTypePerson, ChannelTypeGroup, MessageStatus, PullMode, MessageContent, ConnectionInfo, WKEventManager, WKEvent, MessageContentType, WKEventListener } from "wukongimjssdk";
+import { ConnectStatus, ConnectStatusListener } from 'wukongimjssdk';
+import { SendackPacket, Setting } from 'wukongimjssdk';
+import { MessageListener, MessageStatusListener } from 'wukongimjssdk';
 import Conversation from '../components/Conversation/index.vue'
 import { CustomMessage, orderMessage } from '../customessage';
 import MessageUI from '../messages/Message.vue';
 import { Marked } from 'marked';
 import { markedHighlight } from "marked-highlight";
 import hljs from 'highlight.js';
+import { demoLogoURL } from '../services/assets';
+import { avatarURLForUID } from '../services/avatar';
 
 const marked = new Marked(markedHighlight({
     emptyLangClass: 'hljs',
@@ -53,8 +55,41 @@ const messages = ref<Message[]>(new Array<Message>())
 
 const uid = router.currentRoute.value.query.uid as string || undefined;
 const token = router.currentRoute.value.query.token as string || "token111";
+type MessageAvatarSource = { fromUID: string, send: boolean }
+const messageAvatarCache = new WeakMap<MessageAvatarSource, { uid: string, url: string }>()
+
+// messageAvatarURL keeps generated avatar data scoped to the message lifetime.
+const messageAvatarURL = (message: MessageAvatarSource): string => {
+    const avatarUID = message.fromUID || (message.send ? uid : "") || ""
+    const cachedAvatar = messageAvatarCache.get(message)
+    if (cachedAvatar?.uid === avatarUID) {
+        return cachedAvatar.url
+    }
+
+    const url = avatarURLForUID(avatarUID)
+    messageAvatarCache.set(message, { uid: avatarUID, url })
+    return url
+}
 
 title.value = `${uid || ""}(未连接)`
+
+// renderStreamText 从 event_meta 或 stream_data 中提取流文本到 message.streamText
+const renderStreamText = (m: any) => {
+    // 优先使用 event_meta 中的 snapshot
+    const eventMeta = m.eventMeta
+    if (eventMeta && eventMeta.events && eventMeta.events.length > 0) {
+        for (const ek of eventMeta.events) {
+            if (ek.event_key === "main" || eventMeta.events.length === 1) {
+                const snapshot = ek.snapshot
+                if (snapshot && snapshot.kind === "text" && snapshot.text) {
+                    m.streamText = snapshot.text
+                    return
+                }
+            }
+        }
+    }
+    // fallback: stream_data 已经在 convert.ts 中处理
+}
 
 let connectStatusListener!: ConnectStatusListener
 let messageListener!: MessageListener
@@ -88,10 +123,6 @@ onMounted(() => {
 // 连接IM
 const connectIM = (addr: string) => {
     console.log("connectIM--->", addr)
-
-    // 先断开旧连接
-    WKSDK.shared().disconnect()
-
     const config = WKSDK.shared().config
     if (uid && token) {
         config.uid = uid;
@@ -128,24 +159,45 @@ const connectIM = (addr: string) => {
     }
     WKSDK.shared().chatManager.addMessageListener(messageListener)
 
-    // 流监听
+    // 事件监听 —— 使用 dataJson 获取推送数据
     eventListener = async (event: WKEvent) => {
+        if (!event.dataJson) return
+
+        const pushData = event.dataJson
+
+        const clientMsgNo = pushData.client_msg_no
+        if (!clientMsgNo) return
+
         for (const message of messages.value) {
-            console.log("eventListener--->", event.id, event.type,event.dataText)
-            if (message.clientMsgNo === event.id) {
-                if (message.contentType === MessageContentType.text) {
-                    message.streamText = (message.streamText || "") + (event.dataText || "")
+            if (message.clientMsgNo !== clientMsgNo) continue
+
+            if (event.type === "stream.delta") {
+                // 增量事件：从 payload 中提取文本 delta
+                const payload = pushData.payload
+                if (payload && payload.kind === "text" && payload.delta) {
+                    message.streamText = (message.streamText || "") + payload.delta
                     const htmlText = await marked.parse(message.streamText)
-                    const textContent = new MessageText(htmlText || "")
-                    message.content = textContent
+                    message.content = new MessageText(htmlText || "")
                 }
-                // 刷新ui
-                messages.value = [...messages.value]
-                nextTick(() => {
-                    scrollBottom()
-                })
-                break
+            } else if (event.type === "stream.close" || event.type === "stream.error" || event.type === "stream.cancel") {
+                // 终态事件：可能携带最终 snapshot
+                const payload = pushData.payload
+                const snapshotText = payload?.snapshot?.kind === "text" ? (payload.snapshot.text as string) : ""
+                if (snapshotText) {
+                    message.streamText = snapshotText
+                    const htmlText = await marked.parse(message.streamText)
+                    message.content = new MessageText(htmlText || "")
+                }
+            } else if (event.type === "stream.finish") {
+                (message as any).completed = true
             }
+
+            // 刷新 UI
+            messages.value = [...messages.value]
+            nextTick(() => {
+                scrollBottom()
+            })
+            break
         }
     }
     WKSDK.shared().eventManager.addEventListener(eventListener)
@@ -154,7 +206,7 @@ const connectIM = (addr: string) => {
         console.log(ack)
         messages.value.forEach((m) => {
             if (m.clientSeq == ack.clientSeq) {
-                m.status = ack.reasonCode == 1 ? MessageStatus.Normal : ack.reasonCode == 25 ? MessageStatus.NotFriend : MessageStatus.Fail
+                m.status = ack.reasonCode == 1 ? MessageStatus.Normal : MessageStatus.Fail
                 return
             }
         })
@@ -209,6 +261,7 @@ const pullLast = async () => {
     // 渲染流消息
     for (const m of msgs) {
         if (m.setting.streamOn) {
+            renderStreamText(m)
             if (m.streamText && m.streamText.length > 0) {
                 const htmlText = await marked.parse(m.streamText)
                 m.content = new MessageText(htmlText)
@@ -243,6 +296,7 @@ const pullDown = async () => {
     // 渲染流消息
     for (const m of msgs) {
         if (m.setting.streamOn) {
+            renderStreamText(m)
             if (m.streamText && m.streamText.length > 0) {
                 const htmlText = await marked.parse(m.streamText)
                 m.content = new MessageText(htmlText)
@@ -337,7 +391,7 @@ const onCustomMessageSend = () => {
     customMessage.title = "可可柠檬鲜美奶茶"
     customMessage.num = 1
     customMessage.price = 18
-    customMessage.imgUrl = "https://img1.baidu.com/it/u=3855634790,2542680254&fm=253&fmt=auto&app=138&f=JPEG?w=750&h=496"
+    customMessage.imgUrl = demoLogoURL
 
     WKSDK.shared().chatManager.send(customMessage, to.value)
     scrollBottom()
@@ -419,20 +473,18 @@ const onKeydown = (e: any) => {
                 <div class="message-list" v-on:scroll="handleScroll" ref="chatRef">
                     <template v-for="m in messages">
                         <div class="message right" v-if="m.send" :id="m.clientMsgNo">
-                            <div class="status fail" v-if="m.status == MessageStatus.NotFriend">不再是好友</div>
-                            <div class="status" v-else-if="m.status == MessageStatus.Fail">发送失败</div>
-                            <div class="status" v-else-if="m.status != MessageStatus.Normal">发送中</div>
+                            <div class="status" v-if="m.status != MessageStatus.Normal">发送中</div>
                             <div class="bubble right">
                                 <MessageUI :message="m"></MessageUI>
                             </div>
                             <div class="avatar">
-                                <img :src="`https://api.dicebear.com/9.x/adventurer/svg?seed=${m.fromUID}&radius=50&backgroundType=gradientLinear&backgroundColor=ffd5dc`"
+                                <img :src="messageAvatarURL(m)"
                                     style="width: 40px;height: 40px;" />
                             </div>
                         </div>
                         <div class="message" v-if="!m.send" :id="m.clientMsgNo">
                             <div class="avatar">
-                                <img :src="`https://api.dicebear.com/9.x/adventurer/svg?seed=${m.fromUID}&radius=50&backgroundType=gradientLinear&backgroundColor=ffd5dc`"
+                                <img :src="messageAvatarURL(m)"
                                     style="width: 40px;height: 40px;" />
                             </div>
                             <div class="bubble">
