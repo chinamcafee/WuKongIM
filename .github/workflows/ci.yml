@@ -82,6 +82,28 @@ jobs:
           PACKAGES: ${{ matrix.packages }}
         run: go test $PACKAGES -count=1 -timeout=14m
 
+  go-three-node-macos:
+    name: Go three-node real disk (macOS)
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Verify Go toolchain
+        run: test "$(go env GOVERSION)" = "go1.25.11"
+      - name: Repeat cluster real-disk startup and replication
+        run: go test ./pkg/cluster -run '^(TestClusterThreeNodeDefaultChannelsReplicate(QuorumAppend|ToFollowerStore)|TestNodeDefaultControllerThreeVotersConvergeOverTransport|TestNodeDefaultSeedJoinMirrorSyncsThroughFollowerSeedRedirect|TestNodeDefaultControllerForwardsControlWriteOverTransport)$' -count=3 -timeout=12m
+      - name: Repeat app real-disk startup and send
+        run: go test ./internal/app -run '^TestStaticMultiNodeClusterStartsControllerVoters$' -count=3 -timeout=12m
+
   web:
     name: Web
     runs-on: ubuntu-24.04

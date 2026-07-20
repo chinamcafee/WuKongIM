@@ -1,0 +1,205 @@
+# WuKongIM v3 single-node development configuration.
+#
+# This is the v3 TOML equivalent of config/wk.yaml's active development
+# settings. It starts one complete single-node cluster; it is not a legacy
+# standalone path. The data directory intentionally preserves rootDir from the
+# YAML file, but it must contain v3 data only. Move or clear old v2 development
+# data before the first v3 start.
+#
+# v3 architecture differences that cannot be represented as TOML fields:
+# - tokenAuthOn=false matches the current v3 gateway, whose promoted entrypoint
+#   does not expose token authentication as a startup setting.
+# - demo.on=true is always provided by the embedded API Demo at /demo/.
+#   v2's independent demo.addr (0.0.0.0:5172) no longer exists.
+# - conversation.on=true is always part of the promoted v3 business runtime.
+
+[node]
+id = 1
+data_dir = "./wukongimdata"
+
+[cluster]
+listen_addr = "127.0.0.1:7001"
+id = "wukongim-v3-dev-single"
+nodes = [{ id = 1, addr = "127.0.0.1:7001" }]
+join_token = "change-me"
+initial_slot_count = 1
+hash_slot_count = 256
+slot_replica_n = 1
+channel_replica_n = 1
+node_health_report_interval = "5s"
+node_health_report_ttl = "30s"
+channel_reactor_count = 0
+channel_store_append_workers = 0
+channel_store_apply_workers = 0
+channel_rpc_workers = 50
+max_channels = 0
+channel_append_batch_max_records = 0
+channel_append_batch_max_wait = "0"
+channel_follower_recovery_probe_interval = "2s"
+channel_follower_recovery_probe_jitter = "1s"
+commit_coordinator_flush_window = "200us"
+commit_coordinator_max_requests = 0
+commit_coordinator_max_records = 0
+commit_coordinator_max_bytes = 0
+commit_coordinator_shards = 0
+
+[channel]
+message_retention_physical_gc_enable = false
+message_retention_scan_interval = "1m"
+message_retention_channel_batch_size = 128
+message_retention_max_trim_messages = 1000
+message_retention_max_trim_bytes = 0
+large_group_subscriber_threshold = 500
+
+[api]
+listen_addr = "0.0.0.0:5001"
+external_tcp_addr = "192.168.10.109:5100"
+external_ws_addr = "ws://192.168.10.109:5200"
+external_wss_addr = ""
+
+[manager]
+listen_addr = "0.0.0.0:5300"
+auth_on = false
+jwt_secret = ""
+jwt_issuer = "wukongim-manager"
+jwt_expire = "24h"
+users = []
+
+[bench]
+api_enable = false
+api_token = ""
+api_max_batch_size = 10000
+api_max_payload_bytes = 10485760
+
+[observability]
+metrics_enable = false
+debug_api_enable = false
+
+[prometheus]
+enable = false
+query_base_url = ""
+binary_path = ""
+listen_addr = "127.0.0.1:9099"
+data_dir = "./wukongimdata/prometheus"
+retention_time = "360h"
+retention_size = ""
+scrape_interval = "15s"
+scrape_targets = []
+
+[top]
+api_enable = false
+collect_interval = "1s"
+history_window = "5m"
+
+[diagnostics]
+enable = false
+buffer_size = 50000
+sample_rate = 0.01
+slow_threshold_ms = 500
+error_sample_rate = 1.0
+deep_sample_rate = 0
+deep_slow_threshold_ms = 500
+deep_max_items_per_batch = 16
+debug_matches = []
+
+[log]
+# v2 mode=debug maps to the v3 logger's debug level.
+level = "debug"
+dir = "./wukongimdata/logs"
+max_size = 100
+max_age = 30
+max_backups = 10
+compress = true
+console = true
+format = "console"
+
+[gateway]
+listeners = [
+  { name = "tcp-wkproto", network = "tcp", address = "0.0.0.0:5100", transport = "gnet", protocol = "wkproto" },
+  { name = "ws-gateway", network = "websocket", address = "0.0.0.0:5200", transport = "gnet", protocol = "wsmux" },
+]
+gnet_multicore = true
+gnet_num_event_loop = 0
+runtime_async_send_workers = 128
+runtime_async_send_queue_capacity = 131072
+runtime_async_auth_workers = 16
+runtime_async_auth_queue_capacity = 8192
+runtime_async_pool_release_timeout = "100ms"
+default_session_async_send_batch_max_wait = "1ms"
+default_session_async_send_batch_max_records = 512
+default_session_async_send_batch_max_bytes = 524288
+send_timeout = "5s"
+
+[message]
+# v2 whitelistOffOfPerson=false means personal-channel whitelist checks are on.
+person_whitelist_enabled = true
+system_device_id = "____device"
+# Keep administrative relationship projection changes visible immediately.
+permission_cache_ttl = "0"
+
+[presence]
+activation_timeout = "3s"
+touch_flush_interval = "1s"
+touch_batch_size = 512
+# Maximum owner-local dirty routes processed across all touch chunks in one flush.
+# Must be positive and greater than or equal to touch_batch_size.
+touch_max_routes_per_flush = 65536
+route_ttl = "90s"
+
+[conversation]
+# v3 conversation projection is always enabled; these are its runtime bounds.
+max_last_message_concurrency = 32
+authority_cache_max_rows_per_uid = 4096
+authority_cache_max_rows = 100000
+authority_list_db_window_max = 1000
+authority_handoff_timeout = "3s"
+authority_flush_interval = "1s"
+authority_flush_timeout = "5s"
+authority_flush_batch_rows = 128
+authority_admit_batch_rows = 512
+authority_admit_concurrency = 16
+
+[delivery]
+enable = true
+fanout_page_size = 512
+push_batch_size = 512
+pending_ack_ttl = "30s"
+pending_ack_max_per_session = 1024
+event_queue_size = 1024
+# Maximum recipient-authority delivery batches processed concurrently by this node.
+# This is independent from channel_append.recipient_authority_dispatch_concurrency.
+recipient_worker_concurrency = 100
+
+[channel_append]
+shard_count = 0
+advance_pool_size = 0
+effect_pool_size = 0
+recipient_authority_dispatch_concurrency = 0
+
+[webhook]
+# Exact v3 mapping of the active webhook block in config/wk.yaml.
+# For production, inject the endpoint with WK_WEBHOOK_HTTP_ADDR instead of
+# committing a real credential-bearing URL.
+http_addr = "http://linku-im-processor:LinkU-WuKongIM-Webhook-2026@localhost/link-u-im-processor/webhook"
+focus_events = ["msg.offline", "msg.notify"]
+queue_size = 1024
+workers = 16
+msg_notify_batch_max_items = 100
+msg_notify_batch_max_wait = "500ms"
+online_status_batch_max_items = 512
+online_status_batch_max_wait = "2s"
+offline_uid_batch_size = 512
+request_timeout = "5s"
+retry_max_attempts = 5
+
+[plugin]
+enable = true
+dir = "./wukongimdata/plugins"
+socket_path = "./wukongimdata/run/plugin.sock"
+sandbox_dir = "./wukongimdata/plugin-sandbox"
+state_dir = "./wukongimdata/plugin-state"
+timeout = "5s"
+hot_reload = true
+fail_open = false
+persist_after_queue_size = 1024
+persist_after_workers = 16

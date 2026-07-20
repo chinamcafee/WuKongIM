@@ -8,6 +8,13 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/control"
 )
 
+const (
+	realDiskClusterStartTimeout = 30 * time.Second
+	realDiskClusterReadyTimeout = 30 * time.Second
+	realDiskWriteReadyTimeout   = 30 * time.Second
+	realDiskWriteProbeTimeout   = 2 * time.Second
+)
+
 func validNodeConfig(t *testing.T) Config {
 	t.Helper()
 	return Config{NodeID: 1, ListenAddr: "127.0.0.1:0", DataDir: t.TempDir()}

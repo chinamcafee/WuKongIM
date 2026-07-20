@@ -703,25 +703,9 @@ func TestNodeDefaultControllerThreeVotersConvergeOverTransport(t *testing.T) {
 		nodes = append(nodes, node)
 	}
 
-	startCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	startErrs := make(chan error, len(nodes))
-	for _, node := range nodes {
-		node := node
-		go func() { startErrs <- node.Start(startCtx) }()
-		t.Cleanup(func() { _ = node.Stop(context.Background()) })
-	}
-	for range nodes {
-		if err := <-startErrs; err != nil {
-			t.Fatalf("Start() error = %v", err)
-		}
-	}
-
-	readyCtx, readyCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer readyCancel()
-	if err := WaitClusterReady(readyCtx, nodes...); err != nil {
-		t.Fatalf("WaitClusterReady() error = %v", err)
-	}
+	t.Cleanup(func() { stopNodes(t, nodes...) })
+	startNodes(t, nodes...)
+	waitClusterReady(t, nodes...)
 }
 
 func TestNodeDefaultSeedJoinMirrorSyncsFromSeedAddresses(t *testing.T) {
@@ -806,20 +790,9 @@ func TestNodeDefaultSeedJoinMirrorSyncsThroughFollowerSeedRedirect(t *testing.T)
 		}
 		nodes = append(nodes, node)
 	}
-	startCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	startErrs := make(chan error, len(nodes))
-	for _, node := range nodes {
-		node := node
-		go func() { startErrs <- node.Start(startCtx) }()
-		t.Cleanup(func() { _ = node.Stop(context.Background()) })
-	}
-	for range nodes {
-		if err := <-startErrs; err != nil {
-			t.Fatalf("Start(seed cluster) error = %v", err)
-		}
-	}
-	readyCtx, readyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(func() { stopNodes(t, nodes...) })
+	startNodes(t, nodes...)
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), realDiskClusterReadyTimeout)
 	defer readyCancel()
 	if err := WaitControllerWriteReady(readyCtx, nodes...); err != nil {
 		t.Fatalf("WaitControllerWriteReady() error = %v", err)
@@ -856,7 +829,7 @@ func TestNodeDefaultSeedJoinMirrorSyncsThroughFollowerSeedRedirect(t *testing.T)
 	if err != nil {
 		t.Fatalf("New(joining) error = %v", err)
 	}
-	joinCtx, joinCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	joinCtx, joinCancel := context.WithTimeout(context.Background(), realDiskClusterStartTimeout)
 	defer joinCancel()
 	if err := joining.Start(joinCtx); err != nil {
 		t.Fatalf("Start(joining) error = %v", err)
@@ -934,32 +907,21 @@ func TestNodeDefaultControllerForwardsControlWriteOverTransport(t *testing.T) {
 		nodes = append(nodes, node)
 	}
 
-	startCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	startErrs := make(chan error, len(nodes))
-	for _, node := range nodes {
-		node := node
-		go func() { startErrs <- node.Start(startCtx) }()
-		t.Cleanup(func() { _ = node.Stop(context.Background()) })
-	}
-	for range nodes {
-		if err := <-startErrs; err != nil {
-			t.Fatalf("Start() error = %v", err)
-		}
-	}
+	t.Cleanup(func() { stopNodes(t, nodes...) })
+	startNodes(t, nodes...)
 
-	readyCtx, readyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), realDiskClusterReadyTimeout)
 	err := WaitControllerWriteReady(readyCtx, nodes...)
 	readyCancel()
 	if err != nil {
 		t.Fatalf("WaitControllerWriteReady(initial) error = %v", err)
 	}
 
-	drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), realDiskClusterReadyTimeout)
 	waitForControllerTasksDrained(t, drainCtx, nodes...)
 	drainCancel()
 
-	probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), realDiskClusterReadyTimeout)
 	err = WaitControllerWriteReady(probeCtx, nodes...)
 	probeCancel()
 	if err != nil {

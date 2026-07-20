@@ -6451,6 +6451,12 @@ func requireSnowflakeMessageIDNode(t testing.TB, messageID int64, nodeID uint64)
 	}
 }
 
+const (
+	realDiskThreeNodeClusterStartTimeout = 30 * time.Second
+	realDiskThreeNodeAppStartTimeout     = 60 * time.Second
+	realDiskThreeNodeConvergenceTimeout  = 30 * time.Second
+)
+
 func TestStaticMultiNodeClusterStartsControllerVoters(t *testing.T) {
 	addrs := []string{freeSendackSmokeTCPAddr(t), freeSendackSmokeTCPAddr(t), freeSendackSmokeTCPAddr(t)}
 	voters := []clusterpkg.ControlVoter{
@@ -6478,7 +6484,7 @@ func TestStaticMultiNodeClusterStartsControllerVoters(t *testing.T) {
 					ReplicaCount:     3,
 				},
 				Channel:  clusterpkg.ChannelConfig{TickInterval: time.Millisecond},
-				Timeouts: clusterpkg.TimeoutConfig{Start: 5 * time.Second},
+				Timeouts: clusterpkg.TimeoutConfig{Start: realDiskThreeNodeClusterStartTimeout},
 			},
 		}
 		app, err := newTestApp(t, cfg)
@@ -6488,14 +6494,14 @@ func TestStaticMultiNodeClusterStartsControllerVoters(t *testing.T) {
 		apps = append(apps, app)
 	}
 
-	startCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	startCtx, cancel := context.WithTimeout(context.Background(), realDiskThreeNodeAppStartTimeout)
 	defer cancel()
 	errs := make(chan error, len(apps))
 	for _, app := range apps {
 		app := app
 		go func() { errs <- app.Start(startCtx) }()
 		t.Cleanup(func() {
-			stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer stopCancel()
 			_ = app.Stop(stopCtx)
 		})
@@ -8568,7 +8574,7 @@ func joinCalls(calls []string) string {
 
 func waitAppClusterSnapshotsConverge(t *testing.T, nodes []*clusterpkg.Node) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(realDiskThreeNodeConvergenceTimeout)
 	var last []clusterpkg.Snapshot
 	for time.Now().Before(deadline) {
 		snapshots := make([]clusterpkg.Snapshot, 0, len(nodes))
@@ -8581,7 +8587,7 @@ func waitAppClusterSnapshotsConverge(t *testing.T, nodes []*clusterpkg.Node) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("cluster snapshots did not converge: %#v", last)
+	t.Fatalf("phase=control_snapshot_convergence timeout=%v snapshots=%#v", realDiskThreeNodeConvergenceTimeout, last)
 }
 
 func appClusterSnapshotsConverged(snapshots []clusterpkg.Snapshot) bool {

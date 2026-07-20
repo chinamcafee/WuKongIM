@@ -3,6 +3,8 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,7 +87,8 @@ func TestClusterThreeNodeDefaultChannelsReplicateQuorumAppend(t *testing.T) {
 	startNodes(t, nodes...)
 	t.Cleanup(func() { stopNodes(t, nodes...) })
 	waitClusterReady(t, nodes...)
-	waitNodeWriteReady(t, nodes[0])
+	waitAllHashSlotLeadersConvergedWithin(t, nodes, realDiskClusterReadyTimeout)
+	waitNodeWriteReady(t, nodes[0], nodes)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -112,6 +115,7 @@ func TestClusterThreeNodeDefaultChannelsReplicateToFollowerStore(t *testing.T) {
 	startNodes(t, nodes...)
 	t.Cleanup(func() { stopNodes(t, nodes...) })
 	waitClusterReady(t, nodes...)
+	waitAllHashSlotLeadersConvergedWithin(t, nodes, realDiskClusterReadyTimeout)
 	route := waitRouteKeyLeaderConverged(t, nodes, channelID.ID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -183,16 +187,21 @@ func startNode(t testing.TB, node *Node) {
 
 func startNodes(t testing.TB, nodes ...*Node) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), realDiskClusterStartTimeout)
 	defer cancel()
-	errs := make(chan error, len(nodes))
+	type startResult struct {
+		nodeID uint64
+		err    error
+	}
+	results := make(chan startResult, len(nodes))
 	for _, node := range nodes {
 		node := node
-		go func() { errs <- node.Start(ctx) }()
+		go func() { results <- startResult{nodeID: node.NodeID(), err: node.Start(ctx)} }()
 	}
 	for range nodes {
-		if err := <-errs; err != nil {
-			t.Fatalf("Start() error = %v", err)
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("phase=node_start node=%d error=%v", result.nodeID, result.err)
 		}
 	}
 }
@@ -211,20 +220,20 @@ func stopNodes(t testing.TB, nodes ...*Node) {
 
 func waitClusterReady(t testing.TB, nodes ...*Node) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), realDiskClusterReadyTimeout)
 	defer cancel()
 	if err := WaitClusterReady(ctx, nodes...); err != nil {
-		t.Fatalf("WaitClusterReady() error = %v", err)
+		t.Fatalf("phase=control_snapshot_convergence error=%v", err)
 	}
 }
 
 // waitNodeWriteReady proves that the routed Slot runtime can commit a bounded metadata write.
-func waitNodeWriteReady(t testing.TB, node *Node) {
+func waitNodeWriteReady(t testing.TB, node *Node, nodes []*Node) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(realDiskWriteReadyTimeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), realDiskWriteProbeTimeout)
 		lastErr = node.ProbeWriteReady(ctx)
 		cancel()
 		if lastErr == nil {
@@ -232,7 +241,9 @@ func waitNodeWriteReady(t testing.TB, node *Node) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("ProbeWriteReady(node=%d) error = %v", node.NodeID(), lastErr)
+	latest := make([]nodeReadinessState, len(nodes))
+	clusterLocalReady(nodes, latest)
+	t.Fatalf("phase=health_and_write_probe node=%d error=%v diagnostics=%v", node.NodeID(), lastErr, readinessTimeoutError(context.DeadlineExceeded, latest))
 }
 
 func waitRouteLeader(t testing.TB, node *Node, hashSlot uint16, want uint64) {
@@ -279,28 +290,52 @@ func waitRouteKeyLeaderConverged(t testing.TB, nodes []*Node, key string) Route 
 
 func waitAllHashSlotLeadersConverged(t testing.TB, nodes []*Node) {
 	t.Helper()
+	waitAllHashSlotLeadersConvergedWithin(t, nodes, 2*time.Second)
+}
+
+func waitAllHashSlotLeadersConvergedWithin(t testing.TB, nodes []*Node, timeout time.Duration) {
+	t.Helper()
 	if len(nodes) == 0 {
 		t.Fatal("no cluster nodes provided")
 	}
-	waitUntil(t.(*testing.T), func() bool {
-		hashSlotCount := nodes[0].Snapshot().HashSlotCount
-		if hashSlotCount == 0 {
-			return false
+	deadline := time.Now().Add(timeout)
+	var lastEvidence string
+	for time.Now().Before(deadline) {
+		ready, evidence := hashSlotLeaderConvergence(nodes)
+		lastEvidence = evidence
+		if ready {
+			return
 		}
-		for hashSlot := uint16(0); hashSlot < hashSlotCount; hashSlot++ {
-			candidate, err := nodes[0].RouteHashSlot(hashSlot)
-			if err != nil || candidate.Leader == 0 {
-				return false
-			}
-			for _, node := range nodes[1:] {
-				observed, err := node.RouteHashSlot(hashSlot)
-				if err != nil || observed.SlotID != candidate.SlotID || observed.Leader != candidate.Leader {
-					return false
-				}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("phase=slot_leader_convergence timeout=%v evidence=%s", timeout, lastEvidence)
+}
+
+func hashSlotLeaderConvergence(nodes []*Node) (bool, string) {
+	if len(nodes) == 0 {
+		return false, "nodes=[]"
+	}
+	hashSlotCount := nodes[0].Snapshot().HashSlotCount
+	if hashSlotCount == 0 {
+		return false, fmt.Sprintf("node=%d hash_slot_count=0", nodes[0].NodeID())
+	}
+	ready := true
+	evidence := make([]string, 0, int(hashSlotCount)*len(nodes))
+	for hashSlot := uint16(0); hashSlot < hashSlotCount; hashSlot++ {
+		candidate, err := nodes[0].RouteHashSlot(hashSlot)
+		if err != nil || candidate.Leader == 0 {
+			ready = false
+		}
+		evidence = append(evidence, fmt.Sprintf("hash_slot=%d node=%d route=%+v error=%v", hashSlot, nodes[0].NodeID(), candidate, err))
+		for _, node := range nodes[1:] {
+			observed, observedErr := node.RouteHashSlot(hashSlot)
+			evidence = append(evidence, fmt.Sprintf("hash_slot=%d node=%d route=%+v error=%v", hashSlot, node.NodeID(), observed, observedErr))
+			if observedErr != nil || observed.SlotID != candidate.SlotID || observed.Leader == 0 || observed.Leader != candidate.Leader {
+				ready = false
 			}
 		}
-		return true
-	})
+	}
+	return ready, strings.Join(evidence, "; ")
 }
 
 func firstNonLeaderNode(t testing.TB, nodes []*Node, leader uint64) *Node {

@@ -18,6 +18,9 @@ type nodeReadinessState struct {
 	NodeID                uint64
 	Snapshot              Snapshot
 	ChannelDataPlaneLease control.ChannelDataPlaneLease
+	PendingPhase          string
+	SchedulableDataNodes  []uint64
+	RequiredDataReplicas  uint16
 	ProbeSupported        bool
 	ProbeError            string
 }
@@ -89,14 +92,22 @@ func WaitControllerWriteReady(ctx context.Context, nodes ...*Node) error {
 }
 
 func clusterLocalReady(nodes []*Node, latest []nodeReadinessState) bool {
+	allNodesReady := true
+	for i, node := range nodes {
+		if !nodeLocalReady(node, &latest[i]) {
+			allNodesReady = false
+		}
+	}
+	if !allNodesReady {
+		return false
+	}
+
 	var revision uint64
 	var slotCount uint32
 	var hashSlotCount uint16
 	var controllerLead uint64
-	for i, node := range nodes {
-		if !nodeLocalReady(node, &latest[i]) {
-			return false
-		}
+	converged := true
+	for i := range latest {
 		snap := latest[i].Snapshot
 		if revision == 0 {
 			revision = snap.StateRevision
@@ -106,21 +117,36 @@ func clusterLocalReady(nodes []*Node, latest []nodeReadinessState) bool {
 			continue
 		}
 		if snap.StateRevision != revision || snap.SlotCount != slotCount || snap.HashSlotCount != hashSlotCount || snap.ControllerLead != controllerLead {
-			return false
+			latest[i].PendingPhase = "control_snapshot_convergence"
+			converged = false
 		}
 	}
-	return true
+	if !converged {
+		latest[0].PendingPhase = "control_snapshot_convergence"
+	}
+	return converged
 }
 
 func nodeLocalReady(node *Node, latest *nodeReadinessState) bool {
+	latest.PendingPhase = ""
+	latest.ProbeSupported = false
+	latest.ProbeError = ""
 	if node == nil {
 		latest.NodeID = 0
 		latest.Snapshot = Snapshot{}
+		latest.ChannelDataPlaneLease = control.ChannelDataPlaneLease{}
+		latest.SchedulableDataNodes = nil
+		latest.RequiredDataReplicas = 0
+		latest.PendingPhase = "node_missing"
 		return false
 	}
 	snap := node.Snapshot()
 	latest.NodeID = node.NodeID()
 	latest.Snapshot = snap
+	latest.RequiredDataReplicas = node.cfg.Channel.ReplicaCount
+	node.mu.RLock()
+	latest.SchedulableDataNodes = activeDataNodeIDs(node.controlSnapshot.Nodes)
+	node.mu.RUnlock()
 	latest.ChannelDataPlaneLease = control.ChannelDataPlaneLease{}
 	if node.channelDataPlaneLease != nil {
 		lease := node.channelDataPlaneLease.snapshot()
@@ -130,19 +156,28 @@ func nodeLocalReady(node *Node, latest *nodeReadinessState) bool {
 			Ready:         lease.ready,
 		}
 	}
-	if !node.started.Load() || node.stopping.Load() {
+	if !node.started.Load() {
+		latest.PendingPhase = "node_start"
+		return false
+	}
+	if node.stopping.Load() {
+		latest.PendingPhase = "node_stopping"
 		return false
 	}
 	if node.control != nil && (snap.StateRevision == 0 || !snap.RoutesReady) {
+		latest.PendingPhase = "control_snapshot"
 		return false
 	}
 	if !snap.SlotsReady {
+		latest.PendingPhase = "slot_runtime"
 		return false
 	}
 	if node.channels != nil && !snap.ChannelsReady {
+		latest.PendingPhase = "channel_runtime"
 		return false
 	}
 	if node.channels != nil && node.channelDataPlaneLease != nil && !latest.ChannelDataPlaneLease.Ready {
+		latest.PendingPhase = "channel_data_plane_lease"
 		return false
 	}
 	return true
@@ -205,7 +240,11 @@ func controllerProbeNode(ctx context.Context, nodes []*Node, latest []nodeReadin
 		if !ok {
 			return false, false
 		}
-		return true, runControllerProbe(ctx, probe, &latest[i])
+		ready := runControllerProbe(ctx, probe, &latest[i])
+		if !ready {
+			latest[i].PendingPhase = "controller_write_probe"
+		}
+		return true, ready
 	}
 	return false, false
 }
@@ -226,12 +265,40 @@ func readinessTimeoutError(cause error, latest []nodeReadinessState) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "cluster readiness: %v", cause)
 	for _, item := range latest {
-		fmt.Fprintf(&b, "\nnode=%d snapshot=%+v channel_data_plane_lease=%+v probe_supported=%t", item.NodeID, item.Snapshot, item.ChannelDataPlaneLease, item.ProbeSupported)
+		fmt.Fprintf(&b, "\nnode=%d pending_phase=%q snapshot=%+v channel_data_plane_lease=%+v schedulable_data_nodes=%v required_data_replicas=%d probe_supported=%t", item.NodeID, item.PendingPhase, item.Snapshot, item.ChannelDataPlaneLease, item.SchedulableDataNodes, item.RequiredDataReplicas, item.ProbeSupported)
 		if item.ProbeError != "" {
 			fmt.Fprintf(&b, " probe_error=%q", item.ProbeError)
 		}
 	}
 	return errors.New(b.String())
+}
+
+func TestClusterLocalReadySamplesEveryNodeBeforeReturningFalse(t *testing.T) {
+	nodes := []*Node{
+		nil,
+		{cfg: Config{NodeID: 2}},
+		{cfg: Config{NodeID: 3}},
+	}
+	latest := make([]nodeReadinessState, len(nodes))
+	if clusterLocalReady(nodes, latest) {
+		t.Fatal("clusterLocalReady() = true, want false")
+	}
+	if latest[0].PendingPhase != "node_missing" {
+		t.Fatalf("node 0 pending phase = %q, want node_missing", latest[0].PendingPhase)
+	}
+	for i, nodeID := range []uint64{2, 3} {
+		state := latest[i+1]
+		if state.NodeID != nodeID || state.PendingPhase != "node_start" {
+			t.Fatalf("latest[%d] = %+v, want node=%d pending node_start", i+1, state, nodeID)
+		}
+	}
+
+	err := readinessTimeoutError(context.DeadlineExceeded, latest)
+	for _, want := range []string{"node=2 pending_phase=\"node_start\"", "node=3 pending_phase=\"node_start\""} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("readinessTimeoutError() = %v, want %q", err, want)
+		}
+	}
 }
 
 func TestWaitNodeReadySucceedsForStartedSingleNodeCluster(t *testing.T) {
