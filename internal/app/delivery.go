@@ -487,13 +487,18 @@ func buildRecvPacket(env runtimedelivery.Envelope, uid string, payload []byte, t
 	if env.MessageID > uint64(1<<63-1) {
 		return nil, errRecvMessageIDOverflow
 	}
-	channelID := env.ChannelID
+	sourceChannelID, commandChannel := runtimechannelid.FromCommandChannel(env.ChannelID)
+	channelID := sourceChannelID
 	if env.ChannelType == frame.ChannelTypePerson {
-		channelID = recipientPersonChannelView(env, uid)
+		sourceView := env
+		sourceView.ChannelID = sourceChannelID
+		channelID = recipientPersonChannelView(sourceView, uid)
 	}
 	return &frame.RecvPacket{
 		Framer: frame.Framer{
-			RedDot: env.RedDot,
+			NoPersist: env.MessageSeq == 0,
+			RedDot:    env.RedDot,
+			SyncOnce:  commandChannel,
 		},
 		MessageID:   int64(env.MessageID),
 		MessageSeq:  env.MessageSeq,

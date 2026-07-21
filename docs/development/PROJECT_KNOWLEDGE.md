@@ -216,6 +216,7 @@
 - Node log output is split by `internal/log`: `app.log` contains info and above, `warn.log` contains warnings, `error.log` contains errors, and `debug.log` exists when debug logging is enabled.
 - Bench APIs are benchmark-only `/bench/v1/*` routes gated by `WK_BENCH_API_ENABLE`; remotely reachable deployments must set the sensitive `WK_BENCH_API_TOKEN` bearer capability, and mutations go through benchdata plus user/channel usecase boundaries.
 - Cloud Simulation billable creation and unattended cleanup use separate GitHub Environments; AccessKey mode requires a complete Repository Secret pair, while OIDC mode uses exact workflow-conditioned subjects. Cleanup must never require a reviewer because it is the lease backstop.
+- Cloud Simulation Actions are repository opt-in: provision, analysis, monitor, and cleanup jobs require `ALIBABA_CLOUD_SIM_ENABLED=true`; an unconfigured fork must skip before Alibaba credential resolution.
 - Cloud Simulation may classify a run as released only after the locator matches the authenticated cloud account and region and the provider returns an empty exact-tag inventory; analysis then stops before Codex runs.
 - Cloud Simulation destroy and sweep must prove the active credential matches the retained provider account before interpreting cleanup inventory or mutating resources.
 - Cloud Simulation simple onboarding stores a complete Alibaba AccessKey pair as Repository Secrets and discovers non-secret provider config before billable creation; `scripts/cloud-sim/setup.sh` remains the optional hardened OIDC onboarding path.

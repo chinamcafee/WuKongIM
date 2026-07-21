@@ -73,6 +73,7 @@ concurrency:
 jobs:
   build:
     name: Build immutable deployment bundle
+    if: vars.ALIBABA_CLOUD_SIM_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:

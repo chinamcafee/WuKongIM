@@ -44,6 +44,38 @@ func TestCloudSimulationWorkflowsPreferAccessKeyAndRetainOIDCFallback(t *testing
 	}
 }
 
+func TestCloudSimulationOperationalWorkflowsRequireExplicitRepositoryOptIn(t *testing.T) {
+	root := repoRoot(t)
+	workflows := map[string]int{
+		"cloud-sim-provision.yml": 1,
+		"cloud-sim-analyze.yml":   2,
+		"cloud-sim-monitor.yml":   1,
+		"cloud-sim-cleanup.yml":   1,
+	}
+	for name, want := range workflows {
+		content, err := os.ReadFile(filepath.Join(root, ".github", "workflows", name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if got := strings.Count(string(content), "vars.ALIBABA_CLOUD_SIM_ENABLED == 'true'"); got != want {
+			t.Fatalf("%s opt-in guard count = %d, want %d", name, got, want)
+		}
+	}
+
+	setup, err := os.ReadFile(filepath.Join(root, "scripts", "cloud-sim", "setup.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fragment := range []string{
+		"gh variable set ALIBABA_CLOUD_SIM_ENABLED --repo \"$repository\"",
+		"verify_repo_variable ALIBABA_CLOUD_SIM_ENABLED true",
+	} {
+		if !strings.Contains(string(setup), fragment) {
+			t.Fatalf("OIDC setup missing opt-in activation %q", fragment)
+		}
+	}
+}
+
 func TestCloudSimulationDefaultCostCeilingIsSeventyCNY(t *testing.T) {
 	root := repoRoot(t)
 	workflow, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "cloud-sim-provision.yml"))

@@ -46,13 +46,21 @@ func dispatchCommittedRecipientsForTarget(ctx context.Context, target AuthorityT
 		result, err := dispatchRecipientSetResult(ctx, event, recipientsFromUIDs(event.MessageScopedUIDs), ports)
 		return recipientDispatchResult{activeErr: result.activeErr}, err
 	}
+	sourceChannelID, commandChannel := runtimechannelid.FromCommandChannel(event.ChannelID)
 	if event.ChannelType == channelTypePerson {
-		left, right, err := runtimechannelid.DecodePersonChannel(event.ChannelID)
+		left, right, err := runtimechannelid.DecodePersonChannel(sourceChannelID)
 		if err != nil {
 			return recipientDispatchResult{}, withPostCommitFailureDetail(err, PostCommitFailureDetail{Phase: "person_channel_decode"})
 		}
 		result, dispatchErr := dispatchRecipientSetResult(ctx, event, []Recipient{{UID: left}, {UID: right}}, ports)
 		return recipientDispatchResult{activeErr: result.activeErr}, dispatchErr
+	}
+	// A command channel is an internal delivery/storage view of its source channel.
+	// Subscriber membership remains authoritative on the source channel and its
+	// mutation version is not reflected by the derived command-channel target.
+	// Always page the current source membership instead of using a stale cache.
+	if commandChannel {
+		return dispatchSubscriberPages(ctx, event, ports)
 	}
 	if target.Large {
 		return dispatchSubscriberPages(ctx, event, ports)
@@ -73,7 +81,7 @@ func dispatchSubscriberPages(ctx context.Context, event CommittedEnvelope, ports
 			return result, withPostCommitFailureDetail(err, PostCommitFailureDetail{Phase: "context"})
 		}
 		page, err := ports.subscribers.NextSubscriberPage(ctx, SubscriberPageRequest{
-			ChannelID: ChannelID{ID: event.ChannelID, Type: event.ChannelType},
+			ChannelID: subscriberSourceChannel(event),
 			Cursor:    cursor,
 			Limit:     pageSize,
 		})
@@ -112,7 +120,7 @@ func dispatchSubscriberSnapshot(ctx context.Context, target AuthorityTarget, eve
 		return recipientDispatchResult{}, withPostCommitFailureDetail(err, PostCommitFailureDetail{Phase: "context"})
 	}
 	page, err := ports.subscribers.NextSubscriberPage(ctx, SubscriberPageRequest{
-		ChannelID: ChannelID{ID: event.ChannelID, Type: event.ChannelType},
+		ChannelID: subscriberSourceChannel(event),
 		Limit:     subscriberSnapshotLoadLimit,
 	})
 	if err != nil {
@@ -134,6 +142,11 @@ func dispatchSubscriberSnapshot(ctx context.Context, target AuthorityTarget, eve
 		return recipientDispatchResult{activeErr: dispatch.activeErr}, err
 	}
 	return recipientDispatchResult{subscriberCache: nextCache, activeErr: dispatch.activeErr}, nil
+}
+
+func subscriberSourceChannel(event CommittedEnvelope) ChannelID {
+	sourceChannelID, _ := runtimechannelid.FromCommandChannel(event.ChannelID)
+	return ChannelID{ID: sourceChannelID, Type: event.ChannelType}
 }
 
 func dispatchRecipientSet(ctx context.Context, event CommittedEnvelope, recipients []Recipient, ports commitPorts) error {

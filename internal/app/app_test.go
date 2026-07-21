@@ -4723,6 +4723,31 @@ func TestLocalOwnerPusherWritesRecvPacketAndBindsPendingAck(t *testing.T) {
 	}
 }
 
+func TestBuildRecvPacketExposesSourceChannelForRealtimeCommands(t *testing.T) {
+	group, err := buildRecvPacket(runtimedelivery.Envelope{
+		MessageID: 1, ChannelID: runtimechannelid.ToCommandChannel("room-1"),
+		ChannelType: frame.ChannelTypeGroup,
+	}, "u1", []byte("cmd"), 1)
+	if err != nil {
+		t.Fatalf("buildRecvPacket(group) error = %v", err)
+	}
+	if group.ChannelID != "room-1" || !group.NoPersist || !group.SyncOnce {
+		t.Fatalf("group command packet = %#v, want source channel and command flags", group)
+	}
+
+	personSource := runtimechannelid.EncodePersonChannel("u1", "u2")
+	person, err := buildRecvPacket(runtimedelivery.Envelope{
+		MessageID: 2, ChannelID: runtimechannelid.ToCommandChannel(personSource),
+		ChannelType: frame.ChannelTypePerson,
+	}, "u2", []byte("cmd"), 1)
+	if err != nil {
+		t.Fatalf("buildRecvPacket(person) error = %v", err)
+	}
+	if person.ChannelID != "u1" || !person.NoPersist || !person.SyncOnce {
+		t.Fatalf("person command packet = %#v, want peer source view and command flags", person)
+	}
+}
+
 func TestLocalOwnerPusherDropsMissingOrInactiveSession(t *testing.T) {
 	reg := online.NewRegistry(online.RegistryOptions{ShardCount: 1})
 	inactiveRoute := online.OwnerRoute{UID: "u1", OwnerNodeID: 1, OwnerBootID: 7, OwnerSeq: 11, SessionID: 101, ConnectedUnix: 1001}

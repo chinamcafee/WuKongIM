@@ -588,6 +588,10 @@ done
 gh run watch "$verification_run" --repo "$repository" --exit-status || \
   fail "GitHub OIDC could not assume the Alibaba analyzer role"
 
+printf '%s' 'true' | \
+  gh variable set ALIBABA_CLOUD_SIM_ENABLED --repo "$repository"
+verify_repo_variable ALIBABA_CLOUD_SIM_ENABLED true
+
 source_sha="$(gh api "repos/$repository/commits/main" --jq .sha)"
 [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve the trusted main source SHA"
 

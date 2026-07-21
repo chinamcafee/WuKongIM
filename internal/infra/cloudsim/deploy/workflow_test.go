@@ -41,6 +41,7 @@ func TestCloudSimulationMonitorPatrolsRunningRunsWithoutStartingThem(t *testing.
 	monitor := readWorkflowText(t, repositoryRoot(t), "cloud-sim-monitor.yml")
 	for _, required := range []string{
 		`cron: "*/30 * * * *"`,
+		"if: vars.ALIBABA_CLOUD_SIM_ENABLED == 'true'",
 		"run_id:",
 		"environment: cloud-sim-analysis",
 		`status "$run_id"`,
@@ -67,6 +68,9 @@ func TestCloudSimulationWorkflowPrivilegeSeparation(t *testing.T) {
 	oidcSubject := readWorkflowText(t, root, "cloud-sim-oidc-subject.yml")
 
 	assertWorkflowText(t, provision, "build:\n", "provision:\n", "id-token: write", "environment: cloud-sim-provision")
+	if !strings.Contains(provision, "if: vars.ALIBABA_CLOUD_SIM_ENABLED == 'true'") {
+		t.Fatal("provision workflow can run without explicit repository opt-in")
+	}
 	for _, required := range []string{
 		`transition "$RUN_ID" ready`, `transition "$RUN_ID" running --active-until`,
 		`transition "$RUN_ID" analysis_grace`, `destroy "$RUN_ID"`, `./scripts/cloud-sim/finalize.sh $RUN_ID`,
@@ -82,6 +86,9 @@ func TestCloudSimulationWorkflowPrivilegeSeparation(t *testing.T) {
 
 	prepareSection := between(t, analysis, "  prepare:\n", "  close:\n")
 	closeSection := analysis[strings.Index(analysis, "  close:\n"):]
+	if strings.Count(analysis, "vars.ALIBABA_CLOUD_SIM_ENABLED == 'true'") != 2 {
+		t.Fatal("analysis workflow jobs do not require explicit repository opt-in")
+	}
 	if !strings.Contains(prepareSection, "contents: read") || !strings.Contains(prepareSection, "id-token: write") || strings.Contains(prepareSection, "contents: write") {
 		t.Fatal("analysis session preparation privilege boundary is invalid")
 	}
@@ -126,7 +133,7 @@ func TestCloudSimulationWorkflowPrivilegeSeparation(t *testing.T) {
 			t.Fatalf("analysis session workflow missing guardrail %q", required)
 		}
 	}
-	if !strings.Contains(cleanup, `cron: "*/15 * * * *"`) || !strings.Contains(cleanup, "ALIBABA_CLOUD_SIM_PROVISIONER_ROLE_ARN") || !strings.Contains(cleanup, "environment: cloud-sim-cleanup") {
+	if !strings.Contains(cleanup, `cron: "*/15 * * * *"`) || !strings.Contains(cleanup, "ALIBABA_CLOUD_SIM_PROVISIONER_ROLE_ARN") || !strings.Contains(cleanup, "environment: cloud-sim-cleanup") || !strings.Contains(cleanup, "if: vars.ALIBABA_CLOUD_SIM_ENABLED == 'true'") {
 		t.Fatal("cleanup workflow lacks periodic provisioner-backed reconciliation")
 	}
 	for _, required := range []string{

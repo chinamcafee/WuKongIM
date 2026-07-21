@@ -45,6 +45,63 @@ func TestScopedUIDsBypassSubscriberScan(t *testing.T) {
 	}
 }
 
+func TestCommandChannelUsesSourceChannelSubscribers(t *testing.T) {
+	source := &recordingSubscriberSourceForRecipientTest{
+		pages: []SubscriberPage{{Recipients: []Recipient{{UID: "u2"}}, Done: true}},
+	}
+	enqueuer := &recordingRecipientEnqueuerForRecipientTest{}
+	event := CommittedEnvelope{
+		MessageID:   1,
+		ChannelID:   runtimechannelid.ToCommandChannel("room-1"),
+		ChannelType: 2,
+		SyncOnce:    true,
+	}
+
+	_, err := dispatchCommittedRecipientsForTarget(context.Background(), AuthorityTarget{
+		ChannelID:                 ChannelID{ID: event.ChannelID, Type: event.ChannelType},
+		SubscriberMutationVersion: 99,
+	}, event, subscriberCache{ready: true, mutationVersion: 99}, commitPorts{
+		subscribers:                source,
+		recipientAuthorityResolver: staticRecipientAuthorityResolverForRecipientTest{nodeID: 7},
+		deliveryEnqueuer:           enqueuer,
+		subscriberPageSize:         16,
+	})
+	if err != nil {
+		t.Fatalf("dispatchCommittedRecipientsForTarget() error = %v", err)
+	}
+	if got := source.channels; !reflect.DeepEqual(got, []ChannelID{{ID: "room-1", Type: 2}}) {
+		t.Fatalf("subscriber channels = %#v, want source room-1/2", got)
+	}
+	if got := enqueuer.allUIDs(); !reflect.DeepEqual(got, []string{"u2"}) {
+		t.Fatalf("recipient uids = %#v, want u2", got)
+	}
+}
+
+func TestPersonCommandChannelUsesSourceParticipants(t *testing.T) {
+	enqueuer := &recordingRecipientEnqueuerForRecipientTest{}
+	event := CommittedEnvelope{
+		MessageID:   1,
+		ChannelID:   runtimechannelid.ToCommandChannel(runtimechannelid.EncodePersonChannel("u1", "u2")),
+		ChannelType: channelTypePerson,
+		SyncOnce:    true,
+	}
+
+	err := dispatchCommittedRecipients(context.Background(), event, commitPorts{
+		recipientAuthorityResolver: staticRecipientAuthorityResolverForRecipientTest{nodeID: 7},
+		deliveryEnqueuer:           enqueuer,
+	})
+	if err != nil {
+		t.Fatalf("dispatchCommittedRecipients() error = %v", err)
+	}
+	left, right, err := runtimechannelid.DecodePersonChannel(runtimechannelid.EncodePersonChannel("u1", "u2"))
+	if err != nil {
+		t.Fatalf("DecodePersonChannel() error = %v", err)
+	}
+	if got := enqueuer.allUIDs(); !reflect.DeepEqual(got, []string{left, right}) {
+		t.Fatalf("recipient uids = %#v, want source participants %s,%s", got, left, right)
+	}
+}
+
 func TestRecipientDeliveryDoesNotWaitForActiveBatchAdmission(t *testing.T) {
 	steps := &orderedStepsForDeliveryTest{}
 	active := &recordingActiveAdmitterForRecipientTest{steps: steps}
@@ -900,6 +957,7 @@ type recordingSubscriberSourceForRecipientTest struct {
 	pages                   []SubscriberPage
 	calls                   int
 	limits                  []int
+	channels                []ChannelID
 	failOnCall              bool
 	secondPageAfterDispatch bool
 }
@@ -913,6 +971,7 @@ func (s *recordingSubscriberSourceForRecipientTest) NextSubscriberPage(_ context
 		s.secondPageAfterDispatch = true
 	}
 	s.limits = append(s.limits, req.Limit)
+	s.channels = append(s.channels, req.ChannelID)
 	if s.calls >= len(s.pages) {
 		return SubscriberPage{Done: true}, nil
 	}

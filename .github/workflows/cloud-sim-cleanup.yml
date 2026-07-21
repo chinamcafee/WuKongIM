@@ -27,6 +27,7 @@ concurrency:
 jobs:
   cleanup:
     name: Reconcile expired or selected Alibaba resources
+    if: vars.ALIBABA_CLOUD_SIM_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: cloud-sim-cleanup

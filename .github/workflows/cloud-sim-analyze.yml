@@ -42,7 +42,7 @@ concurrency:
 jobs:
   prepare:
     name: Prepare encrypted local Codex session
-    if: inputs.operation == 'prepare'
+    if: vars.ALIBABA_CLOUD_SIM_ENABLED == 'true' && inputs.operation == 'prepare'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: cloud-sim-analysis
@@ -267,7 +267,7 @@ jobs:
 
   close:
     name: Close local Codex session
-    if: inputs.operation == 'close'
+    if: vars.ALIBABA_CLOUD_SIM_ENABLED == 'true' && inputs.operation == 'close'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: cloud-sim-analysis

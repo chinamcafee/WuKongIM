@@ -14,6 +14,12 @@ jobs use that pair directly. A partial pair fails before any cloud API call.
 When neither secret exists, the established GitHub OIDC roles and non-secret
 role variables remain a compatible, hardened fallback.
 
+All billable, monitoring, analysis, and cleanup jobs additionally require the
+Repository Variable `ALIBABA_CLOUD_SIM_ENABLED=true`. An unconfigured fork
+therefore skips the jobs before any Alibaba credential action runs. AccessKey
+operators set this opt-in after storing the complete pair; the OIDC setup
+wizard sets it only after a successful role exchange.
+
 AccessKey mode is the simplest onboarding path and requires no CloudShell or
 OIDC bootstrap. Provision discovers the current account binding, audited
 Alibaba Cloud Linux image, ESSD-capable zone, and bounded live spot candidates

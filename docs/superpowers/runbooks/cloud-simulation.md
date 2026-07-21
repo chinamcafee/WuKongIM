@@ -20,6 +20,13 @@ ALIBABA_CLOUD_ACCESS_KEY_ID
 ALIBABA_CLOUD_ACCESS_KEY_SECRET
 ```
 
+Then create the Repository Variable `ALIBABA_CLOUD_SIM_ENABLED` with the exact
+value `true`. Cloud Simulation workflows fail closed at the job boundary when
+that explicit opt-in is absent, so an unconfigured fork does not attempt
+Alibaba ECS instance-metadata authentication. Set the variable only after both
+Secrets exist; remove it only after Cleanup proves there are no residual cloud
+resources.
+
 Both values must exist together. A partial pair fails before the workflow calls
 Alibaba. Never paste either value into a workflow input, source file, issue,
 Artifact, or Codex conversation.
@@ -63,6 +70,8 @@ region list, then asks only for one confirmation of the
 non-billable RAM/OIDC plan. It:
 
 - discovers the current Alibaba account without copying it to GitHub;
+- enables the repository Cloud Simulation workflows only after the OIDC
+  exchange succeeds;
 - derives repository-scoped OIDC Provider and RAM Role names so two repositories
   in one Alibaba account cannot overwrite each other's trust;
 - selects a zone with ESSD support, the latest standard x86 Alibaba Cloud Linux

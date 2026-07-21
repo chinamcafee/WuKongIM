@@ -50,6 +50,11 @@ instances, or cleanup calls fail.
 8. Implement Alibaba Cloud end to end first while preserving a provider-neutral
    boundary for a later Tencent Cloud Adapter.
 
+The operational workflows are explicitly repository opt-in. Provision,
+analysis, monitor, and cleanup jobs run only when the Repository Variable
+`ALIBABA_CLOUD_SIM_ENABLED` is exactly `true`; an unconfigured fork skips before
+credential resolution instead of probing Alibaba instance metadata.
+
 ## Non-goals
 
 - Keeping a GitHub job alive for the complete simulation duration.

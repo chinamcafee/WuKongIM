@@ -82,6 +82,11 @@ starts wkbench. Patrol evidence includes target liveness, 30-minute sustained
 target loss, CPU, RSS, disk use, and bounded queue saturation; missing evidence
 fails closed and remains distinct from the cleanup lease backstop.
 
+All operational Cloud Simulation jobs require the repository opt-in
+`ALIBABA_CLOUD_SIM_ENABLED=true`. Forks without Alibaba credentials skip before
+credential resolution; OIDC setup enables the flag only after a verified role
+exchange, while AccessKey operators enable it after storing the complete pair.
+
 `ValidateTencentAdmission` is a delivery-order gate, not a Tencent adapter. It
 requires repository-owner-reviewed real Alibaba workflow references and
 zero-residual proof for every accepted canary/drill before second-provider work
