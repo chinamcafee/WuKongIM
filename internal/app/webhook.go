@@ -3,16 +3,46 @@ package app
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"strings"
 
 	"github.com/WuKongIM/WuKongIM/internal/runtime/channelappend"
 	runtimewebhook "github.com/WuKongIM/WuKongIM/internal/runtime/webhook"
 	"github.com/WuKongIM/WuKongIM/internal/usecase/presence"
+	obsmetrics "github.com/WuKongIM/WuKongIM/pkg/metrics"
 )
 
 type webhookEventRuntime interface {
 	Notify(context.Context, runtimewebhook.Message)
 	Offline(context.Context, runtimewebhook.OfflineMessage)
 	OnlineStatus(context.Context, runtimewebhook.OnlineStatus)
+}
+
+type webhookOutboxRuntime interface {
+	WorkerRuntime
+	OutboxStats(context.Context) (runtimewebhook.OutboxStats, error)
+	ReplayDeadLetters(context.Context, []string) (int, error)
+}
+
+type webhookMetricsObserver struct {
+	metrics *obsmetrics.WebhookMetrics
+}
+
+func (o webhookMetricsObserver) ObserveWebhook(observation runtimewebhook.Observation) {
+	if o.metrics == nil {
+		return
+	}
+	if observation.OutboxSnapshot {
+		o.metrics.SetOutbox(
+			observation.Backlog,
+			observation.DeadLetters,
+			observation.OldestAge,
+			observation.LogicalBytes,
+			observation.RetryAttempts,
+		)
+		return
+	}
+	o.metrics.Observe(observation.Event, observation.Result, observation.Items, observation.Duration)
 }
 
 type webhookNotifyEnqueuer struct {
@@ -46,27 +76,47 @@ func (a *App) wireWebhook() error {
 		Addr:    a.cfg.Webhook.HTTPAddr,
 		Timeout: a.cfg.Webhook.RequestTimeout,
 	})
+	outboxDir := strings.TrimSpace(a.cfg.Webhook.OutboxDir)
+	if outboxDir == "" {
+		outboxDir = filepath.Join(a.cfg.DataDir, "webhook-outbox")
+	}
 	runtime, err := runtimewebhook.New(runtimewebhook.RuntimeOptions{
 		Sender:              sender,
+		Observer:            a.webhookObserver(),
 		QueueSize:           a.cfg.Webhook.QueueSize,
 		Workers:             a.cfg.Webhook.Workers,
-		NotifyBatchMaxItems: a.cfg.Webhook.NotifyBatchMaxItems,
-		NotifyBatchMaxWait:  a.cfg.Webhook.NotifyBatchMaxWait,
 		OnlineBatchMaxItems: a.cfg.Webhook.OnlineBatchMaxItems,
 		OnlineBatchMaxWait:  a.cfg.Webhook.OnlineBatchMaxWait,
 		OfflineUIDBatchSize: a.cfg.Webhook.OfflineUIDBatchSize,
 		RequestTimeout:      a.cfg.Webhook.RequestTimeout,
 		RetryMaxAttempts:    a.cfg.Webhook.RetryMaxAttempts,
 		FocusEvents:         a.cfg.Webhook.FocusEvents,
+		Outbox: runtimewebhook.OutboxOptions{
+			Dir:                outboxDir,
+			MaxEntries:         a.cfg.Webhook.OutboxMaxEntries,
+			MaxBytes:           a.cfg.Webhook.OutboxMaxBytes,
+			DispatchBatchSize:  a.cfg.Webhook.OutboxDispatchBatchSize,
+			RetryBaseDelay:     a.cfg.Webhook.OutboxRetryBaseDelay,
+			RetryMaxDelay:      a.cfg.Webhook.OutboxRetryMaxDelay,
+			DeliveredRetention: a.cfg.Webhook.OutboxDeliveredRetention,
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("internal/app: create webhook runtime: %w", err)
 	}
 	a.webhook = runtime
+	a.webhookOutbox = runtime
 	a.webhookNotify = webhookNotifyEnqueuer{runtime: runtime}
 	a.webhookOffline = webhookOfflineObserver{runtime: runtime, uidBatchSize: a.cfg.Webhook.OfflineUIDBatchSize}
 	a.webhookPresence = webhookPresenceObserver{runtime: runtime}
 	return nil
+}
+
+func (a *App) webhookObserver() runtimewebhook.Observer {
+	if a == nil || a.metrics == nil {
+		return nil
+	}
+	return webhookMetricsObserver{metrics: a.metrics.Webhook}
 }
 
 func (e webhookNotifyEnqueuer) EnqueuePersistAfter(ctx context.Context, event channelappend.CommittedEnvelope) {

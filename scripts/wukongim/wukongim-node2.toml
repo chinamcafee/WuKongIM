@@ -188,6 +188,8 @@ console = true
 format = "console"
 
 [gateway]
+token_auth_enabled = true
+token_auth_timeout = "3s"
 # Client-facing gateway listeners. Use TOML arrays here; WK_ environment overrides use one JSON string value.
 listeners = [{ address = "127.0.0.1:5112", name = "tcp-wkproto", network = "tcp", protocol = "wkproto", transport = "gnet" }, { address = "127.0.0.1:5212", name = "ws-gateway", network = "websocket", protocol = "wsmux", transport = "gnet" }]
 

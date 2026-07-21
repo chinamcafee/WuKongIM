@@ -121,6 +121,29 @@ func TestConversationSyncRejectsInvalidLegacyLastMsgSeqs(t *testing.T) {
 	}
 }
 
+func TestConversationSyncPreservesUint64SequenceFields(t *testing.T) {
+	want := uint64(^uint32(0)) + 99
+	srv := New(Options{Conversations: &recordingConversationUsecase{
+		syncResult: conversationusecase.SyncResult{Conversations: []conversationusecase.SyncConversation{{
+			ChannelID: "g-u64", ChannelType: frame.ChannelTypeGroup,
+			LastMsgSeq: want, ReadToMsgSeq: want - 1,
+		}}},
+	}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/conversation/sync", bytes.NewBufferString(`{"uid":"u1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	wantJSON := `[{"channel_id":"g-u64","channel_type":2,"unread":0,"timestamp":0,"last_msg_seq":4294967394,"last_client_msg_no":"","offset_msg_seq":0,"readed_to_msg_seq":4294967393,"version":0}]`
+	if !jsonEqual(rec.Body.String(), wantJSON) {
+		t.Fatalf("body = %s, want lossless uint64 sequence fields", rec.Body.String())
+	}
+}
+
 func TestConversationSyncObserverRecordsShapeAndLatency(t *testing.T) {
 	conversations := &recordingConversationUsecase{
 		syncResult: conversationusecase.SyncResult{

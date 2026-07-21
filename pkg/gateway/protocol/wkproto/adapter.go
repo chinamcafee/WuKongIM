@@ -89,7 +89,7 @@ func (a *Adapter) Encode(sess session.Session, f frame.Frame, _ session.Outbound
 	}
 	version, ok := sessionVersion(sess, true)
 	if !ok {
-		version = uint8(frame.LegacyMessageSeqVersion)
+		version = uint8(frame.LatestVersion)
 	}
 	return a.codec.EncodeFrame(f, version)
 }

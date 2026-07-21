@@ -272,7 +272,7 @@ WKProto CONNECT:
      - 认证 pending 期间再收到 CONNECT 或业务 frame，直接按 policy_violation 关闭
      - auth executor 队列满时，尽量写出 SystemError CONNACK，然后按 async_auth_queue_full 关闭
   ③ workqueue worker 调用 Authenticator.Authenticate:
-     - tokenAuthOn 且非 visitor 时校验 token
+     - tokenAuthOn 且非 visitor 时使用认证请求 Context 校验 token；校验器错误一律 fail-closed
      - 可选 IsBanned
      - 协商 server protocol version
      - 加密开启时校验 client key，生成 server key / AES key / AES IV / SessionCrypto

@@ -167,15 +167,29 @@ Start(ctx)
 Before the bounded write probes, the Node-created default Slot runtime captures
 one control/route revision and validates every physical Slot runtime involved in
 that view. All locally assigned replicas, including followers, must return a
-local status that agrees with the routed leader. Slots led remotely are queried
+local status that agrees with the routed leader. A locally assigned replica's
+Raft status is sufficient evidence for that Slot and avoids a redundant remote
+RPC during concurrent full-replica startup. Slots not assigned locally are queried
 in one `RPCSlotStatus` batch per expected leader, and each response must contain
 exactly the requested Slot IDs with matching leaders. Missing, duplicate, extra,
 zero-leader, closed, or mismatched status fails readiness before any no-op is
-submitted. The route revision and leader terms are checked again before and
-after the at-most-four no-op proposals, so stale evidence never renews the
+submitted. After the full runtime/status proof, the production path submits one
+representative no-op, preferring a locally led Slot; nodes without a local
+leader submit through one deterministic remote route. Custom proposer harnesses
+retain the bounded at-most-four probe behavior. The route revision and leader
+terms are checked again before and after the no-op proposal, so stale evidence never renews the
 data-plane lease. Custom `WithProposer` overrides retain their existing
 Propose-only bounded no-op behavior; the full status proof is wired explicitly
 with the Node-created default Slot runtime.
+
+The final write-probe fence compares the complete hash-slot mapping, Slot
+leader/term, config epoch, preferred leader, and desired peers against a
+current internally consistent route snapshot. A control revision that advances
+only because of node-health reports does not invalidate otherwise identical
+route authority; current placement candidates are revalidated after the
+probe. This prevents health-report revisions from livelocking concurrent
+multi-node startup without accepting a changed Slot assignment or stale
+leader.
 
 For the Node-created default Slot runtime, `SlotsReady` is re-evaluated by the
 10ms Slot leader observation loop against the current control snapshot. Every

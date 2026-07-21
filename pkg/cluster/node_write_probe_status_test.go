@@ -24,6 +24,7 @@ func TestNodeProbeWriteReadyRejectsMissingUnprobedPhysicalSlotStatus(t *testing.
 		{SlotID: 5, Leader: 2},
 		{SlotID: 6, Leader: 2},
 	})
+	setWriteProbeRemoteOnly(node)
 	caller := &recordingWriteProbeStatusCaller{statusesByNode: map[uint64][]routing.SlotStatus{
 		2: {
 			{SlotID: 1, Leader: 2},
@@ -55,6 +56,7 @@ func TestNodeProbeWriteReadyRejectsMissingUnprobedPhysicalSlotStatus(t *testing.
 func TestNodeProbeWriteReadyRejectsRemoteLeaderMismatch(t *testing.T) {
 	proposer := &statusRecordingProposer{}
 	node := writeProbeNodeForTest(t, proposer, []routing.SlotStatus{{SlotID: 1, Leader: 2}})
+	setWriteProbeRemoteOnly(node)
 	node.slotStatusCaller = &recordingWriteProbeStatusCaller{statusesByNode: map[uint64][]routing.SlotStatus{
 		2: {{SlotID: 1, Leader: 3}},
 	}}
@@ -85,11 +87,15 @@ func TestNodeProbeWriteReadyRejectsClosedLocalFollower(t *testing.T) {
 	if proposer.calls != 0 {
 		t.Fatalf("proposer calls=%d, want local follower validation failure before noop proposals", proposer.calls)
 	}
+	if caller.callsByNode[2] != 0 {
+		t.Fatalf("remote status calls=%d, want local replica proof only", caller.callsByNode[2])
+	}
 }
 
 func TestNodeProbeWriteReadyRejectsRevisionChangeDuringStatusValidation(t *testing.T) {
 	proposer := &statusRecordingProposer{}
 	node := writeProbeNodeForTest(t, proposer, []routing.SlotStatus{{SlotID: 1, Leader: 2}})
+	setWriteProbeRemoteOnly(node)
 	caller := &recordingWriteProbeStatusCaller{statusesByNode: map[uint64][]routing.SlotStatus{
 		2: {{SlotID: 1, Leader: 2}},
 	}}
@@ -107,6 +113,30 @@ func TestNodeProbeWriteReadyRejectsRevisionChangeDuringStatusValidation(t *testi
 	}
 	if proposer.calls != 0 {
 		t.Fatalf("proposer calls=%d, want revision recheck before noop proposals", proposer.calls)
+	}
+}
+
+func TestNodeProbeWriteReadyAllowsHealthOnlyRevisionAdvance(t *testing.T) {
+	proposer := &statusRecordingProposer{}
+	node := writeProbeNodeForTest(t, proposer, []routing.SlotStatus{{SlotID: 1, Leader: 2}})
+	setWriteProbeRemoteOnly(node)
+	caller := &recordingWriteProbeStatusCaller{statusesByNode: map[uint64][]routing.SlotStatus{
+		2: {{SlotID: 1, Leader: 2}},
+	}}
+	caller.onCall = func(_ uint64, _ []uint32) {
+		node.router.AdvanceRevision(2)
+		node.mu.Lock()
+		node.controlSnapshot.Revision = 2
+		node.snapshot.StateRevision = 2
+		node.mu.Unlock()
+	}
+	node.slotStatusCaller = caller
+
+	if err := node.ProbeWriteReady(context.Background()); err != nil {
+		t.Fatalf("ProbeWriteReady() error = %v, want health-only revision advance accepted", err)
+	}
+	if proposer.calls != 1 {
+		t.Fatalf("proposer calls=%d, want one noop proposal", proposer.calls)
 	}
 }
 
@@ -128,6 +158,7 @@ func TestNodeProbeWriteReadyRejectsLocalLeaderTermMismatch(t *testing.T) {
 func TestNodeProbeWriteReadyRejectsRemoteLeaderTermMismatch(t *testing.T) {
 	proposer := &statusRecordingProposer{}
 	node := writeProbeNodeForTest(t, proposer, []routing.SlotStatus{{SlotID: 1, Leader: 2, LeaderTerm: 10}})
+	setWriteProbeRemoteOnly(node)
 	node.slotStatusCaller = &recordingWriteProbeStatusCaller{statusesByNode: map[uint64][]routing.SlotStatus{
 		2: {{SlotID: 1, Leader: 2, LeaderTerm: 11}},
 	}}
@@ -255,6 +286,14 @@ func writeProbeNodeForTest(t *testing.T, proposer *statusRecordingProposer, stat
 		}
 	}
 	return node
+}
+
+func setWriteProbeRemoteOnly(node *Node) {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	for i := range node.controlSnapshot.Slots {
+		node.controlSnapshot.Slots[i].DesiredPeers = []uint64{2, 3}
+	}
 }
 
 func TestWithProposerDoesNotImplicitlyEnableSlotStatusProof(t *testing.T) {

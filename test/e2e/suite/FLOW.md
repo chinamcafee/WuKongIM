@@ -8,6 +8,9 @@ HTTP helpers for real `cmd/wukongim` tests.
 1. `Suite` allocates a test workspace, loopback ports, and a short independent
    plugin socket root.
 2. Config renderers write node TOML and derive the product environment.
+   The harness explicitly disables Gateway token authentication for legacy
+   scenarios that do not provision `/user/token`; authentication scenarios
+   opt in per node and use TCP readiness before registering credentials.
 3. `NodeProcess.Start` removes the harness-only `WK_E2E_*` namespace before
    starting the child process.
 4. Test cleanup stops the current process for every registered node, including

@@ -11,7 +11,7 @@ services:
       - "WK_CLUSTER_APIURL=http://xx.xxx.xxx.xx:5001" # api的内网地址
       - "WK_INTRANET_TCPADDR=xx.xx.xxx.xx:5100" # tcp连接的内网地址，此配置主要用于压测
     healthcheck:
-      test: "wget -q -Y off -O /dev/null http://localhost:5001/health > /dev/null 2>&1"
+      test: "wget -q -Y off -O /dev/null http://localhost:5001/readyz > /dev/null 2>&1"
       interval: 10s
       timeout: 10s
       retries: 3       

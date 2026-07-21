@@ -10,14 +10,13 @@ import (
 	"time"
 )
 
-func TestRuntimeBatchesNotifyMessages(t *testing.T) {
-	sender := &recordingSender{requests: make(chan SendRequest, 1)}
+func TestRuntimeDurablyDispatchesNotifyMessagesIndividually(t *testing.T) {
+	sender := &recordingSender{requests: make(chan SendRequest, 2)}
 	rt, err := New(RuntimeOptions{
 		Sender:              sender,
+		Outbox:              testOutboxOptions(t),
 		QueueSize:           16,
 		Workers:             1,
-		NotifyBatchMaxItems: 2,
-		NotifyBatchMaxWait:  time.Hour,
 		OnlineBatchMaxItems: 2,
 		OnlineBatchMaxWait:  time.Hour,
 		OfflineUIDBatchSize: 2,
@@ -34,29 +33,37 @@ func TestRuntimeBatchesNotifyMessages(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		rt.Notify(context.Background(), Message{MessageID: uint64(i + 1), MessageSeq: uint64(i + 1)})
 	}
-	req := sender.wait(t)
-	if req.Event != EventMsgNotify {
-		t.Fatalf("event = %q, want %q", req.Event, EventMsgNotify)
+	ids := map[string]struct{}{}
+	for i := 0; i < 2; i++ {
+		req := sender.wait(t)
+		if req.Event != EventMsgNotify || req.ID == "" || req.Attempt != 1 {
+			t.Fatalf("request = %#v, want durable notify", req)
+		}
+		ids[req.ID] = struct{}{}
+		var got []MessageResp
+		if err := json.Unmarshal(req.Body, &got); err != nil {
+			t.Fatalf("json.Unmarshal() error = %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("len(got) = %d, want 1", len(got))
+		}
 	}
-	var got []MessageResp
-	if err := json.Unmarshal(req.Body, &got); err != nil {
-		t.Fatalf("json.Unmarshal() error = %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("len(got) = %d, want 2", len(got))
+	if len(ids) != 2 {
+		t.Fatalf("stable ids = %#v, want two distinct ids", ids)
 	}
 }
 
-func TestRuntimeDropsOnFullQueueWithoutBlocking(t *testing.T) {
+func TestRuntimeBackpressuresInsteadOfDroppingWhenOutboxIsFull(t *testing.T) {
 	sender := &blockingSender{started: make(chan struct{}), release: make(chan struct{})}
 	observer := &recordingObserver{}
+	opts := testOutboxOptions(t)
+	opts.MaxEntries = 2
 	rt, err := New(RuntimeOptions{
 		Sender:              sender,
 		Observer:            observer,
+		Outbox:              opts,
 		QueueSize:           1,
 		Workers:             1,
-		NotifyBatchMaxItems: 1,
-		NotifyBatchMaxWait:  time.Millisecond,
 		OnlineBatchMaxItems: 1,
 		OnlineBatchMaxWait:  time.Millisecond,
 		OfflineUIDBatchSize: 1,
@@ -74,9 +81,15 @@ func TestRuntimeDropsOnFullQueueWithoutBlocking(t *testing.T) {
 	rt.Notify(context.Background(), Message{MessageID: 1, MessageSeq: 1})
 	<-sender.started
 	rt.Notify(context.Background(), Message{MessageID: 2, MessageSeq: 2})
-	rt.Notify(context.Background(), Message{MessageID: 3, MessageSeq: 3})
-	if !observer.hasResult(EventMsgNotify, "full") {
-		t.Fatalf("observer did not record queue full: %#v", observer.snapshot())
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	rt.Notify(ctx, Message{MessageID: 3, MessageSeq: 3})
+	if !observer.hasResult(EventMsgNotify, resultOutboxError) {
+		t.Fatalf("observer did not record bounded backpressure cancellation: %#v", observer.snapshot())
+	}
+	stats, err := rt.OutboxStats(context.Background())
+	if err != nil || stats.Backlog != 2 {
+		t.Fatalf("stats = %#v err=%v, want two durable entries", stats, err)
 	}
 }
 
@@ -86,10 +99,9 @@ func TestRuntimeRetriesThenDrops(t *testing.T) {
 	rt, err := New(RuntimeOptions{
 		Sender:              sender,
 		Observer:            observer,
+		Outbox:              testOutboxOptions(t),
 		QueueSize:           4,
 		Workers:             1,
-		NotifyBatchMaxItems: 1,
-		NotifyBatchMaxWait:  time.Millisecond,
 		OnlineBatchMaxItems: 1,
 		OnlineBatchMaxWait:  time.Millisecond,
 		OfflineUIDBatchSize: 1,
@@ -104,9 +116,14 @@ func TestRuntimeRetriesThenDrops(t *testing.T) {
 		t.Fatalf("Start() error = %v", err)
 	}
 	rt.Notify(context.Background(), Message{MessageID: 1, MessageSeq: 1})
-	waitUntil(t, time.Second, func() bool { return observer.hasResult(EventMsgNotify, "retry_exhausted") })
+	waitUntil(t, time.Second, func() bool { return observer.hasResult(EventMsgNotify, resultDeadLetter) })
 	if got := sender.calls.Load(); got != 2 {
 		t.Fatalf("sender calls = %d, want 2", got)
+	}
+	requests := sender.snapshot()
+	if len(requests) != 2 || requests[0].ID == "" || requests[0].ID != requests[1].ID ||
+		requests[0].Attempt != 1 || requests[1].Attempt != 2 {
+		t.Fatalf("retry requests = %#v, want same stable id and attempts 1/2", requests)
 	}
 }
 
@@ -116,10 +133,9 @@ func TestRuntimeNegativeRetryMaxAttemptsAttemptsOnce(t *testing.T) {
 	rt, err := New(RuntimeOptions{
 		Sender:              sender,
 		Observer:            observer,
+		Outbox:              testOutboxOptions(t),
 		QueueSize:           4,
 		Workers:             1,
-		NotifyBatchMaxItems: 1,
-		NotifyBatchMaxWait:  time.Millisecond,
 		OnlineBatchMaxItems: 1,
 		OnlineBatchMaxWait:  time.Millisecond,
 		OfflineUIDBatchSize: 1,
@@ -134,7 +150,7 @@ func TestRuntimeNegativeRetryMaxAttemptsAttemptsOnce(t *testing.T) {
 		t.Fatalf("Start() error = %v", err)
 	}
 	rt.Notify(context.Background(), Message{MessageID: 1, MessageSeq: 1})
-	waitUntil(t, time.Second, func() bool { return observer.hasResult(EventMsgNotify, "retry_exhausted") })
+	waitUntil(t, time.Second, func() bool { return observer.hasResult(EventMsgNotify, resultDeadLetter) })
 	if got := sender.calls.Load(); got != 1 {
 		t.Fatalf("sender calls = %d, want 1", got)
 	}
@@ -143,10 +159,9 @@ func TestRuntimeNegativeRetryMaxAttemptsAttemptsOnce(t *testing.T) {
 func TestRuntimeRejectsZeroRequestTimeout(t *testing.T) {
 	_, err := New(RuntimeOptions{
 		Sender:              &recordingSender{requests: make(chan SendRequest, 1)},
+		Outbox:              testOutboxOptions(t),
 		QueueSize:           4,
 		Workers:             1,
-		NotifyBatchMaxItems: 1,
-		NotifyBatchMaxWait:  time.Millisecond,
 		OnlineBatchMaxItems: 1,
 		OnlineBatchMaxWait:  time.Millisecond,
 		OfflineUIDBatchSize: 1,
@@ -164,11 +179,10 @@ func TestRuntimeFocusEventsFiltersDisabledEvents(t *testing.T) {
 	rt, err := New(RuntimeOptions{
 		Sender:              sender,
 		Observer:            observer,
+		Outbox:              testOutboxOptions(t),
 		QueueSize:           4,
 		Workers:             1,
 		FocusEvents:         []string{EventMsgNotify},
-		NotifyBatchMaxItems: 1,
-		NotifyBatchMaxWait:  time.Millisecond,
 		OnlineBatchMaxItems: 1,
 		OnlineBatchMaxWait:  time.Millisecond,
 		OfflineUIDBatchSize: 1,
@@ -212,10 +226,9 @@ func TestRuntimeAdmissionBeforeStartAndStopAreSafe(t *testing.T) {
 	rt, err := New(RuntimeOptions{
 		Sender:              &recordingSender{requests: make(chan SendRequest, 1)},
 		Observer:            observer,
+		Outbox:              testOutboxOptions(t),
 		QueueSize:           4,
 		Workers:             1,
-		NotifyBatchMaxItems: 1,
-		NotifyBatchMaxWait:  time.Millisecond,
 		OnlineBatchMaxItems: 1,
 		OnlineBatchMaxWait:  time.Millisecond,
 		OfflineUIDBatchSize: 1,
@@ -241,10 +254,9 @@ func TestRuntimeRejectsStartAndAdmissionAfterStop(t *testing.T) {
 	rt, err := New(RuntimeOptions{
 		Sender:              &recordingSender{requests: make(chan SendRequest, 1)},
 		Observer:            observer,
+		Outbox:              testOutboxOptions(t),
 		QueueSize:           4,
 		Workers:             1,
-		NotifyBatchMaxItems: 1,
-		NotifyBatchMaxWait:  time.Millisecond,
 		OnlineBatchMaxItems: 1,
 		OnlineBatchMaxWait:  time.Millisecond,
 		OfflineUIDBatchSize: 1,
@@ -274,10 +286,9 @@ func TestRuntimeSendsOfflineAndOnlineStatusEvents(t *testing.T) {
 	sender := &recordingSender{requests: make(chan SendRequest, 2)}
 	rt, err := New(RuntimeOptions{
 		Sender:              sender,
+		Outbox:              testOutboxOptions(t),
 		QueueSize:           8,
 		Workers:             1,
-		NotifyBatchMaxItems: 1,
-		NotifyBatchMaxWait:  time.Millisecond,
 		OnlineBatchMaxItems: 2,
 		OnlineBatchMaxWait:  time.Hour,
 		OfflineUIDBatchSize: 2,
@@ -318,45 +329,14 @@ func TestRuntimeSendsOfflineAndOnlineStatusEvents(t *testing.T) {
 	}
 }
 
-func TestOfflineMailboxSizingNeverExceedsQueueSize(t *testing.T) {
-	for _, tt := range []struct {
-		queueSize int
-		wantTotal int
-	}{
-		{queueSize: 1, wantTotal: 1},
-		{queueSize: 2, wantTotal: 2},
-		{queueSize: 255, wantTotal: 255},
-		{queueSize: 256, wantTotal: 256},
-		{queueSize: 257, wantTotal: 257},
-		{queueSize: 512, wantTotal: 512},
-		{queueSize: 1024, wantTotal: 1024},
-		{queueSize: 4096, wantTotal: 4096},
-	} {
-		shards, perShard := offlineMailboxSizing(tt.queueSize)
-		if shards <= 0 {
-			t.Fatalf("queueSize=%d shards=%d, want positive", tt.queueSize, shards)
-		}
-		if perShard <= 0 {
-			t.Fatalf("queueSize=%d perShard=%d, want positive", tt.queueSize, perShard)
-		}
-		if got := shards * perShard; got > tt.queueSize {
-			t.Fatalf("queueSize=%d aggregate capacity=%d, want <= queueSize", tt.queueSize, got)
-		}
-		if got := shards * perShard; got != tt.wantTotal {
-			t.Fatalf("queueSize=%d aggregate capacity=%d, want %d", tt.queueSize, got, tt.wantTotal)
-		}
-	}
-}
-
 func TestRuntimeStopsRetryingWhenParentContextIsCanceled(t *testing.T) {
 	parentCtx, cancel := context.WithCancel(context.Background())
 	sender := &cancelingSender{cancel: cancel}
 	rt, err := New(RuntimeOptions{
 		Sender:              sender,
+		Outbox:              testOutboxOptions(t),
 		QueueSize:           4,
 		Workers:             1,
-		NotifyBatchMaxItems: 1,
-		NotifyBatchMaxWait:  time.Millisecond,
 		OnlineBatchMaxItems: 1,
 		OnlineBatchMaxWait:  time.Millisecond,
 		OfflineUIDBatchSize: 1,
@@ -377,10 +357,9 @@ func TestRuntimeRetriesPerAttemptTimeouts(t *testing.T) {
 	sender := &timeoutSender{}
 	rt, err := New(RuntimeOptions{
 		Sender:              sender,
+		Outbox:              testOutboxOptions(t),
 		QueueSize:           4,
 		Workers:             1,
-		NotifyBatchMaxItems: 1,
-		NotifyBatchMaxWait:  time.Millisecond,
 		OnlineBatchMaxItems: 1,
 		OnlineBatchMaxWait:  time.Millisecond,
 		OfflineUIDBatchSize: 1,
@@ -403,8 +382,10 @@ type recordingSender struct {
 
 func (s *recordingSender) Send(_ context.Context, req SendRequest) error {
 	s.requests <- SendRequest{
-		Event: req.Event,
-		Body:  append([]byte(nil), req.Body...),
+		ID:      req.ID,
+		Event:   req.Event,
+		Body:    append([]byte(nil), req.Body...),
+		Attempt: req.Attempt,
 	}
 	return nil
 }
@@ -437,12 +418,23 @@ func (s *blockingSender) Send(ctx context.Context, _ SendRequest) error {
 }
 
 type failingSender struct {
-	calls atomic.Int64
+	calls    atomic.Int64
+	mu       sync.Mutex
+	requests []SendRequest
 }
 
-func (s *failingSender) Send(context.Context, SendRequest) error {
+func (s *failingSender) Send(_ context.Context, request SendRequest) error {
 	s.calls.Add(1)
+	s.mu.Lock()
+	s.requests = append(s.requests, request)
+	s.mu.Unlock()
 	return errors.New("send failed")
+}
+
+func (s *failingSender) snapshot() []SendRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]SendRequest(nil), s.requests...)
 }
 
 type cancelingSender struct {
@@ -504,4 +496,17 @@ func waitUntil(t *testing.T, timeout time.Duration, condition func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("condition did not become true within %v", timeout)
+}
+
+func testOutboxOptions(t *testing.T) OutboxOptions {
+	t.Helper()
+	return OutboxOptions{
+		Dir:                t.TempDir(),
+		MaxEntries:         100,
+		MaxBytes:           1 << 20,
+		DispatchBatchSize:  10,
+		RetryBaseDelay:     2 * time.Millisecond,
+		RetryMaxDelay:      10 * time.Millisecond,
+		DeliveredRetention: time.Hour,
+	}
 }

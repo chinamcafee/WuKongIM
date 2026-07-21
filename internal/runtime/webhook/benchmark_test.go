@@ -6,13 +6,21 @@ import (
 	"time"
 )
 
+func benchmarkOutboxOptions(b *testing.B) OutboxOptions {
+	b.Helper()
+	return OutboxOptions{
+		Dir: b.TempDir(), MaxEntries: b.N + 1024, MaxBytes: 1 << 30,
+		DispatchBatchSize: 100, RetryBaseDelay: time.Millisecond,
+		RetryMaxDelay: time.Second, DeliveredRetention: time.Hour,
+	}
+}
+
 func BenchmarkRuntimeNotifyAdmission(b *testing.B) {
 	rt, err := New(RuntimeOptions{
 		Sender:              discardSender{},
+		Outbox:              benchmarkOutboxOptions(b),
 		QueueSize:           65536,
 		Workers:             16,
-		NotifyBatchMaxItems: 100,
-		NotifyBatchMaxWait:  time.Millisecond,
 		OnlineBatchMaxItems: 512,
 		OnlineBatchMaxWait:  time.Millisecond,
 		OfflineUIDBatchSize: 512,

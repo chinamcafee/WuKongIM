@@ -62,10 +62,14 @@ type OnlineStatus struct {
 
 // SendRequest is one encoded webhook request.
 type SendRequest struct {
+	// ID is the stable durable delivery identity shared by every retry.
+	ID string
 	// Event is the webhook event name sent as the event query parameter.
 	Event string
 	// Body is the already encoded JSON request body.
 	Body []byte
+	// Attempt is the one-based durable delivery attempt.
+	Attempt int
 }
 
 // Sender delivers one encoded webhook request to an external endpoint.
@@ -78,7 +82,7 @@ type Observer interface {
 	ObserveWebhook(Observation)
 }
 
-// Observation describes one webhook admission, send, retry, or drop event.
+// Observation describes one webhook admission, send, retry, dead-letter, or best-effort drop event.
 type Observation struct {
 	// Queue identifies the runtime queue that produced the observation.
 	Queue string
@@ -98,4 +102,16 @@ type Observation struct {
 	Duration time.Duration
 	// Err carries the original error for logs while metrics use Result.
 	Err error
+	// OutboxSnapshot marks this observation as a durable-state gauge update.
+	OutboxSnapshot bool
+	// Backlog is the current active durable delivery count.
+	Backlog int
+	// DeadLetters is the current durable dead-letter count.
+	DeadLetters int
+	// OldestAge is the age of the oldest active/dead durable record.
+	OldestAge time.Duration
+	// LogicalBytes is the bounded logical outbox storage usage.
+	LogicalBytes int64
+	// RetryAttempts is the durable cumulative attempts represented by live records.
+	RetryAttempts int64
 }

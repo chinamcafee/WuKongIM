@@ -203,9 +203,9 @@ func buildSyncConversationView(query SyncQuery, candidate *syncCandidate, latest
 			ChannelType:     uint8(candidate.key.ChannelType),
 			Unread:          unread,
 			Timestamp:       latest.ServerTimestampMS / 1000,
-			LastMsgSeq:      uint32(latest.MessageSeq),
+			LastMsgSeq:      latest.MessageSeq,
 			LastClientMsgNo: latest.ClientMsgNo,
-			ReadToMsgSeq:    uint32(readedTo),
+			ReadToMsgSeq:    readedTo,
 			Version:         syncUpdatedAt,
 		},
 	}, true

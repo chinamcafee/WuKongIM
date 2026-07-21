@@ -95,8 +95,10 @@ type App struct {
 	pluginPersistAfter channelappend.PersistAfterEnqueuer
 	// pluginReceive adapts offline recipient events into plugin Receive events.
 	pluginReceive channelappend.OfflineRecipientObserver
-	// webhook owns bounded best-effort webhook delivery workers.
+	// webhook owns durable critical-webhook and best-effort presence delivery workers.
 	webhook WorkerRuntime
+	// webhookOutbox exposes durable critical-webhook state and controlled dead-letter replay.
+	webhookOutbox webhookOutboxRuntime
 	// webhookNotify adapts durable committed envelopes into msg.notify webhook events.
 	webhookNotify channelappend.PersistAfterEnqueuer
 	// webhookOffline adapts offline recipient batches into msg.offline webhook events.
@@ -104,16 +106,19 @@ type App struct {
 	// webhookPresence adapts owner-local online status transitions into webhook events.
 	webhookPresence presence.OnlineStatusObserver
 	// plugins exposes v2 plugin lifecycle and hook usecases.
-	plugins          *pluginusecase.App
-	channels         *channelusecase.App
-	cmdSync          *cmdsyncusecase.App
-	conversations    *conversationusecase.App
-	users            *userusecase.App
-	delivery         *deliveryusecase.App
-	deliveryManager  *runtimedelivery.Manager
-	deliveryRetry    *runtimedelivery.RetryScheduler
-	deliveryWorker   WorkerRuntime
-	localOwnerPusher *localOwnerPusher
+	plugins       *pluginusecase.App
+	channels      *channelusecase.App
+	cmdSync       *cmdsyncusecase.App
+	conversations *conversationusecase.App
+	users         *userusecase.App
+	// gatewayTokenMetadata is the routed authoritative device-token reader used
+	// by WKProto CONNECT authentication.
+	gatewayTokenMetadata gatewayTokenMetadataReader
+	delivery             *deliveryusecase.App
+	deliveryManager      *runtimedelivery.Manager
+	deliveryRetry        *runtimedelivery.RetryScheduler
+	deliveryWorker       WorkerRuntime
+	localOwnerPusher     *localOwnerPusher
 	// seedJoinLoop retries pre-membership JoinNode RPCs and gates entry startup until admission is observed.
 	seedJoinLoop                seedJoinRuntime
 	conversationRouteLifecycle  WorkerRuntime

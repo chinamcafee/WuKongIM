@@ -13,10 +13,15 @@ import (
 )
 
 const (
-	defaultClusterWriteReadyTimeout = 30 * time.Second
+	// Keep the application-level convergence budget aligned with the Cluster
+	// runtime default. The App owns a copy of the pre-normalized configuration,
+	// so relying on cluster.Config.applyDefaults alone would silently retain the
+	// old 30-second fallback here during real process startup.
+	defaultClusterWriteReadyTimeout = 90 * time.Second
 	clusterWriteReadyPollInterval   = 10 * time.Millisecond
-	clusterWriteReadyProbeTimeout   = time.Second
-	clusterWriteReadyProbePerSlot   = 500 * time.Millisecond
+	clusterWriteReadyProbeTimeout   = 3 * time.Second
+	clusterWriteReadyProbePerSlot   = 1500 * time.Millisecond
+	clusterWriteReadyProbeSlotCap   = 4
 )
 
 // clusterWriteReadyRuntime exposes the cluster route state needed before gateway sends are admitted.
@@ -661,6 +666,9 @@ func (a *App) readyzReport(ctx context.Context) (bool, any) {
 	if a == nil || a.cluster == nil {
 		return false, map[string]any{"ready": false, "reason": "cluster not configured"}
 	}
+	if err := a.webhookOutboxReadiness(ctx); err != nil {
+		return false, map[string]any{"ready": false, "reason": err.Error()}
+	}
 	if a.seedJoinPreActivationMode(ctx) {
 		a.lifecycleMu.Lock()
 		ready := a.clusterStarted && a.gatewayStarted
@@ -683,6 +691,19 @@ func (a *App) readyzReport(ctx context.Context) (bool, any) {
 		reason = lastErr.Error()
 	}
 	return false, map[string]any{"ready": false, "reason": reason}
+}
+
+func (a *App) webhookOutboxReadiness(ctx context.Context) error {
+	if a == nil || !a.cfg.Webhook.Enabled {
+		return nil
+	}
+	if a.webhookOutbox == nil {
+		return fmt.Errorf("webhook outbox not configured")
+	}
+	if _, err := a.webhookOutbox.OutboxStats(ctx); err != nil {
+		return fmt.Errorf("webhook outbox not ready: %w", err)
+	}
+	return nil
 }
 
 func (a *App) waitClusterWriteReady(ctx context.Context) error {
@@ -748,7 +769,11 @@ func clusterWriteReady(ctx context.Context, routes clusterWriteReadyRuntime, las
 func clusterWriteReadyProbeBudget(snapshot cluster.Snapshot) time.Duration {
 	budget := clusterWriteReadyProbeTimeout
 	if snapshot.SlotCount > 0 {
-		scaled := time.Duration(snapshot.SlotCount) * clusterWriteReadyProbePerSlot
+		probeSlots := snapshot.SlotCount
+		if probeSlots > clusterWriteReadyProbeSlotCap {
+			probeSlots = clusterWriteReadyProbeSlotCap
+		}
+		scaled := time.Duration(probeSlots) * clusterWriteReadyProbePerSlot
 		if scaled > budget {
 			budget = scaled
 		}

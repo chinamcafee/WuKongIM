@@ -338,7 +338,10 @@ type TimeoutConfig struct {
 
 func (c *Config) applyDefaults() {
 	if c.Timeouts.Start == 0 {
-		c.Timeouts.Start = 30 * time.Second
+		// Static multi-node cold starts may need multiple Controller/Slot election
+		// and write-probe rounds before every process reaches the API lifecycle.
+		// Keep the failure budget above the observed three-node convergence tail.
+		c.Timeouts.Start = 90 * time.Second
 	}
 	if c.Timeouts.Stop == 0 {
 		c.Timeouts.Stop = 5 * time.Second

@@ -29,6 +29,7 @@ type Registry struct {
 	Delivery        *DeliveryMetrics
 	Presence        *PresenceMetrics
 	Plugin          *PluginMetrics
+	Webhook         *WebhookMetrics
 	Diagnostics     *DiagnosticsMetrics
 	RuntimePressure *RuntimePressureMetrics
 	AntsPool        *AntsPoolMetrics
@@ -61,6 +62,7 @@ func New(nodeID uint64, nodeName string) *Registry {
 		Delivery:        newDeliveryMetrics(registry, labels),
 		Presence:        newPresenceMetrics(registry, labels),
 		Plugin:          newPluginMetrics(registry, labels),
+		Webhook:         newWebhookMetrics(registry, labels),
 		Diagnostics:     newDiagnosticsMetrics(registry, labels),
 		RuntimePressure: newRuntimePressureMetrics(registry, labels),
 		AntsPool:        newAntsPoolMetrics(registry, labels),

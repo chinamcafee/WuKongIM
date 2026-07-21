@@ -19,6 +19,7 @@ import (
 const (
 	defaultBenchAPIMaxBatchSize    = 10000
 	defaultBenchAPIMaxPayloadBytes = 10 * 1024 * 1024
+	defaultGatewayTokenAuthTimeout = 3 * time.Second
 )
 
 // clusterNodeConfig describes one static cluster node from WK_CLUSTER_NODES.
@@ -43,9 +44,11 @@ func missingRequiredConfigKeys(values map[string]string) []string {
 func buildConfig(values map[string]string) (app.Config, error) {
 	cfg := app.Config{
 		Gateway: app.GatewayConfig{
-			Listeners: defaultGatewayListeners(),
-			Session:   gateway.DefaultSessionOptions(),
-			Runtime:   gateway.DefaultRuntimeOptions(),
+			Listeners:        defaultGatewayListeners(),
+			TokenAuthEnabled: true,
+			TokenAuthTimeout: defaultGatewayTokenAuthTimeout,
+			Session:          gateway.DefaultSessionOptions(),
+			Runtime:          gateway.DefaultRuntimeOptions(),
 			Transport: gateway.TransportOptions{
 				Gnet: defaultGatewayGnetOptions(),
 			},
@@ -760,6 +763,23 @@ func buildConfig(values map[string]string) (app.Config, error) {
 		}
 		cfg.Gateway.Listeners = listeners
 	}
+	if raw := configValue(values, "WK_GATEWAY_TOKEN_AUTH_ENABLED"); raw != "" {
+		enabled, err := parseBool("WK_GATEWAY_TOKEN_AUTH_ENABLED", raw)
+		if err != nil {
+			return app.Config{}, err
+		}
+		cfg.Gateway.TokenAuthEnabled = enabled
+	}
+	if raw := configValue(values, "WK_GATEWAY_TOKEN_AUTH_TIMEOUT"); raw != "" {
+		timeout, err := parseDuration("WK_GATEWAY_TOKEN_AUTH_TIMEOUT", raw)
+		if err != nil {
+			return app.Config{}, err
+		}
+		if timeout <= 0 {
+			return app.Config{}, fmt.Errorf("parse WK_GATEWAY_TOKEN_AUTH_TIMEOUT: value must be > 0")
+		}
+		cfg.Gateway.TokenAuthTimeout = timeout
+	}
 	if raw := configValue(values, "WK_GATEWAY_GNET_MULTICORE"); raw != "" {
 		multicore, err := parseBool("WK_GATEWAY_GNET_MULTICORE", raw)
 		if err != nil {
@@ -1223,26 +1243,6 @@ func buildConfig(values map[string]string) (app.Config, error) {
 		}
 		cfg.Webhook.Workers = workers
 	}
-	if raw := configValue(values, "WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_ITEMS"); raw != "" {
-		maxItems, err := parseInt("WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_ITEMS", raw)
-		if err != nil {
-			return app.Config{}, err
-		}
-		if maxItems < 0 {
-			return app.Config{}, fmt.Errorf("parse WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_ITEMS: value must be >= 0")
-		}
-		cfg.Webhook.NotifyBatchMaxItems = maxItems
-	}
-	if raw := configValue(values, "WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_WAIT"); raw != "" {
-		maxWait, err := parseDuration("WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_WAIT", raw)
-		if err != nil {
-			return app.Config{}, err
-		}
-		if maxWait < 0 {
-			return app.Config{}, fmt.Errorf("parse WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_WAIT: value must be >= 0")
-		}
-		cfg.Webhook.NotifyBatchMaxWait = maxWait
-	}
 	if raw := configValue(values, "WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_ITEMS"); raw != "" {
 		maxItems, err := parseInt("WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_ITEMS", raw)
 		if err != nil {
@@ -1292,6 +1292,49 @@ func buildConfig(values map[string]string) (app.Config, error) {
 			return app.Config{}, fmt.Errorf("parse WK_WEBHOOK_RETRY_MAX_ATTEMPTS: value must be >= 0")
 		}
 		cfg.Webhook.RetryMaxAttempts = attempts
+	}
+	cfg.Webhook.OutboxDir = configValue(values, "WK_WEBHOOK_OUTBOX_DIR")
+	if raw := configValue(values, "WK_WEBHOOK_OUTBOX_MAX_ENTRIES"); raw != "" {
+		value, err := parseInt("WK_WEBHOOK_OUTBOX_MAX_ENTRIES", raw)
+		if err != nil || value <= 0 {
+			return app.Config{}, fmt.Errorf("parse WK_WEBHOOK_OUTBOX_MAX_ENTRIES: value must be positive")
+		}
+		cfg.Webhook.OutboxMaxEntries = value
+	}
+	if raw := configValue(values, "WK_WEBHOOK_OUTBOX_MAX_BYTES"); raw != "" {
+		value, err := parseInt64("WK_WEBHOOK_OUTBOX_MAX_BYTES", raw)
+		if err != nil || value <= 0 {
+			return app.Config{}, fmt.Errorf("parse WK_WEBHOOK_OUTBOX_MAX_BYTES: value must be positive")
+		}
+		cfg.Webhook.OutboxMaxBytes = value
+	}
+	if raw := configValue(values, "WK_WEBHOOK_OUTBOX_DISPATCH_BATCH_SIZE"); raw != "" {
+		value, err := parseInt("WK_WEBHOOK_OUTBOX_DISPATCH_BATCH_SIZE", raw)
+		if err != nil || value <= 0 {
+			return app.Config{}, fmt.Errorf("parse WK_WEBHOOK_OUTBOX_DISPATCH_BATCH_SIZE: value must be positive")
+		}
+		cfg.Webhook.OutboxDispatchBatchSize = value
+	}
+	if raw := configValue(values, "WK_WEBHOOK_OUTBOX_RETRY_BASE_DELAY"); raw != "" {
+		value, err := parseDuration("WK_WEBHOOK_OUTBOX_RETRY_BASE_DELAY", raw)
+		if err != nil || value <= 0 {
+			return app.Config{}, fmt.Errorf("parse WK_WEBHOOK_OUTBOX_RETRY_BASE_DELAY: value must be positive")
+		}
+		cfg.Webhook.OutboxRetryBaseDelay = value
+	}
+	if raw := configValue(values, "WK_WEBHOOK_OUTBOX_RETRY_MAX_DELAY"); raw != "" {
+		value, err := parseDuration("WK_WEBHOOK_OUTBOX_RETRY_MAX_DELAY", raw)
+		if err != nil || value <= 0 {
+			return app.Config{}, fmt.Errorf("parse WK_WEBHOOK_OUTBOX_RETRY_MAX_DELAY: value must be positive")
+		}
+		cfg.Webhook.OutboxRetryMaxDelay = value
+	}
+	if raw := configValue(values, "WK_WEBHOOK_OUTBOX_DELIVERED_RETENTION"); raw != "" {
+		value, err := parseDuration("WK_WEBHOOK_OUTBOX_DELIVERED_RETENTION", raw)
+		if err != nil || value <= 0 {
+			return app.Config{}, fmt.Errorf("parse WK_WEBHOOK_OUTBOX_DELIVERED_RETENTION: value must be positive")
+		}
+		cfg.Webhook.OutboxDeliveredRetention = value
 	}
 	cfg.Webhook, err = app.NormalizeWebhookConfig(cfg.Webhook)
 	if err != nil {

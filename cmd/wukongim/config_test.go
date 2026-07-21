@@ -44,6 +44,10 @@ func TestLoadConfigDefaultValues(t *testing.T) {
 		binding.TCPWKProto("tcp-wkproto", "0.0.0.0:5100"),
 		binding.WSMux("ws-gateway", "0.0.0.0:5200"),
 	})
+	if !cfg.Gateway.TokenAuthEnabled || cfg.Gateway.TokenAuthTimeout != 3*time.Second {
+		t.Fatalf("gateway token auth defaults = enabled:%v timeout:%s, want true/3s",
+			cfg.Gateway.TokenAuthEnabled, cfg.Gateway.TokenAuthTimeout)
+	}
 	wantLoops := adaptiveGatewayGnetEventLoops(runtime.GOMAXPROCS(0))
 	if cfg.Gateway.Transport.Gnet.NumEventLoop != wantLoops {
 		t.Fatalf("Gnet.NumEventLoop = %d, want adaptive %d", cfg.Gateway.Transport.Gnet.NumEventLoop, wantLoops)
@@ -371,13 +375,18 @@ func TestLoadConfigExplicitConfigFile(t *testing.T) {
 		`WK_WEBHOOK_FOCUS_EVENTS=["msg.notify","msg.offline"]`,
 		"WK_WEBHOOK_QUEUE_SIZE=2048",
 		"WK_WEBHOOK_WORKERS=32",
-		"WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_ITEMS=200",
-		"WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_WAIT=250ms",
 		"WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_ITEMS=300",
 		"WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_WAIT=1s",
 		"WK_WEBHOOK_OFFLINE_UID_BATCH_SIZE=1000",
 		"WK_WEBHOOK_REQUEST_TIMEOUT=2s",
 		"WK_WEBHOOK_RETRY_MAX_ATTEMPTS=4",
+		"WK_WEBHOOK_OUTBOX_DIR="+filepath.Join(dir, "webhook-outbox"),
+		"WK_WEBHOOK_OUTBOX_MAX_ENTRIES=900000",
+		"WK_WEBHOOK_OUTBOX_MAX_BYTES=3221225472",
+		"WK_WEBHOOK_OUTBOX_DISPATCH_BATCH_SIZE=80",
+		"WK_WEBHOOK_OUTBOX_RETRY_BASE_DELAY=2s",
+		"WK_WEBHOOK_OUTBOX_RETRY_MAX_DELAY=4m",
+		"WK_WEBHOOK_OUTBOX_DELIVERED_RETENTION=96h",
 		"WK_PLUGIN_ENABLE=true",
 		"WK_PLUGIN_DIR=/tmp/wk-plugins",
 		"WK_PLUGIN_SOCKET_PATH=/tmp/wk-plugin.sock",
@@ -552,13 +561,18 @@ func TestLoadConfigExplicitConfigFile(t *testing.T) {
 		!slices.Equal(cfg.Webhook.FocusEvents, []string{"msg.notify", "msg.offline"}) ||
 		cfg.Webhook.QueueSize != 2048 ||
 		cfg.Webhook.Workers != 32 ||
-		cfg.Webhook.NotifyBatchMaxItems != 200 ||
-		cfg.Webhook.NotifyBatchMaxWait != 250*time.Millisecond ||
 		cfg.Webhook.OnlineBatchMaxItems != 300 ||
 		cfg.Webhook.OnlineBatchMaxWait != time.Second ||
 		cfg.Webhook.OfflineUIDBatchSize != 1000 ||
 		cfg.Webhook.RequestTimeout != 2*time.Second ||
-		cfg.Webhook.RetryMaxAttempts != 4 {
+		cfg.Webhook.RetryMaxAttempts != 4 ||
+		cfg.Webhook.OutboxDir != filepath.Join(dir, "webhook-outbox") ||
+		cfg.Webhook.OutboxMaxEntries != 900000 ||
+		cfg.Webhook.OutboxMaxBytes != 3221225472 ||
+		cfg.Webhook.OutboxDispatchBatchSize != 80 ||
+		cfg.Webhook.OutboxRetryBaseDelay != 2*time.Second ||
+		cfg.Webhook.OutboxRetryMaxDelay != 4*time.Minute ||
+		cfg.Webhook.OutboxDeliveredRetention != 96*time.Hour {
 		t.Fatalf("Webhook config = %#v", cfg.Webhook)
 	}
 	if !cfg.Plugin.Enable ||
@@ -1164,13 +1178,18 @@ func TestLoadConfigEnvOverridesFile(t *testing.T) {
 	t.Setenv("WK_WEBHOOK_FOCUS_EVENTS", `["msg.notify","user.onlinestatus"]`)
 	t.Setenv("WK_WEBHOOK_QUEUE_SIZE", "4096")
 	t.Setenv("WK_WEBHOOK_WORKERS", "12")
-	t.Setenv("WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_ITEMS", "150")
-	t.Setenv("WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_WAIT", "125ms")
 	t.Setenv("WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_ITEMS", "250")
 	t.Setenv("WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_WAIT", "750ms")
 	t.Setenv("WK_WEBHOOK_OFFLINE_UID_BATCH_SIZE", "900")
 	t.Setenv("WK_WEBHOOK_REQUEST_TIMEOUT", "1500ms")
 	t.Setenv("WK_WEBHOOK_RETRY_MAX_ATTEMPTS", "5")
+	t.Setenv("WK_WEBHOOK_OUTBOX_DIR", filepath.Join(dir, "env-webhook-outbox"))
+	t.Setenv("WK_WEBHOOK_OUTBOX_MAX_ENTRIES", "800000")
+	t.Setenv("WK_WEBHOOK_OUTBOX_MAX_BYTES", "2147483648")
+	t.Setenv("WK_WEBHOOK_OUTBOX_DISPATCH_BATCH_SIZE", "60")
+	t.Setenv("WK_WEBHOOK_OUTBOX_RETRY_BASE_DELAY", "3s")
+	t.Setenv("WK_WEBHOOK_OUTBOX_RETRY_MAX_DELAY", "6m")
+	t.Setenv("WK_WEBHOOK_OUTBOX_DELIVERED_RETENTION", "72h")
 	t.Setenv("WK_PLUGIN_ENABLE", "true")
 	t.Setenv("WK_PLUGIN_DIR", "/tmp/wk-plugins")
 	t.Setenv("WK_PLUGIN_SOCKET_PATH", "/tmp/wk-plugin.sock")
@@ -1290,13 +1309,18 @@ func TestLoadConfigEnvOverridesFile(t *testing.T) {
 		!slices.Equal(cfg.Webhook.FocusEvents, []string{"msg.notify", "user.onlinestatus"}) ||
 		cfg.Webhook.QueueSize != 4096 ||
 		cfg.Webhook.Workers != 12 ||
-		cfg.Webhook.NotifyBatchMaxItems != 150 ||
-		cfg.Webhook.NotifyBatchMaxWait != 125*time.Millisecond ||
 		cfg.Webhook.OnlineBatchMaxItems != 250 ||
 		cfg.Webhook.OnlineBatchMaxWait != 750*time.Millisecond ||
 		cfg.Webhook.OfflineUIDBatchSize != 900 ||
 		cfg.Webhook.RequestTimeout != 1500*time.Millisecond ||
-		cfg.Webhook.RetryMaxAttempts != 5 {
+		cfg.Webhook.RetryMaxAttempts != 5 ||
+		cfg.Webhook.OutboxDir != filepath.Join(dir, "env-webhook-outbox") ||
+		cfg.Webhook.OutboxMaxEntries != 800000 ||
+		cfg.Webhook.OutboxMaxBytes != 2147483648 ||
+		cfg.Webhook.OutboxDispatchBatchSize != 60 ||
+		cfg.Webhook.OutboxRetryBaseDelay != 3*time.Second ||
+		cfg.Webhook.OutboxRetryMaxDelay != 6*time.Minute ||
+		cfg.Webhook.OutboxDeliveredRetention != 72*time.Hour {
 		t.Fatalf("Webhook env override = %#v", cfg.Webhook)
 	}
 	if !cfg.Plugin.Enable ||
@@ -1726,10 +1750,6 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		{name: "webhook queue size negative", line: "WK_WEBHOOK_QUEUE_SIZE=-1", wantKey: "WK_WEBHOOK_QUEUE_SIZE"},
 		{name: "webhook workers", line: "WK_WEBHOOK_WORKERS=many", wantKey: "WK_WEBHOOK_WORKERS"},
 		{name: "webhook workers negative", line: "WK_WEBHOOK_WORKERS=-1", wantKey: "WK_WEBHOOK_WORKERS"},
-		{name: "webhook notify batch max items", line: "WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_ITEMS=many", wantKey: "WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_ITEMS"},
-		{name: "webhook notify batch max items negative", line: "WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_ITEMS=-1", wantKey: "WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_ITEMS"},
-		{name: "webhook notify batch max wait", line: "WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_WAIT=soon", wantKey: "WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_WAIT"},
-		{name: "webhook notify batch max wait negative", line: "WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_WAIT=-1s", wantKey: "WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_WAIT"},
 		{name: "webhook online batch max items", line: "WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_ITEMS=many", wantKey: "WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_ITEMS"},
 		{name: "webhook online batch max items negative", line: "WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_ITEMS=-1", wantKey: "WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_ITEMS"},
 		{name: "webhook online batch max wait", line: "WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_WAIT=soon", wantKey: "WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_WAIT"},
@@ -1740,6 +1760,13 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		{name: "webhook request timeout negative", line: "WK_WEBHOOK_REQUEST_TIMEOUT=-1s", wantKey: "WK_WEBHOOK_REQUEST_TIMEOUT"},
 		{name: "webhook retry max attempts", line: "WK_WEBHOOK_RETRY_MAX_ATTEMPTS=many", wantKey: "WK_WEBHOOK_RETRY_MAX_ATTEMPTS"},
 		{name: "webhook retry max attempts negative", line: "WK_WEBHOOK_RETRY_MAX_ATTEMPTS=-1", wantKey: "WK_WEBHOOK_RETRY_MAX_ATTEMPTS"},
+		{name: "webhook outbox max entries", line: "WK_WEBHOOK_OUTBOX_MAX_ENTRIES=many", wantKey: "WK_WEBHOOK_OUTBOX_MAX_ENTRIES"},
+		{name: "webhook outbox max entries zero", line: "WK_WEBHOOK_OUTBOX_MAX_ENTRIES=0", wantKey: "WK_WEBHOOK_OUTBOX_MAX_ENTRIES"},
+		{name: "webhook outbox max bytes", line: "WK_WEBHOOK_OUTBOX_MAX_BYTES=many", wantKey: "WK_WEBHOOK_OUTBOX_MAX_BYTES"},
+		{name: "webhook outbox dispatch batch", line: "WK_WEBHOOK_OUTBOX_DISPATCH_BATCH_SIZE=0", wantKey: "WK_WEBHOOK_OUTBOX_DISPATCH_BATCH_SIZE"},
+		{name: "webhook outbox retry base", line: "WK_WEBHOOK_OUTBOX_RETRY_BASE_DELAY=soon", wantKey: "WK_WEBHOOK_OUTBOX_RETRY_BASE_DELAY"},
+		{name: "webhook outbox retry max", line: "WK_WEBHOOK_OUTBOX_RETRY_MAX_DELAY=-1s", wantKey: "WK_WEBHOOK_OUTBOX_RETRY_MAX_DELAY"},
+		{name: "webhook outbox retention", line: "WK_WEBHOOK_OUTBOX_DELIVERED_RETENTION=0s", wantKey: "WK_WEBHOOK_OUTBOX_DELIVERED_RETENTION"},
 		{name: "plugin enable", line: "WK_PLUGIN_ENABLE=maybe", wantKey: "WK_PLUGIN_ENABLE"},
 		{name: "plugin timeout", line: "WK_PLUGIN_TIMEOUT=soon", wantKey: "WK_PLUGIN_TIMEOUT"},
 		{name: "plugin timeout negative", line: "WK_PLUGIN_TIMEOUT=-1s", wantKey: "WK_PLUGIN_TIMEOUT"},

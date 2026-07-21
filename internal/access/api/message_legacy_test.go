@@ -128,6 +128,25 @@ func TestSendMessageWaitForPersistReturnsDurableReceipt(t *testing.T) {
 	}
 }
 
+func TestSendMessageWaitForPersistRejectsNonSuccessReason(t *testing.T) {
+	messages := &recordingMessageUsecase{sendResult: messageusecase.SendResult{
+		Reason: messageusecase.ReasonNotInWhitelist,
+	}}
+	srv := New(Options{Messages: messages})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/message/send", bytes.NewBufferString(`{"from_uid":"u1","channel_id":"u2","channel_type":1,"client_msg_no":"relationship-rejected-1","payload":"aGk=","wait_for_persist":1}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body = %s, want 403", rec.Code, rec.Body.String())
+	}
+	if !jsonEqual(rec.Body.String(), `{"status":403,"code":"send_rejected","msg":"消息未通过发送权限检查","retryable":false,"reason":13}`) {
+		t.Fatalf("body = %q, want explicit persisted rejection", rec.Body.String())
+	}
+}
+
 func TestSendMessageRejectsDurableRequestWithoutClientMsgNo(t *testing.T) {
 	srv := New(Options{Messages: &recordingMessageUsecase{}})
 	rec := httptest.NewRecorder()

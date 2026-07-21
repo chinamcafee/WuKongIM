@@ -1,43 +1,48 @@
 # internal/runtime/webhook Flow
 
-`internal/runtime/webhook` owns node-local best-effort webhook delivery for
-events produced by `internal/app` adapters. It wraps `pkg/workqueue` behind a
-typed API so queue pressure, retry, JSON mapping, and endpoint delivery stay out
-of access adapters and usecases.
+`internal/runtime/webhook` owns node-local HTTP webhook delivery. Critical
+post-commit events (`msg.notify` and `msg.offline`) use a sync-WAL Pebble outbox;
+the presence-only `user.onlinestatus` event remains a bounded best-effort memory
+queue because Link-U does not derive durable business state from it.
 
-It does not own message durability, subscriber scans, presence authority, plugin
-hooks, channel append ordering, or crash replay.
+## Critical Event Flow
 
-## Event Flow
+```text
+durable message commit / bounded offline-recipient chunk
+  -> map to the v3 webhook body
+  -> derive stable X-WK-Webhook-ID from event + message identity + recipients
+  -> sync the active outbox record before admission returns
+  -> bounded workers claim due records
+  -> POST with stable ID and one-based attempt headers
+  -> any HTTP 2xx: atomically replace the active record with a retained dedupe marker
+  -> timeout / transport / non-2xx: persist exponential retry using the same ID
+  -> max attempts: atomically move the record to dead-letter
+```
 
-`msg.notify`
-  -> app adapter receives a durable channelappend committed envelope
-  -> webhook runtime admits a `Message` into a bounded notify batch pool
-  -> worker sends one JSON array to `{HTTPAddr}?event=msg.notify`
+Duplicate source admission is a successful no-op while the identity is pending,
+dead, or retained as delivered. Process restart reopens Pebble and dispatches due
+active records. Capacity is bounded by record count and logical bytes; saturation
+backpressures critical admission instead of dropping it. Successful ID markers are
+pruned only after `outbox_delivered_retention`.
 
-`msg.offline`
-  -> channelappend recipient processor classifies offline recipients
-  -> batch observer passes bounded UID chunks to the app adapter
-  -> webhook runtime admits `OfflineMessage` chunks into a sharded mailbox
-  -> worker sends one JSON object to `{HTTPAddr}?event=msg.offline`
+Operators inspect node-local state with `GET /manager/webhooks/outbox` and may
+requeue an explicit set of 1–100 dead-letter IDs with
+`POST /manager/webhooks/outbox/replay`. Replay requires `cluster.webhook:w` when
+Manager auth is enabled and never accepts an unbounded “replay all” request.
 
-`user.onlinestatus`
-  -> presence usecase observes successful route activation/deactivation
-  -> app adapter formats the legacy status string
-  -> webhook runtime admits it into a bounded online-status batch pool
-  -> worker sends one JSON array to `{HTTPAddr}?event=user.onlinestatus`
+## Best-Effort Presence Flow
 
-## Performance Rules
+`user.onlinestatus` is mapped to the legacy-compatible status string, admitted to
+a bounded batch pool, retried a finite number of times, and then discarded with a
+bounded observation. It never enters the critical outbox.
 
-Webhook admission is bounded and best-effort. Queue-full, closed, canceled, and
-retry-exhausted events are observed and dropped. Webhook delivery never changes
-SENDACK success, durable append success, conversation-active admission, or owner
-delivery.
+## Observability and Security
 
-Large offline fanout must use recipient batches. Do not enqueue one webhook item
-per UID for large groups.
+Prometheus exposes delivery totals and latency plus outbox backlog, oldest age,
+logical bytes, live retry attempts, and dead-letter count. Runtime observations
+use bounded event/result labels. `HTTPAddr` may contain Basic Auth userinfo; sender
+errors never include the configured URL, credentials, response body, payload, or
+chat content.
 
-`HTTPAddr` may contain Basic Auth userinfo and is sensitive configuration. The
-HTTP sender returns fixed error classifications for URL construction and
-transport failures; it never embeds the configured URL, username, password, or
-response body in returned errors that upper layers may log.
+Webhook delivery remains post-commit and cannot rewrite an already successful
+SENDACK. Large offline fanout must continue to enter as bounded recipient chunks.

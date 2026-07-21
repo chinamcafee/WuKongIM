@@ -66,7 +66,7 @@ type Config struct {
 	Presence PresenceConfig
 	// Delivery configures online message delivery fanout and owner-local ack tracking.
 	Delivery DeliveryConfig
-	// Webhook configures node-local best-effort webhook delivery.
+	// Webhook configures durable critical webhooks and best-effort presence delivery.
 	Webhook WebhookConfig
 	// Plugin configures node-local PDK-compatible plugin runtime integration.
 	Plugin PluginConfig
@@ -122,6 +122,12 @@ type ManagerPermissionConfig struct {
 type GatewayConfig struct {
 	// Listeners configures client-facing gateway listeners.
 	Listeners []gateway.ListenerOptions
+	// TokenAuthEnabled requires every non-visitor WKProto CONNECT to match the
+	// durable token registered for its uid and device flag.
+	TokenAuthEnabled bool
+	// TokenAuthTimeout bounds the routed metadata lookup performed during one
+	// WKProto CONNECT authentication attempt.
+	TokenAuthTimeout time.Duration
 	// Session configures gateway session limits and batching.
 	Session gateway.SessionOptions
 	// Runtime configures async gateway worker and queue tuning.
@@ -377,7 +383,7 @@ type DeliveryConfig struct {
 	RecipientWorkerConcurrency int
 }
 
-// WebhookConfig controls node-local best-effort webhook delivery.
+// WebhookConfig controls node-local durable webhook delivery.
 type WebhookConfig struct {
 	// Enabled starts the webhook runtime when at least one endpoint is configured.
 	Enabled bool
@@ -385,14 +391,10 @@ type WebhookConfig struct {
 	HTTPAddr string
 	// FocusEvents limits delivered event names. Empty means all supported webhook events are delivered.
 	FocusEvents []string
-	// QueueSize bounds accepted webhook events waiting in memory before worker execution.
+	// QueueSize only bounds best-effort online-status events kept in memory.
 	QueueSize int
 	// Workers bounds concurrent webhook sender calls.
 	Workers int
-	// NotifyBatchMaxItems limits msg.notify messages sent in one webhook request.
-	NotifyBatchMaxItems int
-	// NotifyBatchMaxWait bounds how long msg.notify waits for adjacent messages before sending a partial batch.
-	NotifyBatchMaxWait time.Duration
 	// OnlineBatchMaxItems limits user.onlinestatus records sent in one webhook request.
 	OnlineBatchMaxItems int
 	// OnlineBatchMaxWait bounds how long user.onlinestatus waits for adjacent records before sending a partial batch.
@@ -401,8 +403,22 @@ type WebhookConfig struct {
 	OfflineUIDBatchSize int
 	// RequestTimeout bounds one outbound webhook request attempt.
 	RequestTimeout time.Duration
-	// RetryMaxAttempts bounds attempts for one admitted webhook batch before it is dropped.
+	// RetryMaxAttempts bounds attempts before a critical delivery moves to dead-letter.
 	RetryMaxAttempts int
+	// OutboxDir stores sync-WAL msg.notify/msg.offline delivery state.
+	OutboxDir string
+	// OutboxMaxEntries bounds pending and dead delivery records.
+	OutboxMaxEntries int
+	// OutboxMaxBytes bounds logical key/value bytes admitted to the outbox.
+	OutboxMaxBytes int64
+	// OutboxDispatchBatchSize bounds records claimed by one worker pass.
+	OutboxDispatchBatchSize int
+	// OutboxRetryBaseDelay is the first durable retry delay.
+	OutboxRetryBaseDelay time.Duration
+	// OutboxRetryMaxDelay caps exponential durable retry backoff.
+	OutboxRetryMaxDelay time.Duration
+	// OutboxDeliveredRetention retains success tombstones for source dedupe.
+	OutboxDeliveredRetention time.Duration
 }
 
 func NormalizeWebhookConfig(cfg WebhookConfig) (WebhookConfig, error) {
@@ -423,12 +439,6 @@ func defaultWebhookConfig(cfg WebhookConfig) WebhookConfig {
 	if cfg.Workers == 0 {
 		cfg.Workers = 16
 	}
-	if cfg.NotifyBatchMaxItems == 0 {
-		cfg.NotifyBatchMaxItems = 100
-	}
-	if cfg.NotifyBatchMaxWait == 0 {
-		cfg.NotifyBatchMaxWait = 500 * time.Millisecond
-	}
 	if cfg.OnlineBatchMaxItems == 0 {
 		cfg.OnlineBatchMaxItems = 512
 	}
@@ -444,6 +454,24 @@ func defaultWebhookConfig(cfg WebhookConfig) WebhookConfig {
 	if cfg.RetryMaxAttempts == 0 {
 		cfg.RetryMaxAttempts = 3
 	}
+	if cfg.OutboxMaxEntries == 0 {
+		cfg.OutboxMaxEntries = 1_000_000
+	}
+	if cfg.OutboxMaxBytes == 0 {
+		cfg.OutboxMaxBytes = 4 << 30
+	}
+	if cfg.OutboxDispatchBatchSize == 0 {
+		cfg.OutboxDispatchBatchSize = 100
+	}
+	if cfg.OutboxRetryBaseDelay == 0 {
+		cfg.OutboxRetryBaseDelay = time.Second
+	}
+	if cfg.OutboxRetryMaxDelay == 0 {
+		cfg.OutboxRetryMaxDelay = 5 * time.Minute
+	}
+	if cfg.OutboxDeliveredRetention == 0 {
+		cfg.OutboxDeliveredRetention = 7 * 24 * time.Hour
+	}
 	return cfg
 }
 
@@ -456,12 +484,6 @@ func validateWebhookConfig(cfg WebhookConfig) error {
 	}
 	if cfg.Workers < 0 {
 		return fmt.Errorf("%w: webhook Workers must be >= 0", ErrInvalidConfig)
-	}
-	if cfg.NotifyBatchMaxItems < 0 {
-		return fmt.Errorf("%w: webhook NotifyBatchMaxItems must be >= 0", ErrInvalidConfig)
-	}
-	if cfg.NotifyBatchMaxWait < 0 {
-		return fmt.Errorf("%w: webhook NotifyBatchMaxWait must be >= 0", ErrInvalidConfig)
 	}
 	if cfg.OnlineBatchMaxItems < 0 {
 		return fmt.Errorf("%w: webhook OnlineBatchMaxItems must be >= 0", ErrInvalidConfig)
@@ -477,6 +499,15 @@ func validateWebhookConfig(cfg WebhookConfig) error {
 	}
 	if cfg.RetryMaxAttempts < 0 {
 		return fmt.Errorf("%w: webhook RetryMaxAttempts must be >= 0", ErrInvalidConfig)
+	}
+	if cfg.OutboxMaxEntries <= 0 || cfg.OutboxMaxBytes <= 0 || cfg.OutboxDispatchBatchSize <= 0 {
+		return fmt.Errorf("%w: webhook outbox limits must be positive", ErrInvalidConfig)
+	}
+	if cfg.OutboxRetryBaseDelay <= 0 || cfg.OutboxRetryMaxDelay < cfg.OutboxRetryBaseDelay {
+		return fmt.Errorf("%w: webhook outbox retry delays are invalid", ErrInvalidConfig)
+	}
+	if cfg.OutboxDeliveredRetention <= 0 {
+		return fmt.Errorf("%w: webhook outbox delivered retention must be positive", ErrInvalidConfig)
 	}
 	return nil
 }

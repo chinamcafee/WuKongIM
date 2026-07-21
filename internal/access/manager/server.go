@@ -208,6 +208,8 @@ type Options struct {
 	Top accessapi.TopSnapshotProvider
 	// WebhookConfig provides the read-only startup webhook configuration snapshot.
 	WebhookConfig WebhookConfigProvider
+	// WebhookOutbox provides durable webhook health and controlled dead-letter replay.
+	WebhookOutbox WebhookOutboxProvider
 	// Logger is the logger used by the manager server.
 	Logger wklog.Logger
 }
@@ -224,6 +226,7 @@ type Server struct {
 	realtimeMonitor RealtimeMonitorProvider
 	top             accessapi.TopSnapshotProvider
 	webhookConfig   WebhookConfigProvider
+	webhookOutbox   WebhookOutboxProvider
 	auth            authState
 	logger          wklog.Logger
 	started         bool
@@ -246,6 +249,7 @@ func New(opts Options) *Server {
 		realtimeMonitor: opts.RealtimeMonitor,
 		top:             opts.Top,
 		webhookConfig:   opts.WebhookConfig,
+		webhookOutbox:   opts.WebhookOutbox,
 		auth:            newAuthState(opts.Auth),
 		logger:          opts.Logger,
 	}
@@ -463,6 +467,13 @@ func (s *Server) registerRoutes() {
 		webhooks.Use(s.requirePermission("cluster.webhook", "r"))
 	}
 	webhooks.GET("/webhooks/config", s.handleWebhookConfig)
+	webhooks.GET("/webhooks/outbox", s.handleWebhookOutbox)
+
+	webhookWrites := s.engine.Group("/manager")
+	if s.auth.enabled() {
+		webhookWrites.Use(s.requirePermission("cluster.webhook", "w"))
+	}
+	webhookWrites.POST("/webhooks/outbox/replay", s.handleWebhookOutboxReplay)
 
 	pluginReads := s.engine.Group("/manager")
 	if s.auth.enabled() {

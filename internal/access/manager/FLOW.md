@@ -77,6 +77,8 @@ POST /manager/messages/retention (message retention request; requires cluster.ch
 GET  /manager/connections (connection list; requires cluster.connection:r when Auth.On=true)
 GET  /manager/connections/:session_id (connection detail; requires cluster.connection:r when Auth.On=true)
 GET  /manager/webhooks/config (read-only webhook startup configuration snapshot; requires cluster.webhook:r when Auth.On=true)
+GET  /manager/webhooks/outbox (node-local durable webhook health and bounded dead-letter preview; requires cluster.webhook:r when Auth.On=true)
+POST /manager/webhooks/outbox/replay (requeue 1–100 explicit dead-letter IDs; requires cluster.webhook:w when Auth.On=true)
 GET  /manager/nodes/:node_id/plugins (node-local plugin inventory; requires cluster.plugin:r when Auth.On=true)
 GET  /manager/nodes/:node_id/plugins/:plugin_no (node-local plugin detail; requires cluster.plugin:r when Auth.On=true)
 PUT  /manager/nodes/:node_id/plugins/:plugin_no/config (node-local plugin desired config update; requires cluster.plugin:w when Auth.On=true)
@@ -114,9 +116,9 @@ wildcard manager permissions continue to satisfy the same middleware check.
 When auth is disabled the route returns `auth_enabled=false` and an empty user
 list so the web permissions page can render a non-error read-only state. The
 catalog includes wildcard `*` and concrete manager resources such as
-`cluster.db:r` and `cluster.webhook:r`; webhook write permission is not
-advertised because webhook configuration is startup-only in this package. The
-route does not mutate runtime config or static auth grants.
+`cluster.db:r` and `cluster.webhook:r/w`. Webhook write permission is limited to
+explicit dead-letter replay; startup configuration remains immutable. The route
+does not mutate runtime config or static auth grants.
 
 `/manager/nodes` preserves the legacy list response shape for the web node list
 view. It reads a control snapshot through `internal/usecase/management` and
@@ -463,6 +465,11 @@ snapshot for the web webhook settings page. The route requires
 the configured `WebhookConfigProvider`, and returns `service_unavailable` when
 the provider is absent or cannot produce a snapshot. It is read-only and does
 not mutate webhook runtime or config state.
+
+`/manager/webhooks/outbox` exposes body-free node-local backlog, oldest age,
+retry, logical-byte, delivered-marker, and dead-letter evidence. Its replay route
+accepts only 1–100 unique, explicit stable IDs, requires `cluster.webhook:w`, and
+returns requested/replayed counts; there is no unbounded replay-all operation.
 
 `/manager/nodes/:node_id/plugins*` exposes node-scoped plugin inventory,
 detail, desired-config update, restart, and uninstall operations for one

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	accessapi "github.com/WuKongIM/WuKongIM/internal/access/api"
@@ -29,6 +30,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/gateway"
 	obsmetrics "github.com/WuKongIM/WuKongIM/pkg/metrics"
 	"github.com/WuKongIM/WuKongIM/pkg/observability/sendtrace"
+	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
 )
 
 func (a *App) applyConfigDefaults() error {
@@ -68,6 +70,9 @@ func (a *App) applyConfigDefaults() error {
 		webhook, err := NormalizeWebhookConfig(a.cfg.Webhook)
 		if err != nil {
 			return err
+		}
+		if webhook.Enabled && strings.TrimSpace(webhook.OutboxDir) == "" {
+			webhook.OutboxDir = filepath.Join(a.cfg.DataDir, "webhook-outbox")
 		}
 		a.cfg.Webhook = webhook
 	}
@@ -618,9 +623,10 @@ func (a *App) wireManagerPluginRPC() {
 }
 
 func (a *App) wireUsers() {
-	if a.users == nil {
-		if node, ok := a.cluster.(clusterinfra.UserMetadataNode); ok {
-			userStore := clusterinfra.NewUserMetadataStore(node)
+	if node, ok := a.cluster.(clusterinfra.UserMetadataNode); ok {
+		userStore := clusterinfra.NewUserMetadataStore(node)
+		a.gatewayTokenMetadata = userStore
+		if a.users == nil {
 			var systemUIDs userusecase.SystemUIDStore
 			if channelNode, ok := a.cluster.(clusterinfra.ChannelMetadataNode); ok {
 				systemUIDs = clusterinfra.NewChannelMetadataStore(channelNode, nil)
@@ -944,6 +950,7 @@ func (a *App) wireManager() {
 			RealtimeMonitor: a.newManagerMonitorProvider(management),
 			Top:             a.topProvider,
 			WebhookConfig:   a,
+			WebhookOutbox:   a,
 			Logger:          a.logger.Named("access.manager"),
 		})
 	}
@@ -1153,9 +1160,21 @@ func managerPermissionConfigs(permissions []ManagerPermissionConfig) []accessman
 
 func (a *App) wireGateway(nodeID uint64) error {
 	if a.gateway == nil && len(a.cfg.Gateway.Listeners) > 0 {
+		authOptions := gateway.WKProtoAuthOptions{
+			NodeID:                  nodeID,
+			RequiredProtocolVersion: frame.LatestVersion,
+		}
+		if a.cfg.Gateway.TokenAuthEnabled {
+			if a.gatewayTokenMetadata == nil {
+				return fmt.Errorf("%w: gateway token metadata reader required", ErrInvalidConfig)
+			}
+			authOptions.TokenAuthOn = true
+			authOptions.VerifyToken = newGatewayTokenVerifier(
+				a.gatewayTokenMetadata, a.cfg.Gateway.TokenAuthTimeout)
+		}
 		gw, err := gateway.New(gateway.Options{
 			Handler:        a.handler,
-			Authenticator:  gateway.NewWKProtoAuthenticator(gateway.WKProtoAuthOptions{NodeID: nodeID}),
+			Authenticator:  gateway.NewWKProtoAuthenticator(authOptions),
 			Listeners:      a.cfg.Gateway.Listeners,
 			DefaultSession: a.cfg.Gateway.Session,
 			Runtime:        a.cfg.Gateway.Runtime,

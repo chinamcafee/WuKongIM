@@ -28,10 +28,10 @@ type legacyConversationResponse struct {
 	ChannelType     uint8               `json:"channel_type"`
 	Unread          int                 `json:"unread"`
 	Timestamp       int64               `json:"timestamp"`
-	LastMsgSeq      uint32              `json:"last_msg_seq"`
+	LastMsgSeq      uint64              `json:"last_msg_seq"`
 	LastClientMsgNo string              `json:"last_client_msg_no"`
 	OffsetMsgSeq    int64               `json:"offset_msg_seq"`
-	ReadedToMsgSeq  uint32              `json:"readed_to_msg_seq"`
+	ReadedToMsgSeq  uint64              `json:"readed_to_msg_seq"`
 	Version         int64               `json:"version"`
 	Recents         []legacyMessageResp `json:"recents,omitempty"`
 }

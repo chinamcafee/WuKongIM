@@ -71,11 +71,8 @@ func TestManagerPermissionsReturnsSanitizedSnapshot(t *testing.T) {
 
 	requirePermissionCatalogEntry(t, body.Resources, "cluster.permission", []string{"r"})
 	requirePermissionCatalogEntry(t, body.Resources, "cluster.db", []string{"r"})
-	requirePermissionCatalogEntry(t, body.Resources, "cluster.webhook", []string{"r"})
+	requirePermissionCatalogEntry(t, body.Resources, "cluster.webhook", []string{"r", "w"})
 	requirePermissionCatalogEntry(t, body.Resources, "*", []string{"*"})
-	if permissionCatalogContains(body.Resources, "cluster.webhook", "w") {
-		t.Fatalf("resources = %#v, did not expect cluster.webhook:w", body.Resources)
-	}
 
 	catalog := managerPermissionResources()
 	catalog[0].Actions[0] = "mutated"

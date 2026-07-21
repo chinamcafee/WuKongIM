@@ -24,8 +24,9 @@ const (
 	resultRetry          = "retry"
 	resultRetryExhausted = "retry_exhausted"
 	resultEncodeError    = "encode_error"
-
-	defaultOfflineShards = 256
+	resultDeduplicated   = "deduplicated"
+	resultDeadLetter     = "dead_letter"
+	resultOutboxError    = "outbox_error"
 )
 
 type runtimeState uint8
@@ -43,14 +44,10 @@ type RuntimeOptions struct {
 	Sender Sender
 	// Observer receives low-cardinality runtime observations.
 	Observer Observer
-	// QueueSize bounds accepted webhook events waiting in memory per event queue.
+	// QueueSize bounds best-effort online-status events waiting in memory.
 	QueueSize int
 	// Workers bounds concurrent sender calls per event queue.
 	Workers int
-	// NotifyBatchMaxItems limits msg.notify messages sent in one request.
-	NotifyBatchMaxItems int
-	// NotifyBatchMaxWait bounds how long msg.notify waits for adjacent messages.
-	NotifyBatchMaxWait time.Duration
 	// OnlineBatchMaxItems limits user.onlinestatus records sent in one request.
 	OnlineBatchMaxItems int
 	// OnlineBatchMaxWait bounds how long user.onlinestatus waits for adjacent records.
@@ -59,25 +56,28 @@ type RuntimeOptions struct {
 	OfflineUIDBatchSize int
 	// RequestTimeout bounds one outbound sender attempt.
 	RequestTimeout time.Duration
-	// RetryMaxAttempts bounds attempts for one admitted webhook batch before drop.
+	// RetryMaxAttempts moves critical delivery to dead-letter and ends best-effort delivery.
 	RetryMaxAttempts int
 	// FocusEvents limits delivered event names. Empty means all events are delivered.
 	FocusEvents []string
+	// Outbox configures sync-WAL storage for msg.notify and msg.offline.
+	Outbox OutboxOptions
 }
 
-// Runtime owns bounded webhook event admission, batching, retry, and delivery.
+// Runtime owns durable critical-webhook and bounded presence-event delivery.
 type Runtime struct {
 	opts     RuntimeOptions
 	sender   Sender
 	observer Observer
 	focus    map[string]struct{}
 
-	mu      sync.RWMutex
-	state   runtimeState
-	stopCh  chan struct{}
-	notify  *workqueue.BoundedBatchPool[Message]
-	online  *workqueue.BoundedBatchPool[OnlineStatus]
-	offline *workqueue.ShardedMailbox[OfflineMessage]
+	mu             sync.RWMutex
+	state          runtimeState
+	stopCh         chan struct{}
+	online         *workqueue.BoundedBatchPool[OnlineStatus]
+	outbox         *DurableOutbox
+	dispatchCancel context.CancelFunc
+	dispatchWG     sync.WaitGroup
 }
 
 // New creates a webhook runtime. Start opens the queues.
@@ -85,14 +85,11 @@ func New(opts RuntimeOptions) (*Runtime, error) {
 	if opts.Sender == nil || opts.QueueSize <= 0 || opts.Workers <= 0 {
 		return nil, workqueue.ErrInvalidConfig
 	}
-	if opts.NotifyBatchMaxWait < 0 || opts.OnlineBatchMaxWait < 0 || opts.RequestTimeout <= 0 {
+	if opts.OnlineBatchMaxWait < 0 || opts.RequestTimeout <= 0 {
 		return nil, workqueue.ErrInvalidConfig
 	}
-	if opts.NotifyBatchMaxItems < 0 || opts.OnlineBatchMaxItems < 0 || opts.OfflineUIDBatchSize < 0 {
+	if opts.OnlineBatchMaxItems < 0 || opts.OfflineUIDBatchSize < 0 {
 		return nil, workqueue.ErrInvalidConfig
-	}
-	if opts.NotifyBatchMaxItems == 0 {
-		opts.NotifyBatchMaxItems = 1
 	}
 	if opts.OnlineBatchMaxItems == 0 {
 		opts.OnlineBatchMaxItems = 1
@@ -108,6 +105,13 @@ func New(opts RuntimeOptions) (*Runtime, error) {
 		if event != "" {
 			rt.focus[event] = struct{}{}
 		}
+	}
+	if rt.enabled(EventMsgNotify) || rt.enabled(EventMsgOffline) {
+		outbox, err := OpenDurableOutbox(opts.Outbox)
+		if err != nil {
+			return nil, err
+		}
+		rt.outbox = outbox
 	}
 	return rt, nil
 }
@@ -134,18 +138,6 @@ func (r *Runtime) Start(ctx context.Context) error {
 	}
 	r.ensureStopChLocked()
 
-	notify, err := workqueue.NewBoundedBatchPool[Message](workqueue.BoundedBatchPoolConfig[Message]{
-		Name:      webhookNotifyQueue,
-		Workers:   r.opts.Workers,
-		QueueSize: r.opts.QueueSize,
-		Policy: func(Message) workqueue.BatchOptions {
-			return workqueue.BatchOptions{MaxItems: r.opts.NotifyBatchMaxItems, MaxWait: r.opts.NotifyBatchMaxWait}
-		},
-	}, r.handleNotifyBatch)
-	if err != nil {
-		return err
-	}
-
 	online, err := workqueue.NewBoundedBatchPool[OnlineStatus](workqueue.BoundedBatchPoolConfig[OnlineStatus]{
 		Name:      webhookOnlineQueue,
 		Workers:   r.opts.Workers,
@@ -155,27 +147,19 @@ func (r *Runtime) Start(ctx context.Context) error {
 		},
 	}, r.handleOnlineBatch)
 	if err != nil {
-		_ = notify.Close(context.Background())
 		return err
 	}
-
-	shards, queueSizePerShard := offlineMailboxSizing(r.opts.QueueSize)
-	offline, err := workqueue.NewShardedMailbox[OfflineMessage](workqueue.ShardedMailboxConfig{
-		Name:              webhookOfflineQueue,
-		Shards:            shards,
-		Workers:           r.opts.Workers,
-		QueueSizePerShard: queueSizePerShard,
-		BatchMaxItems:     1,
-	}, r.handleOfflineBatch)
-	if err != nil {
-		_ = online.Close(context.Background())
-		_ = notify.Close(context.Background())
-		return err
-	}
-
-	r.notify = notify
 	r.online = online
-	r.offline = offline
+	dispatchCtx, dispatchCancel := context.WithCancel(context.Background())
+	r.dispatchCancel = dispatchCancel
+	if r.outbox != nil {
+		r.dispatchWG.Add(1)
+		go r.runOutboxMaintenance(dispatchCtx)
+		for worker := 0; worker < r.opts.Workers; worker++ {
+			r.dispatchWG.Add(1)
+			go r.runOutboxDispatcher(dispatchCtx)
+		}
+	}
 	r.state = runtimeStateStarted
 	return nil
 }
@@ -193,7 +177,11 @@ func (r *Runtime) Stop(ctx context.Context) error {
 	case runtimeStateNew:
 		r.state = runtimeStateStopped
 		close(r.ensureStopChLocked())
+		outbox := r.outbox
 		r.mu.Unlock()
+		if outbox != nil {
+			return outbox.Close()
+		}
 		return nil
 	case runtimeStateStopped:
 		r.mu.Unlock()
@@ -204,22 +192,33 @@ func (r *Runtime) Stop(ctx context.Context) error {
 		return waitForStop(ctx, stopCh)
 	}
 	r.state = runtimeStateStopping
-	notify := r.notify
 	online := r.online
-	offline := r.offline
+	dispatchCancel := r.dispatchCancel
 	stopCh := r.ensureStopChLocked()
 	r.mu.Unlock()
 
-	err := errors.Join(
-		notify.Close(ctx),
-		online.Close(ctx),
-		offline.Close(ctx),
-	)
+	if dispatchCancel != nil {
+		dispatchCancel()
+	}
+	dispatchDone := make(chan struct{})
+	go func() {
+		r.dispatchWG.Wait()
+		close(dispatchDone)
+	}()
+	var dispatchErr error
+	select {
+	case <-ctx.Done():
+		dispatchErr = ctx.Err()
+	case <-dispatchDone:
+	}
+	err := errors.Join(online.Close(ctx), dispatchErr)
+	if r.outbox != nil {
+		err = errors.Join(err, r.outbox.Close())
+	}
 
 	r.mu.Lock()
-	r.notify = nil
 	r.online = nil
-	r.offline = nil
+	r.dispatchCancel = nil
 	r.state = runtimeStateStopped
 	close(stopCh)
 	r.mu.Unlock()
@@ -232,19 +231,32 @@ func (r *Runtime) Notify(ctx context.Context, msg Message) {
 		return
 	}
 	msg = cloneMessage(msg)
-
+	body, err := buildNotifyBody([]Message{msg})
+	if err != nil {
+		r.observeSend(EventMsgNotify, resultEncodeError, 1, 0, 0, err)
+		return
+	}
 	r.mu.RLock()
-	notify := r.notify
-	if r.state != runtimeStateStarted || notify == nil {
-		r.mu.RUnlock()
+	started := r.state == runtimeStateStarted
+	outbox := r.outbox
+	r.mu.RUnlock()
+	if !started || outbox == nil {
 		r.observeAdmission(EventMsgNotify, webhookNotifyQueue, resultClosed, 1, 0, r.opts.QueueSize, nil)
 		return
 	}
-	err := notify.Submit(ctx, msg)
-	depth := notify.QueueDepth()
-	capacity := notify.QueueCapacity()
-	r.mu.RUnlock()
-	r.observeAdmission(EventMsgNotify, webhookNotifyQueue, admissionResult(err), 1, depth, capacity, err)
+	inserted, err := outbox.Enqueue(ctx, OutboxEntry{
+		ID: StableEventID(EventMsgNotify, msg, nil), Event: EventMsgNotify,
+		Body: body, Items: 1,
+	})
+	if err != nil {
+		r.observeAdmission(EventMsgNotify, webhookNotifyQueue, resultOutboxError, 1, 0, r.opts.Outbox.MaxEntries, err)
+		return
+	}
+	result := resultAccepted
+	if !inserted {
+		result = resultDeduplicated
+	}
+	r.observeAdmission(EventMsgNotify, webhookNotifyQueue, result, 1, 0, r.opts.Outbox.MaxEntries, nil)
 }
 
 // Offline admits one bounded recipient chunk for msg.offline delivery.
@@ -254,18 +266,35 @@ func (r *Runtime) Offline(ctx context.Context, msg OfflineMessage) {
 	}
 	msg = cloneOfflineMessage(msg)
 	items := len(msg.ToUIDs)
-
+	if items == 0 {
+		return
+	}
+	body, err := buildOfflineBody(msg, r.opts.OfflineUIDBatchSize)
+	if err != nil {
+		r.observeSend(EventMsgOffline, resultEncodeError, items, 0, 0, err)
+		return
+	}
 	r.mu.RLock()
-	offline := r.offline
-	if r.state != runtimeStateStarted || offline == nil {
-		r.mu.RUnlock()
+	started := r.state == runtimeStateStarted
+	outbox := r.outbox
+	r.mu.RUnlock()
+	if !started || outbox == nil {
 		r.observeAdmission(EventMsgOffline, webhookOfflineQueue, resultClosed, items, 0, r.opts.QueueSize, nil)
 		return
 	}
-	err := offline.Submit(ctx, msg.Message.ChannelID, msg)
-	depth := offline.QueueDepth()
-	r.mu.RUnlock()
-	r.observeAdmission(EventMsgOffline, webhookOfflineQueue, admissionResult(err), items, depth, r.opts.QueueSize, err)
+	inserted, err := outbox.Enqueue(ctx, OutboxEntry{
+		ID: StableEventID(EventMsgOffline, msg.Message, msg.ToUIDs), Event: EventMsgOffline,
+		Body: body, Items: items,
+	})
+	if err != nil {
+		r.observeAdmission(EventMsgOffline, webhookOfflineQueue, resultOutboxError, items, 0, r.opts.Outbox.MaxEntries, err)
+		return
+	}
+	result := resultAccepted
+	if !inserted {
+		result = resultDeduplicated
+	}
+	r.observeAdmission(EventMsgOffline, webhookOfflineQueue, result, items, 0, r.opts.Outbox.MaxEntries, nil)
 }
 
 // OnlineStatus admits one legacy-compatible status record.
@@ -288,16 +317,6 @@ func (r *Runtime) OnlineStatus(ctx context.Context, status OnlineStatus) {
 	r.observeAdmission(EventUserOnlineStatus, webhookOnlineQueue, admissionResult(err), 1, depth, capacity, err)
 }
 
-func (r *Runtime) handleNotifyBatch(ctx context.Context, batch []Message) error {
-	body, err := buildNotifyBody(batch)
-	if err != nil {
-		r.observeSend(EventMsgNotify, resultEncodeError, len(batch), 0, 0, err)
-		return nil
-	}
-	r.sendWithRetry(ctx, EventMsgNotify, body, len(batch))
-	return nil
-}
-
 func (r *Runtime) handleOnlineBatch(ctx context.Context, batch []OnlineStatus) error {
 	body, err := buildOnlineStatusBody(batch)
 	if err != nil {
@@ -308,17 +327,129 @@ func (r *Runtime) handleOnlineBatch(ctx context.Context, batch []OnlineStatus) e
 	return nil
 }
 
-func (r *Runtime) handleOfflineBatch(ctx context.Context, batch workqueue.MailboxBatch[OfflineMessage]) error {
-	for _, item := range batch.Items {
-		body, err := buildOfflineBody(item, r.opts.OfflineUIDBatchSize)
-		items := len(item.ToUIDs)
+func (r *Runtime) runOutboxDispatcher(ctx context.Context) {
+	defer r.dispatchWG.Done()
+	poll := time.NewTicker(100 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.outbox.Wake():
+		case <-poll.C:
+		}
+		entries, err := r.outbox.ClaimDue(time.Now())
 		if err != nil {
-			r.observeSend(EventMsgOffline, resultEncodeError, items, 0, 0, err)
+			if errors.Is(err, ErrOutboxClosed) || ctx.Err() != nil {
+				return
+			}
+			r.observeSend("outbox", resultOutboxError, 0, 0, 0, err)
 			continue
 		}
-		r.sendWithRetry(ctx, EventMsgOffline, body, items)
+		for _, entry := range entries {
+			if ctx.Err() != nil {
+				r.outbox.ReleaseClaim(entry.ID)
+				continue
+			}
+			r.dispatchOutboxEntry(ctx, entry)
+		}
 	}
-	return nil
+}
+
+func (r *Runtime) runOutboxMaintenance(ctx context.Context) {
+	defer r.dispatchWG.Done()
+	statsTicker := time.NewTicker(5 * time.Second)
+	pruneTicker := time.NewTicker(time.Minute)
+	defer statsTicker.Stop()
+	defer pruneTicker.Stop()
+	r.refreshOutboxStats()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-statsTicker.C:
+			r.refreshOutboxStats()
+		case now := <-pruneTicker.C:
+			if err := r.outbox.pruneDelivered(now); err != nil && !errors.Is(err, ErrOutboxClosed) {
+				r.observeSend("outbox", resultOutboxError, 0, 0, 0, err)
+			}
+			r.refreshOutboxStats()
+		}
+	}
+}
+
+func (r *Runtime) dispatchOutboxEntry(ctx context.Context, entry OutboxEntry) {
+	attemptCtx, cancel := context.WithTimeout(ctx, r.opts.RequestTimeout)
+	started := time.Now()
+	err := r.sender.Send(attemptCtx, SendRequest{
+		ID: entry.ID, Event: entry.Event, Body: entry.Body, Attempt: entry.Attempt + 1,
+	})
+	cancel()
+	duration := time.Since(started)
+	if err == nil {
+		if markErr := r.outbox.MarkDelivered(entry, time.Now()); markErr != nil {
+			r.observeSend(entry.Event, resultOutboxError, entry.Items, entry.Attempt+1, duration, markErr)
+			return
+		}
+		r.observeSend(entry.Event, resultOK, entry.Items, entry.Attempt+1, duration, nil)
+		return
+	}
+	if ctx.Err() != nil {
+		r.outbox.ReleaseClaim(entry.ID)
+		return
+	}
+	dead, markErr := r.outbox.MarkFailed(entry, r.opts.RetryMaxAttempts, time.Now())
+	if markErr != nil {
+		r.observeSend(entry.Event, resultOutboxError, entry.Items, entry.Attempt+1, duration, markErr)
+		return
+	}
+	result := resultRetry
+	if dead {
+		result = resultDeadLetter
+	}
+	r.observeSend(entry.Event, result, entry.Items, entry.Attempt+1, duration, err)
+}
+
+// OutboxStats exposes critical webhook backlog and dead-letter state.
+func (r *Runtime) OutboxStats(ctx context.Context) (OutboxStats, error) {
+	if r == nil || r.outbox == nil {
+		return OutboxStats{}, ErrOutboxClosed
+	}
+	return r.outbox.Stats(ctx)
+}
+
+// ReplayDeadLetters requeues an explicit, bounded set of stable webhook IDs.
+func (r *Runtime) ReplayDeadLetters(ctx context.Context, ids []string) (int, error) {
+	if r == nil || r.outbox == nil {
+		return 0, ErrOutboxClosed
+	}
+	replayed, err := r.outbox.ReplayDead(ctx, ids)
+	if err == nil {
+		r.refreshOutboxStats()
+	}
+	return replayed, err
+}
+
+func (r *Runtime) refreshOutboxStats() {
+	if r == nil || r.outbox == nil {
+		return
+	}
+	stats, err := r.outbox.Stats(context.Background())
+	if err == nil {
+		r.observeOutboxStats(stats)
+	}
+}
+
+func (r *Runtime) observeOutboxStats(stats OutboxStats) {
+	if r == nil || r.observer == nil {
+		return
+	}
+	r.observer.ObserveWebhook(Observation{
+		Queue: webhookNotifyQueue, Event: "outbox", Result: "snapshot",
+		OutboxSnapshot: true, Backlog: stats.Backlog, DeadLetters: stats.DeadLetters,
+		OldestAge: stats.OldestAge, LogicalBytes: stats.LogicalBytes,
+		RetryAttempts: stats.RetryAttempts,
+	})
 }
 
 func (r *Runtime) sendWithRetry(ctx context.Context, event string, body []byte, items int) {
@@ -457,22 +588,6 @@ func cloneOfflineMessage(msg OfflineMessage) OfflineMessage {
 	msg.Message = cloneMessage(msg.Message)
 	msg.ToUIDs = append([]string(nil), msg.ToUIDs...)
 	return msg
-}
-
-func offlineMailboxSizing(queueSize int) (int, int) {
-	if queueSize <= 1 {
-		return 1, 1
-	}
-	maxShards := defaultOfflineShards
-	if queueSize < maxShards {
-		maxShards = queueSize
-	}
-	for shards := maxShards; shards > 1; shards-- {
-		if queueSize%shards == 0 {
-			return shards, queueSize / shards
-		}
-	}
-	return 1, queueSize
 }
 
 func waitForStop(ctx context.Context, stopCh <-chan struct{}) error {

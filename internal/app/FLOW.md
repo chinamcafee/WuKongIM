@@ -234,12 +234,14 @@ New(Config)
        and invoke this node's local /plugin/route hook for forwarded plugin
        HTTP requests
   -> when Webhook config is enabled:
-       create the node-local webhook runtime with bounded workqueue admission,
-       finite retry, and an HTTP sender; wire webhook adapters into
+       create the node-local webhook runtime with a sync-WAL Pebble outbox for
+       msg.notify/msg.offline, bounded dispatch, durable exponential retry,
+       dead-letter state, and an HTTP sender; wire webhook adapters into
        channelappend's durable post-commit PersistAfter sink, the batch offline
        recipient observer, and the presence online-status observer
        Plugin hooks and webhook sinks coexist on the same side-effect surfaces.
-       Webhook failures are best-effort side effects and must not affect
+       user.onlinestatus remains best-effort; critical webhook failures remain
+       durable post-commit side effects and must not affect
        SENDACK, durable append, recipient delivery, or conversation active
        admission.
   -> when the cluster exposes Channel runtime append plus channel append authority:
@@ -336,6 +338,11 @@ New(Config)
      control snapshots through the management usecase; the realtime monitor
      does not read from `topCollector`
   -> create pkg/gateway.Gateway with WKProto CONNECT authentication only when listeners are configured
+	   Token authentication is enabled by default by the product config. The app
+	   resolves `uid + device_flag` through the routed Slot metadata device store,
+	   compares the registered token without exposing token material, propagates
+	   the registered DeviceLevel into the gateway session, and rejects CONNECT
+	   when metadata is missing, unavailable, timed out, or inconsistent.
 ```
 
 The DB Inspect reader is app-owned because only the composition root derives
@@ -657,7 +664,7 @@ Start(ctx)
      Controller task in the local control snapshot; failures are logged and
      do not block service startup
   -> seed join loop Start(ctx): retry JoinNode against stable-order seeds when seed-join config is present
-  -> wait for cluster write routing when the cluster runtime exposes route snapshots; the gate also runs the cluster write probe, which proves Slot metadata writes and Channel runtime placement data-node candidates before gateway SEND admission
+  -> wait for cluster write routing when the cluster runtime exposes route snapshots; the gate also runs the cluster write probe, which proves Slot metadata writes and Channel runtime placement data-node candidates before gateway SEND admission; its per-attempt deadline scales with the bounded physical-Slot probe count so a healthy multi-node probe is not repeatedly canceled mid-commit
   -> conversation authority route lifecycle Start(ctx): watch route authorities and seed current targets
   -> conversation active flush worker Start(ctx): persist dirty active rows
      periodically or on a coalesced cache-pressure wakeup
@@ -720,13 +727,15 @@ so accepted durable commits can enqueue plugin side effects until the append
 runtime is stopped. Desired plugin config remains node-local in this phase and
 is applied by the v2 plugin usecase during startup, local config updates, and
 hook candidate selection.
-When webhook delivery is enabled, the app also wires a node-local bounded
-workqueue runtime with an HTTP sender before delivery and channelappend
+When webhook delivery is enabled, the app also wires a node-local durable
+outbox runtime with an HTTP sender before delivery and channelappend
 producers open. Channelappend and presence see only small adapter ports:
 post-commit PersistAfter, batch offline recipient observation, and online-status
-observation. Webhook queue admission, retries, and HTTP failures remain
-best-effort and do not change SENDACK, durable append, plugin hooks,
-conversation active admission, or owner delivery.
+observation. Critical msg.notify/msg.offline records are sync-persisted before
+bounded dispatch, survive restart, retry with the same stable delivery ID, and
+move to dead-letter after the configured maximum attempts. Online-status
+delivery remains best-effort. Neither path changes SENDACK, durable append,
+plugin hooks, conversation active admission, or owner delivery.
 The manager drains accepted fanout before the retry scheduler stops, so queued
 retries remain available while accepted manager work completes. Stale pending
 recvacks expire during owner-local push activity.

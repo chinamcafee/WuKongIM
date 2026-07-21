@@ -62,6 +62,12 @@ func (s *HTTPSender) Send(ctx context.Context, req SendRequest) error {
 		return fmt.Errorf("webhook: create http request failed")
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if req.ID != "" {
+		httpReq.Header.Set("X-WK-Webhook-ID", req.ID)
+	}
+	if req.Attempt > 0 {
+		httpReq.Header.Set("X-WK-Webhook-Attempt", strconv.Itoa(req.Attempt))
+	}
 	resp, err := s.client.Do(httpReq)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -71,7 +77,7 @@ func (s *HTTPSender) Send(ctx context.Context, req SendRequest) error {
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return fmt.Errorf("webhook: http status %s", strconv.Itoa(resp.StatusCode))
 	}
 	return nil

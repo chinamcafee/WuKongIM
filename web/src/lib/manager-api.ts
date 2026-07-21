@@ -73,6 +73,8 @@ import type {
   ManagerPermission,
   ManagerPermissionsResponse,
   ManagerWebhookConfigResponse,
+  ManagerWebhookOutboxReplayResponse,
+  ManagerWebhookOutboxResponse,
   ManagerNodePluginsResponse,
   ManagerPlugin,
   ManagerPluginBindingMutationResponse,
@@ -537,6 +539,17 @@ export function getPermissions() {
 
 export function getWebhookConfig() {
   return jsonManagerFetch<ManagerWebhookConfigResponse>("/manager/webhooks/config")
+}
+
+export function getWebhookOutbox() {
+  return jsonManagerFetch<ManagerWebhookOutboxResponse>("/manager/webhooks/outbox")
+}
+
+export function replayWebhookDeadLetters(ids: string[]) {
+  return jsonManagerFetch<ManagerWebhookOutboxReplayResponse>("/manager/webhooks/outbox/replay", {
+    method: "POST",
+    body: JSON.stringify({ ids }),
+  })
 }
 
 export function getDBInspectTables(params?: { nodeId?: number }) {

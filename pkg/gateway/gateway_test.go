@@ -58,7 +58,7 @@ func TestGatewayWKProtoAuthRejectsBadToken(t *testing.T) {
 		Handler: handler,
 		Authenticator: gateway.NewWKProtoAuthenticator(gateway.WKProtoAuthOptions{
 			TokenAuthOn: true,
-			VerifyToken: func(uid string, deviceFlag frame.DeviceFlag, token string) (frame.DeviceLevel, error) {
+			VerifyToken: func(_ context.Context, uid string, deviceFlag frame.DeviceFlag, token string) (frame.DeviceLevel, error) {
 				if uid == "u1" && token == "good-token" {
 					return frame.DeviceLevelMaster, nil
 				}
@@ -148,7 +148,7 @@ func TestGatewayWKProtoAuthAcceptsConnectBeforeDispatchingFrames(t *testing.T) {
 			Now: func() time.Time {
 				return time.UnixMilli(10_000)
 			},
-			VerifyToken: func(uid string, deviceFlag frame.DeviceFlag, token string) (frame.DeviceLevel, error) {
+			VerifyToken: func(_ context.Context, uid string, deviceFlag frame.DeviceFlag, token string) (frame.DeviceLevel, error) {
 				if uid == "u1" && token == "good-token" {
 					return frame.DeviceLevelMaster, nil
 				}
@@ -208,7 +208,7 @@ func TestGatewayWKProtoActivationSeesDeviceIDBeforeConnectSucceeds(t *testing.T)
 		Handler: handler,
 		Authenticator: gateway.NewWKProtoAuthenticator(gateway.WKProtoAuthOptions{
 			TokenAuthOn: true,
-			VerifyToken: func(uid string, deviceFlag frame.DeviceFlag, token string) (frame.DeviceLevel, error) {
+			VerifyToken: func(_ context.Context, uid string, deviceFlag frame.DeviceFlag, token string) (frame.DeviceLevel, error) {
 				if uid == "u1" && token == "good-token" {
 					return frame.DeviceLevelMaster, nil
 				}

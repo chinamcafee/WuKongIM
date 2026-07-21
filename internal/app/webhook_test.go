@@ -37,8 +37,9 @@ func TestNewWiresWebhookSubsystemWhenEnabled(t *testing.T) {
 }
 
 func TestWebhookConfigSnapshotUsesNormalizedStartupConfig(t *testing.T) {
+	dataDir := t.TempDir()
 	app, err := newTestApp(t, Config{
-		DataDir: t.TempDir(),
+		DataDir: dataDir,
 		Webhook: WebhookConfig{
 			HTTPAddr:    "http://127.0.0.1:8080/webhook",
 			FocusEvents: []string{runtimewebhook.EventMsgNotify},
@@ -57,13 +58,18 @@ func TestWebhookConfigSnapshotUsesNormalizedStartupConfig(t *testing.T) {
 		SupportedEvents:           []string{runtimewebhook.EventMsgNotify, runtimewebhook.EventMsgOffline, runtimewebhook.EventUserOnlineStatus},
 		QueueSize:                 2048,
 		Workers:                   8,
-		MsgNotifyBatchMaxItems:    100,
-		MsgNotifyBatchMaxWait:     "500ms",
 		OnlineStatusBatchMaxItems: 512,
 		OnlineStatusBatchMaxWait:  "2s",
 		OfflineUIDBatchSize:       512,
 		RequestTimeout:            "5s",
 		RetryMaxAttempts:          3,
+		OutboxDir:                 dataDir + "/webhook-outbox",
+		OutboxMaxEntries:          1_000_000,
+		OutboxMaxBytes:            4 << 30,
+		OutboxDispatchBatchSize:   100,
+		OutboxRetryBaseDelay:      "1s",
+		OutboxRetryMaxDelay:       "5m0s",
+		OutboxDeliveredRetention:  "168h0m0s",
 		Source:                    "startup_config",
 		RequiresRestart:           true,
 	}, snapshot)
@@ -87,13 +93,17 @@ func TestWebhookConfigSnapshotReportsDisabledDefaults(t *testing.T) {
 		SupportedEvents:           []string{runtimewebhook.EventMsgNotify, runtimewebhook.EventMsgOffline, runtimewebhook.EventUserOnlineStatus},
 		QueueSize:                 1024,
 		Workers:                   16,
-		MsgNotifyBatchMaxItems:    100,
-		MsgNotifyBatchMaxWait:     "500ms",
 		OnlineStatusBatchMaxItems: 512,
 		OnlineStatusBatchMaxWait:  "2s",
 		OfflineUIDBatchSize:       512,
 		RequestTimeout:            "5s",
 		RetryMaxAttempts:          3,
+		OutboxMaxEntries:          1_000_000,
+		OutboxMaxBytes:            4 << 30,
+		OutboxDispatchBatchSize:   100,
+		OutboxRetryBaseDelay:      "1s",
+		OutboxRetryMaxDelay:       "5m0s",
+		OutboxDeliveredRetention:  "168h0m0s",
 		Source:                    "startup_config",
 		RequiresRestart:           true,
 	}, snapshot)
@@ -279,10 +289,43 @@ func TestWebhookLifecycleStartsBeforeChannelAppendAndStopsAfterDelivery(t *testi
 	})
 }
 
+func TestWebhookOutboxReadinessFailsClosedWhenEnabled(t *testing.T) {
+	disabled := &App{}
+	require.NoError(t, disabled.webhookOutboxReadiness(context.Background()))
+
+	missing := &App{cfg: Config{Webhook: WebhookConfig{Enabled: true}}}
+	require.EqualError(t, missing.webhookOutboxReadiness(context.Background()), "webhook outbox not configured")
+
+	failing := &App{
+		cfg:           Config{Webhook: WebhookConfig{Enabled: true}},
+		webhookOutbox: &recordingWebhookOutboxRuntime{statsErr: runtimewebhook.ErrOutboxClosed},
+	}
+	require.ErrorContains(t, failing.webhookOutboxReadiness(context.Background()), "webhook outbox not ready")
+
+	ready := &App{
+		cfg:           Config{Webhook: WebhookConfig{Enabled: true}},
+		webhookOutbox: &recordingWebhookOutboxRuntime{},
+	}
+	require.NoError(t, ready.webhookOutboxReadiness(context.Background()))
+}
+
 type recordingWebhookRuntime struct {
 	notify  []runtimewebhook.Message
 	offline []runtimewebhook.OfflineMessage
 	online  []runtimewebhook.OnlineStatus
+}
+
+type recordingWebhookOutboxRuntime struct {
+	recordingWorkerRuntime
+	statsErr error
+}
+
+func (r *recordingWebhookOutboxRuntime) OutboxStats(context.Context) (runtimewebhook.OutboxStats, error) {
+	return runtimewebhook.OutboxStats{}, r.statsErr
+}
+
+func (r *recordingWebhookOutboxRuntime) ReplayDeadLetters(context.Context, []string) (int, error) {
+	return 0, nil
 }
 
 func (r *recordingWebhookRuntime) Notify(_ context.Context, msg runtimewebhook.Message) {

@@ -59,11 +59,11 @@ type RecentConversation struct {
 	// Timestamp is the latest message timestamp in Unix seconds.
 	Timestamp int64
 	// LastMsgSeq is the latest message sequence known to conversation sync.
-	LastMsgSeq uint32
+	LastMsgSeq uint64
 	// LastClientMsgNo is the latest client message number when present.
 	LastClientMsgNo string
 	// ReadToMsgSeq is UID's read cursor for this conversation.
-	ReadToMsgSeq uint32
+	ReadToMsgSeq uint64
 	// Version is the sync compatibility version timestamp.
 	Version int64
 	// RecentMessages contains newest message previews for this conversation.

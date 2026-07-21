@@ -104,6 +104,32 @@ jobs:
       - name: Repeat app real-disk startup and send
         run: go test ./internal/app -run '^TestStaticMultiNodeClusterStartsControllerVoters$' -count=3 -timeout=12m
 
+  linku-v3-contract:
+    name: Link-U v3 contract gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Verify Go toolchain
+        run: test "$(go env GOVERSION)" = "go1.25.11"
+      - name: Run static and WKProto v6 contract diff
+        run: go test ./test/contract/... -count=1
+      - name: Build contract binary once
+        run: go build -o "$RUNNER_TEMP/wukongim-linku-v3-contract" ./cmd/wukongim
+      - name: Run single-node and three-node black-box contract
+        env:
+          WK_E2E_BINARY: ${{ runner.temp }}/wukongim-linku-v3-contract
+        run: go test -tags=e2e ./test/e2e/message/linku_v3_contract -count=1 -timeout=12m -p=1
+
   web:
     name: Web
     runs-on: ubuntu-24.04

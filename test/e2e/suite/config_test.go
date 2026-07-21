@@ -34,6 +34,7 @@ func TestRenderSingleNodeConfigUsesWukongIMTOML(t *testing.T) {
 	require.Contains(t, cfg, `listen_addr = "127.0.0.1:13001"`+"\n")
 	require.Contains(t, cfg, "metrics_enable = true\n")
 	require.Contains(t, cfg, `listeners = [{ address = "127.0.0.1:12001", name = "tcp-wkproto", network = "tcp", protocol = "wkproto", transport = "gnet" }]`)
+	require.Contains(t, cfg, "token_auth_enabled = false\n")
 	require.NotContains(t, cfg, "WK_CLUSTER_SLOT_COUNT")
 	require.NotContains(t, cfg, "[manager]")
 }

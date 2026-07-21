@@ -67,6 +67,8 @@ permissions = [
 ]
 
 [gateway]
+token_auth_enabled = true
+token_auth_timeout = "3s"
 gnet_multicore = true
 gnet_num_event_loop = 4
 runtime_async_send_workers = 128

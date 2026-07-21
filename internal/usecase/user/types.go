@@ -165,6 +165,13 @@ func (c UpdateTokenCommand) validate() error {
 		return errors.New("token不能为空！")
 	case strings.Contains(c.UID, "@"), strings.Contains(c.UID, "#"), strings.Contains(c.UID, "&"):
 		return errors.New("uid不能包含特殊字符！")
+	case c.DeviceFlag != protocolmeta.DeviceFlagApp &&
+		c.DeviceFlag != protocolmeta.DeviceFlagWeb &&
+		c.DeviceFlag != protocolmeta.DeviceFlagPC:
+		return errors.New("device_flag不受支持！")
+	case c.DeviceLevel != protocolmeta.DeviceLevelSlave &&
+		c.DeviceLevel != protocolmeta.DeviceLevelMaster:
+		return errors.New("device_level不受支持！")
 	default:
 		return nil
 	}

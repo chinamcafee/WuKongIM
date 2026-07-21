@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"time"
 
 	gatewaytypes "github.com/WuKongIM/WuKongIM/pkg/gateway/types"
@@ -28,11 +29,13 @@ type WKProtoAuthOptions struct {
 	TokenAuthOn       bool
 	EncryptionEnabled bool
 	DisableEncryption bool
-	NodeID            uint64
-	Now               func() time.Time
+	// RequiredProtocolVersion rejects every other CONNECT version when non-zero.
+	RequiredProtocolVersion uint8
+	NodeID                  uint64
+	Now                     func() time.Time
 
 	IsVisitor   func(uid string) bool
-	VerifyToken func(uid string, deviceFlag frame.DeviceFlag, token string) (frame.DeviceLevel, error)
+	VerifyToken func(ctx context.Context, uid string, deviceFlag frame.DeviceFlag, token string) (frame.DeviceLevel, error)
 	IsBanned    func(uid string) (bool, error)
 }
 
@@ -49,10 +52,19 @@ func NewWKProtoAuthenticator(opts WKProtoAuthOptions) Authenticator {
 		encryptionEnabled = true
 	}
 
-	return AuthenticatorFunc(func(_ *Context, connect *frame.ConnectPacket) (*AuthResult, error) {
+	return AuthenticatorFunc(func(authContext *Context, connect *frame.ConnectPacket) (*AuthResult, error) {
 		if connect == nil {
 			return &AuthResult{
 				Connack: &frame.ConnackPacket{ReasonCode: frame.ReasonAuthFail},
+			}, nil
+		}
+		if opts.RequiredProtocolVersion != 0 && connect.Version != opts.RequiredProtocolVersion {
+			return &AuthResult{
+				Connack: &frame.ConnackPacket{
+					Framer:        frame.Framer{HasServerVersion: true},
+					ReasonCode:    frame.ReasonProtocolUpgradeRequired,
+					ServerVersion: opts.RequiredProtocolVersion,
+				},
 			}, nil
 		}
 
@@ -64,7 +76,11 @@ func NewWKProtoAuthenticator(opts WKProtoAuthOptions) Authenticator {
 				}, nil
 			}
 
-			level, err := opts.VerifyToken(connect.UID, connect.DeviceFlag, connect.Token)
+			ctx := context.Background()
+			if authContext != nil && authContext.RequestContext != nil {
+				ctx = authContext.RequestContext
+			}
+			level, err := opts.VerifyToken(ctx, connect.UID, connect.DeviceFlag, connect.Token)
 			if err != nil {
 				return &AuthResult{
 					Connack: &frame.ConnackPacket{ReasonCode: frame.ReasonAuthFail},
@@ -87,7 +103,9 @@ func NewWKProtoAuthenticator(opts WKProtoAuthOptions) Authenticator {
 		}
 
 		serverVersion := connect.Version
-		if serverVersion == 0 || serverVersion > frame.LatestVersion {
+		if opts.RequiredProtocolVersion != 0 {
+			serverVersion = opts.RequiredProtocolVersion
+		} else if serverVersion == 0 || serverVersion > frame.LatestVersion {
 			serverVersion = frame.LatestVersion
 		}
 
@@ -97,7 +115,7 @@ func NewWKProtoAuthenticator(opts WKProtoAuthOptions) Authenticator {
 			ServerVersion: serverVersion,
 			NodeId:        opts.NodeID,
 		}
-		connack.HasServerVersion = connect.Version > 3
+		connack.HasServerVersion = connect.Version > 3 || opts.RequiredProtocolVersion != 0
 
 		sessionValues := map[string]any{
 			SessionValueUID:             connect.UID,

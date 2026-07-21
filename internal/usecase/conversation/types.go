@@ -147,11 +147,11 @@ type SyncConversation struct {
 	// Timestamp is the latest message timestamp in Unix seconds.
 	Timestamp int64
 	// LastMsgSeq is the newest visible channel sequence.
-	LastMsgSeq uint32
+	LastMsgSeq uint64
 	// LastClientMsgNo is the client idempotency key of the newest visible message.
 	LastClientMsgNo string
 	// ReadToMsgSeq is the read floor returned to legacy clients.
-	ReadToMsgSeq uint32
+	ReadToMsgSeq uint64
 	// Version is a compatibility timestamp for this conversation row.
 	Version int64
 	// Recents contains recent messages for this conversation when requested.

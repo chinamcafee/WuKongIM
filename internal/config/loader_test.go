@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	managementusecase "github.com/WuKongIM/WuKongIM/internal/usecase/management"
 )
@@ -53,6 +54,10 @@ hash_slot_count = 256
 	}
 	if cfg.ConfigPath != path {
 		t.Fatalf("ConfigPath = %q, want %q", cfg.ConfigPath, path)
+	}
+	if !cfg.Gateway.TokenAuthEnabled || cfg.Gateway.TokenAuthTimeout != 3*time.Second {
+		t.Fatalf("gateway token auth defaults = enabled:%v timeout:%s, want true/3s",
+			cfg.Gateway.TokenAuthEnabled, cfg.Gateway.TokenAuthTimeout)
 	}
 }
 

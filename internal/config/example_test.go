@@ -6,7 +6,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestRootTOMLExampleLoads(t *testing.T) {
@@ -47,18 +46,23 @@ func TestV2WKYAMLEquivalentTOMLLoads(t *testing.T) {
 	if cfg.Cluster.Slots.ReplicaCount != 1 || cfg.Cluster.Channel.ReplicaCount != 1 || cfg.Cluster.Slots.HashSlotCount != 256 {
 		t.Fatalf("replica config = slots:%d channels:%d hash_slots:%d", cfg.Cluster.Slots.ReplicaCount, cfg.Cluster.Channel.ReplicaCount, cfg.Cluster.Slots.HashSlotCount)
 	}
-	if cfg.API.ListenAddr != "0.0.0.0:5001" || cfg.API.ExternalTCPAddr != "192.168.10.109:5100" || cfg.API.ExternalWSAddr != "ws://192.168.10.109:5200" {
+	if cfg.API.ListenAddr != "127.0.0.1:5001" || cfg.API.ExternalTCPAddr != "192.168.10.109:5100" || cfg.API.ExternalWSAddr != "ws://192.168.10.109:5200" {
 		t.Fatalf("API config = %#v", cfg.API)
 	}
-	if cfg.Manager.ListenAddr != "0.0.0.0:5300" || cfg.Manager.AuthOn {
+	if cfg.Manager.ListenAddr != "127.0.0.1:5300" || !cfg.Manager.AuthOn || len(cfg.Manager.Users) != 1 {
 		t.Fatalf("manager config = %#v", cfg.Manager)
 	}
-	if len(cfg.Gateway.Listeners) != 2 || !cfg.Message.PersonWhitelistEnabled || !cfg.Delivery.Enabled || !cfg.Plugin.Enable {
-		t.Fatalf("runtime config = listeners:%d whitelist:%t delivery:%t plugin:%t", len(cfg.Gateway.Listeners), cfg.Message.PersonWhitelistEnabled, cfg.Delivery.Enabled, cfg.Plugin.Enable)
+	if len(cfg.Gateway.Listeners) != 2 || !cfg.Gateway.TokenAuthEnabled ||
+		!cfg.Observability.MetricsEnabled || !cfg.Message.PersonWhitelistEnabled ||
+		!cfg.Delivery.Enabled || !cfg.Plugin.Enable {
+		t.Fatalf("runtime config = listeners:%d token_auth:%t metrics:%t whitelist:%t delivery:%t plugin:%t",
+			len(cfg.Gateway.Listeners), cfg.Gateway.TokenAuthEnabled,
+			cfg.Observability.MetricsEnabled, cfg.Message.PersonWhitelistEnabled,
+			cfg.Delivery.Enabled, cfg.Plugin.Enable)
 	}
 	if !cfg.Webhook.Enabled || cfg.Webhook.HTTPAddr != "http://linku-im-processor:LinkU-WuKongIM-Webhook-2026@localhost/link-u-im-processor/webhook" ||
 		!slices.Equal(cfg.Webhook.FocusEvents, []string{"msg.offline", "msg.notify"}) ||
-		cfg.Webhook.NotifyBatchMaxItems != 100 || cfg.Webhook.NotifyBatchMaxWait != 500*time.Millisecond || cfg.Webhook.RetryMaxAttempts != 5 {
+		cfg.Webhook.RetryMaxAttempts != 5 {
 		t.Fatalf("webhook config = %#v", cfg.Webhook)
 	}
 	if cfg.Log.Level != "debug" || cfg.Log.Dir != "./wukongimdata/logs" {

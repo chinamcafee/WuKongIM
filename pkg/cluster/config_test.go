@@ -64,6 +64,9 @@ func TestConfigDefaultStartTimeoutAllowsMultipleScaledWriteProbeAttempts(t *test
 	if got := cfg.Timeouts.Start; got < minimum {
 		t.Fatalf("Timeouts.Start default = %s, want at least %s for multiple scaled write-probe attempts", got, minimum)
 	}
+	if got := cfg.Timeouts.Start; got != 90*time.Second {
+		t.Fatalf("Timeouts.Start default = %s, want 90s three-node cold-start budget", got)
+	}
 }
 
 func TestConfigRejectsInvalidHealthReportTTL(t *testing.T) {

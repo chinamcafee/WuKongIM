@@ -89,8 +89,8 @@ var builtinManagerPermissionResources = []ManagerPermissionResource{
 	},
 	{
 		Resource:    "cluster.webhook",
-		Actions:     []string{"r"},
-		Description: "Read webhook startup configuration snapshots.",
+		Actions:     []string{"r", "w"},
+		Description: "Read webhook state and replay explicitly selected dead letters.",
 	},
 	{
 		Resource:    "cluster.plugin",

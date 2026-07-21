@@ -24,12 +24,6 @@ func TestWebhookConfigDefaultsWhenEndpointConfigured(t *testing.T) {
 	if cfg.Workers != 16 {
 		t.Fatalf("Workers = %d, want 16", cfg.Workers)
 	}
-	if cfg.NotifyBatchMaxItems != 100 {
-		t.Fatalf("NotifyBatchMaxItems = %d, want 100", cfg.NotifyBatchMaxItems)
-	}
-	if cfg.NotifyBatchMaxWait != 500*time.Millisecond {
-		t.Fatalf("NotifyBatchMaxWait = %v, want 500ms", cfg.NotifyBatchMaxWait)
-	}
 	if cfg.OnlineBatchMaxItems != 512 {
 		t.Fatalf("OnlineBatchMaxItems = %d, want 512", cfg.OnlineBatchMaxItems)
 	}
@@ -56,7 +50,6 @@ func TestWebhookConfigRejectsInvalidValues(t *testing.T) {
 		{name: "disabled negative queue", cfg: WebhookConfig{QueueSize: -1}},
 		{name: "negative queue", cfg: WebhookConfig{HTTPAddr: "http://127.0.0.1/hook", QueueSize: -1}},
 		{name: "negative workers", cfg: WebhookConfig{HTTPAddr: "http://127.0.0.1/hook", Workers: -1}},
-		{name: "negative notify batch", cfg: WebhookConfig{HTTPAddr: "http://127.0.0.1/hook", NotifyBatchMaxItems: -1}},
 		{name: "negative online wait", cfg: WebhookConfig{HTTPAddr: "http://127.0.0.1/hook", OnlineBatchMaxWait: -1}},
 		{name: "negative retry", cfg: WebhookConfig{HTTPAddr: "http://127.0.0.1/hook", RetryMaxAttempts: -1}},
 	}

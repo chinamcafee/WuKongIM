@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -66,6 +67,9 @@ func (n *Node) ProbeWriteReady(ctx context.Context) error {
 	}
 
 	slotIDs := selectWriteProbeSlotIDs(slotHashSlots, slotLeaders, n.cfg.NodeID)
+	if validateStatuses {
+		slotIDs = selectValidatedWriteProbeSlotIDs(slotHashSlots, slotLeaders, n.cfg.NodeID)
+	}
 
 	command := metafsm.EncodeNoopCommand()
 	for _, slotID := range slotIDs {
@@ -104,6 +108,11 @@ type writeProbeStatusPlan struct {
 	slotLeaders map[uint32]uint64
 	// slotLeaderTerms records the observed leader term paired with slotLeaders.
 	slotLeaderTerms map[uint32]uint64
+	// Slot assignment fields fence topology changes while allowing unrelated
+	// control revisions, such as health reports, to advance during the probe.
+	slotConfigEpochs     map[uint32]uint64
+	slotPreferredLeaders map[uint32]uint64
+	slotPeers            map[uint32][]uint64
 	// localAssignedSlotIDs includes followers as well as locally led Slots.
 	localAssignedSlotIDs []uint32
 	// localStatusRuntime reads node-local Multi-Raft status without an RPC round trip.
@@ -131,13 +140,16 @@ func (n *Node) captureWriteProbeStatusPlan(snapshot Snapshot) (writeProbeStatusP
 		return writeProbeStatusPlan{}, fmt.Errorf("%w: write probe route revision=%d state_revision=%d hash_slots=%d", ErrRouteNotReady, routeTableRevision(table), stateRevision, snapshot.HashSlotCount)
 	}
 	plan := writeProbeStatusPlan{
-		revision:           stateRevision,
-		hashToSlot:         append([]uint32(nil), table.HashToSlot...),
-		slotHashSlots:      make(map[uint32]uint16),
-		slotLeaders:        make(map[uint32]uint64),
-		slotLeaderTerms:    make(map[uint32]uint64),
-		localStatusRuntime: statusRuntime,
-		remoteStatusCaller: statusCaller,
+		revision:             stateRevision,
+		hashToSlot:           append([]uint32(nil), table.HashToSlot...),
+		slotHashSlots:        make(map[uint32]uint16),
+		slotLeaders:          make(map[uint32]uint64),
+		slotLeaderTerms:      make(map[uint32]uint64),
+		slotConfigEpochs:     make(map[uint32]uint64),
+		slotPreferredLeaders: make(map[uint32]uint64),
+		slotPeers:            make(map[uint32][]uint64),
+		localStatusRuntime:   statusRuntime,
+		remoteStatusCaller:   statusCaller,
 	}
 	for hashSlot, slotID := range table.HashToSlot {
 		if slotID == 0 {
@@ -154,6 +166,9 @@ func (n *Node) captureWriteProbeStatusPlan(snapshot Snapshot) (writeProbeStatusP
 			plan.slotHashSlots[slotID] = uint16(hashSlot)
 			plan.slotLeaders[slotID] = leader
 			plan.slotLeaderTerms[slotID] = table.SlotLeaderTerms[slotID]
+			plan.slotConfigEpochs[slotID] = table.SlotConfigEpochs[slotID]
+			plan.slotPreferredLeaders[slotID] = table.SlotPreferredLeaders[slotID]
+			plan.slotPeers[slotID] = append([]uint64(nil), table.SlotPeers[slotID]...)
 		}
 	}
 	for _, slot := range controlSnapshot.Slots {
@@ -220,6 +235,13 @@ func (n *Node) validateWriteProbeSlotStatuses(ctx context.Context, plan writePro
 	}
 	remoteSlotIDs := make(map[uint64][]uint32)
 	for slotID, leader := range plan.slotLeaders {
+		// A locally assigned replica already reports the authoritative Raft
+		// leader and term below. Do not duplicate that proof with a remote RPC;
+		// doing so makes full-replica clusters create an all-to-all readiness
+		// storm while every node is starting concurrently.
+		if _, locallyAssigned := localSlots[slotID]; locallyAssigned {
+			continue
+		}
 		switch {
 		case leader == 0:
 			return fmt.Errorf("%w: write probe slot=%d has no runtime leader", ErrRouteNotReady, slotID)
@@ -309,12 +331,12 @@ func (n *Node) ensureWriteProbeStatusPlanCurrent(plan writeProbeStatusPlan) erro
 	stateRevision := n.snapshot.StateRevision
 	controlRevision := n.controlSnapshot.Revision
 	n.mu.RUnlock()
-	if stateRevision != plan.revision || controlRevision != plan.revision {
-		return fmt.Errorf("%w: write probe revision changed from %d to state=%d control=%d", ErrRouteNotReady, plan.revision, stateRevision, controlRevision)
+	if stateRevision != controlRevision {
+		return fmt.Errorf("%w: write probe current state/control revision mismatch state=%d control=%d", ErrRouteNotReady, stateRevision, controlRevision)
 	}
 	current := n.router.Table()
-	if current == nil || current.Revision != plan.revision || len(current.HashToSlot) != len(plan.hashToSlot) {
-		return fmt.Errorf("%w: write probe route table changed during validation", ErrRouteNotReady)
+	if current == nil || current.Revision != stateRevision || len(current.HashToSlot) != len(plan.hashToSlot) {
+		return fmt.Errorf("%w: write probe current route revision=%d state_revision=%d", ErrRouteNotReady, routeTableRevision(current), stateRevision)
 	}
 	for i, slotID := range plan.hashToSlot {
 		if current.HashToSlot[i] != slotID {
@@ -325,6 +347,14 @@ func (n *Node) ensureWriteProbeStatusPlanCurrent(plan writeProbeStatusPlan) erro
 		if current.SlotLeaders[slotID] != leader || current.SlotLeaderTerms[slotID] != plan.slotLeaderTerms[slotID] {
 			return fmt.Errorf("%w: write probe slot=%d route authority changed", ErrRouteNotReady, slotID)
 		}
+		if current.SlotConfigEpochs[slotID] != plan.slotConfigEpochs[slotID] ||
+			current.SlotPreferredLeaders[slotID] != plan.slotPreferredLeaders[slotID] ||
+			!slices.Equal(current.SlotPeers[slotID], plan.slotPeers[slotID]) {
+			return fmt.Errorf("%w: write probe slot=%d assignment changed", ErrRouteNotReady, slotID)
+		}
+	}
+	if err := n.probeChannelPlacementReady(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -418,6 +448,32 @@ func selectWriteProbeSlotIDs(slotHashSlots map[uint32]uint16, slotLeaders map[ui
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
+}
+
+// selectValidatedWriteProbeSlotIDs needs only one write after every physical
+// Slot runtime and route authority has already been validated. Prefer a local
+// leader to avoid an all-to-all forwarding storm during concurrent startup;
+// nodes without a local leader still prove the forwarding path through one
+// deterministic remote Slot.
+func selectValidatedWriteProbeSlotIDs(
+	slotHashSlots map[uint32]uint16,
+	slotLeaders map[uint32]uint64,
+	localNodeID uint64,
+) []uint32 {
+	slotIDs := make([]uint32, 0, len(slotHashSlots))
+	for slotID := range slotHashSlots {
+		slotIDs = append(slotIDs, slotID)
+	}
+	sort.Slice(slotIDs, func(i, j int) bool { return slotIDs[i] < slotIDs[j] })
+	for _, slotID := range slotIDs {
+		if slotLeaders[slotID] == localNodeID {
+			return []uint32{slotID}
+		}
+	}
+	if len(slotIDs) == 0 {
+		return nil
+	}
+	return slotIDs[:1]
 }
 
 func (n *Node) probeChannelPlacementReady() error {

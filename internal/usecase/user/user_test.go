@@ -45,6 +45,8 @@ func TestUpdateTokenValidatesLegacyInputs(t *testing.T) {
 		{name: "missing uid", cmd: UpdateTokenCommand{Token: "token-1"}, want: "uid不能为空！"},
 		{name: "missing token", cmd: UpdateTokenCommand{UID: "u1"}, want: "token不能为空！"},
 		{name: "special char", cmd: UpdateTokenCommand{UID: "u@1", Token: "token-1"}, want: "uid不能包含特殊字符！"},
+		{name: "unsupported device flag", cmd: UpdateTokenCommand{UID: "u1", Token: "token-1", DeviceFlag: 98}, want: "device_flag不受支持！"},
+		{name: "unsupported device level", cmd: UpdateTokenCommand{UID: "u1", Token: "token-1", DeviceLevel: 9}, want: "device_level不受支持！"},
 		{name: "system uid", cmd: UpdateTokenCommand{UID: DefaultSystemUID, Token: "token-1"}, want: "系统账号不允许更新token！"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

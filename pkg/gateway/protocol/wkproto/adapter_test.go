@@ -183,7 +183,7 @@ func TestAdapterDecodeDetachesInboundSendPayloadFromInputBuffer(t *testing.T) {
 func TestAdapterUsesSessionVersionForOutboundFrames(t *testing.T) {
 	adapter := adapterpkg.New()
 	sess := testkit.NewProtocolSession()
-	sess.SetValue(gateway.SessionValueProtocolVersion, uint8(5))
+	sess.SetValue(gateway.SessionValueProtocolVersion, uint8(frame.LatestVersion))
 
 	encoded, err := adapter.Encode(sess, &frame.SendackPacket{
 		MessageID:   9,
@@ -196,7 +196,7 @@ func TestAdapterUsesSessionVersionForOutboundFrames(t *testing.T) {
 		t.Fatalf("Encode: %v", err)
 	}
 
-	f, _, err := codec.New().DecodeFrame(encoded, 5)
+	f, _, err := codec.New().DecodeFrame(encoded, frame.LatestVersion)
 	if err != nil {
 		t.Fatalf("DecodeFrame: %v", err)
 	}
@@ -206,6 +206,30 @@ func TestAdapterUsesSessionVersionForOutboundFrames(t *testing.T) {
 	}
 	if ack.MessageSeq != 42 {
 		t.Fatalf("MessageSeq = %d, want 42", ack.MessageSeq)
+	}
+}
+
+func TestAdapterDefaultsOutboundFramesToV6(t *testing.T) {
+	adapter := adapterpkg.New()
+	want := uint64(^uint32(0)) + 7
+
+	encoded, err := adapter.Encode(nil, &frame.SendackPacket{
+		MessageID:   9,
+		MessageSeq:  want,
+		ClientSeq:   7,
+		ClientMsgNo: "m-v6",
+		ReasonCode:  frame.ReasonSuccess,
+	}, session.OutboundMeta{})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	f, _, err := codec.New().DecodeFrame(encoded, frame.LatestVersion)
+	if err != nil {
+		t.Fatalf("DecodeFrame: %v", err)
+	}
+	ack, ok := f.(*frame.SendackPacket)
+	if !ok || ack.MessageSeq != want {
+		t.Fatalf("decoded = %#v, want v6 message_seq %d", f, want)
 	}
 }
 

@@ -42,6 +42,21 @@ func (c *WKProtoClient) Connect(addr, uid, deviceID string) error {
 
 // ConnectContext opens the TCP connection and returns the successful Connack.
 func (c *WKProtoClient) ConnectContext(ctx context.Context, addr, uid, deviceID string) (*frame.ConnackPacket, error) {
+	return c.ConnectWithTokenContext(ctx, addr, uid, deviceID, "", frame.APP)
+}
+
+// ConnectWithToken opens the TCP connection with explicit token and device identity.
+func (c *WKProtoClient) ConnectWithToken(addr, uid, deviceID, token string, deviceFlag frame.DeviceFlag) error {
+	_, err := c.ConnectWithTokenContext(context.Background(), addr, uid, deviceID, token, deviceFlag)
+	return err
+}
+
+// ConnectWithTokenContext completes a token-authenticated WKProto handshake.
+func (c *WKProtoClient) ConnectWithTokenContext(
+	ctx context.Context,
+	addr, uid, deviceID, token string,
+	deviceFlag frame.DeviceFlag,
+) (*frame.ConnackPacket, error) {
 	if c == nil {
 		return nil, fmt.Errorf("wkproto client: nil client")
 	}
@@ -62,7 +77,8 @@ func (c *WKProtoClient) ConnectContext(ctx context.Context, addr, uid, deviceID 
 	connack, err := inner.Connect(ctx, wkclient.ConnectOptions{
 		UID:        uid,
 		DeviceID:   deviceID,
-		DeviceFlag: frame.APP,
+		DeviceFlag: deviceFlag,
+		Token:      token,
 	})
 	if err != nil {
 		_ = inner.Close()

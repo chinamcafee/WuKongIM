@@ -84,6 +84,8 @@ console = true
 format = "console"
 
 [gateway]
+token_auth_enabled = true
+token_auth_timeout = "3s"
 listeners = [{ name = "tcp-wkproto", network = "tcp", address = "127.0.0.1:5113", transport = "gnet", protocol = "wkproto" }, { name = "ws-gateway", network = "websocket", address = "127.0.0.1:5213", transport = "gnet", protocol = "wsmux" }]
 gnet_multicore = true
 gnet_num_event_loop = 0

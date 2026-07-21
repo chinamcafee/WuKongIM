@@ -234,13 +234,18 @@ export function WebhooksPage() {
                   {[
                     ["webhooks.queueSize", intl.formatNumber(config.queue_size)],
                     ["webhooks.workers", intl.formatNumber(config.workers)],
-                    ["webhooks.messageBatchItems", intl.formatNumber(config.msg_notify_batch_max_items)],
-                    ["webhooks.messageBatchWait", config.msg_notify_batch_max_wait],
                     ["webhooks.onlineStatusBatchItems", intl.formatNumber(config.online_status_batch_max_items)],
                     ["webhooks.onlineStatusBatchWait", config.online_status_batch_max_wait],
                     ["webhooks.offlineUidBatchSize", intl.formatNumber(config.offline_uid_batch_size)],
                     ["webhooks.requestTimeout", config.request_timeout],
                     ["webhooks.retryAttempts", intl.formatNumber(config.retry_max_attempts)],
+                    ["webhooks.outboxDir", config.outbox_dir],
+                    ["webhooks.outboxMaxEntries", intl.formatNumber(config.outbox_max_entries)],
+                    ["webhooks.outboxMaxBytes", intl.formatNumber(config.outbox_max_bytes)],
+                    ["webhooks.outboxDispatchBatchSize", intl.formatNumber(config.outbox_dispatch_batch_size)],
+                    ["webhooks.outboxRetryBaseDelay", config.outbox_retry_base_delay],
+                    ["webhooks.outboxRetryMaxDelay", config.outbox_retry_max_delay],
+                    ["webhooks.outboxDeliveredRetention", config.outbox_delivered_retention],
                   ].map(([labelId, value]) => (
                     <tr className="border-t border-border first:border-t-0" key={labelId}>
                       <th className="w-64 px-3 py-3 text-left font-medium text-muted-foreground">

@@ -40,13 +40,18 @@ function webhookConfig(overrides: Partial<ManagerWebhookConfigResponse> = {}): M
     supported_events: ["msg.notify", "msg.offline"],
     queue_size: 2048,
     workers: 4,
-    msg_notify_batch_max_items: 128,
-    msg_notify_batch_max_wait: "500ms",
     online_status_batch_max_items: 64,
     online_status_batch_max_wait: "1s",
     offline_uid_batch_size: 200,
     request_timeout: "3s",
     retry_max_attempts: 5,
+    outbox_dir: "/tmp/webhook-outbox",
+    outbox_max_entries: 1000000,
+    outbox_max_bytes: 4294967296,
+    outbox_dispatch_batch_size: 100,
+    outbox_retry_base_delay: "1s",
+    outbox_retry_max_delay: "5m0s",
+    outbox_delivered_retention: "168h0m0s",
     source: "wukongim.conf",
     requires_restart: false,
     ...overrides,
@@ -69,13 +74,18 @@ test("renders enabled webhook config with endpoint and selected focus events", a
     supported_events: ["msg.notify", "msg.offline", "user.onlinestatus"],
     queue_size: 2048,
     workers: 4,
-    msg_notify_batch_max_items: 128,
-    msg_notify_batch_max_wait: "500ms",
     online_status_batch_max_items: 64,
     online_status_batch_max_wait: "1s",
     offline_uid_batch_size: 200,
     request_timeout: "3s",
     retry_max_attempts: 5,
+    outbox_dir: "/tmp/webhook-outbox",
+    outbox_max_entries: 1000000,
+    outbox_max_bytes: 4294967296,
+    outbox_dispatch_batch_size: 100,
+    outbox_retry_base_delay: "1s",
+    outbox_retry_max_delay: "5m0s",
+    outbox_delivered_retention: "168h0m0s",
     source: "wukongim.conf",
     requires_restart: true,
   })
@@ -97,10 +107,10 @@ test("renders enabled webhook config with endpoint and selected focus events", a
   expect(within(deliveryTable).getByText("2,048")).toBeInTheDocument()
   expect(within(deliveryTable).getByText("Workers")).toBeInTheDocument()
   expect(within(deliveryTable).getByText("4")).toBeInTheDocument()
-  expect(within(deliveryTable).getByText("Message batch wait")).toBeInTheDocument()
-  expect(within(deliveryTable).getByText("500ms")).toBeInTheDocument()
+  expect(within(deliveryTable).getByText("Durable outbox directory")).toBeInTheDocument()
+  expect(within(deliveryTable).getByText("/tmp/webhook-outbox")).toBeInTheDocument()
   expect(within(deliveryTable).getByText("Online status batch wait")).toBeInTheDocument()
-  expect(within(deliveryTable).getByText("1s")).toBeInTheDocument()
+  expect(within(deliveryTable).getAllByText("1s")).toHaveLength(2)
   expect(within(deliveryTable).getByText("Retry attempts")).toBeInTheDocument()
   expect(within(deliveryTable).getByText("5")).toBeInTheDocument()
 })
@@ -113,13 +123,18 @@ test("renders disabled webhook config with empty endpoint and all events", async
     supported_events: ["msg.notify", "msg.offline"],
     queue_size: 1024,
     workers: 2,
-    msg_notify_batch_max_items: 100,
-    msg_notify_batch_max_wait: "1s",
     online_status_batch_max_items: 80,
     online_status_batch_max_wait: "2s",
     offline_uid_batch_size: 150,
     request_timeout: "5s",
     retry_max_attempts: 3,
+    outbox_dir: "/tmp/webhook-outbox",
+    outbox_max_entries: 1000000,
+    outbox_max_bytes: 4294967296,
+    outbox_dispatch_batch_size: 100,
+    outbox_retry_base_delay: "1s",
+    outbox_retry_max_delay: "5m0s",
+    outbox_delivered_retention: "168h0m0s",
     source: "environment",
     requires_restart: false,
   })
@@ -157,13 +172,18 @@ test("renders successful config without editable controls", async () => {
     supported_events: ["msg.notify"],
     queue_size: 2048,
     workers: 4,
-    msg_notify_batch_max_items: 128,
-    msg_notify_batch_max_wait: "500ms",
     online_status_batch_max_items: 64,
     online_status_batch_max_wait: "1s",
     offline_uid_batch_size: 200,
     request_timeout: "3s",
     retry_max_attempts: 5,
+    outbox_dir: "/tmp/webhook-outbox",
+    outbox_max_entries: 1000000,
+    outbox_max_bytes: 4294967296,
+    outbox_dispatch_batch_size: 100,
+    outbox_retry_base_delay: "1s",
+    outbox_retry_max_delay: "5m0s",
+    outbox_delivered_retention: "168h0m0s",
     source: "wukongim.conf",
     requires_restart: false,
   })

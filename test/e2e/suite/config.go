@@ -63,6 +63,9 @@ func RenderClusterConfig(local NodeSpec, nodes []NodeSpec) string {
 		{key: "WK_METRICS_ENABLE", value: "true"},
 		{key: "WK_GATEWAY_LISTENERS", value: renderGatewayListeners(local.GatewayAddr)},
 		{key: "WK_GATEWAY_SEND_TIMEOUT", value: "5s"},
+		// Most scenarios do not provision /user/token metadata. Token-auth tests
+		// must opt in explicitly through WithNodeConfigOverrides.
+		{key: "WK_GATEWAY_TOKEN_AUTH_ENABLED", value: "false"},
 	}
 	if local.ManagerAddr != "" {
 		lines = append(lines, configLine{key: "WK_MANAGER_LISTEN_ADDR", value: local.ManagerAddr})
@@ -107,6 +110,9 @@ func RenderSeedJoinNodeConfig(local NodeSpec, cfg SeedJoinNodeConfig) string {
 		{key: "WK_METRICS_ENABLE", value: "true"},
 		{key: "WK_GATEWAY_LISTENERS", value: renderGatewayListeners(local.GatewayAddr)},
 		{key: "WK_GATEWAY_SEND_TIMEOUT", value: "5s"},
+		// Most scenarios do not provision /user/token metadata. Token-auth tests
+		// must opt in explicitly through WithNodeConfigOverrides.
+		{key: "WK_GATEWAY_TOKEN_AUTH_ENABLED", value: "false"},
 	}
 	if local.ManagerAddr != "" {
 		lines = append(lines, configLine{key: "WK_MANAGER_LISTEN_ADDR", value: local.ManagerAddr})

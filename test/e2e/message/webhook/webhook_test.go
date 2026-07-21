@@ -33,8 +33,6 @@ func TestWukongIMWebhookReceivesNotifyOfflineAndOnlineStatus(t *testing.T) {
 		"WK_WEBHOOK_HTTP_ADDR":                     sink.URL(),
 		"WK_WEBHOOK_QUEUE_SIZE":                    "64",
 		"WK_WEBHOOK_WORKERS":                       "2",
-		"WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_ITEMS":    "1",
-		"WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_WAIT":     "1ms",
 		"WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_ITEMS": "1",
 		"WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_WAIT":  "1ms",
 		"WK_WEBHOOK_OFFLINE_UID_BATCH_SIZE":        "32",
@@ -104,8 +102,10 @@ func TestWukongIMWebhookReceivesNotifyOfflineAndOnlineStatus(t *testing.T) {
 		return fmt.Errorf("notify messages = %#v, want committed sendack message", messages)
 	})
 	require.Equal(t, "application/json", notifyReq.ContentType)
+	require.NotEmpty(t, notifyReq.ID)
+	require.Equal(t, "1", notifyReq.Attempt)
 
-	sink.requireEvent(t, webhookEventMsgOffline, node, func(req webhookRequest) error {
+	offlineReq := sink.requireEvent(t, webhookEventMsgOffline, node, func(req webhookRequest) error {
 		offline, err := decodeOffline(req.Body)
 		if err != nil {
 			return err
@@ -121,6 +121,8 @@ func TestWukongIMWebhookReceivesNotifyOfflineAndOnlineStatus(t *testing.T) {
 		}
 		return nil
 	})
+	require.NotEmpty(t, offlineReq.ID)
+	require.Equal(t, "1", offlineReq.Attempt)
 }
 
 type webhookSink struct {
@@ -133,6 +135,8 @@ type webhookRequest struct {
 	Method      string
 	ContentType string
 	Event       string
+	ID          string
+	Attempt     string
 	Body        []byte
 }
 
@@ -150,6 +154,8 @@ func newWebhookSink(t *testing.T) *webhookSink {
 			Method:      r.Method,
 			ContentType: r.Header.Get("Content-Type"),
 			Event:       r.URL.Query().Get("event"),
+			ID:          r.Header.Get("X-WK-Webhook-ID"),
+			Attempt:     r.Header.Get("X-WK-Webhook-Attempt"),
 			Body:        append([]byte(nil), body...),
 		})
 		sink.mu.Unlock()

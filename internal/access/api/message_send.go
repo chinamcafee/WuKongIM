@@ -183,6 +183,10 @@ func (s *Server) handleSendMessage(c *gin.Context) {
 		return
 	}
 	if req.WaitForPersist == 1 {
+		if result.Reason != messageusecase.ReasonSuccess {
+			writePersistReasonError(c, result.Reason)
+			return
+		}
 		deduplicated := 0
 		if result.Deduplicated {
 			deduplicated = 1
@@ -200,6 +204,28 @@ func (s *Server) handleSendMessage(c *gin.Context) {
 		MessageID:  int64(result.MessageID),
 		MessageSeq: result.MessageSeq,
 		Reason:     uint8(mapMessageReason(result.Reason)),
+	})
+}
+
+func writePersistReasonError(c *gin.Context, reason messageusecase.Reason) {
+	mapped := mapMessageReason(reason)
+	status := http.StatusForbidden
+	code := "send_rejected"
+	message := "消息未通过发送权限检查"
+	retryable := false
+	if mapped == frame.ReasonSystemError || mapped == frame.ReasonNodeNotMatch {
+		status = http.StatusServiceUnavailable
+		code = "send_unavailable"
+		message = "消息发送服务暂时不可用"
+		retryable = true
+	} else if mapped == frame.ReasonPayloadDecodeError {
+		status = http.StatusBadRequest
+		code = "send_invalid"
+		message = "消息发送请求无效"
+	}
+	c.JSON(status, gin.H{
+		"status": status, "code": code, "msg": message,
+		"retryable": retryable, "reason": uint8(mapped),
 	})
 }
 

@@ -119,6 +119,28 @@ func TestSyncReadsOnlyNormalKindRows(t *testing.T) {
 	}
 }
 
+func TestSyncPreservesUint64MessageSequences(t *testing.T) {
+	store := newConversationSyncStore()
+	want := uint64(^uint32(0)) + 99
+	store.active = []metadb.ConversationState{{
+		UID: "u1", Kind: metadb.ConversationKindNormal, ChannelID: "g-u64", ChannelType: 2,
+		ReadSeq: want - 1, ActiveAt: 100,
+	}}
+	store.latest[ConversationKey{ChannelID: "g-u64", ChannelType: 2}] = LastMessage{
+		MessageSeq: want, FromUID: "u1", ServerTimestampMS: 1000,
+	}
+
+	got, err := New(Options{Store: store, StateStore: store, Messages: store}).Sync(
+		context.Background(), SyncQuery{UID: "u1"},
+	)
+	if err != nil {
+		t.Fatalf("Sync(): %v", err)
+	}
+	if len(got.Conversations) != 1 || got.Conversations[0].LastMsgSeq != want || got.Conversations[0].ReadToMsgSeq != want {
+		t.Fatalf("conversation = %#v, want uint64 sequence %d", got.Conversations, want)
+	}
+}
+
 func TestSyncReportsOverlayAndRecentLoadShape(t *testing.T) {
 	store := newConversationSyncStore()
 	store.active = []metadb.ConversationState{{

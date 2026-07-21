@@ -6290,6 +6290,9 @@ func TestDefaultClusterWriteReadyTimeoutAllowsMultipleScaledWriteProbeAttempts(t
 	if got := defaultClusterWriteReadyTimeout; got < minimum {
 		t.Fatalf("default cluster write-ready timeout = %s, want at least %s for multiple scaled write-probe attempts", got, minimum)
 	}
+	if got := defaultClusterWriteReadyTimeout; got != 90*time.Second {
+		t.Fatalf("default cluster write-ready timeout = %s, want 90s three-node cold-start budget", got)
+	}
 }
 
 func TestClusterWriteReadinessFailureStopsClusterBeforeGateway(t *testing.T) {

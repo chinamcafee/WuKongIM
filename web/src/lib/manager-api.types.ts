@@ -33,15 +33,45 @@ export type ManagerWebhookConfigResponse = {
   supported_events: string[]
   queue_size: number
   workers: number
-  msg_notify_batch_max_items: number
-  msg_notify_batch_max_wait: string
   online_status_batch_max_items: number
   online_status_batch_max_wait: string
   offline_uid_batch_size: number
   request_timeout: string
   retry_max_attempts: number
+  outbox_dir: string
+  outbox_max_entries: number
+  outbox_max_bytes: number
+  outbox_dispatch_batch_size: number
+  outbox_retry_base_delay: string
+  outbox_retry_max_delay: string
+  outbox_delivered_retention: string
   source: string
   requires_restart: boolean
+}
+
+export type ManagerWebhookDeadLetter = {
+  id: string
+  event: string
+  items: number
+  attempt: number
+  created_at: string
+  last_error_code: string
+}
+
+export type ManagerWebhookOutboxResponse = {
+  backlog: number
+  dead_letter_count: number
+  delivered_tombstones: number
+  logical_bytes: number
+  oldest_age: string
+  retry_attempts: number
+  oldest_created_at?: string
+  dead_letters: ManagerWebhookDeadLetter[]
+}
+
+export type ManagerWebhookOutboxReplayResponse = {
+  requested: number
+  replayed: number
 }
 
 export type ManagerLoginResponse = {

@@ -52,6 +52,8 @@ import {
   promoteControllerVoter,
   getPermissions,
   getWebhookConfig,
+  getWebhookOutbox,
+  replayWebhookDeadLetters,
   getPluginBindings,
   getSlot,
   getSlotLogs,
@@ -276,13 +278,18 @@ describe("manager api client", () => {
       supported_events: ["msg.notify", "msg.offline", "user.onlinestatus"],
       queue_size: 1024,
       workers: 4,
-      msg_notify_batch_max_items: 100,
-      msg_notify_batch_max_wait: "200ms",
       online_status_batch_max_items: 50,
       online_status_batch_max_wait: "500ms",
       offline_uid_batch_size: 200,
       request_timeout: "5s",
       retry_max_attempts: 3,
+      outbox_dir: "/tmp/webhook-outbox",
+      outbox_max_entries: 1000000,
+      outbox_max_bytes: 4294967296,
+      outbox_dispatch_batch_size: 100,
+      outbox_retry_base_delay: "1s",
+      outbox_retry_max_delay: "5m0s",
+      outbox_delivered_retention: "168h0m0s",
       source: "config",
       requires_restart: true,
     }
@@ -293,6 +300,35 @@ describe("manager api client", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "/manager/webhooks/config",
       expect.objectContaining({ headers: expect.any(Headers) }),
+    )
+  })
+
+  it("reads webhook outbox health and replays explicit dead letters", async () => {
+    const snapshot = {
+      backlog: 2,
+      dead_letter_count: 1,
+      delivered_tombstones: 4,
+      logical_bytes: 4096,
+      oldest_age: "1m0s",
+      retry_attempts: 3,
+      dead_letters: [],
+    }
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify(snapshot), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ requested: 2, replayed: 1 }), { status: 200 }))
+
+    await expect(getWebhookOutbox()).resolves.toEqual(snapshot)
+    await expect(replayWebhookDeadLetters(["wh_dead", "wh_missing"])).resolves.toEqual({ requested: 2, replayed: 1 })
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/manager/webhooks/outbox",
+      expect.objectContaining({ headers: expect.any(Headers) }),
+    )
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/manager/webhooks/outbox/replay",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ ids: ["wh_dead", "wh_missing"] }) }),
     )
   })
 

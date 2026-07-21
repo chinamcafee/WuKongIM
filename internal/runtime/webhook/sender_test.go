@@ -28,11 +28,15 @@ func TestHTTPSenderPostsEventQueryAndBody(t *testing.T) {
 	var gotMethod string
 	var gotContentType string
 	var gotToken string
+	var gotID string
+	var gotAttempt string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotEvent = r.URL.Query().Get("event")
 		gotToken = r.URL.Query().Get("token")
 		gotMethod = r.Method
 		gotContentType = r.Header.Get("Content-Type")
+		gotID = r.Header.Get("X-WK-Webhook-ID")
+		gotAttempt = r.Header.Get("X-WK-Webhook-Attempt")
 		data, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Fatalf("ReadAll() error = %v", err)
@@ -46,7 +50,7 @@ func TestHTTPSenderPostsEventQueryAndBody(t *testing.T) {
 		Addr:    server.URL + "/webhook?token=keep",
 		Timeout: time.Second,
 	})
-	if err := sender.Send(context.Background(), SendRequest{Event: EventMsgNotify, Body: []byte(`[{"message_id":1}]`)}); err != nil {
+	if err := sender.Send(context.Background(), SendRequest{ID: "wh_stable", Event: EventMsgNotify, Body: []byte(`[{"message_id":1}]`), Attempt: 2}); err != nil {
 		t.Fatalf("Send() error = %v", err)
 	}
 	if gotMethod != http.MethodPost {
@@ -61,20 +65,28 @@ func TestHTTPSenderPostsEventQueryAndBody(t *testing.T) {
 	if gotToken != "keep" {
 		t.Fatalf("token query = %q, want keep", gotToken)
 	}
+	if gotID != "wh_stable" || gotAttempt != "2" {
+		t.Fatalf("durable headers = %q/%q", gotID, gotAttempt)
+	}
 	if gotBody != `[{"message_id":1}]` {
 		t.Fatalf("body = %q", gotBody)
 	}
 }
 
-func TestHTTPSenderReturnsErrorOnNonOK(t *testing.T) {
+func TestHTTPSenderAcceptsAny2xxAndRejectsNon2xx(t *testing.T) {
+	status := http.StatusAccepted
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusAccepted)
+		w.WriteHeader(status)
 	}))
 	defer server.Close()
 
 	sender := NewHTTPSender(HTTPSenderOptions{Addr: server.URL, Timeout: time.Second})
+	if err := sender.Send(context.Background(), SendRequest{Event: EventMsgNotify, Body: []byte(`[]`)}); err != nil {
+		t.Fatalf("Send() error = %v, want 202 accepted", err)
+	}
+	status = http.StatusBadGateway
 	if err := sender.Send(context.Background(), SendRequest{Event: EventMsgNotify, Body: []byte(`[]`)}); err == nil {
-		t.Fatalf("Send() error = nil, want error for non-200 status")
+		t.Fatalf("Send() error = nil, want non-2xx rejection")
 	}
 }
 

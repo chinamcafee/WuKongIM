@@ -188,7 +188,11 @@ func (s *Suite) StartSingleNodeCluster(opts ...Option) *StartedNode {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	require.NoError(s.t, WaitHTTPReady(ctx, spec.APIAddr, "/readyz"), process.DumpDiagnostics())
-	require.NoError(s.t, WaitWKProtoReady(ctx, spec.GatewayAddr), process.DumpDiagnostics())
+	if nodeTokenAuthEnabled(spec) {
+		require.NoError(s.t, WaitTCPReady(ctx, spec.GatewayAddr), process.DumpDiagnostics())
+	} else {
+		require.NoError(s.t, WaitWKProtoReady(ctx, spec.GatewayAddr), process.DumpDiagnostics())
+	}
 
 	return node
 }
@@ -353,11 +357,22 @@ func (c *StartedCluster) WaitClusterReady(ctx context.Context) error {
 		return err
 	}
 	for _, node := range c.Nodes {
-		if err := WaitWKProtoReady(ctx, node.Spec.GatewayAddr); err != nil {
+		var err error
+		if nodeTokenAuthEnabled(node.Spec) {
+			err = WaitTCPReady(ctx, node.Spec.GatewayAddr)
+		} else {
+			err = WaitWKProtoReady(ctx, node.Spec.GatewayAddr)
+		}
+		if err != nil {
 			return fmt.Errorf("node %d wkproto not ready: %w", node.Spec.ID, err)
 		}
 	}
 	return nil
+}
+
+func nodeTokenAuthEnabled(spec NodeSpec) bool {
+	value, ok := spec.ConfigOverrides["WK_GATEWAY_TOKEN_AUTH_ENABLED"]
+	return ok && strings.EqualFold(strings.TrimSpace(value), "true")
 }
 
 // DumpDiagnostics returns a cluster-scoped snapshot of readiness and node artifacts.
