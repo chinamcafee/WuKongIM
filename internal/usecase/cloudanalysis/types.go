@@ -202,11 +202,11 @@ type WorkloadPhaseWindow struct {
 type WorkloadWorkerFailure struct {
 	// WorkerID identifies the failed or unreachable worker.
 	WorkerID string `json:"worker_id"`
-	// Phase identifies the lifecycle phase when the failure was observed.
+	// Phase identifies the lifecycle or terminal control phase when the failure was observed.
 	Phase string `json:"phase"`
 	// ReasonCode is a stable machine-readable failure classification.
 	ReasonCode string `json:"reason_code"`
-	// Operation identifies a safe low-cardinality workload operation when known.
+	// Operation identifies a safe low-cardinality workload operation or control stage when known.
 	Operation string `json:"operation,omitempty"`
 	// Detail is a fixed reason-code-owned diagnostic description.
 	Detail string `json:"detail"`
@@ -296,6 +296,8 @@ type DiagnosticsQueryRequest struct {
 	RunID string `json:"run_id"`
 	// NodeID optionally restricts the query to one cluster node.
 	NodeID uint64 `json:"node_id,omitempty"`
+	// SlotID optionally restricts the query to one physical Slot.
+	SlotID uint32 `json:"slot_id,omitempty"`
 	// TraceID filters by diagnostics trace identity.
 	TraceID string `json:"trace_id,omitempty"`
 	// ClientMsgNo filters by client message number.

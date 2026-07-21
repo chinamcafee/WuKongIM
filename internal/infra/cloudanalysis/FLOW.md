@@ -4,7 +4,7 @@
 over startup-configured private origins only:
 
 ```text
-manager -> nodes, workqueues, app logs, diagnostics, task audits, redacted config
+manager -> nodes, workqueues, app logs, physical-Slot-filtered diagnostics, task audits, redacted config
 prometheus -> /api/v1/query_range with usecase-resolved PromQL, including
               node-exporter textfile evidence for service cgroup memory
 node APIs -> /debug/pprof for allowlisted node IDs
@@ -12,7 +12,9 @@ node APIs -> /debug/pprof for allowlisted node IDs
 
 The manager client authenticates with a dedicated run-scoped capability user or
 pre-issued bearer token and caches only the short-lived JWT. It does not reuse a
-human manager session. HTTP bodies and profile retention are size bounded.
+human manager session. Diagnostics forward the optional exact physical
+`slot_id` selector to the private Manager API. HTTP bodies and profile retention
+are size bounded.
 
 Raw profiles remain in an in-memory bounded store on the gateway. MCP consumers
 receive metadata or symbolized top rows, never raw profile bytes or filesystem
@@ -33,8 +35,15 @@ for every worker included in `summary.worker_failed`; otherwise the source rejec
 the document instead of reporting complete evidence. Failure detail accepts only
 fixed reason-code templates or an explicit redaction marker, so forged producer
 text cannot cross the MCP boundary. The optional failed-worker `operation` also
-uses a fixed person/group send, sendack, recv, recvack, or sendack-lock allowlist;
-unknown operation text is rejected rather than exposed through the MCP.
+uses a reason-bound allowlist: person/group send, sendack, recv, recvack, or
+sendack-lock for session failures, and `worker_status` or `phase_completion` for
+phase timeouts. `worker_stop_failed` is accepted only with phase `stop`; unknown
+operations and mismatched reason/phase tuples are rejected rather than exposed
+through the MCP. Any structured worker failure also requires a failed status,
+non-zero exit code, and non-passed stability verdict. A `worker_stop_failed`
+record further requires worker-failure exit code `4` and verdict
+`harness_invalid`, so stop evidence cannot coexist with a passing or unrelated
+terminal outcome.
 
 Node hosts sample the `wukongim.service` cgroup once per second from one bounded
 collector process and again from

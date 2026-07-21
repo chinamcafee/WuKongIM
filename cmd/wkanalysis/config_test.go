@@ -83,6 +83,74 @@ func TestDefaultMetricQueriesExcludeZeroCapacityRuntimeQueues(t *testing.T) {
 	}
 }
 
+func TestDefaultMetricQueriesIncludeConversationActiveConservationEvidence(t *testing.T) {
+	queries := defaultMetricQueries()
+	wantIDs := []string{
+		"conversation_active_cache_rows",
+		"conversation_active_dirty_rows",
+		"conversation_active_dirty_queue_rows",
+		"conversation_active_dirty_age_buckets",
+		"conversation_active_oldest_dirty_age",
+		"conversation_active_dirty_mutation_rate",
+		"conversation_active_cache_lock_p99",
+		"conversation_active_flush_rows_cumulative",
+		"conversation_active_flush_stage_p99",
+		"conversation_active_flush_attempt_rate",
+		"conversation_active_pressure_events",
+		"conversation_active_pressure_state",
+		"conversation_active_pressure_wakeup_p99",
+	}
+	for _, id := range wantIDs {
+		if queries[id] == "" {
+			t.Fatalf("metric query %q is missing from the Analysis allowlist", id)
+		}
+	}
+	if got := queries["conversation_active_flush_rows_cumulative"]; got != `sum by (instance, node_name, result, stage, reason) (wukongim_conversation_active_flush_rows_total{job="wukongim"})` {
+		t.Fatalf("conversation flush conservation query = %q", got)
+	}
+}
+
+func TestDefaultMetricQueriesIncludeConversationPersistDrilldownEvidence(t *testing.T) {
+	queries := defaultMetricQueries()
+	wantIDs := []string{
+		"storage_commit_queue_depth",
+		"storage_commit_request_p99",
+		"storage_commit_batch_stage_p99",
+		"slot_proposal_rate",
+		"slot_proposal_apply_p99",
+		"slot_apply_gap",
+		"slot_background_proposal_admission_rate",
+		"slot_runtime_queue_pressure",
+	}
+	for _, id := range wantIDs {
+		if queries[id] == "" {
+			t.Fatalf("metric query %q is missing from the Analysis allowlist", id)
+		}
+	}
+	if got := queries["storage_commit_queue_depth"]; got != `sum by (instance, node_name, store) (wukongim_storage_commit_queue_depth{job="wukongim"})` {
+		t.Fatalf("storage commit queue query = %q, want node-preserving dimensions", got)
+	}
+	if got := queries["conversation_active_cache_lock_p99"]; got != `histogram_quantile(0.99, sum by (instance, node_name, result, phase, le) (rate(wukongim_conversation_active_cache_lock_duration_seconds_bucket{job="wukongim"}[1m])))` {
+		t.Fatalf("conversation cache lock query = %q, want result and phase dimensions", got)
+	}
+	if got := queries["slot_proposal_apply_p99"]; got != `histogram_quantile(0.99, sum by (instance, node_name, le) (rate(wukongim_slot_apply_duration_seconds_bucket{job="wukongim"}[1m])))` {
+		t.Fatalf("slot proposal apply query = %q, want per-node aggregation without slot_id", got)
+	}
+}
+
+func TestDefaultMetricQueriesIncludePreferredLeaderReconcileEvidence(t *testing.T) {
+	queries := defaultMetricQueries()
+	want := map[string]string{
+		"slot_preferred_leader_reconcile_rate":  `sum by (instance, node_name, decision) (rate(wukongim_slot_preferred_leader_reconcile_total{job="wukongim"}[1m]))`,
+		"slot_preferred_leader_strict_wait_p99": `histogram_quantile(0.99, sum by (le, instance, node_name, decision) (rate(wukongim_slot_preferred_leader_strict_wait_duration_seconds_bucket{job="wukongim"}[5m])))`,
+	}
+	for id, query := range want {
+		if queries[id] != query {
+			t.Fatalf("metric query %q = %q, want %q", id, queries[id], query)
+		}
+	}
+}
+
 func TestLoadServeConfigRejectsTokenPastLeaseGuard(t *testing.T) {
 	now := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
 	env := map[string]string{

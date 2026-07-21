@@ -116,6 +116,7 @@ func TestClusterThreeNodeDefaultChannelsReplicateToFollowerStore(t *testing.T) {
 	t.Cleanup(func() { stopNodes(t, nodes...) })
 	waitClusterReady(t, nodes...)
 	waitAllHashSlotLeadersConvergedWithin(t, nodes, realDiskClusterReadyTimeout)
+	waitNodeWriteReady(t, nodes[0], nodes)
 	route := waitRouteKeyLeaderConverged(t, nodes, channelID.ID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

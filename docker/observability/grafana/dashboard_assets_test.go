@@ -510,6 +510,104 @@ func TestRuntimeOpsDashboardIncludesPresencePanels(t *testing.T) {
 	}
 }
 
+func TestRuntimeOpsConversationFlushHistogramsPreserveNodeAndKind(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("dashboards", "wukongim-v2-runtime-ops.json"))
+	if err != nil {
+		t.Fatalf("read runtime ops dashboard: %v", err)
+	}
+	type target struct {
+		Expr         string `json:"expr"`
+		LegendFormat string `json:"legendFormat"`
+	}
+	var dashboard struct {
+		Panels []struct {
+			Title   string   `json:"title"`
+			Targets []target `json:"targets"`
+		} `json:"panels"`
+	}
+	if err := json.Unmarshal(raw, &dashboard); err != nil {
+		t.Fatalf("parse runtime ops dashboard: %v", err)
+	}
+	var targets []target
+	for _, panel := range dashboard.Panels {
+		if panel.Title == "Conversation Active Cache And Flush" {
+			targets = panel.Targets
+			break
+		}
+	}
+	if len(targets) == 0 {
+		t.Fatal("runtime ops dashboard is missing the conversation-active panel")
+	}
+	assertTarget := func(metric string, exprTokens []string, legendTokens []string) {
+		t.Helper()
+		for _, candidate := range targets {
+			if !strings.Contains(candidate.Expr, metric) {
+				continue
+			}
+			for _, token := range exprTokens {
+				if !strings.Contains(candidate.Expr, token) {
+					t.Errorf("%s query does not preserve %q: %s", metric, token, candidate.Expr)
+				}
+			}
+			for _, token := range legendTokens {
+				if !strings.Contains(candidate.LegendFormat, token) {
+					t.Errorf("%s legend does not preserve %q: %s", metric, token, candidate.LegendFormat)
+				}
+			}
+			return
+		}
+		t.Errorf("conversation-active panel does not query %s", metric)
+	}
+	assertTarget(
+		"wukongim_conversation_active_flush_duration_seconds_bucket",
+		[]string{"by (le, node_name, result)"},
+		[]string{"{{node_name}}", "{{result}}"},
+	)
+	assertTarget(
+		"wukongim_conversation_active_flush_rows_bucket",
+		[]string{"by (le, node_name, result, kind)"},
+		[]string{"{{node_name}}", "{{result}}", "{{kind}}"},
+	)
+	assertTarget(
+		"wukongim_conversation_active_cache_dirty_queue_rows",
+		[]string{"by (node_name)"},
+		[]string{"{{node_name}}"},
+	)
+	assertTarget(
+		"wukongim_conversation_active_cache_dirty_age_buckets",
+		[]string{"by (node_name)"},
+		[]string{"{{node_name}}"},
+	)
+
+	var latencyTargets []target
+	for _, panel := range dashboard.Panels {
+		if panel.Title == "Conversation Active Latency Breakdown" {
+			latencyTargets = panel.Targets
+			break
+		}
+	}
+	if len(latencyTargets) == 0 {
+		t.Fatal("runtime ops dashboard is missing the conversation-active latency breakdown panel")
+	}
+	for _, candidate := range latencyTargets {
+		if !strings.Contains(candidate.Expr, "wukongim_conversation_active_cache_lock_duration_seconds_bucket") {
+			continue
+		}
+		for _, token := range []string{"by (le, node_name, result, phase)", "[$__rate_interval]"} {
+			if !strings.Contains(candidate.Expr, token) {
+				t.Errorf("cache-lock query does not preserve %q: %s", token, candidate.Expr)
+			}
+		}
+		for _, token := range []string{"{{node_name}}", "{{result}}", "{{phase}}"} {
+			if !strings.Contains(candidate.LegendFormat, token) {
+				t.Errorf("cache-lock legend does not preserve %q: %s", token, candidate.LegendFormat)
+			}
+		}
+		return
+	}
+	t.Error("conversation-active latency breakdown does not query cache-lock duration")
+}
+
 func TestRuntimeOpsDashboardIncludesChannelRegistryPanels(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("dashboards", "wukongim-v2-runtime-ops.json"))
 	if err != nil {

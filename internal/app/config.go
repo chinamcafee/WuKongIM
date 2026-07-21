@@ -371,15 +371,16 @@ type DeliveryConfig struct {
 	Enabled bool
 	// FanoutPageSize limits subscriber UIDs read by one fanout page.
 	FanoutPageSize int
-	// PushBatchSize limits owner-node route pushes produced by one delivery batch.
+	// PushBatchSize limits recipients in one exact-target lookup and delivery plan,
+	// and independently limits routes in each plan-wide owner-node push chunk.
 	PushBatchSize int
 	// PendingAckTTL bounds stale pending recvack cleanup during delivery activity.
 	PendingAckTTL time.Duration
 	// PendingAckMaxPerSession limits owner-local pending recvacks for one UID/session.
 	PendingAckMaxPerSession int
-	// EventQueueSize bounds committed-message events waiting for asynchronous delivery fanout.
+	// EventQueueSize bounds recipient delivery plans waiting for asynchronous processing.
 	EventQueueSize int
-	// RecipientWorkerConcurrency bounds recipient-authority delivery worker goroutines independently from per-message target dispatch.
+	// RecipientWorkerConcurrency bounds recipient delivery plan workers independently from per-message target dispatch.
 	RecipientWorkerConcurrency int
 }
 

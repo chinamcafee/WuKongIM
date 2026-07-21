@@ -34,11 +34,16 @@ New(Config)
      Prometheus metrics and the optional Top collector
   -> create metrics registry when Observability.MetricsEnabled=true and attach
      runtime observers for metrics/logging
-     (gateway runtime pressure, Slot scheduler/proposal/apply-gap/leader-election pressure, Controller Raft step queue/bounded outbound send queue/apply gap, Transport service RPC totals/latency and observed write-batch shape, Channel runtime append/replication/PullHint/PullBatch/leader-Pull/runtime pressure stages, message DB grouped commit pressure, and delivery fanout)
+     (gateway runtime pressure, Slot scheduler/proposal/apply-gap/leader-election pressure and low-cardinality preferred-leader reconcile decisions/strict-wait latency, Controller Raft step queue/bounded outbound send queue/apply gap, Transport service RPC totals/latency and observed write-batch shape, Channel runtime append/replication/PullHint/PullBatch/leader-Pull/runtime pressure stages, message DB grouped commit pressure, and delivery fanout)
      plus direct ants/v2 pool occupancy gauges for instrumented runtime pools
-     plus conversation list request latency/page-shape metrics, conversation
+     plus direct channelappend owner-push attempts on the same bounded delivery
+     push metric families used by runtime fanout, conversation list request latency/page-shape metrics, conversation
      authority admit/list/cache-pressure/handoff counters, conversation active
-     cache/flush gauges and histograms, channel append and post-commit
+     cache gauges, dirty-mutation counters, persisted/cleared/requeued/superseded
+     flush conservation counters, fair dirty-queue and bounded dirty-age-index
+     gauges, accepted/rejected admission cache-lock wait/hold histograms, split clear lock-wait/apply
+     flush-stage histograms, and pressure-wakeup
+     lifecycle metrics, channel append and post-commit
      counters, presence authority expiry cost/index gauges and bounded owner
      touch-flush route/chunk/target-group counters, recipient delivery worker
      queue/admission/process metrics plus configured worker capacity and current
@@ -96,7 +101,11 @@ New(Config)
      fields without scanning loaded channel maps.
   -> when Observability.Diagnostics.Enabled=true:
        create a bounded node-local diagnostics store, runtime tracking rules,
-       sampler, and sendtrace sink; install the process-wide sendtrace sink
+       sampler, and sendtrace sink; attach PreferredLeader reconciliation
+       diagnostics that retain explicit physical Slot, actual/preferred leader,
+       Raft term, and config epoch fields while retaining recovery-to-match
+       transitions, suppressing steady matches, and coalescing identical
+       30-second repeats; install the process-wide sendtrace sink
        and expose local diagnostics debug APIs only when
        Observability.DebugAPIEnabled=true
   -> when an effective node data dir is configured:
@@ -376,6 +385,14 @@ tracking sampler, and process-wide sendtrace sink. Manager diagnostics routes
 use that same store for local reads and tracking-rule mutations; non-local
 node-scoped reads and mutations route through the manager diagnostics RPC path
 without falling back to legacy `internal` diagnostics state.
+PreferredLeader details remain node-local diagnostics rather than Prometheus
+labels: one bounded signature per observed physical Slot preserves state changes
+immediately and resamples an unchanged non-match decision at most once every 30
+seconds. A non-match to `match` recovery is retained once, while initial or
+repeated steady `match` decisions remain available only through aggregate
+metrics and later cluster snapshots so they cannot churn the diagnostics ring.
+Diagnostic event counts are transition evidence, not reconcile-rate evidence;
+aggregate Prometheus counters remain the frequency source.
 
 Controller Raft status and manual compaction use a cluster-routed management
 operator created in the app composition root. Local reads and compaction call
@@ -390,7 +407,12 @@ delivery disabled, committed message effects still run inside the channel
 authority writer so recent conversation state is updated, but no online
 delivery is submitted. With delivery enabled, gateway RECVACK and session close
 feedback flows to the delivery usecase, while channelappend post-commit effects
-enqueue recipient-authority delivery batches into the recipient delivery worker.
+enqueue bounded multi-target recipient delivery plans into the recipient
+delivery worker. Each plan retains every exact Slot authority fence. The app
+presence adapter converts all plan groups in one call; the cluster adapter then
+batches local groups in the presence directory and sends at most one batch RPC
+to each remote Slot leader. Results remain aligned per exact target so a failed
+leader group does not discard successful groups from the same plan.
 `Config.ChannelAppend.AuthorityShardCount` defaults to a CPU-aware lookup-shard
 count with a minimum of four. `ChannelAppend.AdvancePoolSize` is the direct ants
 pool capacity used to activate channelappend writer state machines.
@@ -406,11 +428,13 @@ backlog records and drops the newest already-durable envelope without returning
 Prepare runs inline on the writer advance path; append remains the foreground
 durable path that determines SEND/SENDACK throughput.
 `ChannelAppend.RecipientAuthorityDispatchConcurrency` defaults to a bounded
-recipient-authority target fanout per post-commit envelope.
+recipient-authority target fanout for legacy batch-only enqueuers. The
+production plan-capable worker admits exact-target groups together instead of
+using this target fanout.
 `Delivery.RecipientWorkerConcurrency` independently defaults to 100 and controls
-only the goroutines draining the bounded recipient delivery queue, so target
-fanout and delivery execution capacity can be tuned without changing each
-other. The lookup-shard count controls writer map sharding; effect workers run only blocking effects and never write channel
+only the goroutines draining the bounded recipient delivery queue. The legacy
+target fanout and production plan execution capacities therefore remain
+independent. The lookup-shard count controls writer map sharding; effect workers run only blocking effects and never write channel
 state concurrently with another advance for the same channel. The delivery
 observer maps aggregate writer pressure and effect pool observations into
 Prometheus, and also records direct ants/v2 occupancy for the channelappend
@@ -423,8 +447,13 @@ The foreground SEND path waits only for channel-authority durable append;
 subscriber scan, recipient authority grouping, delivery enqueue, and the
 independent conversation active projection all run after SENDACK from the
 authority writer's best-effort post-commit pipeline. The recipient delivery worker later
-drains accepted batches, resolves online routes, and pushes owner-node delivery
-commands. Post-commit persistence and restart replay are not part of
+drains accepted plans, resolves all exact-target groups through the batched
+presence seam, coalesces successful routes by owner across each whole plan,
+splits each owner group by `Delivery.PushBatchSize`, and pushes those bounded
+commands in first-seen order. The owner-push adapter records every actual local
+or remote attempt in the delivery push count, route-count, and duration metrics.
+Post-commit persistence
+and restart replay are not part of
 channelappend. Post-commit enqueue failures are logged with the failing phase and
 route/dispatch context, counted through effect metrics, and dropped after the
 routed helper's bounded retry window; they do not change channel durability or
@@ -452,12 +481,15 @@ subscriber source, or the cluster Slot metadata source. When cluster exposes
 batch key routing, the app recipient resolver resolves each subscriber page's
 unique UIDs through one batch route lookup. After each recipient set is formed,
 channelappend groups recipients by exact UID hash-slot authority
-target including Slot leader term and Slot config epoch, then enqueues delivery.
+target including Slot leader term and Slot config epoch, then packs the groups
+into a bounded delivery plan. The worker preserves those fences while the
+presence usecase groups target lookups by actual leader and returns partial
+per-target results.
 It next admits an independent kind-aware `conversationactive.ActiveBatch`
 through the shared `ConversationAuthorityClient`; channelappend chooses normal
 versus CMD kind from the committed envelope, and active admission still runs
 when online delivery is disabled. When delivery is enabled, the app wires a bounded
-recipient delivery worker that drains those batches and runs the delivery-only
+recipient delivery worker that drains those plans and runs the delivery-only
 channelappend recipient processor outside the authority writer. `/bench/v1/channels`,
 `/bench/v1/channels/subscribers`, and `/bench/v1/channels/subscribers/remove`
 write real channel metadata or add/remove subscriber rows through Slot proposals.
@@ -465,7 +497,7 @@ The benchmark data writer uses bounded concurrency for independent
 channel/subscriber mutations while preserving subscriber mutation order within
 the same channel. Scoped UID delivery bypasses subscriber scan and
 flows through recipient authority grouping, presence resolution, and the local
-or RPC owner pusher after the recipient delivery worker accepts the batch.
+or RPC owner pusher after the recipient delivery worker accepts the plan.
 The app maps the worker's serialized execution-pressure observation into
 Prometheus worker capacity and in-flight gauges. These metrics do not include
 UID, channel, slot, or per-target labels.
@@ -555,9 +587,10 @@ When metrics are enabled, the app maps API conversation-list observations to
 Prometheus metrics for latency, returned items, sparse items, last-message
 loads, last-message errors, active-index stale skips, and whether another active
 page exists using only low-cardinality labels. It also maps conversation active
-cache observations to Prometheus gauges for cached rows, dirty rows, oldest
-dirty age, fixed normal/CMD row and dirty-row counts, and flush
-result/row/duration metrics.
+cache observations to Prometheus gauges for cached rows, dirty rows, fair
+dirty-queue rows, bounded dirty-age buckets, oldest dirty age, fixed normal/CMD
+row and dirty-row counts, accepted/rejected admission cache-lock latency, and
+flush result/row/stage-duration metrics.
 
 Conversation list with authority enabled:
 
@@ -622,6 +655,9 @@ touch patches through the conversation active flush worker or handoff drain.
 Cache pressure only sends a nonblocking wakeup to that worker; admission never
 performs durable I/O. The app conversation authority keeps route target fencing,
 lifecycle handoff, observer mapping, and usecase/RPC type adaptation.
+Aggregate admission cache snapshots are coalesced to a 100ms interval in the
+production authority wiring; pressure transitions and flush completion still
+publish immediate snapshots, while mutation counters remain unsampled.
 
 SEND with channel authority routing enabled:
 
@@ -801,7 +837,8 @@ periodic tick or coalesced cache-pressure wakeup
   -> skip receiver-only ActiveAt updates inside AuthorityActiveCooldown
   -> store.TouchConversationActiveAtBatch persists remaining ActiveAt/ReadSeq/UpdatedAt
   -> after a successful pressure-cycle attempt, requeue one wakeup while dirty
-     rows remain above the 70% low watermark
+     rows remain above the 70% low watermark and at least one dirty marker was
+     cleared; a zero-progress attempt waits for the next periodic tick
 
 cache admission
   -> at 80% total occupancy with dirty rows above the 70% low watermark, start
