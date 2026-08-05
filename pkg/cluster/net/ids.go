@@ -38,7 +38,7 @@ const (
 	RPCPresenceOwner
 	// RPCDeliveryPush serves internal owner-node delivery push batches.
 	RPCDeliveryPush
-	// RPCDeliveryFanout serves internal authority-node delivery fanout tasks.
+	// RPCDeliveryFanout reserves the retired delivery-fanout service ID; do not reuse it.
 	RPCDeliveryFanout
 	// RPCChannelPullBatch serves grouped Channel follower pull requests.
 	RPCChannelPullBatch
@@ -91,6 +91,22 @@ const (
 	RPCManagerNodeConfig
 	// RPCManagerLatestMessages serves node-local newest-message index reads.
 	RPCManagerLatestMessages
+	// RPCScheduledBackupMessages exports one bounded committed-message stream.
+	RPCScheduledBackupMessages
+	// RPCScheduledBackupSlot exports one complete logical Hash Slot.
+	RPCScheduledBackupSlot
+	// RPCScheduledBackupRepositoryProbe proves cross-node repository visibility.
+	RPCScheduledBackupRepositoryProbe
+	// RPCScheduledBackupRestore performs one node-local staged restore step.
+	RPCScheduledBackupRestore
+	// RPCOpsMCP serves token-free Manager-to-owner MCP forwarding and bounded pprof.
+	RPCOpsMCP
+	// RPCManagerGoroutines serves node-local managed goroutine snapshots.
+	RPCManagerGoroutines
+	// RPCSlotSubscriberMetadata serves Slot-leader subscriber set reads.
+	RPCSlotSubscriberMetadata
+	// RPCSlotChannelMetadata serves Slot-leader channel metadata point reads.
+	RPCSlotChannelMetadata
 )
 
 func transportServiceAlias(serviceID uint8) string {
@@ -163,6 +179,16 @@ func transportServiceAlias(serviceID uint8) string {
 		return "manager node config"
 	case RPCManagerLatestMessages:
 		return "manager latest messages"
+	case RPCScheduledBackupMessages:
+		return "scheduled backup messages"
+	case RPCScheduledBackupSlot:
+		return "scheduled backup slot"
+	case RPCScheduledBackupRepositoryProbe:
+		return "scheduled backup repository probe"
+	case RPCScheduledBackupRestore:
+		return "scheduled backup restore"
+	case RPCOpsMCP:
+		return "operations MCP"
 	case RPCManagerMessageRetention:
 		return "manager message retention"
 	case RPCNodeLifecycle:
@@ -175,6 +201,12 @@ func transportServiceAlias(serviceID uint8) string {
 		return "slot status"
 	case RPCManagerTaskAudit:
 		return "manager task audit"
+	case RPCManagerGoroutines:
+		return "manager goroutines"
+	case RPCSlotSubscriberMetadata:
+		return "slot subscriber metadata"
+	case RPCSlotChannelMetadata:
+		return "slot channel metadata"
 	case RPCChannelMigrationMeta:
 		return "channel migration meta"
 	case RPCMessageEventAppend:

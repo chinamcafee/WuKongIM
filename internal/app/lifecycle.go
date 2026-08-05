@@ -9,6 +9,7 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster"
 	"github.com/WuKongIM/WuKongIM/pkg/gateway"
+	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 )
 
@@ -109,6 +110,14 @@ func (a *App) Start(ctx context.Context) error {
 			return errors.Join(err, stopErr)
 		}
 	}
+	if a.backupRuntime != nil {
+		if err := a.backupRuntime.Start(ctx); err != nil {
+			a.logLifecycleError("backup_runtime", "start", err)
+			stopErr := a.rollbackStarted(ctx)
+			return errors.Join(err, stopErr)
+		}
+		a.backupRuntimeStarted = true
+	}
 	if a.conversationRouteLifecycle != nil {
 		if err := a.conversationRouteLifecycle.Start(ctx); err != nil {
 			a.logLifecycleError("conversation_route_lifecycle", "start", err)
@@ -173,6 +182,13 @@ func (a *App) Start(ctx context.Context) error {
 		}
 		a.channelAppendStarted = true
 	}
+	if a.restoreMaintenance.Load() {
+		if err := a.suspendRestoreSideEffects(ctx); err != nil {
+			a.logLifecycleError("restore_side_effects", "suspend", err)
+			stopErr := a.rollbackStarted(ctx)
+			return errors.Join(err, stopErr)
+		}
+	}
 	if a.top != nil {
 		if err := a.top.Start(ctx); err != nil {
 			a.logLifecycleError("top", "start", err)
@@ -212,6 +228,15 @@ func (a *App) Start(ctx context.Context) error {
 			return errors.Join(err, stopErr)
 		}
 		a.gatewayStarted = true
+		a.applyRestoreGatewayMaintenance(a.restoreMaintenance.Load())
+	}
+	a.logStarted(startedAt)
+	return nil
+}
+
+func (a *App) logStarted(startedAt time.Time) {
+	if a.goroutines != nil {
+		a.goroutines.SetReady(true)
 	}
 	readySnapshot := a.startupSnapshot()
 	startupDuration := time.Since(startedAt)
@@ -221,7 +246,6 @@ func (a *App) Start(ctx context.Context) error {
 		wklog.Duration("startupDuration", startupDuration),
 	)...)
 	a.startupConsole.ready(readySnapshot, startupDuration)
-	return nil
 }
 
 func (a *App) startupSnapshot() startupConsoleSnapshot {
@@ -353,13 +377,24 @@ func (a *App) Stop(ctx context.Context) error {
 	defer a.lifecycleMu.Unlock()
 
 	a.stopped = true
+	if a.goroutines != nil {
+		a.goroutines.SetReady(false)
+	}
 	a.restoreDiagnosticsSink()
 	if !a.started {
-		err := a.closeControllerTaskAudit()
-		if err != nil {
-			a.logLifecycleWarn("controller_task_audit", "stop", err)
+		var err error
+		if a.channelAppends != nil {
+			if stopErr := a.channelAppends.Stop(ctx); stopErr != nil {
+				a.logLifecycleWarn("channel_append", "stop_before_start", stopErr)
+				err = errors.Join(err, stopErr)
+			}
 		}
-		return errors.Join(err, a.syncLogger())
+		if stopErr := a.closeControllerTaskAudit(); stopErr != nil {
+			a.logLifecycleWarn("controller_task_audit", "stop", stopErr)
+			err = errors.Join(err, stopErr)
+		}
+		err = errors.Join(err, a.closeOpsMCPCalls(), a.waitManagedGoroutines(ctx), a.syncLogger())
+		return err
 	}
 	var err error
 	if a.gatewayStarted && a.gateway != nil {
@@ -402,10 +437,22 @@ func (a *App) Stop(ctx context.Context) error {
 			a.topStarted = false
 		}
 	}
+	if a.backupRuntimeStarted && a.backupRuntime != nil {
+		if stopErr := a.backupRuntime.Stop(ctx); stopErr != nil {
+			a.logLifecycleWarn("backup_runtime", "stop", stopErr)
+			err = errors.Join(err, stopErr)
+		} else {
+			a.backupRuntimeStarted = false
+		}
+	}
 	if a.channelAppendStarted && a.channelAppends != nil {
 		if stopErr := a.channelAppends.Stop(ctx); stopErr != nil {
 			a.logLifecycleWarn("channel_append", "stop", stopErr)
 			err = errors.Join(err, stopErr)
+			// Channel append keeps the same graceful drain alive after a caller
+			// deadline. Its delivery, conversation, plugin, webhook, and cluster
+			// dependencies must remain running until a later Stop finishes that drain.
+			return errors.Join(err, a.syncLogger())
 		} else {
 			a.channelAppendStarted = false
 		}
@@ -486,10 +533,58 @@ func (a *App) Stop(ctx context.Context) error {
 		a.logLifecycleWarn("controller_task_audit", "stop", stopErr)
 		err = errors.Join(err, stopErr)
 	}
-	if !a.gatewayStarted && !a.prometheusStarted && !a.managerStarted && !a.apiStarted && !a.topStarted && !a.channelAppendStarted && !a.deliveryStarted && !a.webhookStarted && !a.pluginHookStarted && !a.pluginRuntimeStarted && !a.conversationActiveStarted && !a.conversationRouteStarted && !a.presenceStarted && !a.seedJoinStarted && !a.clusterStarted {
+	if stopErr := a.closeOpsMCPCalls(); stopErr != nil {
+		a.logLifecycleWarn("ops_mcp_audit", "stop", stopErr)
+		err = errors.Join(err, stopErr)
+	}
+	if !a.gatewayStarted && !a.prometheusStarted && !a.managerStarted && !a.apiStarted && !a.topStarted && !a.backupRuntimeStarted && !a.channelAppendStarted && !a.deliveryStarted && !a.webhookStarted && !a.pluginHookStarted && !a.pluginRuntimeStarted && !a.conversationActiveStarted && !a.conversationRouteStarted && !a.presenceStarted && !a.seedJoinStarted && !a.clusterStarted {
 		a.started = false
+		err = errors.Join(err, a.waitManagedGoroutines(ctx))
 	}
 	err = errors.Join(err, a.syncLogger())
+	return err
+}
+
+func (a *App) waitManagedGoroutines(ctx context.Context) error {
+	if a == nil || a.goroutines == nil {
+		return nil
+	}
+	modules := []goruntimeregistry.Module{
+		goruntimeregistry.ModuleAPI,
+		goruntimeregistry.ModuleManager,
+		goruntimeregistry.ModuleGateway,
+		goruntimeregistry.ModuleTransport,
+		goruntimeregistry.ModuleCluster,
+		goruntimeregistry.ModuleController,
+		goruntimeregistry.ModuleSlot,
+		goruntimeregistry.ModuleChannel,
+		goruntimeregistry.ModuleDatabase,
+		goruntimeregistry.ModulePresence,
+		goruntimeregistry.ModuleChannelAppend,
+		goruntimeregistry.ModuleDelivery,
+		goruntimeregistry.ModuleConversation,
+		goruntimeregistry.ModuleWebhook,
+		goruntimeregistry.ModulePlugin,
+		goruntimeregistry.ModuleBackup,
+		goruntimeregistry.ModuleObservability,
+		goruntimeregistry.ModuleApp,
+	}
+	var err error
+	for _, module := range modules {
+		if waitErr := a.goroutines.Group(module).WaitFrom(ctx, a.goroutineBaseline); waitErr != nil {
+			a.logLifecycleWarn(string(module), "stop", waitErr)
+			err = errors.Join(err, waitErr)
+		}
+	}
+	return err
+}
+
+func (a *App) closeOpsMCPCalls() error {
+	if a == nil || a.opsMCPCalls == nil {
+		return nil
+	}
+	err := a.opsMCPCalls.Close()
+	a.opsMCPCalls = nil
 	return err
 }
 
@@ -502,6 +597,14 @@ func (a *App) syncLogger() error {
 
 func (a *App) rollbackStarted(ctx context.Context) error {
 	var err error
+	if a.backupRuntimeStarted && a.backupRuntime != nil {
+		if stopErr := a.backupRuntime.Stop(ctx); stopErr != nil {
+			a.logLifecycleWarn("backup_runtime", "rollback_stop", stopErr)
+			err = errors.Join(err, stopErr)
+		} else {
+			a.backupRuntimeStarted = false
+		}
+	}
 	if a.prometheusStarted && a.prometheus != nil {
 		if stopErr := a.prometheus.Stop(ctx); stopErr != nil {
 			a.logLifecycleWarn("prometheus", "rollback_stop", stopErr)
@@ -538,6 +641,10 @@ func (a *App) rollbackStarted(ctx context.Context) error {
 		if stopErr := a.channelAppends.Stop(ctx); stopErr != nil {
 			a.logLifecycleWarn("channel_append", "rollback_stop", stopErr)
 			err = errors.Join(err, stopErr)
+			// Keep already-started post-commit dependencies available for the
+			// channel append drain. App remains retryable because started and the
+			// component flags are cleared only after a complete later Stop.
+			return err
 		} else {
 			a.channelAppendStarted = false
 		}
@@ -666,6 +773,11 @@ func (a *App) readyzReport(ctx context.Context) (bool, any) {
 	if a == nil || a.cluster == nil {
 		return false, map[string]any{"ready": false, "reason": "cluster not configured"}
 	}
+	if a.restoreMaintenance.Load() {
+		return false, map[string]any{
+			"ready": false, "reason": "restore maintenance",
+		}
+	}
 	if err := a.webhookOutboxReadiness(ctx); err != nil {
 		return false, map[string]any{"ready": false, "reason": err.Error()}
 	}
@@ -707,6 +819,10 @@ func (a *App) webhookOutboxReadiness(ctx context.Context) error {
 }
 
 func (a *App) waitClusterWriteReady(ctx context.Context) error {
+	return a.waitClusterReady(ctx, "cluster write readiness", clusterWriteReady)
+}
+
+func (a *App) waitClusterReady(ctx context.Context, label string, ready func(context.Context, clusterWriteReadyRuntime, *error) bool) error {
 	routes, ok := a.cluster.(clusterWriteReadyRuntime)
 	if !ok {
 		return nil
@@ -723,36 +839,24 @@ func (a *App) waitClusterWriteReady(ctx context.Context) error {
 
 	var lastErr error
 	for {
-		if clusterWriteReady(waitCtx, routes, &lastErr) {
+		if ready(waitCtx, routes, &lastErr) {
 			return nil
 		}
 		select {
 		case <-waitCtx.Done():
 			if lastErr != nil {
-				return fmt.Errorf("internal/app: cluster write readiness: %w", lastErr)
+				return fmt.Errorf("internal/app: %s: %w", label, lastErr)
 			}
-			return fmt.Errorf("internal/app: cluster write readiness: %w", waitCtx.Err())
+			return fmt.Errorf("internal/app: %s: %w", label, waitCtx.Err())
 		case <-ticker.C:
 		}
 	}
 }
 
 func clusterWriteReady(ctx context.Context, routes clusterWriteReadyRuntime, lastErr *error) bool {
-	snapshot := routes.Snapshot()
-	if !snapshot.RoutesReady || !snapshot.SlotsReady || !snapshot.ChannelsReady || snapshot.HashSlotCount == 0 {
-		*lastErr = fmt.Errorf("snapshot not ready: routes=%t slots=%t channels=%t hashSlotCount=%d", snapshot.RoutesReady, snapshot.SlotsReady, snapshot.ChannelsReady, snapshot.HashSlotCount)
+	snapshot, ready := clusterRestoreRoutingReady(routes, lastErr)
+	if !ready {
 		return false
-	}
-	for hashSlot := uint16(0); hashSlot < snapshot.HashSlotCount; hashSlot++ {
-		route, err := routes.RouteHashSlot(hashSlot)
-		if err != nil {
-			*lastErr = fmt.Errorf("route hash slot %d: %w", hashSlot, err)
-			return false
-		}
-		if route.Leader == 0 {
-			*lastErr = fmt.Errorf("route hash slot %d has no leader", hashSlot)
-			return false
-		}
 	}
 	if probe, ok := routes.(clusterWriteProbeRuntime); ok {
 		probeCtx, cancel := context.WithTimeout(ctx, clusterWriteReadyProbeBudget(snapshot))
@@ -764,6 +868,26 @@ func clusterWriteReady(ctx context.Context, routes clusterWriteReadyRuntime, las
 		}
 	}
 	return true
+}
+
+func clusterRestoreRoutingReady(routes clusterWriteReadyRuntime, lastErr *error) (cluster.Snapshot, bool) {
+	snapshot := routes.Snapshot()
+	if !snapshot.RoutesReady || !snapshot.SlotsReady || !snapshot.ChannelsReady || snapshot.HashSlotCount == 0 {
+		*lastErr = fmt.Errorf("snapshot not ready: routes=%t slots=%t channels=%t hashSlotCount=%d", snapshot.RoutesReady, snapshot.SlotsReady, snapshot.ChannelsReady, snapshot.HashSlotCount)
+		return snapshot, false
+	}
+	for hashSlot := uint16(0); hashSlot < snapshot.HashSlotCount; hashSlot++ {
+		route, err := routes.RouteHashSlot(hashSlot)
+		if err != nil {
+			*lastErr = fmt.Errorf("route hash slot %d: %w", hashSlot, err)
+			return snapshot, false
+		}
+		if route.Leader == 0 {
+			*lastErr = fmt.Errorf("route hash slot %d has no leader", hashSlot)
+			return snapshot, false
+		}
+	}
+	return snapshot, true
 }
 
 func clusterWriteReadyProbeBudget(snapshot cluster.Snapshot) time.Duration {

@@ -21,11 +21,11 @@ id = "wukongim-single"
 # New dynamic data nodes must use WK_CLUSTER_SEEDS instead of WK_CLUSTER_NODES.
 nodes = [{ addr = "127.0.0.1:7001", id = 1 }]
 
-# Physical Slot count created by the initial Controller snapshot.
-initial_slot_count = 1
+# Logical Slot Raft Group count created by the initial Controller snapshot.
+initial_slot_count = 10
 
-# Logical hash-slot count used for routing channel keys to physical Slots.
-hash_slot_count = 16
+# Stable physical hash-slot fence count used to route keys to logical Slot Raft Groups.
+hash_slot_count = 256
 
 # Desired Slot replica count for this single-node cluster.
 slot_replica_n = 1
@@ -46,7 +46,13 @@ channel_store_append_workers = 0
 
 channel_store_apply_workers = 0
 
-channel_rpc_workers = 50
+# Bounds blocking replication RPC work. The 160-worker default avoids the scheduler
+# and allocation overhead observed with oversized pools while retaining burst headroom.
+channel_rpc_workers = 160
+
+# Maximum same-target Pull or PullHint items coalesced into one bounded
+# replication transport call. Zero uses the runtime default.
+channel_rpc_batch_max_items = 16
 
 # Maximum loaded Channel runtimes on this node. 0 keeps unlimited behavior.
 max_channels = 0
@@ -72,7 +78,9 @@ commit_coordinator_max_records = 0
 
 commit_coordinator_max_bytes = 0
 
-commit_coordinator_shards = 0
+# Four partition-hashed coordinators preserve per-channel append locking and
+# synchronous durable commits while allowing unrelated channels to commit concurrently.
+commit_coordinator_shards = 4
 
 [api]
 # Optional HTTP API listener for /healthz, /readyz, metrics, and bench/v1.
@@ -250,11 +258,13 @@ authority_flush_interval = "1s"
 
 authority_flush_timeout = "5s"
 
-authority_flush_batch_rows = 128
+authority_flush_batch_rows = 512
 
 authority_admit_batch_rows = 512
 
 authority_admit_concurrency = 16
+
+
 
 [delivery]
 # Online delivery fanout and owner-local recvack tracking are enabled by default; set false to disable them.

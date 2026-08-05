@@ -9,6 +9,8 @@ import { routes } from "@/app/router"
 const getNodesMock = vi.fn()
 const getApplicationLogSourcesMock = vi.fn()
 const getApplicationLogEntriesMock = vi.fn()
+const getPermissionsMock = vi.fn()
+const getBackupDashboardMock = vi.fn()
 
 vi.mock("@/lib/manager-api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/manager-api")>()
@@ -17,6 +19,8 @@ vi.mock("@/lib/manager-api", async (importOriginal) => {
     getNodes: (...args: unknown[]) => getNodesMock(...args),
     getApplicationLogSources: (...args: unknown[]) => getApplicationLogSourcesMock(...args),
     getApplicationLogEntries: (...args: unknown[]) => getApplicationLogEntriesMock(...args),
+    getPermissions: (...args: unknown[]) => getPermissionsMock(...args),
+    getBackupDashboard: (...args: unknown[]) => getBackupDashboardMock(...args),
   }
 })
 
@@ -37,6 +41,17 @@ beforeEach(() => {
   getNodesMock.mockReset()
   getApplicationLogSourcesMock.mockReset()
   getApplicationLogEntriesMock.mockReset()
+  getPermissionsMock.mockReset()
+  getBackupDashboardMock.mockReset()
+  getPermissionsMock.mockRejectedValue(new Error("authentication required"))
+  getBackupDashboardMock.mockResolvedValue({
+    state: {
+      revision: 0,
+      manager_session_epoch: 0,
+    },
+    archives: [],
+    credentials_configured: false,
+  })
   getNodesMock.mockResolvedValue({
     total: 1,
     items: [{
@@ -75,6 +90,50 @@ test("redirects anonymous /dashboard visits to /login", async () => {
   )
 
   expect(await screen.findByRole("heading", { name: /sign in/i })).toBeInTheDocument()
+})
+
+test("opens backup management read-only for a fresh auth-disabled browser", async () => {
+  getPermissionsMock.mockResolvedValue({
+    auth_enabled: false,
+    current_user: "",
+    users: [],
+    resources: [],
+  })
+  const router = createMemoryRouter(routes, { initialEntries: ["/cluster/backups"] })
+
+  render(
+    <AppProviders>
+      <RouterProvider router={router} />
+    </AppProviders>,
+  )
+
+  expect(await screen.findByRole("heading", { name: "Backups" })).toBeInTheDocument()
+  expect(screen.getByText("Manager authentication is disabled. Backup changes and restores are unavailable.")).toBeInTheDocument()
+  expect(await screen.findByRole("button", { name: "Save settings" })).toBeDisabled()
+  expect(useAuthStore.getState()).toMatchObject({
+    status: "readonly",
+    permissions: [{ resource: "cluster.backup", actions: ["r"] }],
+  })
+})
+
+test("confines the auth-disabled readonly session to backup management", async () => {
+  getPermissionsMock.mockResolvedValue({
+    auth_enabled: false,
+    current_user: "",
+    users: [],
+    resources: [],
+  })
+  const router = createMemoryRouter(routes, { initialEntries: ["/cluster/nodes"] })
+
+  render(
+    <AppProviders>
+      <RouterProvider router={router} />
+    </AppProviders>,
+  )
+
+  expect(await screen.findByRole("heading", { name: "Backups" })).toBeInTheDocument()
+  expect(router.state.location.pathname).toBe("/cluster/backups")
+  expect(getNodesMock).not.toHaveBeenCalled()
 })
 
 test("redirects authenticated /login visits to the cluster live monitor", async () => {

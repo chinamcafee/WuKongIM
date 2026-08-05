@@ -17,6 +17,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/raftlog"
 	metafsm "github.com/WuKongIM/WuKongIM/pkg/slot/fsm"
 	"github.com/WuKongIM/WuKongIM/pkg/slot/multiraft"
+	slotproxy "github.com/WuKongIM/WuKongIM/pkg/slot/proxy"
 	"go.etcd.io/raft/v3/raftpb"
 )
 
@@ -112,8 +113,9 @@ func (n *Node) ensureDefaultSlots() error {
 	n.defaultSlotRuntime = runtime
 	n.defaultSlotRaftDB = raftDB
 	n.defaultSlotMetaDB = metaDB
-	n.defaultSlotProposer = defaultSlotProposer{runtime: runtime}
+	n.defaultSlotProposer = defaultSlotProposer{runtime: runtime, acquireAdmission: n.acquireWriteAdmission}
 	n.slotStatusRuntime = runtime
+	n.defaultSlotProxy = slotproxy.NewChannelMetadataStore(n, metaDB)
 	n.registerDefaultSlotHandlers(runtime)
 	n.defaultSlots = true
 	return nil
@@ -131,7 +133,7 @@ func (n *Node) registerDefaultSlotHandlers(runtime *multiraft.Runtime) {
 		return
 	}
 	n.transportServer.Register(clusternet.MsgSlotRaftBatch, slotRaftBatchHandler{runtime: runtime})
-	n.transportServer.Register(clusternet.RPCSlotForwardPropose, propose.NewForwardHandler(defaultSlotProposer{runtime: runtime}))
+	n.transportServer.Register(clusternet.RPCSlotForwardPropose, propose.NewForwardHandler(defaultSlotProposer{runtime: runtime, acquireAdmission: n.acquireWriteAdmission}))
 	n.transportServer.Register(clusternet.RPCPluginBindingScan, pluginBindingScanHandler{node: n})
 	n.transportServer.Register(clusternet.RPCSlotStatus, slotStatusHandler{runtime: runtime})
 	n.transportServer.Register(clusternet.RPCChannelMigrationMeta, channelMigrationMetaHandler{node: n})
@@ -153,16 +155,20 @@ func (t networkSlotTransport) Send(ctx context.Context, batch []multiraft.Envelo
 	if t.sender == nil {
 		return nil
 	}
+	var sendErrs []error
 	for nodeID, envelopes := range groupSlotRaftEnvelopes(batch) {
 		payload, err := encodeSlotRaftBatch(envelopes)
 		if err != nil {
-			return err
+			sendErrs = append(sendErrs, fmt.Errorf("encode Slot Raft batch for node %d: %w", nodeID, err))
+			continue
 		}
 		if err := clusternet.SendOwnedPayload(ctx, t.sender, nodeID, clusternet.MsgSlotRaftBatch, payload); err != nil {
-			return err
+			// One unavailable voter must not suppress election or replication
+			// messages for the remaining live voters in the same Ready batch.
+			sendErrs = append(sendErrs, fmt.Errorf("send Slot Raft batch to node %d: %w", nodeID, err))
 		}
 	}
-	return nil
+	return errors.Join(sendErrs...)
 }
 
 func groupSlotRaftEnvelopes(batch []multiraft.Envelope) map[uint64][]multiraft.Envelope {

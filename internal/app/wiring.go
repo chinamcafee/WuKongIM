@@ -11,30 +11,35 @@ import (
 	accessgateway "github.com/WuKongIM/WuKongIM/internal/access/gateway"
 	accessmanager "github.com/WuKongIM/WuKongIM/internal/access/manager"
 	accessnode "github.com/WuKongIM/WuKongIM/internal/access/node"
+	accessops "github.com/WuKongIM/WuKongIM/internal/access/opsmcp"
+	opscontract "github.com/WuKongIM/WuKongIM/internal/contracts/opsmcp"
 	clusterinfra "github.com/WuKongIM/WuKongIM/internal/infra/cluster"
 	applog "github.com/WuKongIM/WuKongIM/internal/log"
 	obsdiagnostics "github.com/WuKongIM/WuKongIM/internal/observability/diagnostics"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/channelappend"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/conversationactive"
-	runtimedelivery "github.com/WuKongIM/WuKongIM/internal/runtime/delivery"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/online"
+	runtimeops "github.com/WuKongIM/WuKongIM/internal/runtime/opsmcp"
 	authoritypresence "github.com/WuKongIM/WuKongIM/internal/runtime/presence"
 	channelusecase "github.com/WuKongIM/WuKongIM/internal/usecase/channel"
 	cmdsyncusecase "github.com/WuKongIM/WuKongIM/internal/usecase/cmdsync"
 	conversationusecase "github.com/WuKongIM/WuKongIM/internal/usecase/conversation"
-	deliveryusecase "github.com/WuKongIM/WuKongIM/internal/usecase/delivery"
 	managementusecase "github.com/WuKongIM/WuKongIM/internal/usecase/management"
 	"github.com/WuKongIM/WuKongIM/internal/usecase/message"
+	observe "github.com/WuKongIM/WuKongIM/internal/usecase/opsobserve"
 	"github.com/WuKongIM/WuKongIM/internal/usecase/presence"
 	userusecase "github.com/WuKongIM/WuKongIM/internal/usecase/user"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster"
 	"github.com/WuKongIM/WuKongIM/pkg/gateway"
+	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 	obsmetrics "github.com/WuKongIM/WuKongIM/pkg/metrics"
 	"github.com/WuKongIM/WuKongIM/pkg/observability/sendtrace"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 func (a *App) applyConfigDefaults() error {
+	var err error
 	a.cfg.Manager = defaultManagerConfig(a.cfg.Manager)
 	if err := validateManagerConfig(a.cfg.Manager); err != nil {
 		return err
@@ -89,7 +94,6 @@ func (a *App) applyConfigDefaults() error {
 	if err := validatePrometheusConfig(a.cfg); err != nil {
 		return err
 	}
-	var err error
 	a.cfg.Top, err = NormalizeTopConfig(a.cfg.Top)
 	if err != nil {
 		return err
@@ -173,6 +177,16 @@ func (a *App) configureObservability(clusterCfg *cluster.Config) {
 		clusterCfg.Transport.Observer = combineTransportObservers(clusterCfg.Transport.Observer, &transportMetricsObserver{metrics: a.metrics})
 		clusterCfg.MessageEvent.Observer = combineMessageEventObservers(clusterCfg.MessageEvent.Observer, messageEventMetricsObserver{metrics: a.metrics})
 	}
+	if a.goroutines == nil {
+		a.goroutines = goruntimeregistry.Default()
+	}
+	if a.metrics != nil {
+		prometheus.WrapRegistererWith(prometheus.Labels{
+			"node_id":   fmt.Sprintf("%d", clusterCfg.NodeID),
+			"node_name": fmt.Sprintf("node-%d", clusterCfg.NodeID),
+		}, a.metrics.PrometheusRegistry()).MustRegister(a.goroutines)
+	}
+	clusterCfg.Goroutines = a.goroutines
 	if top != nil && a.cfg.Top.APIEnabled {
 		clusterCfg.Channel.Observer = combineChannelObservers(clusterCfg.Channel.Observer, topChannelObserver{top: top})
 		clusterCfg.Slots.Observer = combineSlotObservers(clusterCfg.Slots.Observer, topSlotObserver{top: top})
@@ -353,14 +367,16 @@ func (a *App) wireConversations(conversationReadStore *clusterinfra.Conversation
 	if a.conversations == nil {
 		if conversationReadStore != nil {
 			var store conversationusecase.Store = conversationReadStore
+			var deleteStore conversationusecase.DeleteStore = conversationReadStore
 			if a.conversationAuthorityClient != nil {
 				store = a.conversationAuthorityClient
+				deleteStore = a.conversationAuthorityClient
 			}
 			a.conversations = conversationusecase.New(conversationusecase.Options{
 				Store:              store,
 				StateStore:         conversationReadStore,
 				StateMutationStore: conversationReadStore,
-				DeleteStore:        conversationReadStore,
+				DeleteStore:        deleteStore,
 				Messages:           conversationReadStore,
 			})
 		}
@@ -372,10 +388,13 @@ func (a *App) wirePresence() {
 		observer := presenceMetricsObserver{metrics: a.metrics}
 		directory := authoritypresence.NewDirectory(authoritypresence.DirectoryOptions{LocalNodeID: presenceNode.NodeID()})
 		a.presenceDirectory = directory
-		authority := presenceDirectoryAuthority{directory: directory}
+		authority := clusterinfra.NewPresenceDirectoryAuthority(directory)
 		ownerActions := presenceOwnerActions{local: a.online}
 		client := clusterinfra.NewPresenceAuthorityClient(presenceNode, authority)
 		client.SetLocalOwner(ownerActions)
+		if a.metrics != nil {
+			client.SetEndpointLookupObserver(observer)
+		}
 		a.presenceAuthorityClient = client
 		adapter := accessnode.New(accessnode.Options{Authority: authority, Owner: ownerActions, Logger: a.logger.Named("node")})
 		presenceNode.RegisterRPC(accessnode.PresenceAuthorityRPCServiceID, nodeRPCHandlerFunc(adapter.HandlePresenceAuthorityRPC))
@@ -562,6 +581,18 @@ func (a *App) wireManagerTaskAuditRPC() {
 	registrar.RegisterRPC(accessnode.ManagerTaskAuditRPCServiceID, nodeRPCHandlerFunc(adapter.HandleManagerTaskAuditRPC))
 }
 
+func (a *App) wireManagerGoroutineRPC() {
+	registrar, ok := a.cluster.(nodeRPCRegistrar)
+	if !ok || a.goroutines == nil {
+		return
+	}
+	adapter := accessnode.New(accessnode.Options{
+		ManagerGoroutines: managerGoroutineLocalReader{registry: a.goroutines},
+		Logger:            a.logger.Named("node"),
+	})
+	registrar.RegisterRPC(accessnode.ManagerGoroutineRPCServiceID, nodeRPCHandlerFunc(adapter.HandleManagerGoroutineRPC))
+}
+
 func (a *App) wireNodeLifecycleRPC() {
 	registrar, hasRegistrar := a.cluster.(nodeRPCRegistrar)
 	if !hasRegistrar {
@@ -656,123 +687,47 @@ func (a *App) wireUsers() {
 	}
 }
 
-func (a *App) wireDelivery() {
-	if a.cfg.Delivery.Enabled && a.delivery == nil {
-		localPusher := &localOwnerPusher{online: a.online, pendingAckTTL: a.cfg.Delivery.PendingAckTTL, logger: a.logger.Named("delivery.owner")}
-		a.localOwnerPusher = localPusher
-		deliveryObserver := a.deliveryObserver()
-		var push runtimedelivery.Pusher = localPusher
-		var fanoutRemote runtimedelivery.FanoutTaskForwarder
-		var localNodeID uint64
-		if presenceNode, ok := a.cluster.(clusterinfra.PresenceNode); ok {
-			localNodeID = presenceNode.NodeID()
-			nodeClient := accessnode.NewClient(presenceNode)
-			push = clusterinfra.NewDeliveryPusher(localNodeID, localPusher, nodeClient)
-			fanoutRemote = nodeClient
-		}
-		var partitioner runtimedelivery.Partitioner
-		if routes, ok := a.cluster.(clusterWriteReadyRuntime); ok {
-			partitioner = clusterinfra.NewDeliveryPartitioner(routes)
-		}
-		fanoutWorker := runtimedelivery.NewFanoutWorker(runtimedelivery.FanoutWorkerOptions{
-			Subscribers: appSubscriberPlanner{
-				channel: runtimedelivery.NewChannelSubscriberPlanner(runtimedelivery.ChannelSubscriberPlannerOptions{
-					Source: a.deliverySubscribers,
-				}),
-			},
-			Presence:      presenceResolverAdapter{presence: a.presence},
-			Push:          push,
-			PageSize:      a.cfg.Delivery.FanoutPageSize,
-			PushBatchSize: a.cfg.Delivery.PushBatchSize,
-			Observer:      deliveryObserver,
-		})
-		var fanoutRunner runtimedelivery.FanoutTaskRunner = fanoutWorker
-		if localNodeID != 0 {
-			fanoutRunner = runtimedelivery.NewFanoutTaskRouter(runtimedelivery.FanoutTaskRouterOptions{
-				LocalNodeID: localNodeID,
-				Local:       fanoutWorker,
-				Remote:      fanoutRemote,
-				Observer:    deliveryObserver,
-			})
-		}
-		var retryObserver runtimedelivery.RetryObserver
-		if observer, ok := deliveryObserver.(runtimedelivery.RetryObserver); ok {
-			retryObserver = observer
-		}
-		retryScheduler := runtimedelivery.NewRetryScheduler(runtimedelivery.RetrySchedulerOptions{
-			Runner:      fanoutRunner,
-			Capacity:    a.cfg.Delivery.EventQueueSize,
-			MaxAttempts: defaultDeliveryRetryMaxAttempts,
-			Backoff:     defaultDeliveryRetryBackoff,
-			Observer:    retryObserver,
-		})
-		var managerObserver runtimedelivery.ManagerObserver
-		if observer, ok := deliveryObserver.(runtimedelivery.ManagerObserver); ok {
-			managerObserver = observer
-		}
-		var ackObserver runtimedelivery.AckObserver
-		if observer, ok := deliveryObserver.(runtimedelivery.AckObserver); ok {
-			ackObserver = observer
-		}
-		manager := runtimedelivery.NewManager(runtimedelivery.ManagerOptions{
-			Planner:         runtimedelivery.NewPlanner(runtimedelivery.PlannerOptions{Partitioner: partitioner}),
-			Runner:          retryScheduler,
-			AsyncQueueSize:  a.cfg.Delivery.EventQueueSize,
-			AsyncWorkers:    1,
-			ManagerObserver: managerObserver,
-			AckObserver:     ackObserver,
-			Acks: runtimedelivery.NewAckTracker(runtimedelivery.AckTrackerOptions{
-				MaxPendingPerSession: a.cfg.Delivery.PendingAckMaxPerSession,
-			}),
-		})
-		localPusher.delivery = manager
-		a.deliveryManager = manager
-		a.deliveryRetry = retryScheduler
-		a.delivery = deliveryusecase.New(deliveryusecase.Options{Runtime: deliveryRuntimeAdapter{manager: manager}})
-		if a.deliveryWorker == nil {
-			a.deliveryWorker = deliveryWorkerGroup{retryScheduler, manager}
-		}
-		if presenceNode, ok := a.cluster.(clusterinfra.PresenceNode); ok {
-			adapter := accessnode.New(accessnode.Options{Delivery: localPusher, DeliveryFanout: fanoutWorker, Logger: a.logger.Named("node")})
-			presenceNode.RegisterRPC(accessnode.DeliveryPushRPCServiceID, nodeRPCHandlerFunc(adapter.HandleDeliveryPushRPC))
-			presenceNode.RegisterRPC(accessnode.DeliveryFanoutRPCServiceID, nodeRPCHandlerFunc(adapter.HandleDeliveryFanoutRPC))
-		}
-	}
-}
-
 func (a *App) wireChannelAppend(nodeID uint64) error {
 	if a.channelAppends == nil {
 		appendNode, hasAppendNode := a.cluster.(clusterinfra.ChannelAppendNode)
 		authorityNode, hasAuthorityNode := a.cluster.(clusterinfra.ChannelAppendAuthorityNode)
 		if hasAppendNode && hasAuthorityNode {
 			metadata := a.ensureChannelAppendMetadataCache()
-			messageIDs, err := newNodeMessageIDs(nodeID)
-			if err != nil {
-				return fmt.Errorf("internal/app: create message id generator: %w", err)
+			messageIDs := a.messageIDs
+			if messageIDs == nil {
+				var err error
+				messageIDs, err = newNodeMessageIDs(nodeID)
+				if err != nil {
+					return fmt.Errorf("internal/app: create message id generator: %w", err)
+				}
+				a.messageIDs = messageIDs
 			}
 			opts := channelappend.Options{
-				LocalNodeID:                           nodeID,
-				Appender:                              clusterinfra.NewChannelAppender(appendNode, a.logger.Named("cluster.append")),
-				MessageID:                             messageIDs,
-				AuthorityShardCount:                   a.cfg.ChannelAppend.AuthorityShardCount,
-				AdvancePoolSize:                       a.cfg.ChannelAppend.AdvancePoolSize,
-				EffectPoolSize:                        a.cfg.ChannelAppend.EffectPoolSize,
-				RecipientAuthorityDispatchConcurrency: a.cfg.ChannelAppend.RecipientAuthorityDispatchConcurrency,
-				RecipientBatchSize:                    a.cfg.Delivery.PushBatchSize,
-				SubscriberScanPageSize:                a.cfg.Delivery.FanoutPageSize,
+				LocalNodeID:            nodeID,
+				Appender:               clusterinfra.NewChannelAppender(appendNode, a.logger.Named("cluster.append")),
+				MessageID:              messageIDs,
+				AuthorityShardCount:    a.cfg.ChannelAppend.AuthorityShardCount,
+				AdvancePoolSize:        a.cfg.ChannelAppend.AdvancePoolSize,
+				EffectPoolSize:         a.cfg.ChannelAppend.EffectPoolSize,
+				RecipientBatchSize:     a.cfg.Delivery.PushBatchSize,
+				SubscriberScanPageSize: a.cfg.Delivery.FanoutPageSize,
 			}
 			if idempotencyNode, ok := a.cluster.(clusterinfra.ChannelIdempotencyNode); ok {
 				opts.Idempotency = clusterinfra.NewChannelIdempotencyStore(idempotencyNode)
 			}
 			if a.deliveryMeta != nil {
-				opts.Subscribers = channelAppendDeliverySubscriberSource{source: a.deliveryMeta}
+				opts.Subscribers = a.deliveryMeta
 			} else if a.deliverySubscribers != nil {
-				opts.Subscribers = channelAppendDeliverySubscriberSource{source: a.deliverySubscribers}
+				opts.Subscribers = a.deliverySubscribers
 			} else if subscriberNode, ok := a.cluster.(recipientSubscriberNode); ok {
 				opts.Subscribers = channelAppendSubscriberSource{node: subscriberNode}
 			}
-			if recipientNode, ok := a.cluster.(recipientAuthorityRouteNode); ok {
-				opts.RecipientAuthorityResolver = channelAppendRecipientResolver{node: recipientNode}
+			var recipientObserver clusterinfra.RecipientAuthorityResolveObserver
+			if a.metrics != nil {
+				recipientObserver = deliveryMetricsObserver{metrics: a.metrics}
+			}
+			if resolver := clusterinfra.NewRecipientAuthorityResolver(a.cluster, recipientObserver); resolver != nil {
+				opts.RecipientAuthorityResolver = resolver
 			}
 			if a.conversationAuthorityClient != nil {
 				opts.ConversationActiveAdmitter = a.conversationAuthorityClient
@@ -784,28 +739,7 @@ func (a *App) wireChannelAppend(nodeID uint64) error {
 				opts.Observer = observer
 			}
 			if a.cfg.Delivery.Enabled {
-				offlineSingle, offlineBatch := composeOfflineRecipientObservers(a.pluginReceive, a.webhookOffline)
-				deliveryObserver := a.deliveryObserver()
-				processor := channelappend.NewRecipientProcessor(channelappend.RecipientProcessorOptions{
-					PresenceResolver:            channelAppendPresenceResolver{presence: a.presence},
-					OwnerPusher:                 a.channelAppendOwnerPusher(nodeID, deliveryObserver),
-					OwnerPushBatchSize:          a.cfg.Delivery.PushBatchSize,
-					OfflineRecipientObserver:    offlineSingle,
-					OfflineRecipientsObserver:   offlineBatch,
-					DeliveryRetryMaxAttempts:    defaultDeliveryRetryMaxAttempts,
-					DeliveryRetryInitialBackoff: defaultDeliveryRetryBackoff,
-					DeliveryRetryMaxBackoff:     defaultDeliveryRetryBackoff,
-				})
-				if a.channelAppendDeliveryWorker == nil {
-					a.channelAppendDeliveryWorker = channelappend.NewRecipientDeliveryWorker(channelappend.RecipientDeliveryWorkerOptions{
-						Processor: processor,
-						QueueSize: a.cfg.Delivery.EventQueueSize,
-						Workers:   a.cfg.Delivery.RecipientWorkerConcurrency,
-						Observer:  observer,
-					})
-				}
-				opts.RecipientDeliveryEnqueuer = a.channelAppendDeliveryWorker
-				a.deliveryWorker = appendDeliveryWorker(a.deliveryWorker, a.channelAppendDeliveryWorker)
+				opts.OnlineDeliveryEnqueuer = a.onlineDelivery
 			}
 			group := channelappend.New(opts)
 			var remote clusterinfra.ChannelAppendRemoteForwarder
@@ -841,17 +775,6 @@ func (a *App) ensureChannelAppendMetadataCache() *clusterinfra.ChannelAppendMeta
 		a.channelAppendMetadata = clusterinfra.NewChannelAppendMetadataCache()
 	}
 	return a.channelAppendMetadata
-}
-
-func (a *App) channelAppendOwnerPusher(nodeID uint64, observer runtimedelivery.Observer) channelappend.OwnerPusher {
-	if a.localOwnerPusher == nil {
-		return nil
-	}
-	var pusher runtimedelivery.Pusher = a.localOwnerPusher
-	if rpcNode, ok := a.cluster.(accessnode.PresenceRPCNode); ok {
-		pusher = clusterinfra.NewDeliveryPusher(nodeID, a.localOwnerPusher, accessnode.NewClient(rpcNode))
-	}
-	return channelAppendOwnerPusher{next: pusher, observer: observer}
 }
 
 func (a *App) wireMessages() {
@@ -919,6 +842,7 @@ func (a *App) wireAPI() {
 		a.api = accessapi.New(accessapi.Options{
 			ListenAddr:               a.cfg.API.ListenAddr,
 			Readyz:                   a.readyzReport,
+			Maintenance:              a.restoreMaintenance.Load,
 			BenchEnabled:             a.cfg.Bench.APIEnabled,
 			BenchToken:               a.cfg.Bench.APIToken,
 			BenchMaxBatchSize:        a.cfg.Bench.APIMaxBatchSize,
@@ -942,15 +866,24 @@ func (a *App) wireAPI() {
 			DebugConfig:              a.debugConfigSnapshot,
 			DebugCluster:             a.debugClusterSnapshot,
 			Diagnostics:              a,
-			Top:                      a.topProvider,
-			Logger:                   a.logger.Named("access.api"),
+			GoroutineSnapshot: func() any {
+				return a.goroutines.Snapshot()
+			},
+			Top:    a.topProvider,
+			Logger: a.logger.Named("access.api"),
 		})
 	}
 }
 
 func (a *App) wireManager() {
 	if a.manager == nil && strings.TrimSpace(a.cfg.Manager.ListenAddr) != "" {
+		a.ensureOpsMCPCallControl()
 		management := a.newManagerManagement()
+		var opsMCPManagement accessmanager.OpsMCPManagement
+		if candidate, ok := management.(accessmanager.OpsMCPManagement); ok {
+			opsMCPManagement = candidate
+		}
+		a.wireOpsMCP(management)
 		a.manager = accessmanager.New(accessmanager.Options{
 			ListenAddr: a.cfg.Manager.ListenAddr,
 			Auth: accessmanager.AuthConfig{
@@ -961,13 +894,106 @@ func (a *App) wireManager() {
 				Users:     managerUserConfigs(a.cfg.Manager.Users),
 			},
 			Management:      management,
+			OpsMCP:          opsMCPManagement,
+			OpsMCPHandler:   a.opsMCPEndpoint,
 			RealtimeMonitor: a.newManagerMonitorProvider(management),
 			Top:             a.topProvider,
 			WebhookConfig:   a,
 			WebhookOutbox:   a,
+			Backup:          a.newBackupManagement(),
+			Restore:         a.newRestoreManagement(),
+			SessionEpoch:    a.managerSessionEpoch,
+			Maintenance:     a.restoreMaintenance.Load,
 			Logger:          a.logger.Named("access.manager"),
 		})
 	}
+}
+
+type opsMCPRPCNode interface {
+	clusterinfra.ManagementNode
+	accessnode.PresenceRPCNode
+}
+
+type opsMCPProfileLeaseRouter struct {
+	localNodeID uint64
+	local       *runtimeops.ProfileAnalyzer
+	remote      *accessnode.Client
+}
+
+func (r opsMCPProfileLeaseRouter) VerifyOpsMCPProfileLease(
+	ctx context.Context,
+	ownerNodeID uint64,
+	request opscontract.ProfileLeaseRequest,
+) error {
+	if ownerNodeID == r.localNodeID {
+		return r.local.AuthorizeProfileLease(ctx, request)
+	}
+	return r.remote.VerifyOpsMCPProfileLease(ctx, ownerNodeID, request)
+}
+
+func (a *App) ensureOpsMCPCallControl() {
+	if a == nil || a.opsMCPCalls != nil {
+		return
+	}
+	a.opsMCPCalls = runtimeops.NewCallControl(runtimeops.CallControlConfig{
+		AuditPath: filepath.Join(a.cfg.Log.Dir, "mcp-audit.jsonl"),
+		Observer:  opsMCPMetrics(a.metrics),
+	})
+}
+
+func opsMCPMetrics(registry *obsmetrics.Registry) runtimeops.CallObserver {
+	if registry == nil {
+		return nil
+	}
+	return registry.OpsMCP
+}
+
+func (a *App) wireOpsMCP(management accessmanager.Management) {
+	if a == nil || a.opsMCPEndpoint != nil || management == nil {
+		return
+	}
+	node, hasNode := a.cluster.(opsMCPRPCNode)
+	registrar, hasRegistrar := a.cluster.(nodeRPCRegistrar)
+	if !hasNode || !hasRegistrar {
+		return
+	}
+	clusterID := strings.TrimSpace(a.cfg.Cluster.Control.ClusterID)
+	if runtime, ok := a.cluster.(startupClusterRuntime); ok {
+		clusterID = strings.TrimSpace(runtime.ClusterID())
+	}
+	state := clusterinfra.NewOpsMCPStateReader(node)
+	client := accessnode.NewClient(node)
+	analyzer := runtimeops.NewProfileAnalyzer(state, client, node.NodeID())
+	profiler := runtimeops.NewProfiler(state, opsMCPProfileLeaseRouter{
+		localNodeID: node.NodeID(), local: analyzer, remote: client,
+	}, node.NodeID())
+	metrics, err := clusterinfra.NewOpsPrometheusReader(managerPrometheusBaseURL(a.cfg.Observability.Prometheus), nil)
+	if err != nil {
+		metrics = nil
+	}
+	inventory, _ := management.(clusterinfra.OpsInventoryReader)
+	tasks, _ := management.(clusterinfra.OpsTaskReader)
+	logs, _ := management.(clusterinfra.OpsLogReader)
+	diagnosticsReader, _ := management.(clusterinfra.OpsDiagnosticsReader)
+	configReader, _ := management.(clusterinfra.OpsConfigReader)
+	source := clusterinfra.NewOpsObservationSource(clusterinfra.OpsObservationSourceConfig{
+		Inventory: inventory, Tasks: tasks, Logs: logs, Diagnostics: diagnosticsReader,
+		Config: configReader, Metrics: metrics, Backup: a.newBackupManagement(), Profiles: analyzer,
+	})
+	service, err := observe.New(observe.Config{ClusterID: clusterID, Source: source})
+	if err != nil {
+		return
+	}
+	endpoint, err := accessops.NewEndpoint(accessops.Config{
+		Verifier: runtimeops.NewNodeVerifier(state, node.NodeID()), Service: service,
+		LocalNodeID: node.NodeID(), Forwarder: client, Calls: a.opsMCPCalls,
+	})
+	if err != nil {
+		return
+	}
+	a.opsMCPEndpoint = endpoint
+	adapter := accessnode.NewOpsMCPRPCAdapterWithServices(endpoint, profiler, a.opsMCPCalls, analyzer)
+	registrar.RegisterRPC(accessnode.OpsMCPRPCServiceID, nodeRPCHandlerFunc(adapter.HandleRPC))
 }
 
 func (a *App) newManagerMonitorProvider(control managerClusterControlReader) accessmanager.RealtimeMonitorProvider {
@@ -976,13 +1002,26 @@ func (a *App) newManagerMonitorProvider(control managerClusterControlReader) acc
 	if nodeID == 0 {
 		nodeID = a.cfg.Cluster.NodeID
 	}
-	return newManagerPrometheusMonitorProvider(managerPrometheusMonitorOptions{
+	base := newManagerPrometheusMonitorProvider(managerPrometheusMonitorOptions{
 		Enabled:  a.cfg.Observability.MetricsEnabled && strings.TrimSpace(prometheusBaseURL) != "",
 		BaseURL:  prometheusBaseURL,
 		NodeID:   nodeID,
 		NodeName: fmt.Sprintf("node-%d", nodeID),
 		Control:  control,
 	})
+	var remote managerGoroutineSnapshotReader
+	if node, ok := a.cluster.(accessnode.PresenceRPCNode); ok {
+		remote = accessnode.NewClient(node)
+	}
+	return &managerRealtimeMonitorProvider{
+		base: base,
+		goroutines: &managerGoroutineMonitor{
+			localNodeID: nodeID,
+			registry:    a.goroutines,
+			control:     control,
+			remote:      remote,
+		},
+	}
 }
 
 func managerPrometheusBaseURL(cfg PrometheusConfig) string {
@@ -1001,8 +1040,9 @@ func managerPrometheusBaseURL(cfg PrometheusConfig) string {
 func (a *App) newManagerManagement() accessmanager.Management {
 	if node, ok := a.cluster.(clusterinfra.ManagementNode); ok {
 		opts := managementusecase.Options{
-			Cluster:       clusterinfra.NewManagementSnapshotReader(node),
-			Conversations: a.conversations,
+			Cluster:                 clusterinfra.NewManagementSnapshotReader(node),
+			Conversations:           a.conversations,
+			ChannelBusinessOperator: newManagerChannelBusinessOperator(a.channels),
 		}
 		if a.metrics != nil {
 			observer := &nodeLifecycleMetricsObserver{metrics: a.metrics}
@@ -1033,6 +1073,9 @@ func (a *App) newManagerManagement() accessmanager.Management {
 		}
 		if runtimeNode, ok := a.cluster.(clusterinfra.ChannelRuntimeMetaScanNode); ok {
 			opts.ChannelRuntimeMeta = clusterinfra.NewChannelRuntimeMetaReader(runtimeNode)
+		}
+		if runtimeNode, ok := a.cluster.(clusterinfra.ChannelRuntimeMetaPointNode); ok {
+			opts.ChannelRuntimeMetaPoint = clusterinfra.NewChannelRuntimeMetaPointReader(runtimeNode)
 		}
 		if migrationNode, ok := a.cluster.(clusterinfra.ChannelMigrationStoreNode); ok {
 			opts.ChannelMigration = clusterinfra.NewChannelMigrationStore(migrationNode)
@@ -1122,6 +1165,14 @@ func (a *App) newManagerManagement() accessmanager.Management {
 			opts.ControllerVoterReadiness = lifecycleClient
 			opts.ControllerVoterPreparer = lifecycleClient
 		}
+		if opsMCPNode, ok := a.cluster.(clusterinfra.ManagementOpsMCPNode); ok {
+			opts.OpsMCP = clusterinfra.NewManagementOpsMCPWriter(opsMCPNode)
+		}
+		if auditNode, ok := a.cluster.(clusterinfra.ManagementOpsMCPAuditNode); ok {
+			opts.OpsMCPAudit = clusterinfra.NewManagementOpsMCPAuditReader(auditNode, a.opsMCPCalls)
+		} else {
+			opts.OpsMCPAudit = a.opsMCPCalls
+		}
 		return managementusecase.New(opts)
 	}
 	return nil
@@ -1191,10 +1242,14 @@ func (a *App) wireGateway(nodeID uint64) error {
 			Authenticator:  gateway.NewWKProtoAuthenticator(authOptions),
 			Listeners:      a.cfg.Gateway.Listeners,
 			DefaultSession: a.cfg.Gateway.Session,
-			Runtime:        a.cfg.Gateway.Runtime,
-			Transport:      a.cfg.Gateway.Transport,
-			Observer:       a.gatewayObserver(),
-			Logger:         a.logger.Named("gateway"),
+			Runtime: func() gateway.RuntimeOptions {
+				runtimeOptions := a.cfg.Gateway.Runtime
+				runtimeOptions.Goroutines = a.goroutines
+				return runtimeOptions
+			}(),
+			Transport: a.cfg.Gateway.Transport,
+			Observer:  a.gatewayObserver(),
+			Logger:    a.logger.Named("gateway"),
 		})
 		if err != nil {
 			return err

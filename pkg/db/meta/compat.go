@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"math"
 
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/dberrors"
@@ -377,6 +378,58 @@ func (db *DB) ExportHashSlotSnapshot(ctx context.Context, hashSlots []uint16) (S
 		return SlotSnapshot{}, dberrors.ErrClosed
 	}
 	return db.meta.ExportHashSlotSnapshot(ctx, hashSlots)
+}
+
+// OpenHashSlotSnapshot opens a pinned streaming snapshot for selected hash slots.
+func (db *DB) OpenHashSlotSnapshot(ctx context.Context, hashSlots []uint16) (io.ReadCloser, error) {
+	if db == nil || db.meta == nil {
+		return nil, dberrors.ErrClosed
+	}
+	return db.meta.OpenHashSlotSnapshot(ctx, hashSlots)
+}
+
+// OpenBackupHashSlotSnapshot opens a pinned semantic backup snapshot.
+func (db *DB) OpenBackupHashSlotSnapshot(ctx context.Context, hashSlots []uint16) (io.ReadCloser, error) {
+	if db == nil || db.meta == nil {
+		return nil, dberrors.ErrClosed
+	}
+	return db.meta.OpenBackupHashSlotSnapshot(ctx, hashSlots)
+}
+
+// HasBackupBusinessData reports whether selected hash slots contain semantic
+// rows that make a restore target non-empty.
+func (db *DB) HasBackupBusinessData(ctx context.Context, hashSlots []uint16) (bool, error) {
+	if db == nil || db.meta == nil {
+		return false, dberrors.ErrClosed
+	}
+	return db.meta.HasBackupBusinessData(ctx, hashSlots)
+}
+
+// ImportHashSlotSnapshotReaderPreservingMigrationMeta installs a seekable
+// semantic snapshot with bounded memory while retaining target-local migration rows.
+func (db *DB) ImportHashSlotSnapshotReaderPreservingMigrationMeta(ctx context.Context, hashSlots []uint16, reader io.ReadSeeker, size int64) error {
+	if db == nil || db.meta == nil {
+		return dberrors.ErrClosed
+	}
+	return db.meta.ImportHashSlotSnapshotReaderPreservingMigrationMeta(ctx, hashSlots, reader, size)
+}
+
+// ImportHashSlotSnapshotReaderForRestore installs semantic metadata with
+// bounded memory and optional authentication-token invalidation.
+func (db *DB) ImportHashSlotSnapshotReaderForRestore(ctx context.Context, hashSlots []uint16, reader io.ReadSeeker, size int64, invalidateTokens bool) error {
+	if db == nil || db.meta == nil {
+		return dberrors.ErrClosed
+	}
+	return db.meta.ImportHashSlotSnapshotReaderForRestore(ctx, hashSlots, reader, size, invalidateTokens)
+}
+
+// ImportHashSlotSnapshotReaderForRestoreWithStats installs semantic metadata
+// and returns the authenticated portable record count.
+func (db *DB) ImportHashSlotSnapshotReaderForRestoreWithStats(ctx context.Context, hashSlots []uint16, reader io.ReadSeeker, size int64, invalidateTokens bool) (BackupSnapshotStats, error) {
+	if db == nil || db.meta == nil {
+		return BackupSnapshotStats{}, dberrors.ErrClosed
+	}
+	return db.meta.ImportHashSlotSnapshotReaderForRestoreWithStats(ctx, hashSlots, reader, size, invalidateTokens)
 }
 
 // ImportHashSlotSnapshot imports selected hash slots.
@@ -1388,6 +1441,71 @@ func (b *WriteBatch) UpsertChannel(hashSlot uint16, channel Channel) error {
 	return b.batch.UpsertChannel(HashSlot(hashSlot), channel)
 }
 
+// CreateChannelConditionally stages a create-only channel mutation.
+func (b *WriteBatch) CreateChannelConditionally(hashSlot uint16, channel Channel) (*ChannelConditionalMutationResult, error) {
+	if err := b.ensure(); err != nil {
+		return nil, err
+	}
+	if err := validateChannel(channel); err != nil {
+		return nil, err
+	}
+	hs := HashSlot(hashSlot)
+	primaryKey := encodeChannelRowKey(hs, channel.ChannelID, channel.ChannelType, channelPrimaryFamilyID)
+	result := &ChannelConditionalMutationResult{}
+	b.batch.addOp(hs, func(ctx context.Context, state *batchCommitState, batch *engine.Batch) error {
+		_, exists, err := state.loadChannel(ctx, primaryKey, channel.ChannelID, channel.ChannelType)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return nil
+		}
+		shard := &Shard{db: state.db, hashSlot: hs}
+		if err := shard.stageChannel(batch, primaryKey, channel); err != nil {
+			return err
+		}
+		state.channelPublishes[string(primaryKey)] = channel
+		delete(state.channelDeletes, string(primaryKey))
+		result.Applied = true
+		return nil
+	})
+	return result, nil
+}
+
+// PatchChannelBusinessFlags stages an existing-only partial flag update.
+func (b *WriteBatch) PatchChannelBusinessFlags(hashSlot uint16, channelID string, channelType int64, flags ChannelBusinessFlags) (*ChannelConditionalMutationResult, error) {
+	if err := b.ensure(); err != nil {
+		return nil, err
+	}
+	if err := validateKeyString(channelID); err != nil {
+		return nil, err
+	}
+	hs := HashSlot(hashSlot)
+	primaryKey := encodeChannelRowKey(hs, channelID, channelType, channelPrimaryFamilyID)
+	result := &ChannelConditionalMutationResult{}
+	b.batch.addOp(hs, func(ctx context.Context, state *batchCommitState, batch *engine.Batch) error {
+		channel, exists, err := state.loadChannel(ctx, primaryKey, channelID, channelType)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return nil
+		}
+		channel.Ban = flags.Ban
+		channel.Disband = flags.Disband
+		channel.SendBan = flags.SendBan
+		shard := &Shard{db: state.db, hashSlot: hs}
+		if err := shard.stageChannel(batch, primaryKey, channel); err != nil {
+			return err
+		}
+		state.channelPublishes[string(primaryKey)] = channel
+		delete(state.channelDeletes, string(primaryKey))
+		result.Applied = true
+		return nil
+	})
+	return result, nil
+}
+
 func (b *WriteBatch) DeleteChannel(hashSlot uint16, channelID string, channelType int64) error {
 	if err := b.ensure(); err != nil {
 		return err
@@ -1471,10 +1589,22 @@ func (b *WriteBatch) AdvanceChannelRetentionThroughSeq(hashSlot uint16, req Chan
 }
 
 func (b *WriteBatch) AddSubscribers(hashSlot uint16, channelID string, channelType int64, uids []string, mutationVersion ...uint64) error {
-	return b.stageSubscribers(hashSlot, channelID, channelType, uids, optionalVersion(mutationVersion), true)
+	_, err := b.stageSubscribers(hashSlot, channelID, channelType, uids, optionalVersion(mutationVersion), true)
+	return err
 }
 
 func (b *WriteBatch) RemoveSubscribers(hashSlot uint16, channelID string, channelType int64, uids []string, mutationVersion ...uint64) error {
+	_, err := b.stageSubscribers(hashSlot, channelID, channelType, uids, optionalVersion(mutationVersion), false)
+	return err
+}
+
+// AddSubscribersCounted stages a set add and returns a result populated by Commit.
+func (b *WriteBatch) AddSubscribersCounted(hashSlot uint16, channelID string, channelType int64, uids []string, mutationVersion ...uint64) (*SubscriberMutationResult, error) {
+	return b.stageSubscribers(hashSlot, channelID, channelType, uids, optionalVersion(mutationVersion), true)
+}
+
+// RemoveSubscribersCounted stages a set removal and returns a result populated by Commit.
+func (b *WriteBatch) RemoveSubscribersCounted(hashSlot uint16, channelID string, channelType int64, uids []string, mutationVersion ...uint64) (*SubscriberMutationResult, error) {
 	return b.stageSubscribers(hashSlot, channelID, channelType, uids, optionalVersion(mutationVersion), false)
 }
 
@@ -1506,14 +1636,15 @@ func (b *WriteBatch) AppendMessageEvent(hashSlot uint16, event MessageEventAppen
 	return b.batch.AppendMessageEvent(HashSlot(hashSlot), event)
 }
 
-func (b *WriteBatch) stageSubscribers(hashSlot uint16, channelID string, channelType int64, uids []string, mutationVersion uint64, add bool) error {
+func (b *WriteBatch) stageSubscribers(hashSlot uint16, channelID string, channelType int64, uids []string, mutationVersion uint64, add bool) (*SubscriberMutationResult, error) {
 	if err := b.ensure(); err != nil {
-		return err
+		return nil, err
 	}
 	normalized, err := normalizeSubscriberUIDs(uids)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	result := &SubscriberMutationResult{RequestedCount: len(normalized)}
 	hs := HashSlot(hashSlot)
 	b.batch.addOp(hs, func(ctx context.Context, state *batchCommitState, batch *engine.Batch) error {
 		primaryKey := encodeChannelRowKey(hs, channelID, channelType, channelPrimaryFamilyID)
@@ -1542,6 +1673,7 @@ func (b *WriteBatch) stageSubscribers(hashSlot uint16, channelID string, channel
 			if add {
 				if !exists {
 					channel.SubscriberCount++
+					result.ChangedCount++
 				}
 				if err := batch.Set(key, nil); err != nil {
 					return err
@@ -1550,6 +1682,9 @@ func (b *WriteBatch) stageSubscribers(hashSlot uint16, channelID string, channel
 			} else {
 				if exists && channel.SubscriberCount > 0 {
 					channel.SubscriberCount--
+				}
+				if exists {
+					result.ChangedCount++
 				}
 				if err := batch.Delete(key); err != nil {
 					return err
@@ -1566,7 +1701,7 @@ func (b *WriteBatch) stageSubscribers(hashSlot uint16, channelID string, channel
 		}
 		return nil
 	})
-	return nil
+	return result, nil
 }
 
 func (b *WriteBatch) UpsertConversationState(hashSlot uint16, state ConversationState) error {
@@ -2350,6 +2485,10 @@ func (b *WriteBatch) stageChannelMigrationTaskAndMeta(hashSlot uint16, guard Cha
 			return err
 		}
 		nextMeta = normalizeChannelRuntimeMeta(nextMeta)
+		// Migration mutations bypass the ordinary runtime-meta upsert path, so
+		// advance the complete-route generation whenever the projected route,
+		// authority, membership, retention, or write-fence state changes.
+		nextMeta = bumpRuntimeRoute(meta, nextMeta, true)
 		if !guard.matches(task) || !runtimeGuard.matches(meta) {
 			if task == nextTask && channelRuntimeMetaEqual(meta, nextMeta) {
 				return nil

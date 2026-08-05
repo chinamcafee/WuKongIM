@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"io"
 	"reflect"
 	"sync"
 	"testing"
@@ -13,6 +14,55 @@ import (
 	channel "github.com/WuKongIM/WuKongIM/pkg/db/message/channelcompat"
 	"github.com/stretchr/testify/require"
 )
+
+func TestFullBackupSnapshotDoesNotHideLaterCommittedAppends(t *testing.T) {
+	ctx := context.Background()
+	factory := NewMessageDBFactory(t.TempDir())
+	t.Cleanup(func() { _ = factory.Close() })
+	id := ch.ChannelID{ID: "online-backup-append", Type: 2}
+	key := ch.ChannelKeyForID(id)
+	store, err := factory.ChannelStore(key, id)
+	require.NoError(t, err)
+	closeChannelStoreOnCleanup(t, store)
+
+	_, err = store.AppendLeader(ctx, AppendLeaderRequest{
+		Records: []ch.Record{{
+			ID: 1, ClientMsgNo: "before", Payload: []byte("before"),
+			SizeBytes: len("before"),
+		}},
+		Sync: true,
+	})
+	require.NoError(t, err)
+
+	snapshot, _, err := factory.OpenBackupSnapshotWithStats(
+		ctx,
+		BackupSnapshotRequest{
+			HashSlot: 7,
+			Channels: []BackupChannelCut{{
+				Key: key, ID: id, Epoch: 1, HW: 1,
+			}},
+		},
+	)
+	require.NoError(t, err)
+	_, err = io.Copy(io.Discard, snapshot)
+	require.NoError(t, err)
+	require.NoError(t, snapshot.Close())
+
+	_, err = store.AppendLeader(ctx, AppendLeaderRequest{
+		Records: []ch.Record{{
+			ID: 2, ClientMsgNo: "after", Payload: []byte("after"),
+			SizeBytes: len("after"),
+		}},
+		Sync: true,
+	})
+	require.NoError(t, err)
+
+	committed, err := store.ReadCommitted(ctx, ReadCommittedRequest{
+		FromSeq: 1, Limit: 10, MaxBytes: 1024,
+	})
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 2}, messageSeqs(committed.Messages))
+}
 
 func TestMessageDBStoreAdapterContract(t *testing.T) {
 	factory := NewMessageDBFactory(t.TempDir())
@@ -610,6 +660,13 @@ func TestNewMessageDBFactoryWithOptionsConfiguresCommitCoordinatorTuning(t *test
 	require.Equal(t, 512, cfg.MaxRecords)
 	require.Equal(t, 256*1024, cfg.MaxBytes)
 	require.Equal(t, 4, cfg.Shards)
+}
+
+func TestNewMessageDBFactoryUsesQPSValidatedCommitShardsByDefault(t *testing.T) {
+	factory := NewMessageDBFactory(t.TempDir())
+	t.Cleanup(func() { _ = factory.Close() })
+
+	require.Equal(t, 4, factory.CommitCoordinatorConfig().Shards)
 }
 
 func TestMessageDBFactoryMetricsSnapshotReportsPhysicalStore(t *testing.T) {

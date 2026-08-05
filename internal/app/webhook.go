@@ -65,7 +65,13 @@ type composedPersistAfterEnqueuer struct {
 
 type composedOfflineRecipientsObserver struct {
 	pluginSingle channelappend.OfflineRecipientObserver
+	pluginBatch  channelappend.OfflineRecipientsObserver
 	webhookBatch channelappend.OfflineRecipientsObserver
+}
+
+type singleOfflineRecipientsObserver struct {
+	// next receives one compatibility callback per UID in a canonical batch.
+	next channelappend.OfflineRecipientObserver
 }
 
 func (a *App) wireWebhook() error {
@@ -100,6 +106,7 @@ func (a *App) wireWebhook() error {
 			RetryMaxDelay:      a.cfg.Webhook.OutboxRetryMaxDelay,
 			DeliveredRetention: a.cfg.Webhook.OutboxDeliveredRetention,
 		},
+		Goroutines: a.goroutines,
 	})
 	if err != nil {
 		return fmt.Errorf("internal/app: create webhook runtime: %w", err)
@@ -183,15 +190,36 @@ func (e composedPersistAfterEnqueuer) EnqueuePersistAfter(ctx context.Context, e
 func composeOfflineRecipientObservers(
 	pluginSingle channelappend.OfflineRecipientObserver,
 	webhookBatch channelappend.OfflineRecipientsObserver,
-) (channelappend.OfflineRecipientObserver, channelappend.OfflineRecipientsObserver) {
-	if pluginSingle == nil || webhookBatch == nil {
-		return pluginSingle, webhookBatch
+) channelappend.OfflineRecipientsObserver {
+	if pluginSingle == nil {
+		return webhookBatch
 	}
-	return pluginSingle, composedOfflineRecipientsObserver{pluginSingle: pluginSingle, webhookBatch: webhookBatch}
+	pluginBatch, _ := pluginSingle.(channelappend.OfflineRecipientsObserver)
+	if webhookBatch == nil {
+		if pluginBatch != nil {
+			return pluginBatch
+		}
+		return singleOfflineRecipientsObserver{next: pluginSingle}
+	}
+	return composedOfflineRecipientsObserver{
+		pluginSingle: pluginSingle,
+		pluginBatch:  pluginBatch,
+		webhookBatch: webhookBatch,
+	}
+}
+
+func (o singleOfflineRecipientsObserver) ObserveOfflineRecipients(ctx context.Context, event channelappend.OfflineRecipientsEvent) {
+	for _, uid := range event.UIDs {
+		o.next.ObserveOfflineRecipient(ctx, channelappend.OfflineRecipientEvent{Event: event.Event, UID: uid})
+	}
 }
 
 func (o composedOfflineRecipientsObserver) ObserveOfflineRecipients(ctx context.Context, event channelappend.OfflineRecipientsEvent) {
 	o.webhookBatch.ObserveOfflineRecipients(ctx, event)
+	if o.pluginBatch != nil {
+		o.pluginBatch.ObserveOfflineRecipients(ctx, event)
+		return
+	}
 	for _, uid := range event.UIDs {
 		o.pluginSingle.ObserveOfflineRecipient(ctx, channelappend.OfflineRecipientEvent{
 			Event: event.Event,

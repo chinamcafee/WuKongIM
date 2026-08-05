@@ -48,6 +48,13 @@ import type {
   ManagerJoinNodeResponse,
   ManagerActivateNodeResponse,
   ManagerLoginResponse,
+  ManagerMCPAuditsResponse,
+  ManagerMCPMutationInput,
+  ManagerMCPMutationResponse,
+  ManagerMCPOwnerMutationInput,
+  ManagerMCPStatusResponse,
+  ManagerMCPTokenResponse,
+  ManagerMCPTokenRevokeInput,
   ManagerMessagesResponse,
   ManagerRecentConversationsResponse,
   ManagerRuntimeWorkqueuesResponse,
@@ -119,6 +126,15 @@ import type {
   BusinessChannelMemberListKind,
   BusinessChannelMembersParams,
   BusinessChannelMembersResponse,
+  ManagerBackupArchive,
+  ManagerBackupArchiveDetail,
+  ManagerBackupConfigureResult,
+  ManagerBackupDashboard,
+  ManagerBackupJob,
+  ManagerBackupPlanInput,
+  ManagerBackupRepositoryTestResult,
+  ManagerRestoreInput,
+  ManagerRestoreJob,
   ManagerApplicationLogEntriesResponse,
   ManagerApplicationLogSourcesResponse,
   ManagerBusinessChannelDetailResponse,
@@ -128,7 +144,8 @@ import type {
   PromoteControllerVoterResponse,
   RepairChannelClusterLeaderInput,
   TransferChannelClusterLeaderInput,
-  UpsertBusinessChannelInput,
+  CreateBusinessChannelInput,
+  UpdateBusinessChannelInput,
   UserListParams,
 } from "@/lib/manager-api.types"
 
@@ -154,19 +171,28 @@ type ManagerErrorResponse = {
   error?: string
   message?: string
   report?: unknown
+  detail?: unknown
 }
 
 export class ManagerApiError extends Error {
   status: number
   error: string
   report?: unknown
+  detail?: unknown
 
-  constructor(status: number, error: string, message: string, report?: unknown) {
+  constructor(
+    status: number,
+    error: string,
+    message: string,
+    report?: unknown,
+    detail?: unknown,
+  ) {
     super(message)
     this.name = "ManagerApiError"
     this.status = status
     this.error = error
     this.report = report
+    this.detail = detail
   }
 }
 
@@ -203,6 +229,7 @@ async function parseManagerError(response: Response) {
     payload?.error ?? "request_failed",
     payload?.message ?? `Request failed with status ${response.status}`,
     payload?.report,
+    payload?.detail,
   )
 }
 
@@ -351,6 +378,10 @@ function buildBusinessChannelsPath(params?: BusinessChannelListParams) {
   return query ? `/manager/channels?${query}` : "/manager/channels"
 }
 
+function encodeBusinessChannelPathID(channelId: string) {
+  return encodeURIComponent(encodeURIComponent(channelId))
+}
+
 function buildBusinessChannelMembersPath(
   channelType: number,
   channelId: string,
@@ -364,7 +395,10 @@ function buildBusinessChannelMembersPath(
   if (params?.cursor) {
     search.set("cursor", params.cursor)
   }
-  const path = `/manager/channels/${channelType}/${encodeURIComponent(channelId)}/${listKind}`
+  if (params?.uid) {
+    search.set("uid", params.uid)
+  }
+  const path = `/manager/channels/${channelType}/${encodeBusinessChannelPathID(channelId)}/${listKind}`
   const query = search.toString()
   return query ? `${path}?${query}` : path
 }
@@ -535,6 +569,57 @@ export function getOverview() {
 
 export function getPermissions() {
   return jsonManagerFetch<ManagerPermissionsResponse>("/manager/permissions")
+}
+
+export function getMCPStatus() {
+  return jsonManagerFetch<ManagerMCPStatusResponse>("/manager/mcp")
+}
+
+export function getMCPAudits(limit = 200) {
+  return jsonManagerFetch<ManagerMCPAuditsResponse>(`/manager/mcp/audits?limit=${limit}`)
+}
+
+function mcpMutationInit(input: ManagerMCPMutationInput, method: string, body: Record<string, unknown>) {
+  return {
+    method,
+    headers: { "Idempotency-Key": input.idempotencyKey },
+    body: JSON.stringify({ expected_revision: input.expectedRevision, ...body }),
+  }
+}
+
+export function createMCPToken(input: ManagerMCPMutationInput) {
+  return jsonManagerFetch<ManagerMCPTokenResponse>(
+    "/manager/mcp/tokens",
+    mcpMutationInit(input, "POST", {}),
+  )
+}
+
+export function revokeMCPToken(input: ManagerMCPTokenRevokeInput) {
+  return jsonManagerFetch<ManagerMCPMutationResponse>(
+    `/manager/mcp/tokens/${encodeURIComponent(input.credentialId)}`,
+    mcpMutationInit(input, "DELETE", {}),
+  )
+}
+
+export function setMCPOwner(input: ManagerMCPOwnerMutationInput) {
+  return jsonManagerFetch<ManagerMCPMutationResponse>(
+    "/manager/mcp/owner",
+    mcpMutationInit(input, "PUT", { owner_node_id: input.ownerNodeId }),
+  )
+}
+
+export function startMCP(input: ManagerMCPMutationInput) {
+  return jsonManagerFetch<ManagerMCPMutationResponse>(
+    "/manager/mcp/start",
+    mcpMutationInit(input, "POST", {}),
+  )
+}
+
+export function stopMCP(input: ManagerMCPMutationInput) {
+  return jsonManagerFetch<ManagerMCPMutationResponse>(
+    "/manager/mcp/stop",
+    mcpMutationInit(input, "POST", {}),
+  )
 }
 
 export function getWebhookConfig() {
@@ -1029,11 +1114,11 @@ export function getBusinessChannels(params?: BusinessChannelListParams) {
 
 export function getBusinessChannel(channelType: number, channelId: string) {
   return jsonManagerFetch<ManagerBusinessChannelDetailResponse>(
-    `/manager/channels/${channelType}/${encodeURIComponent(channelId)}`,
+    `/manager/channels/${channelType}/${encodeBusinessChannelPathID(channelId)}`,
   )
 }
 
-export function upsertBusinessChannel(input: UpsertBusinessChannelInput) {
+export function createBusinessChannel(input: CreateBusinessChannelInput) {
   return jsonManagerFetch<ManagerBusinessChannelDetailResponse>("/manager/channels", {
     method: "POST",
     body: JSON.stringify({
@@ -1044,6 +1129,24 @@ export function upsertBusinessChannel(input: UpsertBusinessChannelInput) {
       send_ban: input.sendBan,
     }),
   })
+}
+
+export function updateBusinessChannel(
+  channelType: number,
+  channelId: string,
+  input: UpdateBusinessChannelInput,
+) {
+  return jsonManagerFetch<ManagerBusinessChannelDetailResponse>(
+    `/manager/channels/${channelType}/${encodeBusinessChannelPathID(channelId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({
+        ban: input.ban,
+        disband: input.disband,
+        send_ban: input.sendBan,
+      }),
+    },
+  )
 }
 
 export function getBusinessChannelMembers(
@@ -1064,7 +1167,7 @@ export function addBusinessChannelMembers(
   input: MutateBusinessChannelMembersInput,
 ) {
   return jsonManagerFetch<MutateBusinessChannelMembersResponse>(
-    `/manager/channels/${channelType}/${encodeURIComponent(channelId)}/${listKind}/add`,
+    `/manager/channels/${channelType}/${encodeBusinessChannelPathID(channelId)}/${listKind}/add`,
     {
       method: "POST",
       body: JSON.stringify({ uids: input.uids }),
@@ -1079,7 +1182,7 @@ export function removeBusinessChannelMembers(
   input: MutateBusinessChannelMembersInput,
 ) {
   return jsonManagerFetch<MutateBusinessChannelMembersResponse>(
-    `/manager/channels/${channelType}/${encodeURIComponent(channelId)}/${listKind}/remove`,
+    `/manager/channels/${channelType}/${encodeBusinessChannelPathID(channelId)}/${listKind}/remove`,
     {
       method: "POST",
       body: JSON.stringify({ uids: input.uids }),
@@ -1270,4 +1373,86 @@ export function getDashboardMetrics(params?: { window?: string; step?: string })
   if (params?.step) search.set("step", params.step)
   const query = search.toString()
   return jsonManagerFetch<DashboardMetricsResponse>(`/manager/dashboard/metrics${query ? `?${query}` : ""}`)
+}
+
+export function getBackupDashboard() {
+  return jsonManagerFetch<ManagerBackupDashboard>("/manager/backups")
+}
+
+export function saveBackupPlan(input: ManagerBackupPlanInput) {
+  return jsonManagerFetch<ManagerBackupConfigureResult>("/manager/backups/plan", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  })
+}
+
+export function testBackupRepository(expectedPlanRevision: number) {
+  return jsonManagerFetch<ManagerBackupRepositoryTestResult>("/manager/backups/repository/test", {
+    method: "POST",
+    body: JSON.stringify({
+      expected_plan_revision: expectedPlanRevision,
+    }),
+  })
+}
+
+export function startBackupJob() {
+  return jsonManagerFetch<ManagerBackupJob>("/manager/backups/jobs", {
+    method: "POST",
+    body: JSON.stringify({}),
+  })
+}
+
+export async function cancelBackupJob(jobID: string) {
+  await managerFetch(`/manager/backups/jobs/${encodeURIComponent(jobID)}/cancel`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  })
+}
+
+export function getBackupArchive(archiveID: string) {
+  return jsonManagerFetch<ManagerBackupArchiveDetail>(
+    `/manager/backups/archives/${encodeURIComponent(archiveID)}`,
+  )
+}
+
+export function verifyBackupArchive(archiveID: string) {
+  return jsonManagerFetch<ManagerBackupArchiveDetail>(
+    `/manager/backups/archives/${encodeURIComponent(archiveID)}/verify`,
+    { method: "POST", body: JSON.stringify({}) },
+  )
+}
+
+export function setBackupArchiveHold(archiveID: string, held: boolean, note = "") {
+  return jsonManagerFetch<ManagerBackupArchive>(
+    `/manager/backups/archives/${encodeURIComponent(archiveID)}/hold`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ held, note }),
+    },
+  )
+}
+
+export async function deleteBackupArchive(archiveID: string) {
+  await managerFetch(`/manager/backups/archives/${encodeURIComponent(archiveID)}`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirmation: `DELETE ${archiveID}` }),
+  })
+}
+
+export function startBackupRestore(archiveID: string, input: ManagerRestoreInput) {
+  return jsonManagerFetch<ManagerRestoreJob>(
+    `/manager/backups/archives/${encodeURIComponent(archiveID)}/restore`,
+    {
+      method: "POST",
+      body: JSON.stringify(input),
+    },
+  )
+}
+
+export async function cancelBackupRestore(jobID: string) {
+  await managerFetch(`/manager/backups/restores/${encodeURIComponent(jobID)}/cancel`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  })
 }

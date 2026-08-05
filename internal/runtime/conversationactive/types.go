@@ -14,13 +14,17 @@ var ErrStoreRequired = errors.New("conversationactive: store required")
 // ErrCachePressure reports that admitting new active rows would exceed the cache bound.
 var ErrCachePressure = errors.New("conversationactive: cache pressure")
 
+// ErrHashSlotConflict reports that one exact cache address was assigned to
+// different logical hash slots inside a routed admission transaction.
+var ErrHashSlotConflict = errors.New("conversationactive: hash slot conflict")
+
 // Options configures the conversation active admission manager.
 type Options struct {
 	// NowMS returns the current Unix millisecond when a batch does not carry ActiveAtMS.
 	NowMS func() int64
 	// Store reads and persists durable active conversation rows that have already flushed to DB.
 	Store ActiveStore
-	// ActiveCooldown skips receiver-only active_at flushes newer than the durable row by less than this duration.
+	// ActiveCooldown suppresses receiver-only dirty work and flushes newer than the durable row by less than this duration.
 	ActiveCooldown time.Duration
 	// MaxCachedRows bounds in-memory active rows across all users; zero disables the bound.
 	MaxCachedRows int
@@ -81,6 +85,8 @@ type MutationObservation struct {
 	BecameDirty int
 	// DirtyUpdated is the number of unique already-dirty rows advanced to a newer version.
 	DirtyUpdated int
+	// CooldownSuppressed is the number of clean receiver rows whose latest view advanced without durable dirty work.
+	CooldownSuppressed int
 	// Unchanged is the number of unique existing rows whose projection and ownership were unchanged.
 	Unchanged int
 	// LockWaitDuration is time spent waiting for the node-local cache lock.
@@ -104,6 +110,8 @@ type FlushObservation struct {
 	Persisted int
 	// Skipped is the number of selected rows routed through the cooldown no-write path after durable-state comparison.
 	Skipped int
+	// DeleteFenced is the number of selected rows rejected by a durable delete barrier without a touch write.
+	DeleteFenced int
 	// Cleared is the number of dirty markers actually cleared after version fencing.
 	Cleared int
 	// VersionConflicts is the number of dirty markers retained because a concurrent update advanced the version.
@@ -160,6 +168,8 @@ type FlushResult struct {
 	Persisted int
 	// Skipped is the number of rows routed through the cooldown no-write path.
 	Skipped int
+	// DeleteFenced is the number of rows rejected by a durable delete barrier without a touch write.
+	DeleteFenced int
 	// Cleared is the number of dirty markers actually cleared after version fencing.
 	Cleared int
 	// VersionConflicts is the number of dirty markers retained after concurrent updates.
@@ -198,6 +208,16 @@ type ActiveBatch struct {
 	Recipients []ActiveEntry
 }
 
+// RoutedActiveBatch binds one already-partitioned active batch to its exact
+// logical UID hash slot. Callers must preserve the authority fence separately;
+// the manager uses only HashSlot for cache ownership indexes.
+type RoutedActiveBatch struct {
+	// HashSlot is the logical UID hash slot that owns every non-empty UID in Batch.
+	HashSlot uint16
+	// Batch contains only sender and recipient rows already routed to HashSlot.
+	Batch ActiveBatch
+}
+
 // ActiveEntry identifies one user touched by an active batch.
 type ActiveEntry struct {
 	// UID identifies the user that should see the conversation as active.
@@ -216,8 +236,10 @@ type ActivePatch struct {
 	ChannelID string
 	// ChannelType identifies the active conversation channel type.
 	ChannelType uint8
-	// ActiveAtMS is the maximum observed Unix millisecond activity timestamp.
+	// ActiveAtMS is the latest observed Unix millisecond activity timestamp exposed by the cache view.
 	ActiveAtMS int64
 	// ReadSeq is advanced only for the sender's own conversation row.
 	ReadSeq uint64
+	// MessageSeq is the latest committed channel sequence represented by this activity observation.
+	MessageSeq uint64
 }

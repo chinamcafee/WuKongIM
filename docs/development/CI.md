@@ -1,113 +1,159 @@
-# Continuous Integration
+# Pull-request review and CI
 
-WuKongIM uses two fail-closed GitHub Actions workflows. All Go commands use
-explicit repository roots and `GOWORK=off`; repository-root `./...` is not a
-valid gate because Go package discovery ignores `.gitignore` and can include
-local packages below `tmp/` or `web/node_modules/`.
+WuKongIM uses a review-only Review Agent as the automated pull-request
+adjudicator. The authoritative Workflow catalog lives in
+[`.github/workflows/README.md`](../../.github/workflows/README.md).
 
-## Fast CI
+## Pull-request flow
 
-`.github/workflows/ci.yml` runs for pull requests, pushes to `main`, and manual
-dispatches. Obsolete runs for the same pull request/ref are cancelled.
+An open, non-Draft pull request targeting `main` produces no Agent review by
+default. A repository administrator starts review by posting
+`@review-agent review`; the resulting generation binds the exact head SHA,
+base SHA, test-merge SHA, intent digest, and signed-state parent.
 
-| Check | Timeout | Contract |
-| --- | ---: | --- |
-| `Go quality` | 10m | tracked-file `gofmt`, `go mod tidy -diff`, explicit-root `go vet` |
-| `Go unit (cmd)` | 15m | `./cmd/...` |
-| `Go unit (internal)` | 15m | `./internal/...` |
-| `Go unit (pkg)` | 15m | `./pkg/...` |
-| `Go unit (scripts-docker)` | 15m | `./scripts/... ./docker/...` |
-| `Web` | 10m | frozen Bun install, lint baseline, Vitest, TypeScript, build, tracked-output diff |
-| `Demo` | 10m | pinned Node/Yarn, frozen install, avatar unit tests, Vue type check/build, tracked-output diff |
+The Review Agent:
 
-The local equivalent uses Go 1.25.11, Bun 1.3.11, Node 22.12.0, and Yarn 1.22.22, matching CI:
+1. reads the complete changed-file inventory and trusted base/control
+   instructions;
+2. computes mandatory checks from protected policy;
+3. reviews the complete change with one pinned ephemeral model session;
+4. may add bounded checks only by protected name;
+5. validates real evidence independently of model claims; and
+6. publishes one mutable status comment, one formal Review, up to 20 blocking
+   inline comments, and `Review Agent Verdict`.
+
+Only `approved` unlocks the automated gate. `changes_required`,
+`inconclusive`, stale state, missing evidence, merge conflict, or
+infrastructure failure all keep it blocked. A human `REQUEST_CHANGES` Review
+remains independently blocking.
+
+The model never edits code, commits, pushes, rebases, merges, closes a pull
+request, dismisses a Review, or resolves a thread. After approval, the
+protected Publisher may merge only the exact reviewed head of a repository
+administrator or organization member; every other author requires a human
+merge.
+
+Draft pull requests do not call the model. A new commit or intent change
+invalidates the old generation and requires another administrator command:
+`review` for a new head or `reconsider` for changed same-head facts. The
+repository runs at most three model sessions, one per pull request, and at most
+one first-time external contributor session.
+
+There is no Review Agent Cron or periodic scan.
+
+## Commands
+
+Commands must be one exact, unedited, single-line pull-request comment:
+
+- `@review-agent review`
+- `@review-agent status`
+- `@review-agent explain <question>`
+- `@review-agent reconsider <reason>`
+- `@review-agent retry`
+- `@review-agent cancel`
+
+Status is public, deterministic, and does not call a model. Every other command
+requires current repository `admin` permission. Explain cannot change the
+verdict. Reconsider is limited to two sessions per head. Infrastructure retry
+is limited to one.
+
+Ordinary comments, including Review Agent's own status comment, are observed
+no-ops.
+
+Controller no-ops stop after the fresh-fact plan is recorded. They do not enter
+the credentialed State Writer or Publisher Environments and do not start the
+Dispatcher. Non-no-op Controller jobs reuse one exact-control,
+manifest-verified binary built by reconciliation rather than compiling it once
+per authority boundary.
+
+## Trusted checks
+
+`.github/review-agent/policy.json` maps complete path inventory to mandatory
+named checks. It includes Go unit/Vet, script integration, Workflow contracts,
+Manager Web, Chat Demo, documentation, race, integration, E2E, and
+three-node-cluster commands.
+
+Pure allowlisted documentation uses only documentation contracts. Every other
+path receives the repository-default Go unit/Vet pair before domain-specific
+checks are added, so an unfamiliar root path cannot silently escape
+deterministic validation.
+
+The model can inspect the checkout, but model-authored commands and outcomes
+never count as evidence. It can request a protected check name through the
+local Check MCP. The trusted runner resolves fixed arguments, timeouts,
+working directories, and output bounds, then appends catalog-bound records to
+the evidence ledger.
+
+All repository-wide Go commands use `GOWORK=off` and explicit roots. Root
+`./...` is forbidden because Go package discovery ignores `.gitignore`.
+
+## Security boundaries
+
+- The zero-permission Signal and default-branch Controller never execute
+  candidate code.
+- Candidate and deterministic-check jobs receive no App, GitHub write, cloud,
+  deploy, package-publish, or organization-private credentials.
+- Candidate checks run in per-command disposable worktrees and a rootless
+  network namespace with isolated loopback for local test servers.
+- The deterministic baseline disables the runner's `sudo` binary before
+  candidate commands execute.
+- Codex runs with full runner-user filesystem and public-network access through
+  `--dangerously-bypass-approvals-and-sandbox`. It receives no GitHub/App
+  credential or inherited host environment, has no Docker socket, and loses
+  `sudo` before execution. Candidate checks still use the private-network and
+  Bubblewrap boundary, and tracked candidate-tree mutation fails validation.
+- One root-owned loopback Responses proxy is Codex's only model transport. It
+  clamps every request to the protected 32,768-token output ceiling and injects
+  the OpenRouter credential. The root-only credential handoff is deleted before
+  the listener is published, and runner-user Codex cannot replace the proxy or
+  reach an unclamped credential path.
+- The protected Check MCP is required at Codex startup; missing named-check
+  tools fail closed instead of degrading to an evidence-free model session.
+- The State Writer App can write only Contents state refs.
+- The Review Agent App can write Issues, Reviews, Checks, and the exact-head PR
+  merge endpoint. GitHub requires `contents:write` for that merge; the adapter
+  exposes no generic contents, branch, or commit write.
+- Publisher jobs do not check out or execute candidate code.
+- Durable PR and scheduler state use a verified latest-plus-predecessor rolling
+  checkpoint; older App-authored commits remain append-only audit history.
+
+Each signed lease has one 90-minute wall-time budget, including its one
+automatic infrastructure retry. Reconsideration and explanation leases use the
+same rule. Late review results fail closed as `inconclusive`; late explanations
+cannot change the decision. Merge conflicts are deterministic
+`changes_required` decisions and do not consume a model session.
+Every named trusted check is capped at 30 minutes. The workflow reserves up to
+30 minutes for baseline checks, 40 minutes for the reviewer, and 20 minutes for
+evidence validation and signed-state publication within the same lease.
+
+Pull-request changes to `AGENTS.md`, `FLOW.md`, policy, prompts, schemas,
+Workflows, CODEOWNERS, or Review Agent code cannot govern their own review.
+The protected base/control versions remain authoritative.
+
+## Review gate
+
+The signed `Review Agent Verdict` is the sole automated review gate for every
+path, including Review Agent control-plane code. CODEOWNERS records maintenance
+ownership but is not an additional approval gate. The repository Ruleset must
+require the dedicated Review Agent App check and keep the pull-request branch
+up to date with `main` before merge.
+
+## Local verification
 
 ```bash
-export GOWORK=off
-test "$(go env GOVERSION)" = "go1.25.11"
-unformatted="$(git ls-files -z '*.go' | xargs -0 gofmt -l)"
-test -z "$unformatted"
-GOWORK=off go vet ./cmd/... ./internal/... ./pkg/... ./scripts/... ./docker/...
-GOWORK=off go test ./cmd/... -count=1
-GOWORK=off go test ./internal/... -count=1
-GOWORK=off go test ./pkg/... -count=1
-GOWORK=off go test ./scripts/... ./docker/... -count=1
-GOWORK=off go mod tidy -diff
+GOWORK=off go test ./internal/contracts/reviewagent \
+  ./internal/usecase/reviewagent ./internal/runtime/reviewagentverify \
+  ./internal/infra/reviewagentgithub ./internal/access/reviewagentcli \
+  ./internal/access/reviewagentcheckmcp ./internal/app \
+  ./cmd/wkreviewagent ./cmd/wkreviewcheckmcp ./scripts -count=1
 
-cd web
-test "$(bun --version)" = "1.3.11"
-bun install --frozen-lockfile
-bun run lint
-bun run test
-bunx tsc -b
-bun run build
-changes="$(git status --porcelain -- ../internal/access/manager/webui/dist)"
-test -z "$changes"
+GOWORK=off go test -tags=integration \
+  ./internal/runtime/reviewagentverify -count=1
 
-cd ../demo/chatdemo
-test "$(node --version)" = "v22.12.0"
-test "$(corepack yarn --version)" = "1.22.22"
-corepack yarn install --frozen-lockfile
-corepack yarn test
-corepack yarn build
-changes="$(git status --porcelain -- ../../internal/access/api/demoui/dist)"
-test -z "$changes"
+node --test .github/review-agent/responses-budget-proxy.test.mjs
+
+go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.9 \
+  .github/workflows/review-agent-pr-signal.yml \
+  .github/workflows/review-agent.yml \
+  .github/workflows/review-agent-run.yml
 ```
-
-`bun run lint` compares current ESLint results with
-`web/eslint-baseline.json`. A new, changed, or removed finding fails. After a
-reviewed lint cleanup, run `bun run lint:update-baseline` and commit the smaller
-deterministic baseline in the same change. CI never updates the baseline.
-The complete manager Web production bundle under
-`internal/access/manager/webui/dist` is also tracked and rebuilt in CI because
-ordinary Go compilation embeds it without invoking Bun.
-The complete chat Demo production bundle under
-`internal/access/api/demoui/dist` follows the same tracked-artifact contract;
-ordinary Go compilation embeds it without invoking Node or Yarn.
-
-## Nightly and Manual Coverage
-
-`.github/workflows/nightly.yml` starts daily at `18:00 UTC` (`02:00` in
-Asia/Shanghai) and supports manual dispatch.
-
-| Check | Timeout | Contract |
-| --- | ---: | --- |
-| `Go race (internal-runtime)` | 45m | `internal/app` and `internal/runtime/...` |
-| `Go race (gateway-transport)` | 45m | `pkg/gateway/...` and `pkg/transport/...` |
-| `Go race (channel-cluster-slot)` | 45m | `pkg/channel/...`, `pkg/cluster/...`, and `pkg/slot/...` |
-| `Go integration` | 30m | `-tags=integration` across explicit `internal/...` and `pkg/...` roots |
-| `Go e2e` | 60m | one prebuilt real `cmd/wukongim` binary and `test/e2e/...` |
-| `Three-node smoke` | 30m | base three-node cluster plus real `wkcli sim` traffic |
-
-Nightly failures remain failures; they do not retroactively block a merged pull
-request. Gofail dynamic-node faults and the 100K-subscriber scenario remain
-explicit opt-in stress paths rather than part of the daily workflow.
-
-## Failure Evidence
-
-Nightly uploads evidence only on failure and retains it for 7 days. Race,
-integration, and e2e jobs upload their bounded `go test` log. Three-node smoke
-uploads only `summary.md`, `cluster.log`, `sim.jsonl`, and `node-logs/*.log`
-from `${RUNNER_TEMP}`.
-
-Never upload the whole smoke directory. It can contain a compiled binary, node
-databases, PID files, generated configurations, and—if promotion is enabled—an
-authentication response and manager token.
-
-## Workflow Maintenance
-
-- Keep `permissions: contents: read` and `persist-credentials: false`.
-- Pin actions by full commit SHA and keep the reviewed release in the comment.
-- Update `scripts/github_workflows_test.go` when intentionally changing action
-  pins, package groups, timeouts, or artifact paths.
-- Parse both files and run the contract tests before pushing:
-
-```bash
-ruby -e 'require "yaml"; ARGV.each { |f| YAML.load_file(f) }' .github/workflows/*.yml
-GOWORK=off go test ./scripts \
-  -run '^(TestCIWorkflowContract|TestNightlyWorkflowContract)$' -count=1
-```
-
-Repository administrators may mark the fast CI checks as required on `main`
-after observing a successful remote run. Branch-protection changes and workflow
-dispatches are external operations and are not performed by repository code.

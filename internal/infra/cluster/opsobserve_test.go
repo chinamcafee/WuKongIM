@@ -1,0 +1,285 @@
+package cluster
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+
+	backupcontract "github.com/WuKongIM/WuKongIM/internal/contracts/backup"
+	backupusecase "github.com/WuKongIM/WuKongIM/internal/usecase/backup"
+	management "github.com/WuKongIM/WuKongIM/internal/usecase/management"
+	observe "github.com/WuKongIM/WuKongIM/internal/usecase/opsobserve"
+)
+
+func TestOpsObservationSafeProjectionsOmitInternalErrorsAndTokens(t *testing.T) {
+	task := safeControllerTasks([]management.ControllerTask{{
+		TaskID: "task-1", LastError: "dial 10.0.0.4:7000: secret failure",
+		Participants: []management.ControllerTaskParticipant{{NodeID: 1, LastError: "stack trace"}},
+	}})
+	slot := safeSlot(management.Slot{SlotID: 1, Task: &management.SlotTask{
+		TaskID: "slot-task", LastError: "raw raft failure",
+		Participants: []management.SlotTaskParticipant{{NodeID: 1, LastError: "raw participant failure"}},
+	}})
+	channel := safeChannelRuntime(management.ChannelRuntimeMeta{
+		ChannelID: "channel-a", ChannelType: 1, WriteFenceToken: "secret-fence-token",
+	})
+	diagnostics := safeDiagnostics(management.DiagnosticsQueryResponse{
+		Notes:  []string{"dial 10.0.0.5:7000"},
+		Nodes:  []management.DiagnosticsNodeResult{{NodeID: 1, Notes: []string{"internal address"}}},
+		Events: []management.DiagnosticsEvent{{NodeID: 1, Error: "implementation stack"}},
+	})
+
+	payload, err := json.Marshal([]any{task, slot, channel, diagnostics})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	for _, forbidden := range []string{
+		"10.0.0.4", "secret failure", "stack trace", "raw raft failure",
+		"raw participant failure", "secret-fence-token", "10.0.0.5", "implementation stack",
+	} {
+		if strings.Contains(string(payload), forbidden) {
+			t.Fatalf("safe projection leaked %q: %s", forbidden, payload)
+		}
+	}
+}
+
+func TestOpsObservationSafeProjectionsUseStableSnakeCaseJSON(t *testing.T) {
+	payload, err := json.Marshal([]any{
+		safeNodeHealth(management.Node{
+			NodeID: 1,
+			Membership: management.NodeMembership{
+				Role: "data", JoinState: "active", Schedulable: true,
+			},
+			Health: management.NodeHealth{RuntimeReady: true, ObservedControlRevision: 7},
+		}),
+		safeSlot(management.Slot{
+			SlotID: 3,
+			Assignment: management.SlotAssignment{
+				DesiredPeers: []uint64{1, 2, 3}, PreferredLeader: 2,
+			},
+			Runtime: management.SlotRuntime{LeaderID: 2, HasQuorum: true},
+		}),
+		safeNodeDiagnosticSummary(management.DynamicNodeDiagnosticSummary{SafeToRemove: true}),
+		safeNodeDiagnosticSlots([]management.DynamicNodeDiagnosticSlot{{
+			SlotID: 3, CurrentLeader: 2,
+		}}),
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	encoded := string(payload)
+	for _, expected := range []string{
+		`"join_state":"active"`, `"runtime_ready":true`, `"observed_control_revision":7`,
+		`"desired_peers":[1,2,3]`, `"preferred_leader":2`, `"has_quorum":true`,
+		`"safe_to_remove":true`, `"current_leader":2`,
+	} {
+		if !strings.Contains(encoded, expected) {
+			t.Fatalf("safe projection missing %q: %s", expected, encoded)
+		}
+	}
+	for _, forbidden := range []string{
+		`"JoinState"`, `"RuntimeReady"`, `"DesiredPeers"`, `"SafeToRemove"`,
+	} {
+		if strings.Contains(encoded, forbidden) {
+			t.Fatalf("safe projection leaked unstable field %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func TestOpsObservationConfigRedactsAddressLikeValues(t *testing.T) {
+	result := safeConfig(management.NodeConfigSnapshot{
+		GeneratedAt: time.Unix(1, 0).UTC(), NodeID: 1,
+		Groups: []management.NodeConfigGroup{{ID: "cluster", Items: []management.NodeConfigItem{
+			{Key: "WK_CLUSTER_LISTEN_ADDR", Value: "10.0.0.1:7000"},
+			{Key: "WK_CLUSTER_HASH_SLOT_COUNT", Value: "256"},
+		}}},
+	})
+	if got := result.Groups[0].Items[0]; got.Value != "******" || !got.Redacted {
+		t.Fatalf("address item = %#v", got)
+	}
+	if got := result.Groups[0].Items[1]; got.Value != "256" || got.Redacted {
+		t.Fatalf("ordinary item = %#v", got)
+	}
+}
+
+func TestOpsObservationClusterHealthAcceptsReadyMatchedSlotAndChecksMetrics(t *testing.T) {
+	source := NewOpsObservationSource(OpsObservationSourceConfig{
+		Inventory: healthyOpsInventory{},
+		Metrics: opsMetricsStub{responses: map[string]observe.MetricRangeData{
+			observe.MetricQueryTargetsUp: {
+				Series: []observe.MetricSeries{
+					{Values: metricValues("1")},
+					{Values: metricValues("0")},
+				},
+			},
+			observe.MetricQueryRuntimeQueuePressure: {
+				Series: []observe.MetricSeries{{Values: metricValues("0.90")}},
+			},
+		}},
+	})
+	result, err := source.ClusterHealth(context.Background(), observe.ClusterHealthRequest{})
+	if err != nil {
+		t.Fatalf("ClusterHealth() error = %v", err)
+	}
+	if result.Status != observe.StatusDegraded || result.Completeness != observe.CompletenessComplete {
+		t.Fatalf("result = %#v", result)
+	}
+	codes := make(map[string]bool, len(result.ReasonCodes))
+	for _, reason := range result.ReasonCodes {
+		codes[reason.Code] = true
+	}
+	if !codes["metric_targets_down"] || !codes["runtime_queue_pressure_high"] ||
+		codes["slot_health_degraded"] || codes["slot_health_missing"] {
+		t.Fatalf("reason codes = %#v", result.ReasonCodes)
+	}
+}
+
+func TestOpsObservationMissingNodeHealthProducesUnknownEvidence(t *testing.T) {
+	source := NewOpsObservationSource(OpsObservationSourceConfig{
+		Inventory: missingHealthOpsInventory{},
+	})
+
+	clusterResult, err := source.ClusterHealth(context.Background(), observe.ClusterHealthRequest{})
+	if err != nil {
+		t.Fatalf("ClusterHealth() error = %v", err)
+	}
+	if clusterResult.Status != observe.StatusUnknown ||
+		clusterResult.Freshness != observe.FreshnessMissing ||
+		clusterResult.Completeness != observe.CompletenessPartial {
+		t.Fatalf("cluster result = %#v", clusterResult)
+	}
+	if len(clusterResult.ReasonCodes) != 1 || clusterResult.ReasonCodes[0].Code != "node_health_missing" {
+		t.Fatalf("cluster reason codes = %#v", clusterResult.ReasonCodes)
+	}
+
+	nodeResult, err := source.NodeInspect(context.Background(), observe.NodeInspectRequest{NodeID: 1})
+	if err != nil {
+		t.Fatalf("NodeInspect() error = %v", err)
+	}
+	if nodeResult.Status != observe.StatusUnknown ||
+		nodeResult.Freshness != observe.FreshnessMissing ||
+		nodeResult.Completeness != observe.CompletenessPartial {
+		t.Fatalf("node result = %#v", nodeResult)
+	}
+	if len(nodeResult.ReasonCodes) != 1 || nodeResult.ReasonCodes[0].Code != "node_health_missing" {
+		t.Fatalf("node reason codes = %#v", nodeResult.ReasonCodes)
+	}
+}
+
+func TestLatestMetricValueRejectsNonFiniteAndMalformedValues(t *testing.T) {
+	for _, value := range []string{"NaN", "+Inf", "not-a-number"} {
+		if _, ok := latestMetricValue(observe.MetricSeries{Values: metricValues(value)}); ok {
+			t.Fatalf("latestMetricValue(%q) accepted invalid value", value)
+		}
+	}
+}
+
+func TestOpsObservationBackupInspectUsesBoundedArchiveInventory(t *testing.T) {
+	backup := &opsBackupStub{
+		dashboard: backupusecase.Dashboard{
+			State: backupcontract.SystemState{
+				Plan: &backupcontract.Plan{Enabled: true, Revision: 4, Cron: "0 1 * * *", TimeZone: "Asia/Shanghai"},
+			},
+			Archives: []backupusecase.ArchiveSummary{
+				{ID: "archive-match", Held: true, Health: backupusecase.ArchiveHealthHealthy},
+				{ID: "archive-later", Health: backupusecase.ArchiveHealthHealthy},
+			},
+		},
+	}
+	source := NewOpsObservationSource(OpsObservationSourceConfig{Backup: backup})
+
+	result, err := source.BackupInspect(context.Background(), observe.BackupInspectRequest{
+		ArchiveID: "archive-match",
+		Limit:     1,
+	})
+	if err != nil {
+		t.Fatalf("BackupInspect() error = %v", err)
+	}
+	if result.Completeness != observe.CompletenessComplete || len(result.Warnings) != 0 {
+		t.Fatalf("result coverage = %#v, warnings = %#v", result.Completeness, result.Warnings)
+	}
+	data, ok := result.Data.(backupInspectData)
+	if !ok {
+		t.Fatalf("result data type = %T", result.Data)
+	}
+	if !data.Enabled || data.PlanRevision != 4 || len(data.Archives) != 1 ||
+		data.Archives[0].ID != "archive-match" || !data.Archives[0].Held {
+		t.Fatalf("backup data = %#v", data)
+	}
+}
+
+type healthyOpsInventory struct{}
+
+func (healthyOpsInventory) ListNodes(context.Context) (management.NodeList, error) {
+	return management.NodeList{
+		ControllerLeaderID: 1,
+		Items: []management.Node{{
+			NodeID: 1, Status: "alive",
+			Health: management.NodeHealth{Freshness: "fresh", RuntimeReady: true},
+		}},
+	}, nil
+}
+
+func (healthyOpsInventory) ListSlots(context.Context, management.ListSlotsOptions) ([]management.Slot, error) {
+	return []management.Slot{{
+		SlotID:  1,
+		State:   management.SlotState{Quorum: "ready", Sync: "matched"},
+		Runtime: management.SlotRuntime{HasQuorum: true},
+	}}, nil
+}
+
+func (healthyOpsInventory) DynamicNodeDiagnostics(context.Context, management.DynamicNodeDiagnosticsRequest) (management.DynamicNodeDiagnosticsResponse, error) {
+	return management.DynamicNodeDiagnosticsResponse{}, nil
+}
+
+func (healthyOpsInventory) GetChannelRuntimeMeta(context.Context, string, int64) (management.ChannelRuntimeMeta, error) {
+	return management.ChannelRuntimeMeta{}, nil
+}
+
+type missingHealthOpsInventory struct {
+	healthyOpsInventory
+}
+
+func (missingHealthOpsInventory) ListNodes(context.Context) (management.NodeList, error) {
+	return management.NodeList{
+		ControllerLeaderID: 1,
+		Items: []management.Node{{
+			NodeID: 1,
+			Status: "alive",
+			Health: management.NodeHealth{Freshness: "missing"},
+		}},
+	}, nil
+}
+
+func (missingHealthOpsInventory) DynamicNodeDiagnostics(context.Context, management.DynamicNodeDiagnosticsRequest) (management.DynamicNodeDiagnosticsResponse, error) {
+	return management.DynamicNodeDiagnosticsResponse{
+		Node: management.Node{
+			NodeID: 1,
+			Status: "alive",
+			Health: management.NodeHealth{Freshness: "missing"},
+		},
+	}, nil
+}
+
+type opsMetricsStub struct {
+	responses map[string]observe.MetricRangeData
+}
+
+func (s opsMetricsStub) QueryOpsMetrics(_ context.Context, request observe.MetricsQueryRangeRequest) (observe.MetricRangeData, error) {
+	return s.responses[request.QueryID], nil
+}
+
+type opsBackupStub struct {
+	dashboard backupusecase.Dashboard
+}
+
+func (s *opsBackupStub) Dashboard(context.Context) (backupusecase.Dashboard, error) {
+	return s.dashboard, nil
+}
+
+func metricValues(value string) [][]json.RawMessage {
+	encoded, _ := json.Marshal(value)
+	return [][]json.RawMessage{{json.RawMessage(`1`), encoded}}
+}

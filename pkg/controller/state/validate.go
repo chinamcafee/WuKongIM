@@ -1,6 +1,7 @@
 package state
 
 import (
+	"encoding/hex"
 	"fmt"
 	"reflect"
 	"sort"
@@ -46,7 +47,81 @@ func (s ClusterState) Validate() error {
 	if err := validateTasks(s.Tasks, assignments, nodes); err != nil {
 		return err
 	}
+	if err := validateScheduledBackup(s.ScheduledBackup); err != nil {
+		return err
+	}
+	if s.ScheduledBackup != nil && s.ScheduledBackup.ActiveRestore != nil {
+		if len(s.Tasks) != 0 {
+			return invalid("active restore requires an empty Controller task set")
+		}
+		if s.Config.HashSlotCount != BackupHashSlotCount {
+			return invalid("active restore requires exactly 256 hash slots")
+		}
+	}
+	if s.ScheduledBackup != nil && s.ScheduledBackup.ActiveBackup != nil &&
+		len(s.Tasks) != 0 {
+		return invalid("active backup requires an empty Controller task set")
+	}
+	if err := validateOpsMCP(s.OpsMCP, nodes); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateOpsMCP(opsMCP *OpsMCPState, nodes map[uint64]Node) error {
+	if opsMCP == nil {
+		return nil
+	}
+	if len(opsMCP.Credentials) > MaxOpsMCPCredentials {
+		return invalid("ops_mcp credentials exceed limit")
+	}
+	if opsMCP.ProfileFenceUntilUnixMillis < 0 {
+		return invalid("ops_mcp profile fence is invalid")
+	}
+	if opsMCP.Enabled && opsMCP.OwnerNodeID == 0 {
+		return invalid("enabled ops_mcp requires an owner")
+	}
+	if opsMCP.Enabled && len(opsMCP.Credentials) == 0 {
+		return invalid("enabled ops_mcp requires a credential")
+	}
+	if opsMCP.OwnerNodeID != 0 {
+		owner, ok := nodes[opsMCP.OwnerNodeID]
+		if !ok || owner.JoinState != NodeJoinStateActive {
+			return invalid("ops_mcp owner must be an active cluster node")
+		}
+	}
+	credentialIDs := make(map[string]struct{}, len(opsMCP.Credentials))
+	for _, credential := range opsMCP.Credentials {
+		if !validOpsMCPCredentialID(credential.ID) || !validSHA256(credential.DigestSHA256) || credential.CreatedAtUnixMillis <= 0 {
+			return invalid("ops_mcp credential is invalid")
+		}
+		if _, exists := credentialIDs[credential.ID]; exists {
+			return invalid("duplicate ops_mcp credential id")
+		}
+		credentialIDs[credential.ID] = struct{}{}
+	}
+	return nil
+}
+
+func validOpsMCPCredentialID(value string) bool {
+	if value == "" || len(value) > 64 {
+		return false
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '-' || char == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 32
 }
 
 func validateNodes(nodes []Node) (map[uint64]Node, error) {

@@ -51,6 +51,9 @@ import {
   getOverview,
   promoteControllerVoter,
   getPermissions,
+  getMCPStatus,
+  createMCPToken,
+  setMCPOwner,
   getWebhookConfig,
   getWebhookOutbox,
   replayWebhookDeadLetters,
@@ -93,19 +96,30 @@ import {
   transferSlotLeader,
   advanceMessageRetention,
   addBusinessChannelMembers,
+  createBusinessChannel,
   createDiagnosticsTrackingRule,
   deleteDiagnosticsTrackingRule,
   repairChannelClusterLeader,
   getBusinessChannel,
   getBusinessChannelMembers,
   getBusinessChannels,
+  getBackupDashboard,
+  saveBackupPlan,
+  testBackupRepository,
+  startBackupJob,
+  cancelBackupJob,
+  verifyBackupArchive,
+  setBackupArchiveHold,
+  deleteBackupArchive,
+  startBackupRestore,
+  cancelBackupRestore,
   listDiagnosticsTrackingRules,
   resetUserToken,
   removeBusinessChannelMembers,
   transferChannelClusterLeader,
   queryDBInspect,
   updateNodePluginConfig,
-  upsertBusinessChannel,
+  updateBusinessChannel,
 } from "@/lib/manager-api"
 
 describe("manager api client", () => {
@@ -268,6 +282,32 @@ describe("manager api client", () => {
       "/manager/permissions",
       expect.objectContaining({ headers: expect.any(Headers) }),
     )
+  })
+
+  it("uses revision fences and idempotency keys for MCP administration", async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        cluster_id: "cluster-a", revision: 7, enabled: false, observed_status: "stopped",
+        owner_node_id: 0, owner_candidates: [], credentials: [], warnings: [],
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        credential_id: "credential-a", token: "wko_credential-a_secret",
+        created_at_unix_ms: 1710000001000, revision: 8,
+      }), { status: 201 }))
+      .mockResolvedValueOnce(new Response('{"accepted":true}', { status: 200 }))
+
+    await getMCPStatus()
+    await createMCPToken({ expectedRevision: 7, idempotencyKey: "create-1" })
+    await setMCPOwner({ ownerNodeId: 2, expectedRevision: 8, idempotencyKey: "owner-1" })
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/manager/mcp")
+    const createInit = fetchMock.mock.calls[1]?.[1] as { headers: Headers; body: string }
+    expect(createInit.headers.get("Idempotency-Key")).toBe("create-1")
+    expect(JSON.parse(createInit.body)).toEqual({ expected_revision: 7 })
+    const ownerInit = fetchMock.mock.calls[2]?.[1] as { headers: Headers; body: string; method: string }
+    expect(ownerInit.method).toBe("PUT")
+    expect(ownerInit.headers.get("Idempotency-Key")).toBe("owner-1")
+    expect(JSON.parse(ownerInit.body)).toEqual({ expected_revision: 8, owner_node_id: 2 })
   })
 
   it("fetches webhook config from the manager webhook config endpoint", async () => {
@@ -587,15 +627,19 @@ describe("manager api client", () => {
 
     await getBusinessChannel(2, "g/1")
 
-    expect(fetchMock.mock.calls[0]?.[0]).toBe("/manager/channels/2/g%2F1")
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/manager/channels/2/g%252F1")
   })
 
-  it("upserts a business channel with backend field names", async () => {
-    fetchMock.mockResolvedValue(new Response(JSON.stringify({ channel_id: "g1", channel_type: 2 }), { status: 200 }))
+  it("creates and updates a business channel with explicit method semantics", async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({ channel_id: "g1", channel_type: 2 }), { status: 201 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ channel_id: "g1", channel_type: 2 }), { status: 200 }))
 
-    await upsertBusinessChannel({ channelId: "g1", channelType: 2, ban: true, disband: false, sendBan: true })
+    await createBusinessChannel({ channelId: "g1", channelType: 2, ban: true, disband: false, sendBan: true })
+    await updateBusinessChannel(2, "g1", { ban: false, disband: true, sendBan: false })
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe("/manager/channels")
+    expect((fetchMock.mock.calls[0]?.[1] as RequestInit).method).toBe("POST")
     expect(JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
       channel_id: "g1",
       channel_type: 2,
@@ -603,14 +647,26 @@ describe("manager api client", () => {
       disband: false,
       send_ban: true,
     })
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/manager/channels/2/g1")
+    expect((fetchMock.mock.calls[1]?.[1] as RequestInit).method).toBe("PATCH")
+    expect(JSON.parse((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string)).toEqual({
+      ban: false,
+      disband: true,
+      send_ban: false,
+    })
   })
 
   it("fetches business channel members by list kind", async () => {
-    fetchMock.mockResolvedValue(new Response(JSON.stringify({ items: [], has_more: false }), { status: 200 }))
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [], has_more: false }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [], has_more: false }), { status: 200 }))
 
     await getBusinessChannelMembers(2, "g/1", "allowlist", { limit: 100, cursor: "next" })
 
-    expect(fetchMock.mock.calls[0]?.[0]).toBe("/manager/channels/2/g%2F1/allowlist?limit=100&cursor=next")
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/manager/channels/2/g%252F1/allowlist?limit=100&cursor=next")
+
+    await getBusinessChannelMembers(2, "g/1", "allowlist", { limit: 100, uid: "user exact" })
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/manager/channels/2/g%252F1/allowlist?limit=100&uid=user+exact")
   })
 
   it("adds and removes business channel members with uid bodies", async () => {
@@ -2452,6 +2508,93 @@ describe("manager api client", () => {
       error: "scale_in_blocked",
       message: "blocked",
       report,
+    })
+  })
+
+  it("keeps repository failure detail on ManagerApiError", async () => {
+    const detail = {
+      provider: "oss",
+      stage: "write_marker",
+      reason: "invalid_access_key",
+      provider_code: "InvalidAccessKeyId",
+      request_id: "request-1",
+      node_id: 2,
+    }
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({
+        error: "backup_repository_auth_failed",
+        message: "Alibaba Cloud OSS rejected the AccessKey ID.",
+        detail,
+      }), { status: 503 }),
+    )
+
+    await expect(testBackupRepository(4)).rejects.toMatchObject({
+      status: 503,
+      error: "backup_repository_auth_failed",
+      message: "Alibaba Cloud OSS rejected the AccessKey ID.",
+      detail,
+    })
+  })
+
+  it("calls the scheduled full-backup and in-place restore endpoints", async () => {
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ state: {}, archives: [] }), { status: 200 }))
+    const plan = {
+      expected_revision: 3,
+      enabled: true,
+      store: { kind: "file" as const },
+      cron: "@every 12h",
+      time_zone: "Asia/Shanghai",
+      retention_count: 7,
+      rate_mib_per_second: 50,
+      workers_per_node: 1,
+      max_duration_hours: 12,
+    }
+
+    await getBackupDashboard()
+    await saveBackupPlan(plan)
+    await testBackupRepository(3)
+    await startBackupJob()
+    await cancelBackupJob("job 1")
+    await verifyBackupArchive("archive/1")
+    await setBackupArchiveHold("archive/1", true, "operator hold")
+    await deleteBackupArchive("archive/1")
+    await startBackupRestore("archive/1", {
+      username: "admin",
+      password: "secret",
+      confirmation: "RESTORE archive/1",
+    })
+    await cancelBackupRestore("restore 1")
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/manager/backups",
+      "/manager/backups/plan",
+      "/manager/backups/repository/test",
+      "/manager/backups/jobs",
+      "/manager/backups/jobs/job%201/cancel",
+      "/manager/backups/archives/archive%2F1/verify",
+      "/manager/backups/archives/archive%2F1/hold",
+      "/manager/backups/archives/archive%2F1",
+      "/manager/backups/archives/archive%2F1/restore",
+      "/manager/backups/restores/restore%201/cancel",
+    ])
+    expect(fetchMock.mock.calls.map((call) =>
+      (call[1] as { method?: string } | undefined)?.method,
+    )).toEqual([
+      undefined, "PUT", "POST", "POST", "POST",
+      "POST", "PUT", "DELETE", "POST", "POST",
+    ])
+    expect(JSON.parse((fetchMock.mock.calls[1]?.[1] as { body: string }).body)).toEqual(plan)
+    expect(JSON.parse((fetchMock.mock.calls[2]?.[1] as { body: string }).body)).toEqual({
+      expected_plan_revision: 3,
+    })
+    expect(JSON.parse((fetchMock.mock.calls[7]?.[1] as { body: string }).body)).toEqual({
+      confirmation: "DELETE archive/1",
+    })
+    expect(JSON.parse((fetchMock.mock.calls[8]?.[1] as { body: string }).body)).toEqual({
+      username: "admin",
+      password: "secret",
+      confirmation: "RESTORE archive/1",
     })
   })
 

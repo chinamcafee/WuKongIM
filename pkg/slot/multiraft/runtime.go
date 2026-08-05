@@ -55,14 +55,14 @@ func New(opts Options) (*Runtime, error) {
 func (r *Runtime) start() {
 	for i := 0; i < r.opts.Workers; i++ {
 		r.wg.Add(1)
-		goroutine.SafeGo(r.opts.Goroutines, "slot", "raft_worker", func() {
+		goroutine.SafeGo(r.opts.Goroutines, goroutine.TaskSlotRaftWorker, func() {
 			defer r.wg.Done()
 			r.runWorker()
 		})
 	}
 
 	r.wg.Add(1)
-	goroutine.SafeGo(r.opts.Goroutines, "slot", "raft_ticker", func() {
+	goroutine.SafeGo(r.opts.Goroutines, goroutine.TaskSlotRaftTicker, func() {
 		defer r.wg.Done()
 		r.runTicker()
 	})
@@ -184,4 +184,28 @@ func (r *Runtime) observeSchedulerTask(task string, d time.Duration) {
 	if r != nil && r.opts.Observer != nil {
 		r.opts.Observer.ObserveSchedulerTask(task, d)
 	}
+}
+
+// ProposalsQuiescent reports whether every local Slot has completed all
+// ordinary proposals admitted before the caller's external fence boundary.
+func (r *Runtime) ProposalsQuiescent() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	if r.closed {
+		r.mu.RUnlock()
+		return false
+	}
+	slots := make([]*slot, 0, len(r.slots))
+	for _, localSlot := range r.slots {
+		slots = append(slots, localSlot)
+	}
+	r.mu.RUnlock()
+	for _, localSlot := range slots {
+		if !localSlot.proposalsQuiescent() {
+			return false
+		}
+	}
+	return true
 }

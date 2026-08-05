@@ -26,6 +26,74 @@ export type ManagerPermissionsResponse = {
   resources: ManagerPermissionResource[]
 }
 
+export type ManagerMCPCredential = {
+  id: string
+  created_at_unix_ms: number
+  old: boolean
+}
+
+export type ManagerMCPStatusResponse = {
+  cluster_id: string
+  revision: number
+  enabled: boolean
+  observed_status: "stopped" | "ready" | "unavailable"
+  owner_node_id: number
+  owner_candidates: {
+    node_id: number
+    status: string
+  }[]
+  credentials: ManagerMCPCredential[]
+  warnings: string[]
+}
+
+export type ManagerMCPTokenResponse = {
+  credential_id: string
+  token: string
+  created_at_unix_ms: number
+  revision: number
+}
+
+export type ManagerMCPMutationResponse = {
+  accepted: boolean
+}
+
+export type ManagerMCPAudit = {
+  request_id: string
+  recorder_node_id?: number
+  phase: string
+  ingress_node_id?: number
+  owner_node_id?: number
+  credential_id: string
+  tool: string
+  node_id?: number
+  slot_id?: number
+  channel_type?: number
+  result: string
+  started_at: string
+  duration_ms: number
+  response_bytes: number
+  cache_hit: boolean
+  pprof_kind?: string
+  pprof_seconds?: number
+}
+
+export type ManagerMCPAuditsResponse = {
+  items: ManagerMCPAudit[]
+}
+
+export type ManagerMCPMutationInput = {
+  expectedRevision: number
+  idempotencyKey: string
+}
+
+export type ManagerMCPOwnerMutationInput = ManagerMCPMutationInput & {
+  ownerNodeId: number
+}
+
+export type ManagerMCPTokenRevokeInput = ManagerMCPMutationInput & {
+  credentialId: string
+}
+
 export type ManagerWebhookConfigResponse = {
   enabled: boolean
   http_addr: string
@@ -341,7 +409,7 @@ export type RealtimeMonitorStatus = "ready" | "partial" | "prometheus_disabled" 
 
 export type RealtimeMonitorTone = "normal" | "warning" | "critical"
 
-export type RealtimeMonitorSource = "prometheus" | "control_snapshot"
+export type RealtimeMonitorSource = "prometheus" | "control_snapshot" | "direct_node_rpc"
 
 export type RealtimeMonitorCategory =
   | "common"
@@ -354,6 +422,7 @@ export type RealtimeMonitorCategory =
   | "control"
   | "slot"
   | "node"
+  | "goroutines"
 
 export type RealtimeMonitorPoint = {
   timestamp: number
@@ -406,6 +475,70 @@ export type RealtimeMonitorCategoryEntry = {
   count: number
 }
 
+export type GoroutineTaskSnapshot = {
+  task: string
+  name: string
+  kind: "singleton" | "fixed" | "dynamic" | "pool" | "burst"
+  critical: boolean
+  expected?: number
+  active: number
+  process_peak: number
+  total_started: number
+  total_stopped: number
+  panics: number
+  busy_tasks?: number
+  pool_capacity?: number
+  queue_depth?: number
+  queue_capacity?: number
+  rejected_total?: number
+  running_for?: number
+  health: "normal" | "warning" | "critical"
+  health_reason?: string
+}
+
+export type GoroutineModuleSnapshot = {
+  module: string
+  active: number
+  process_peak: number
+  total_started: number
+  total_stopped: number
+  panics: number
+  busy_tasks?: number
+  pool_capacity?: number
+  queue_depth?: number
+  queue_capacity?: number
+  rejected_total?: number
+  tasks: GoroutineTaskSnapshot[]
+  health: "normal" | "warning" | "critical"
+}
+
+export type GoroutineRegistrySnapshot = {
+  generated_at: string
+  process_started_at: string
+  boot_id: string
+  process_total: number
+  managed_total: number
+  unmanaged_total: number
+  reconciled: boolean
+  total_active: number
+  total_started: number
+  total_panics: number
+  modules: GoroutineModuleSnapshot[]
+}
+
+export type RealtimeMonitorGoroutines = {
+  status: "ready" | "partial"
+  generated_at: string
+  nodes: Array<{
+    node_id: number
+    name: string
+    status: string
+    supported: boolean
+    error?: string
+    snapshot?: GoroutineRegistrySnapshot
+  }>
+}
+
 export type RealtimeMonitorResponse = {
   status: RealtimeMonitorStatus
   generated_at: string
@@ -418,10 +551,12 @@ export type RealtimeMonitorResponse = {
   sources: {
     prometheus: RealtimeMonitorSourceStatus
     control_snapshot: RealtimeMonitorSourceStatus
+    goroutines?: RealtimeMonitorSourceStatus
   }
   categories: RealtimeMonitorCategoryEntry[]
   snapshot: RealtimeMonitorSnapshotEntry[]
   cards: RealtimeMonitorCard[]
+  goroutines?: RealtimeMonitorGoroutines
 }
 
 export type ManagerNode = {
@@ -552,6 +687,7 @@ export type ManagerNodeConfigItem = {
   key: string
   label: string
   value: string
+  source: "toml" | "env" | "default" | "derived"
   sensitive: boolean
   redacted: boolean
 }
@@ -1583,9 +1719,15 @@ export type ManagerBusinessChannelDetailResponse = ManagerBusinessChannelListIte
   has_denylist: boolean
 }
 
-export type UpsertBusinessChannelInput = {
+export type CreateBusinessChannelInput = {
   channelId: string
   channelType: number
+  ban?: boolean
+  disband?: boolean
+  sendBan?: boolean
+}
+
+export type UpdateBusinessChannelInput = {
   ban?: boolean
   disband?: boolean
   sendBan?: boolean
@@ -1596,6 +1738,7 @@ export type BusinessChannelMemberListKind = "subscribers" | "allowlist" | "denyl
 export type BusinessChannelMembersParams = {
   limit?: number
   cursor?: string
+  uid?: string
 }
 
 export type ManagerBusinessChannelMember = {
@@ -1616,7 +1759,8 @@ export type MutateBusinessChannelMembersResponse = {
   channel_id: string
   channel_type: number
   list: BusinessChannelMemberListKind
-  changed: boolean
+  requested_count: number
+  changed_count: number
 }
 
 export type ManagerChannelClusterSummaryResponse = {
@@ -2153,4 +2297,216 @@ export type ManagerDBInspectDescribeResponse = ManagerDBInspectQueryResponse
 export type ManagerDBInspectQueryInput = {
   node_id?: number
   query: string
+}
+
+export type ManagerBackupStoreKind = "file" | "oss" | "cos" | "s3"
+
+export type ManagerBackupStore = {
+  kind: ManagerBackupStoreKind
+  endpoint?: string
+  region?: string
+  bucket?: string
+  prefix?: string
+  path_style?: boolean
+  credential_revision?: number
+}
+
+export type ManagerBackupRepositoryVerification = {
+  status: "unverified" | "verified"
+  verified_at_unix_ms?: number
+}
+
+export type ManagerBackupRepositoryErrorDetail = {
+  provider: ManagerBackupStoreKind
+  stage:
+    | "open"
+    | "write_marker"
+    | "read_marker"
+    | "write_receipt"
+    | "read_receipt"
+    | "list"
+    | "delete"
+    | "bind_identity"
+    | "mark_verified"
+  reason:
+    | "invalid_access_key"
+    | "signature_mismatch"
+    | "access_denied"
+    | "bucket_not_found"
+    | "region_mismatch"
+    | "endpoint_unreachable"
+    | "tls_failure"
+    | "timeout"
+    | "read_failed"
+    | "write_failed"
+    | "list_failed"
+    | "delete_failed"
+    | "repository_in_use"
+    | "node_unreachable"
+    | "unknown"
+  provider_code?: string
+  request_id?: string
+  node_id?: number
+}
+
+export type ManagerBackupPlan = {
+  revision: number
+  enabled: boolean
+  store: ManagerBackupStore
+  repository_verification?: ManagerBackupRepositoryVerification
+  cron: string
+  time_zone: string
+  retention_count: number
+  rate_bytes_per_sec: number
+  workers_per_node: number
+  max_duration_ms: number
+  schedule_cursor_unix_ms: number
+  created_unix_ms: number
+  updated_unix_ms: number
+}
+
+export type ManagerBackupSlotProgress = {
+  hash_slot: number
+  status: "pending" | "running" | "complete" | "failed"
+  attempt: number
+  owner_node_id?: number
+  logical_bytes?: number
+  stored_bytes?: number
+  records?: number
+  updated_unix_ms?: number
+  error_code?: string
+}
+
+export type ManagerBackupJob = {
+  id: string
+  trigger: "initial" | "scheduled" | "manual"
+  status: string
+  plan_revision: number
+  scheduled_at_unix_ms?: number
+  started_at_unix_ms: number
+  deadline_unix_ms: number
+  updated_unix_ms: number
+  cancel_requested?: boolean
+  slots: ManagerBackupSlotProgress[]
+  logical_bytes?: number
+  stored_bytes?: number
+  records?: number
+  error_code?: string
+}
+
+export type ManagerRestoreSlotProgress = {
+  hash_slot: number
+  status: string
+  attempt: number
+  replica_node_ids?: number[]
+  logical_bytes?: number
+  updated_unix_ms?: number
+  error_code?: string
+}
+
+export type ManagerRestoreJob = {
+  id: string
+  backup_id: string
+  initiator: string
+  status: string
+  started_at_unix_ms: number
+  deadline_unix_ms: number
+  updated_unix_ms: number
+  cancel_requested?: boolean
+  maintenance_entered?: boolean
+  target_activation: string
+  slots: ManagerRestoreSlotProgress[]
+  logical_bytes?: number
+  error_code?: string
+}
+
+export type ManagerBackupTaskRecord = {
+  id: string
+  kind: string
+  initiator?: string
+  trigger?: string
+  status: string
+  started_at_unix_ms: number
+  completed_at_unix_ms: number
+  scheduled_at_unix_ms?: number
+  error_code?: string
+}
+
+export type ManagerBackupSystemState = {
+  revision: number
+  manager_session_epoch: number
+  plan?: ManagerBackupPlan
+  active_backup?: ManagerBackupJob
+  active_restore?: ManagerRestoreJob
+  history?: ManagerBackupTaskRecord[]
+}
+
+export type ManagerBackupArchive = {
+  id: string
+  trigger: string
+  source_cluster_id: string
+  started_at_unix_ms: number
+  completed_at_unix_ms: number
+  logical_bytes: number
+  stored_bytes: number
+  records: number
+  max_message_id: string
+  held: boolean
+  hold_note?: string
+  health: "healthy" | "corrupt"
+  error_code?: string
+}
+
+export type ManagerBackupDashboard = {
+  state: ManagerBackupSystemState
+  archives: ManagerBackupArchive[]
+  credentials_configured: boolean
+  next_scheduled_unix_ms?: number
+  backup_health?: "healthy" | "warning" | "critical"
+  backup_health_reason?: "latest_backup_failed" | "successful_backup_stale"
+  last_successful_backup_unix_ms?: number
+  repository_error?: string
+}
+
+export type ManagerBackupArchiveDetail = {
+  archive: ManagerBackupArchive
+  manifest: Record<string, unknown>
+}
+
+export type ManagerBackupPlanInput = {
+  expected_revision: number
+  enabled: boolean
+  store: {
+    kind: ManagerBackupStoreKind
+    endpoint?: string
+    region?: string
+    bucket?: string
+    prefix?: string
+    path_style?: boolean
+    access_key?: string
+    secret_key?: string
+  }
+  cron: string
+  time_zone: string
+  retention_count: number
+  rate_mib_per_second: number
+  workers_per_node: number
+  max_duration_hours: number
+}
+
+export type ManagerBackupConfigureResult = {
+  plan: ManagerBackupPlan
+  initial_job?: ManagerBackupJob
+  credentials_configured: boolean
+}
+
+export type ManagerBackupRepositoryTestResult = {
+  ok: boolean
+  plan: ManagerBackupPlan
+}
+
+export type ManagerRestoreInput = {
+  username: string
+  password: string
+  confirmation: string
 }

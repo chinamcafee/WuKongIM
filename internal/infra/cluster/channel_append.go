@@ -22,6 +22,14 @@ type ChannelAppendAuthorityNode interface {
 	GetChannelMetadata(context.Context, string, int64) (metadb.Channel, error)
 }
 
+// channelAppendAuthorityInvalidator invalidates one exact append-authority
+// version without evicting a concurrently installed newer route.
+type channelAppendAuthorityInvalidator interface {
+	// InvalidateChannelAppendAuthority invalidates the matching leader and
+	// generation fences for id.
+	InvalidateChannelAppendAuthority(channelruntime.ChannelID, uint64, uint64, uint64, uint64)
+}
+
 // ChannelAppendRemoteForwarder forwards sends to a remote channel authority.
 type ChannelAppendRemoteForwarder interface {
 	// ForwardSendBatch forwards items to the resolved channel authority target.
@@ -36,6 +44,7 @@ type ChannelAppendClient struct {
 }
 
 var _ channelappend.AuthorityResolver = (*ChannelAppendClient)(nil)
+var _ channelappend.AuthorityInvalidator = (*ChannelAppendClient)(nil)
 var _ channelappend.RemoteForwarder = (*ChannelAppendClient)(nil)
 
 // NewChannelAppendClient creates a cluster-backed channel append client.
@@ -66,6 +75,7 @@ func (c *ChannelAppendClient) ResolveAppendAuthority(ctx context.Context, id cha
 		applyChannelAppendMetadata(&target, metadata)
 		return target, nil
 	}
+	cacheGeneration := c.metadata.Generation()
 	channel, err := c.node.GetChannelMetadata(ctx, id.ID, int64(id.Type))
 	if err != nil && !errors.Is(err, metadb.ErrNotFound) {
 		return channelappend.AuthorityTarget{}, mapChannelAppendRouteError(err)
@@ -76,9 +86,28 @@ func (c *ChannelAppendClient) ResolveAppendAuthority(ctx context.Context, id cha
 			SubscriberMutationVersion: channel.SubscriberMutationVersion,
 		}
 		applyChannelAppendMetadata(&target, metadata)
-		c.metadata.Store(id, metadata)
+		c.metadata.StoreIfGeneration(id, metadata, cacheGeneration)
 	}
 	return target, nil
+}
+
+// InvalidateAppendAuthority removes only the failed authority version cached by
+// the hosted Channel service. Concurrently installed newer metadata remains cached.
+func (c *ChannelAppendClient) InvalidateAppendAuthority(id channelappend.ChannelID, target channelappend.AuthorityTarget) {
+	if c == nil || c.node == nil {
+		return
+	}
+	invalidator, ok := c.node.(channelAppendAuthorityInvalidator)
+	if !ok {
+		return
+	}
+	invalidator.InvalidateChannelAppendAuthority(
+		channelruntime.ChannelID{ID: id.ID, Type: id.Type},
+		target.LeaderNodeID,
+		target.Epoch,
+		target.LeaderEpoch,
+		target.RouteGeneration,
+	)
 }
 
 func applyChannelAppendMetadata(target *channelappend.AuthorityTarget, metadata ChannelAppendMetadata) {
@@ -99,11 +128,12 @@ func (c *ChannelAppendClient) ForwardSendBatch(ctx context.Context, target chann
 
 func channelAppendTargetFromMeta(meta channelruntime.Meta) channelappend.AuthorityTarget {
 	return channelappend.AuthorityTarget{
-		ChannelID:    channelappend.ChannelID{ID: meta.ID.ID, Type: meta.ID.Type},
-		ChannelKey:   string(meta.Key),
-		LeaderNodeID: uint64(meta.Leader),
-		Epoch:        meta.Epoch,
-		LeaderEpoch:  meta.LeaderEpoch,
+		ChannelID:       channelappend.ChannelID{ID: meta.ID.ID, Type: meta.ID.Type},
+		ChannelKey:      string(meta.Key),
+		LeaderNodeID:    uint64(meta.Leader),
+		Epoch:           meta.Epoch,
+		LeaderEpoch:     meta.LeaderEpoch,
+		RouteGeneration: meta.RouteGeneration,
 	}
 }
 

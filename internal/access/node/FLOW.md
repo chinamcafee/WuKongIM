@@ -34,9 +34,13 @@ Supported authority calls:
 multiple exact authority targets that all name the destination leader, and the
 response stays aligned with the input groups. Each group has its own stable
 status and routes, so a stale target does not discard successful sibling
-groups. Authorities may implement `EndpointsByUIDs` to validate and read one
-target under a single directory lock; otherwise the adapter preserves
-compatibility by calling `EndpointsByUID` for each UID in that group. Both the
+groups. Authorities may implement `EndpointsByTargets` to resolve the complete
+ordered group collection in one call. The production directory uses that seam
+to lock each touched directory shard once while retaining every group's
+complete target fence and aligned status. Authorities that do not expose that
+seam may implement `EndpointsByUIDs` to validate and read one target under a
+single directory lock; otherwise the adapter preserves compatibility by calling
+`EndpointsByUID` for each UID in that group. Both the
 group count and aggregate UID/route counts use the presence RPC collection
 limit. A group that would exceed the per-response route budget is returned as a
 group-scoped rejection while bounded sibling groups keep their aligned results.
@@ -78,37 +82,32 @@ committed message identifiers, sender echo-suppression fields, payload, red-dot
 flag, and request-scoped UIDs. Responses carry status plus accepted, retryable,
 and dropped route groups.
 
-## Delivery Fanout RPC
-
-```text
-remote delivery fanout router
-  -> encode W K V F 1 request
-  -> cluster RPCDeliveryFanout
-  -> Adapter.HandleDeliveryFanoutRPC
-  -> DeliveryFanoutRunner.RunTask
-  -> encode W K V f 1 response
-```
-
-Delivery fanout requests carry one `runtime/delivery.FanoutTask` in the stable
-field order `Envelope`, `Partition`, `Cursor`, and `Attempt`. The receiving
-node runs only the subscriber fanout task; owner-node delivery still uses the
-separate Delivery Push RPC after presence resolution.
+The canonical runtime and client expose `PushOwner`; the adapter converts that
+contract to the version-one wire DTOs without changing the exact
+`WKVD1`/`WKVd1` bytes. The retired Delivery Fanout RPC has no handler, client,
+or codec. `RPCDeliveryFanout` remains a reserved numeric service ID and must not
+be reused.
 
 ## Conversation Authority RPC
 
 ```text
 remote conversation authority client
-  -> encode W K V C 1 request
+  -> encode W K V C 1 single-target request
+     or W K V C 2 multi-target active-batch request
   -> cluster RPCConversationAuthority
   -> Adapter.HandleConversationAuthorityRPC
   -> ConversationAuthority port
-  -> encode W K V c 1 response
+     or optional ConversationBatchAuthority port
+  -> encode W K V c 1 single-target response
+     or W K V c 2 group-aligned response
 ```
 
 Supported conversation authority calls:
 
 - `AdmitPatches(RouteTarget, []ActivePatch)`
 - `AdmitActiveBatch(RouteTarget, conversationactive.ActiveBatch)`
+- `HideConversationsForTarget(RouteTarget, []metadb.ConversationDelete)`
+  preserves canceled/deadline status across the node RPC boundary, matching local authority calls.
 - `ListConversationActiveViewForTarget(RouteTarget, kind, uid, activeCursor, limit)`
 - `DrainAuthority(RouteTarget)`
 
@@ -122,6 +121,34 @@ The RPC boundary is deliberately narrow:
   authority target. Sender/recipient route grouping is performed by
   `internal/infra/cluster`; this package only transports the exact batch
   subset it receives.
+- Bulk active-batch admit carries multiple exact targets for one destination
+  leader in one `WKVC2` envelope. Every group retains its own hash slot, Slot,
+  leader term, config epoch, route revision, and authority epoch fence. The
+  `WKVc2` response contains one stable status per input group in the same
+  order, so one stale target does not discard successful sibling groups. The
+  adapter uses `ConversationBatchAuthority` when implemented and otherwise
+  preserves compatibility by calling `AdmitActiveBatch` once per group.
+- Bulk request group count and aggregate active-row count are both limited to
+  4,096. The client rejects a zero or mismatched destination leader before
+  transport, and both codecs reject malformed, truncated, oversized, unknown-
+  status, or trailing data. Existing `WKVC1`/`WKVc1` bytes and the single-group
+  API remain unchanged.
+- During a rolling upgrade, only the exact old-peer `WKVC2` invalid-codec
+  remote error enables fallback to the original `WKVC1` calls. Other transport
+  or protocol errors do not fan out. Unsupported capability is cached per
+  client and destination node for a bounded TTL to avoid repeated hot-path
+  probes. A transport cancellation is normalized to `context.Canceled`; a
+  retryable connection timeout remains distinct for the routed client to
+  classify without weakening the caller deadline.
+- Hide carries one exact, ordered `ConversationDelete` collection to the fenced
+  UID authority target. The client does not split the mutation collection:
+  collections above 4,096 entries fail before transport, and malformed or
+  oversized wire collections fail closed during decode. The adapter waits for
+  the authority result and maps it through the existing route status contract.
+  The `WKVC1` hide extension follows the existing common request prefix and
+  appends `DeleteCount`, then each delete in the stable field order `UID`,
+  `Kind`, `ChannelID`, `ChannelType`, `DeletedToSeq`, and `UpdatedAt`. Existing
+  operation byte layouts are unchanged.
 - List reads the target-owned active view for one `metadb.ConversationKind`
   from the authority node. The local authority implementation decides how to
   merge unflushed cache rows with DB rows; this package only transports the
@@ -421,6 +448,24 @@ generic peer or error fields. Event count is not a reconcile-rate signal:
 node-local retention keeps state changes immediately and resamples an unchanged
 signature at most once every 30 seconds, while Prometheus keeps aggregate rates.
 
+## Manager Goroutine RPC
+
+```text
+manager realtime monitor
+  -> cluster RPCManagerGoroutines
+  -> Adapter.HandleManagerGoroutineRPC
+  -> app-local registry projection
+  -> management.GoroutineSnapshot read model
+  -> bounded JSON snapshot response
+```
+
+Manager Goroutine RPC is read-only and node-local. It returns process identity,
+process/managed/unmanaged totals, and fixed module/task counters. Cluster-wide
+selection, fan-out concurrency, per-node deadlines, short-lived caching, and
+partial support are owned by `internal/app`; this adapter does not inspect
+stacks or derive task names from function addresses, and it does not expose the
+concrete registry runtime type across the access boundary.
+
 ## Manager Application Log RPC
 
 ```text
@@ -438,6 +483,42 @@ and does not read Controller, Slot, Channel, Raft, or other distributed logs.
 The server calls only the configured management application log reader port; it
 does not inspect filesystem paths, discover files, merge logs across nodes, or
 decide which manager HTTP request should target a remote node.
+Entry requests carry the opaque cursor plus bounded `before` and `after`
+context counts so the selected node, which owns rotation and cursor semantics,
+constructs the exact surrounding raw-log page.
+
+## Operations MCP RPC
+
+```text
+any Manager /mcp ingress
+  -> RPCOpsMCP forward request
+  -> configured execution owner revalidates ID/digest/revision
+  -> owner executes the stateless MCP request
+
+execution owner pprof_analyze
+  -> owner creates a random, short-lived, one-time in-memory lease
+  -> RPCOpsMCP profile request carries that opaque lease ID
+  -> selected target revalidates owner/revision
+  -> RPCOpsMCP profile_lease callback consumes the lease at the real owner
+  -> target captures a bounded profile only after lease confirmation
+  -> owner parses and discards raw profile bytes
+
+Manager audit page
+  -> RPCOpsMCP audits request to alive/suspect peers
+  -> each peer returns at most 200 local non-secret summaries
+```
+
+The shared service uses a typed versioned envelope for `forward`, `profile`,
+`profile_lease`, and `audits` operations. Its caller node identity is populated
+by the local cluster client and remains a consistency check, not the profile
+authorization proof. Forwarding requires that identity to match the ingress
+field. Profiling additionally requires the target to consume the unpredictable
+owner-held lease exactly once; a peer cannot authorize capture by constructing
+a matching caller/owner JSON payload. Forwarding carries a credential ID and
+already-computed digest but never the raw `wko_*` token. Requests and responses
+are capped at 64 KiB and 1 MiB; ephemeral profile payloads have a separate
+32 MiB internal cap. There is no failover owner: an unavailable configured
+owner returns a stable unavailable result to the ingress Manager.
 
 ## Codec Rules
 
@@ -455,15 +536,17 @@ Delivery push RPC uses fixed magic headers:
 - Request: `W K V D 1`
 - Response: `W K V d 1`
 
-Delivery fanout RPC uses fixed magic headers:
-
-- Request: `W K V F 1`
-- Response: `W K V f 1`
-
 Conversation authority RPC uses fixed magic headers:
 
-- Request: `W K V C 1`
-- Response: `W K V c 1`
+- Single-group request: `W K V C 1`
+- Single-group response: `W K V c 1`
+- Bulk-group request: `W K V C 2` (`WKVC2`)
+- Bulk-group response: `W K V c 2` (`WKVc2`)
+
+`WKVC2` carries an ordered collection of exact `RouteTarget` plus
+`ActiveBatch` groups, bounded by 4,096 aggregate rows. `WKVc2` carries one
+status for every input group in the same order. `WKVC1`/`WKVc1` retain their
+original single-group layout for rolling-upgrade fallback.
 
 Conversation authority request targets carry `HashSlot`, `SlotID`,
 `LeaderNodeID`, Slot `LeaderTerm`, Slot `ConfigEpoch`, route revision, and the
@@ -531,6 +614,11 @@ Manager Node Config RPC uses fixed magic headers:
 - Request: `W K V C 1`
 - Response: `W K V c 1`
 
+Manager Backup RPC uses fixed magic headers:
+
+- Request: `W K B M Q 2`
+- Response: `W K B M R 2`
+
 Strings and collections are length-delimited with varints. Unsigned numeric
 fields use uvarints and signed time/delay fields use varints. Decoders reject
 unknown operations, malformed varints, oversized collections, truncated
@@ -564,7 +652,7 @@ Channel Append RPC statuses and item error codes preserve:
 - `append_result_missing`
 - `channel_busy`
 
-Delivery push and fanout responses currently use:
+Delivery push responses currently use:
 
 - `ok`
 - `rejected`
@@ -585,8 +673,35 @@ Delivery push and fanout responses currently use:
   effects.
 - This package must not mutate local gateway sessions or authority runtime
   state except through the `PresenceAuthority`, `PresenceOwner`, and
-  `DeliveryOwnerPush` / `DeliveryFanoutRunner` / `ConversationAuthority` /
+  `DeliveryOwnerPush` / `ConversationAuthority` /
   standalone channel-write `ChannelAppend`, manager connection reader, and
   manager log reader, manager plugin reader, manager DB inspect reader,
   manager diagnostics reader/operator, and manager application log reader
   adapter interfaces.
+
+## Scheduled Backup RPC
+
+Scheduled backup uses fixed, versioned, bounded node RPCs:
+
+- repository probe asks every active data node to observe a shared marker and
+  publish its own receipt;
+- Slot export dispatches to the current physical Slot leader;
+- message export dispatches bounded Channel shards to their current leaders;
+- restore dispatches one idempotent prepare, stage, verify, switch, rollback,
+  or cleanup command to a physical Slot replica.
+
+Large archive and restore payloads never cross node RPC. Producing nodes read
+or write the shared repository directly; responses carry only byte/record
+counts and fixed-size references to authenticated, repository-resident chunk
+indexes. Decoders reject unknown fields, trailing bytes, unsafe identifiers,
+invalid Hash Slots, oversized frames, and unsupported versions.
+
+Repository probe failures return a bounded, secret-safe DTO containing only
+provider, operation stage, stable reason, provider code, request ID, and node
+ID. The receiving adapter validates every enum before reconstructing the typed
+repository error. Raw provider messages, request bodies, credentials, and
+credential ciphertext never cross this RPC.
+
+Restore handlers require the local Controller mirror to show the same active
+restore and maintenance state before touching local files. Commands are fenced
+by job ID, backup ID, Hash Slot, and attempt.

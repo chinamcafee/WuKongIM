@@ -63,6 +63,16 @@ var builtinManagerPermissionResources = []ManagerPermissionResource{
 		Description: "Read Controller state and perform Controller operations.",
 	},
 	{
+		Resource:    "cluster.backup",
+		Actions:     []string{"r", "w"},
+		Description: "Read and manage scheduled full backups and their archives.",
+	},
+	{
+		Resource:    "cluster.restore",
+		Actions:     []string{"w"},
+		Description: "Restore a verified archive with a separately reviewed explicit grant; wildcard grants do not apply.",
+	},
+	{
 		Resource:    "cluster.diagnostics",
 		Actions:     []string{"r", "w"},
 		Description: "Read diagnostics data and manage tracking rules.",
@@ -71,6 +81,11 @@ var builtinManagerPermissionResources = []ManagerPermissionResource{
 		Resource:    "cluster.log",
 		Actions:     []string{"r"},
 		Description: "Read ordinary application log sources and entries.",
+	},
+	{
+		Resource:    "cluster.mcp",
+		Actions:     []string{"r", "w"},
+		Description: "Read and administer the embedded read-only operations MCP.",
 	},
 	{
 		Resource:    "cluster.db",

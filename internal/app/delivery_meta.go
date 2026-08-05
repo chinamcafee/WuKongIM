@@ -7,10 +7,9 @@ import (
 	"sync/atomic"
 
 	accessapi "github.com/WuKongIM/WuKongIM/internal/access/api"
-	runtimedelivery "github.com/WuKongIM/WuKongIM/internal/runtime/delivery"
-	"github.com/WuKongIM/WuKongIM/pkg/cluster"
-	"github.com/WuKongIM/WuKongIM/pkg/cluster/routing"
+	"github.com/WuKongIM/WuKongIM/internal/runtime/channelappend"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
+	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 )
 
 const deliveryMetaMutationConcurrency = 32
@@ -18,7 +17,6 @@ const deliveryMetaSubscriberCacheMaxChannels = 4096
 const deliveryMetaSubscriberCacheLoadPageSize = 1024
 
 type deliveryMetaNode interface {
-	Snapshot() cluster.Snapshot
 	UpsertChannelMetadata(context.Context, metadb.Channel) error
 	AddChannelSubscribers(context.Context, string, int64, []string, uint64) error
 	RemoveChannelSubscribers(context.Context, string, int64, []string, uint64) error
@@ -29,7 +27,7 @@ type recipientSubscriberNode interface {
 	ListChannelSubscribersPage(context.Context, string, int64, string, int) ([]string, string, bool, error)
 }
 
-// deliveryMetaStore adapts cluster Slot metadata to bench setup and delivery fanout.
+// deliveryMetaStore adapts cluster Slot metadata to bench setup and channelappend subscriber scans.
 type deliveryMetaStore struct {
 	// node owns the real replicated Slot metadata store.
 	node    deliveryMetaNode
@@ -149,7 +147,7 @@ func runDeliveryMetaTasks(ctx context.Context, tasks []func(context.Context) (in
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go func() {
+		goruntimeregistry.SafeGo(nil, goruntimeregistry.TaskAppDeliveryMetadata, func() {
 			defer wg.Done()
 			for task := range jobs {
 				n, err := task(workCtx)
@@ -160,7 +158,7 @@ func runDeliveryMetaTasks(ctx context.Context, tasks []func(context.Context) (in
 					setErr(err)
 				}
 			}
-		}()
+		})
 	}
 send:
 	for _, task := range tasks {
@@ -181,21 +179,20 @@ send:
 	return int(accepted.Load()), nil
 }
 
-func (s *deliveryMetaStore) ListSubscribers(ctx context.Context, req runtimedelivery.SubscriberPageRequest) (runtimedelivery.UIDPage, error) {
+func (s *deliveryMetaStore) NextSubscriberPage(ctx context.Context, req channelappend.SubscriberPageRequest) (channelappend.SubscriberPage, error) {
 	if s == nil || s.node == nil {
-		return runtimedelivery.UIDPage{Done: true}, nil
+		return channelappend.SubscriberPage{Done: true}, nil
 	}
 	limit := req.Limit
 	if limit <= 0 {
 		limit = 1
 	}
-	key := deliveryMetaSubscriberKey{channelID: req.ChannelID, channelType: req.ChannelType}
+	key := deliveryMetaSubscriberKey{channelID: req.ChannelID.ID, channelType: req.ChannelID.Type}
 	snapshot, err := s.subscriberSnapshot(ctx, key)
 	if err != nil {
-		return runtimedelivery.UIDPage{}, err
+		return channelappend.SubscriberPage{}, err
 	}
-	filtered := s.filterPartition(snapshot, req.Partition)
-	return subscriberPageFromSnapshot(filtered, req.Cursor, limit)
+	return subscriberPageFromSnapshot(snapshot, req.Cursor, limit)
 }
 
 func (s *deliveryMetaStore) subscriberSnapshot(ctx context.Context, key deliveryMetaSubscriberKey) ([]string, error) {
@@ -224,6 +221,12 @@ func (s *deliveryMetaStore) storeSubscriberSnapshot(key deliveryMetaSubscriberKe
 	snapshot := append([]string(nil), uids...)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// A restore or concurrent subscriber mutation may have invalidated the
+	// database read while it was in flight. Return the caller's snapshot, but
+	// never publish it into the cache under an obsolete generation.
+	if s.version.Load() != version {
+		return snapshot
+	}
 	if s.subscriberCache == nil {
 		s.subscriberCache = make(map[deliveryMetaSubscriberKey]deliveryMetaSubscriberCacheEntry)
 	}
@@ -232,6 +235,19 @@ func (s *deliveryMetaStore) storeSubscriberSnapshot(key deliveryMetaSubscriberKe
 	}
 	s.subscriberCache[key] = deliveryMetaSubscriberCacheEntry{version: version, uids: snapshot}
 	return snapshot
+}
+
+// resetAfterRestore invalidates subscriber snapshots loaded from the previous
+// logical generation. The generation fence also prevents a slow pre-restore
+// database read from repopulating the cache after this method returns.
+func (s *deliveryMetaStore) resetAfterRestore() {
+	if s == nil {
+		return
+	}
+	s.version.Add(1)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	clear(s.subscriberCache)
 }
 
 func (s *deliveryMetaStore) loadSubscriberSnapshot(ctx context.Context, key deliveryMetaSubscriberKey) ([]string, error) {
@@ -247,54 +263,37 @@ func (s *deliveryMetaStore) loadSubscriberSnapshot(ctx context.Context, key deli
 			return out, nil
 		}
 		if nextCursor == "" || nextCursor == cursor {
-			return nil, runtimedelivery.ErrInvalidSubscriberCursor
+			return nil, channelappend.ErrInvalidSubscriberCursor
 		}
 		cursor = nextCursor
 	}
 }
 
-func subscriberPageFromSnapshot(uids []string, cursor string, limit int) (runtimedelivery.UIDPage, error) {
+func subscriberPageFromSnapshot(uids []string, cursor string, limit int) (channelappend.SubscriberPage, error) {
 	start := 0
 	if cursor != "" {
 		offset, err := strconv.Atoi(cursor)
 		if err != nil || offset < 0 {
-			return runtimedelivery.UIDPage{}, runtimedelivery.ErrInvalidSubscriberCursor
+			return channelappend.SubscriberPage{}, channelappend.ErrInvalidSubscriberCursor
 		}
 		start = offset
 	}
 	if start >= len(uids) {
-		return runtimedelivery.UIDPage{Done: true}, nil
+		return channelappend.SubscriberPage{Done: true}, nil
 	}
 	end := start + limit
+	pageEnd := min(end, len(uids))
+	pageRecipients := make([]channelappend.Recipient, 0, pageEnd-start)
+	for _, uid := range uids[start:pageEnd] {
+		pageRecipients = append(pageRecipients, channelappend.Recipient{UID: uid})
+	}
 	if end >= len(uids) {
-		return runtimedelivery.UIDPage{UIDs: append([]string(nil), uids[start:]...), Done: true}, nil
+		return channelappend.SubscriberPage{Recipients: pageRecipients, Done: true}, nil
 	}
-	return runtimedelivery.UIDPage{
-		UIDs:       append([]string(nil), uids[start:end]...),
-		NextCursor: strconv.Itoa(end),
+	return channelappend.SubscriberPage{
+		Recipients: pageRecipients,
+		Cursor:     strconv.Itoa(end),
 	}, nil
-}
-
-func (s *deliveryMetaStore) filterPartition(uids []string, partition runtimedelivery.Partition) []string {
-	count := uint16(0)
-	if s != nil && s.node != nil {
-		count = s.node.Snapshot().HashSlotCount
-	}
-	if count == 0 || isDefaultDeliveryPartition(partition) {
-		return uids
-	}
-	filtered := make([]string, 0, len(uids))
-	for _, uid := range uids {
-		slot := routing.HashSlotForKey(uid, count)
-		if slot >= partition.HashSlotStart && slot <= partition.HashSlotEnd {
-			filtered = append(filtered, uid)
-		}
-	}
-	return filtered
-}
-
-func isDefaultDeliveryPartition(partition runtimedelivery.Partition) bool {
-	return partition.LeaderNodeID == 0 && partition.HashSlotStart == 0 && partition.HashSlotEnd == 0
 }
 
 func int64FromBool(value bool) int64 {

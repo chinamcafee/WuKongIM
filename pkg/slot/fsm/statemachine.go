@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"sync"
 	"time"
@@ -176,6 +177,7 @@ func (m *stateMachine) ApplyBatch(ctx context.Context, cmds []multiraft.Command)
 	defer wb.Close()
 
 	results := make([][]byte, len(cmds))
+	appliedCommands := make([]command, len(cmds))
 	var pendingDeltaKeys []deltaReplayKey
 	var pendingForwardDeltas []pendingForwardDelta
 	pendingDeltaRecords := make(map[metadb.AppliedHashSlotDelta]struct{})
@@ -278,6 +280,7 @@ commandLoop:
 			return nil, fmt.Errorf("%w: stage migration maintenance slot=%d hash_slot=%d command_type=%d", err, m.slot, hashSlot, commandTypeForDiagnostics(cmd.Data))
 		}
 		pendingForwardDeltas = append(pendingForwardDeltas, pendingForwards...)
+		appliedCommands[i] = decoded
 		results[i] = commandApplyResult(decoded)
 	}
 
@@ -295,6 +298,11 @@ commandLoop:
 	}
 	m.markAppliedDeltas(pendingDeltaKeys)
 	m.forwardCommittedDeltas(ctx, pendingForwardDeltas)
+	for i, decoded := range appliedCommands {
+		if decoded != nil {
+			results[i] = commandApplyResult(decoded)
+		}
+	}
 	return results, nil
 }
 
@@ -714,6 +722,17 @@ func (m *stateMachine) Snapshot(ctx context.Context) (multiraft.Snapshot, error)
 
 func (m *stateMachine) ExportHashSlotSnapshot(ctx context.Context, hashSlot uint16) (metadb.SlotSnapshot, error) {
 	return m.db.ExportHashSlotSnapshot(ctx, []uint16{hashSlot})
+}
+
+// OpenHashSlotSnapshot pins and streams one currently owned logical hash slot.
+func (m *stateMachine) OpenHashSlotSnapshot(ctx context.Context, hashSlot uint16) (io.ReadCloser, error) {
+	m.ownershipMu.RLock()
+	_, owned := m.ownedHashSlots[hashSlot]
+	m.ownershipMu.RUnlock()
+	if !owned {
+		return nil, metadb.ErrInvalidArgument
+	}
+	return m.db.OpenBackupHashSlotSnapshot(ctx, []uint16{hashSlot})
 }
 
 func (m *stateMachine) ImportHashSlotSnapshot(ctx context.Context, snap metadb.SlotSnapshot) error {

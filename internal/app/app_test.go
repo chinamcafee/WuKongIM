@@ -24,11 +24,9 @@ import (
 	accessgateway "github.com/WuKongIM/WuKongIM/internal/access/gateway"
 	accessmanager "github.com/WuKongIM/WuKongIM/internal/access/manager"
 	accessnode "github.com/WuKongIM/WuKongIM/internal/access/node"
-	"github.com/WuKongIM/WuKongIM/internal/contracts/messageevents"
 	clusterinfra "github.com/WuKongIM/WuKongIM/internal/infra/cluster"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/channelappend"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/conversationactive"
-	runtimedelivery "github.com/WuKongIM/WuKongIM/internal/runtime/delivery"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/online"
 	authoritypresence "github.com/WuKongIM/WuKongIM/internal/runtime/presence"
 	channelusecase "github.com/WuKongIM/WuKongIM/internal/usecase/channel"
@@ -47,7 +45,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/gateway"
 	gatewaycore "github.com/WuKongIM/WuKongIM/pkg/gateway/core"
 	"github.com/WuKongIM/WuKongIM/pkg/gateway/session"
-	gatewaytransport "github.com/WuKongIM/WuKongIM/pkg/gateway/transport"
+	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 	runtimechannelid "github.com/WuKongIM/WuKongIM/pkg/protocol/channelid"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -56,12 +54,168 @@ import (
 
 func newTestApp(t *testing.T, cfg Config, opts ...Option) (*App, error) {
 	t.Helper()
+	cfg = isolatePluginRuntimeForTest(cfg)
 	opts = append([]Option{WithLogger(wklog.NewNop())}, opts...)
 	app, err := New(cfg, opts...)
 	if app != nil {
 		t.Cleanup(app.restoreDiagnosticsSink)
 	}
 	return app, err
+}
+
+func isolatePluginRuntimeForTest(cfg Config) Config {
+	if !cfg.Plugin.Enable {
+		cfg.Plugin.SetEnableExplicit(true)
+	}
+	return cfg
+}
+
+func TestNewTestAppDisablesDefaultPluginRuntime(t *testing.T) {
+	app, err := newTestApp(t, Config{}, WithCluster(&fakeCluster{}), WithGateway(nil))
+	if err != nil {
+		t.Fatalf("newTestApp() error = %v", err)
+	}
+	if app.cfg.Plugin.Enable || app.pluginRuntime != nil {
+		t.Fatalf("test plugin runtime enabled=%v runtime=%T, want isolated", app.cfg.Plugin.Enable, app.pluginRuntime)
+	}
+}
+
+func TestAppAlwaysWiresGoroutineRegistryAndDebugSummary(t *testing.T) {
+	app, err := newTestApp(t, Config{
+		API: APIConfig{ListenAddr: "127.0.0.1:0"},
+		Observability: ObservabilityConfig{
+			DebugAPIEnabled: true,
+		},
+	}, WithCluster(&fakeCluster{}), WithGateway(nil))
+	if err != nil {
+		t.Fatalf("newTestApp() error = %v", err)
+	}
+	if app.goroutines == nil {
+		t.Fatal("goroutine registry is nil")
+	}
+	api, ok := app.api.(*accessapi.Server)
+	if !ok {
+		t.Fatalf("api = %T, want *api.Server", app.api)
+	}
+	rec := httptest.NewRecorder()
+	api.Engine().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/debug/goroutines/summary", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("summary status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var snapshot goruntimeregistry.Snapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &snapshot); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	if snapshot.BootID == "" || snapshot.ProcessTotal == 0 {
+		t.Fatalf("summary = %+v, want process identity and total", snapshot)
+	}
+}
+
+func TestAppStopReturnsManagedGoroutineWaitEvidence(t *testing.T) {
+	registry := goruntimeregistry.New()
+	release := make(chan struct{})
+	registry.Go(goruntimeregistry.TaskManagerSnapshotFanout, func() { <-release })
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if registry.Snapshot().ManagedTotal == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	app := &App{started: true, goroutines: registry, logger: wklog.NewNop()}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := app.Stop(ctx)
+	var waitErr *goruntimeregistry.WaitError
+	if !errors.As(err, &waitErr) {
+		t.Fatalf("Stop() error = %v, want managed goroutine WaitError", err)
+	}
+	if waitErr.Module != goruntimeregistry.ModuleManager || len(waitErr.Tasks) != 1 ||
+		waitErr.Tasks[0].Task != goruntimeregistry.TaskManagerSnapshotFanout {
+		t.Fatalf("wait evidence = %+v, want manager snapshot fanout", waitErr)
+	}
+	close(release)
+}
+
+func TestAppStopBeforeStartReleasesChannelAppendPools(t *testing.T) {
+	registry := goruntimeregistry.Default()
+	baseline := registry.Baseline()
+	group := channelappend.New(channelappend.Options{LocalNodeID: 1})
+	app := &App{
+		channelAppends:    group,
+		goroutines:        registry,
+		goroutineBaseline: baseline,
+		logger:            wklog.NewNop(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := app.Stop(ctx); err != nil {
+		t.Fatalf("Stop() before Start error = %v", err)
+	}
+	if err := registry.Group(goruntimeregistry.ModuleChannelAppend).WaitFrom(ctx, baseline); err != nil {
+		t.Fatalf("channelappend managed activity after App.Stop() = %v", err)
+	}
+}
+
+func TestNewConstructionFailureReleasesChannelAppendPools(t *testing.T) {
+	registry := goruntimeregistry.Default()
+	baseline := registry.Baseline()
+	cfg := isolatePluginRuntimeForTest(Config{
+		Gateway: GatewayConfig{
+			Listeners: []gateway.ListenerOptions{{
+				Network:   "tcp",
+				Address:   "127.0.0.1:0",
+				Transport: "gnet",
+				Protocol:  "wkproto",
+			}},
+		},
+	})
+
+	app, err := New(cfg, WithLogger(wklog.NewNop()))
+	if err == nil {
+		if app != nil {
+			_ = app.Stop(context.Background())
+		}
+		t.Fatal("New() error = nil, want invalid gateway listener error")
+	}
+	if app != nil {
+		t.Fatalf("New() app = %#v, want nil on construction error", app)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := registry.Group(goruntimeregistry.ModuleChannelAppend).WaitFrom(ctx, baseline); err != nil {
+		t.Fatalf("channelappend managed activity after failed New() = %v", err)
+	}
+}
+
+func TestRecordingAppLoggerSupportsConcurrentWritesAndSnapshots(t *testing.T) {
+	logger := &recordingAppLogger{}
+	const (
+		workers = 16
+		writes  = 64
+	)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for range writes {
+				logger.Info("concurrent")
+				_ = logger.entriesSnapshot()
+			}
+			_ = logger.Sync()
+		}()
+	}
+	wg.Wait()
+
+	if got := len(logger.entriesSnapshot()); got != workers*writes {
+		t.Fatalf("entries = %d, want %d", got, workers*writes)
+	}
+	if got := logger.syncCallCount(); got != workers {
+		t.Fatalf("Sync calls = %d, want %d", got, workers)
+	}
 }
 
 func captureStdout(t *testing.T, run func()) string {
@@ -618,7 +772,7 @@ func TestDefaultConsoleSeparatesStartupPresentationFromStructuredLifecycleLogs(t
 	logDir := t.TempDir()
 	console := captureStdout(t, func() {
 		calls := make([]string, 0, 2)
-		app, err := New(Config{
+		app, err := New(isolatePluginRuntimeForTest(Config{
 			NodeID:  1,
 			DataDir: shortAppTestDataDir(t),
 			Cluster: clusterpkg.Config{
@@ -626,7 +780,7 @@ func TestDefaultConsoleSeparatesStartupPresentationFromStructuredLifecycleLogs(t
 				Control: clusterpkg.ControlConfig{Voters: []clusterpkg.ControlVoter{{NodeID: 1}}},
 			},
 			Log: LogConfig{Dir: logDir, Console: true, Format: "json"},
-		}, WithCluster(&fakeCluster{calls: &calls}))
+		}), WithCluster(&fakeCluster{calls: &calls}))
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
@@ -662,14 +816,14 @@ func TestDisabledConsoleWritesNoStartupPresentation(t *testing.T) {
 	logConfig.SetExplicitFlags(false, true)
 	console := captureStdout(t, func() {
 		calls := make([]string, 0, 1)
-		app, err := New(Config{
+		app, err := New(isolatePluginRuntimeForTest(Config{
 			NodeID: 1,
 			Cluster: clusterpkg.Config{
 				NodeID:  1,
 				Control: clusterpkg.ControlConfig{Voters: []clusterpkg.ControlVoter{{NodeID: 1}}},
 			},
 			Log: logConfig,
-		}, WithCluster(&fakeCluster{calls: &calls}))
+		}), WithCluster(&fakeCluster{calls: &calls}))
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
@@ -692,7 +846,7 @@ func TestDefaultConsoleFormatsFailureWithoutStructuredDuplicate(t *testing.T) {
 	console := captureStdout(t, func() {
 		calls := make([]string, 0, 3)
 		gatewayErr := errors.New("gateway unavailable")
-		app, err := New(Config{
+		app, err := New(isolatePluginRuntimeForTest(Config{
 			NodeID:  4,
 			DataDir: shortAppTestDataDir(t),
 			Cluster: clusterpkg.Config{
@@ -700,7 +854,7 @@ func TestDefaultConsoleFormatsFailureWithoutStructuredDuplicate(t *testing.T) {
 				Control: clusterpkg.ControlConfig{Voters: []clusterpkg.ControlVoter{{NodeID: 4}}},
 			},
 			Log: LogConfig{Dir: logDir, Console: true, Format: "json"},
-		},
+		}),
 			WithCluster(&fakeCluster{calls: &calls}),
 			WithGateway(&fakeGateway{calls: &calls, startErr: gatewayErr}),
 		)
@@ -1308,6 +1462,77 @@ func TestManagementGatewayDrainWriterResumesLocalGateway(t *testing.T) {
 	}
 	if !gateway.AcceptingNewSessions() || summary.Draining || !summary.AcceptingNewSessions {
 		t.Fatalf("gateway accepting=%v summary=%#v, want local resume", gateway.AcceptingNewSessions(), summary)
+	}
+}
+
+func TestRestoreMaintenanceDisconnectsClientsAndControlsAdmission(t *testing.T) {
+	gateway := &gatewayAdmissionStub{accepting: true}
+	app := &App{gateway: gateway}
+
+	app.applyRestoreGatewayMaintenance(true)
+	if gateway.AcceptingNewSessions() || gateway.disconnectCount != 1 ||
+		!app.restoreMaintenance.Load() {
+		t.Fatalf(
+			"maintenance gateway accepting=%v disconnects=%d state=%v",
+			gateway.AcceptingNewSessions(), gateway.disconnectCount,
+			app.restoreMaintenance.Load(),
+		)
+	}
+
+	app.applyRestoreGatewayMaintenance(false)
+	if !gateway.AcceptingNewSessions() || gateway.disconnectCount != 1 ||
+		app.restoreMaintenance.Load() {
+		t.Fatalf(
+			"resumed gateway accepting=%v disconnects=%d state=%v",
+			gateway.AcceptingNewSessions(), gateway.disconnectCount,
+			app.restoreMaintenance.Load(),
+		)
+	}
+}
+
+func TestRestoreMaintenanceSuspendsAndResumesSideEffectsOnce(t *testing.T) {
+	calls := make([]string, 0, 6)
+	app := &App{
+		deliveryWorker: &recordingWorkerRuntime{
+			name: "delivery", calls: &calls,
+		},
+		webhook: &recordingWorkerRuntime{
+			name: "webhook", calls: &calls,
+		},
+		pluginHook: &recordingWorkerRuntime{
+			name: "plugin_hook", calls: &calls,
+		},
+	}
+
+	if err := app.suspendRestoreSideEffects(context.Background()); err != nil {
+		t.Fatalf("suspendRestoreSideEffects(): %v", err)
+	}
+	if err := app.suspendRestoreSideEffects(context.Background()); err != nil {
+		t.Fatalf("second suspendRestoreSideEffects(): %v", err)
+	}
+	if err := app.resumeRestoreSideEffects(context.Background()); err != nil {
+		t.Fatalf("resumeRestoreSideEffects(): %v", err)
+	}
+	if err := app.resumeRestoreSideEffects(context.Background()); err != nil {
+		t.Fatalf("second resumeRestoreSideEffects(): %v", err)
+	}
+	if got := joinCalls(calls); got !=
+		"delivery.stop,webhook.stop,plugin_hook.stop,"+
+			"delivery.stop,webhook.stop,plugin_hook.stop,"+
+			"plugin_hook.start,webhook.start,delivery.start" {
+		t.Fatalf("calls = %s", got)
+	}
+}
+
+func TestRestoreMaintenanceMakesBusinessReadinessFalse(t *testing.T) {
+	app := &App{cluster: &fakeManagerCluster{nodeID: 1}}
+	app.restoreMaintenance.Store(true)
+	ready, body := app.readyzReport(context.Background())
+	if ready {
+		t.Fatalf("readyz ready=true body=%#v during restore maintenance", body)
+	}
+	if got := body.(map[string]any)["reason"]; got != "restore maintenance" {
+		t.Fatalf("readyz reason = %v", got)
 	}
 }
 
@@ -2856,33 +3081,6 @@ func TestValidateDeliveryConfigRejectsInvalidValues(t *testing.T) {
 	}
 }
 
-func TestNewWiresIndependentRecipientDeliveryWorkerConcurrency(t *testing.T) {
-	cluster := newFakePresenceCluster(1, nil)
-	app, err := newTestApp(t,
-		Config{
-			Cluster: clusterpkg.Config{NodeID: 1},
-			ChannelAppend: ChannelAppendConfig{
-				RecipientAuthorityDispatchConcurrency: 3,
-			},
-			Delivery: DeliveryConfig{
-				Enabled:                    true,
-				RecipientWorkerConcurrency: 7,
-			},
-		},
-		WithCluster(cluster),
-		WithGateway(&fakeGateway{calls: &[]string{}}),
-	)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	if app.channelAppendDeliveryWorker == nil {
-		t.Fatal("channelappend recipient delivery worker was not wired")
-	}
-	if got := app.channelAppendDeliveryWorker.WorkerCapacity(); got != 7 {
-		t.Fatalf("recipient delivery worker capacity = %d, want 7", got)
-	}
-}
-
 func TestDefaultConversationConfigUsesRuntimeDefaults(t *testing.T) {
 	cfg := defaultConversationConfig(ConversationConfig{})
 
@@ -2907,7 +3105,7 @@ func TestDefaultConversationAuthorityConfig(t *testing.T) {
 		cfg.AuthorityActiveCooldown != 2*time.Hour ||
 		cfg.AuthorityFlushInterval != time.Second ||
 		cfg.AuthorityFlushTimeout != 5*time.Second ||
-		cfg.AuthorityFlushBatchRows != 128 ||
+		cfg.AuthorityFlushBatchRows != 512 ||
 		cfg.AuthorityAdmitBatchRows != 512 ||
 		cfg.AuthorityAdmitConcurrency != 16 {
 		t.Fatalf("conversation authority defaults = %#v", cfg)
@@ -2957,7 +3155,7 @@ func TestNewBuildsRootLogger(t *testing.T) {
 	cfg := Config{Log: LogConfig{Dir: t.TempDir(), Console: false, Format: "json"}}
 	cfg.Log.SetExplicitFlags(false, true)
 	app, err := New(
-		cfg,
+		isolatePluginRuntimeForTest(cfg),
 		WithCluster(&fakeCluster{calls: &calls}),
 		WithGateway(&fakeGateway{calls: &calls}),
 	)
@@ -3045,9 +3243,6 @@ func TestConfigureObservabilityWiresTopObserversWhenMetricsDisabled(t *testing.T
 	if clusterCfg.Transport.Observer == nil {
 		t.Fatal("transport top observer was not wired")
 	}
-	if app.deliveryObserver() == nil {
-		t.Fatal("delivery top observer was not wired")
-	}
 }
 
 func TestConfigureObservabilitySamplesResourcesForMetricsWithoutTopProvider(t *testing.T) {
@@ -3083,7 +3278,7 @@ func TestStopSyncsLogger(t *testing.T) {
 	calls := make([]string, 0, 4)
 	logger := &recordingAppLogger{}
 	app, err := New(
-		Config{},
+		isolatePluginRuntimeForTest(Config{}),
 		WithCluster(&fakeCluster{calls: &calls}),
 		WithGateway(&fakeGateway{calls: &calls}),
 		WithLogger(logger),
@@ -3097,67 +3292,8 @@ func TestStopSyncsLogger(t *testing.T) {
 	if err := app.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop() error = %v", err)
 	}
-	if logger.syncCalls != 1 {
-		t.Fatalf("Sync calls = %d, want 1", logger.syncCalls)
-	}
-}
-
-func TestNewWiresDeliveryWhenEnabled(t *testing.T) {
-	cluster := newFakePresenceCluster(1, nil)
-	app, err := newTestApp(t,
-		Config{
-			Cluster:  clusterpkg.Config{NodeID: 1},
-			Delivery: DeliveryConfig{Enabled: true},
-		},
-		WithCluster(cluster),
-		WithGateway(&fakeGateway{calls: &[]string{}}),
-	)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if app.Delivery() == nil {
-		t.Fatal("delivery usecase was not wired")
-	}
-	if app.deliveryManager == nil {
-		t.Fatal("delivery manager was not wired")
-	}
-	if _, ok := cluster.registeredHandlers[accessnode.DeliveryPushRPCServiceID]; !ok {
-		t.Fatalf("delivery push rpc service was not registered")
-	}
-	if app.deliveryWorker == nil {
-		t.Fatal("delivery worker was not wired")
-	}
-	if app.channelAppendDeliveryWorker == nil {
-		t.Fatal("channelappend recipient delivery worker was not wired")
-	}
-	if app.deliveryManager == nil || app.deliveryManager.PendingAckCount() != 0 {
-		t.Fatal("delivery manager was not initialized for async runtime")
-	}
-	group, ok := app.deliveryWorker.(deliveryWorkerGroup)
-	if !ok {
-		t.Fatalf("delivery worker = %T, want deliveryWorkerGroup", app.deliveryWorker)
-	}
-	if len(group) != 3 {
-		t.Fatalf("delivery worker count = %d, want recipient worker, retry scheduler, and manager", len(group))
-	}
-	if group[0] != app.deliveryRetry {
-		t.Fatalf("delivery worker[0] = %T, want retry scheduler", group[0])
-	}
-	if group[1] != app.deliveryManager {
-		t.Fatalf("delivery worker[1] = %T, want manager", group[1])
-	}
-	if _, ok := group[2].(*channelappend.RecipientDeliveryWorker); !ok {
-		t.Fatalf("delivery worker[2] = %T, want recipient delivery worker", group[2])
-	}
-	if group[2] != app.channelAppendDeliveryWorker {
-		t.Fatalf("delivery worker[2] = %T, want app channelappend recipient delivery worker", group[2])
-	}
-	if app.deliveryRetry == nil {
-		t.Fatal("delivery retry scheduler was not wired")
-	}
-	if _, ok := cluster.registeredHandlers[accessnode.DeliveryFanoutRPCServiceID]; !ok {
-		t.Fatalf("delivery fanout rpc service was not registered")
+	if got := logger.syncCallCount(); got != 1 {
+		t.Fatalf("Sync calls = %d, want 1", got)
 	}
 }
 
@@ -4012,6 +4148,147 @@ func TestConversationAuthorityRouteLifecycleDrainDoesNotBlockNewLocalAuthority(t
 	})
 }
 
+func TestConversationAuthorityRouteLifecycleReservationWaitDoesNotBlockNewLocalAuthority(t *testing.T) {
+	oldLocalTarget := conversationusecase.RouteTarget{HashSlot: 7, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 9, ConfigEpoch: 3, RouteRevision: 10, AuthorityEpoch: 20}
+	remoteTarget := conversationusecase.RouteTarget{HashSlot: 7, SlotID: 2, LeaderNodeID: 2, LeaderTerm: 10, ConfigEpoch: 3, RouteRevision: 11, AuthorityEpoch: 21}
+	newLocalTarget := conversationusecase.RouteTarget{HashSlot: 7, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 11, ConfigEpoch: 3, RouteRevision: 12, AuthorityEpoch: 22}
+	local := newConversationAuthority(conversationAuthorityOptions{LocalNodeID: 1, Store: &appRecordingConversationAuthorityStore{}, MaxRows: 10})
+	watch := make(chan clusterpkg.RouteAuthorityEvent, 2)
+	lifecycle := newConversationAuthorityRouteLifecycle(conversationAuthorityRouteLifecycleOptions{
+		LocalAuthority: local,
+		LocalNodeID:    1,
+		Initial: func() []clusterpkg.RouteAuthority {
+			return []clusterpkg.RouteAuthority{authorityFromConversationTarget(oldLocalTarget)}
+		},
+		Watch:          func() <-chan clusterpkg.RouteAuthorityEvent { return watch },
+		HandoffTimeout: 250 * time.Millisecond,
+	})
+	if err := lifecycle.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	mutationReady := make(chan struct{})
+	releaseMutation := make(chan struct{})
+	local.beforeActiveMutation = func() {
+		close(mutationReady)
+		<-releaseMutation
+	}
+	admitDone := make(chan error, 1)
+	go func() {
+		admitDone <- local.AdmitActiveBatch(context.Background(), oldLocalTarget, conversationactive.ActiveBatch{
+			Kind: metadb.ConversationKindNormal, SenderUID: "old", ChannelID: "reservation-wait", ChannelType: 2, MessageSeq: 7, ActiveAtMS: 100,
+		})
+	}()
+	<-mutationReady
+
+	watch <- clusterpkg.RouteAuthorityEvent{Authorities: []clusterpkg.RouteAuthority{authorityFromConversationTarget(remoteTarget)}}
+	waitUntil(t, 75*time.Millisecond, func() bool {
+		local.mu.Lock()
+		defer local.mu.Unlock()
+		return local.targets[targetKey(oldLocalTarget)] == conversationAuthorityDraining
+	})
+	watch <- clusterpkg.RouteAuthorityEvent{Authorities: []clusterpkg.RouteAuthority{authorityFromConversationTarget(newLocalTarget)}}
+	waitUntil(t, 75*time.Millisecond, func() bool {
+		return local.AdmitPatches(context.Background(), newLocalTarget, nil) == nil
+	})
+
+	close(releaseMutation)
+	if err := <-admitDone; err != nil {
+		t.Fatalf("old AdmitActiveBatch() error = %v", err)
+	}
+	if err := lifecycle.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+}
+
+func TestConversationAuthorityRouteLifecycleUnknownThenRemoteRetainsOlderDrainReservation(t *testing.T) {
+	oldLocalTarget := conversationusecase.RouteTarget{HashSlot: 7, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 9, ConfigEpoch: 3, RouteRevision: 10, AuthorityEpoch: 20}
+	unknownTarget := conversationusecase.RouteTarget{HashSlot: 7, SlotID: 2, LeaderNodeID: 0, LeaderTerm: 10, ConfigEpoch: 3, RouteRevision: 11, AuthorityEpoch: 21}
+	remoteTarget := conversationusecase.RouteTarget{HashSlot: 7, SlotID: 2, LeaderNodeID: 2, LeaderTerm: 11, ConfigEpoch: 3, RouteRevision: 12, AuthorityEpoch: 22}
+	store := &appRecordingConversationAuthorityStore{}
+	observer := &appHandoffChannelObserver{results: make(chan string, 4)}
+	local := newConversationAuthority(conversationAuthorityOptions{LocalNodeID: 1, Store: store, MaxRows: 10, Observer: observer})
+	watch := make(chan clusterpkg.RouteAuthorityEvent, 2)
+	lifecycle := newConversationAuthorityRouteLifecycle(conversationAuthorityRouteLifecycleOptions{
+		LocalAuthority: local,
+		LocalNodeID:    1,
+		Initial: func() []clusterpkg.RouteAuthority {
+			return []clusterpkg.RouteAuthority{authorityFromConversationTarget(oldLocalTarget)}
+		},
+		Watch:          func() <-chan clusterpkg.RouteAuthorityEvent { return watch },
+		HandoffTimeout: time.Second,
+	})
+	if err := lifecycle.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	mutationReady := make(chan struct{})
+	releaseMutation := make(chan struct{})
+	local.beforeActiveMutation = func() {
+		close(mutationReady)
+		<-releaseMutation
+	}
+	admitDone := make(chan error, 1)
+	go func() {
+		admitDone <- local.AdmitActiveBatch(context.Background(), oldLocalTarget, conversationactive.ActiveBatch{
+			Kind: metadb.ConversationKindNormal, SenderUID: "old", ChannelID: "unknown-remote-reservation", ChannelType: 2, MessageSeq: 7, ActiveAtMS: 100,
+		})
+	}()
+	<-mutationReady
+
+	watch <- clusterpkg.RouteAuthorityEvent{Authorities: []clusterpkg.RouteAuthority{authorityFromConversationTarget(unknownTarget)}}
+	waitUntil(t, 75*time.Millisecond, func() bool {
+		local.mu.Lock()
+		defer local.mu.Unlock()
+		return local.targets[targetKey(unknownTarget)] == conversationAuthorityWarming
+	})
+	watch <- clusterpkg.RouteAuthorityEvent{Authorities: []clusterpkg.RouteAuthority{authorityFromConversationTarget(remoteTarget)}}
+	deadline := time.After(500 * time.Millisecond)
+	for {
+		select {
+		case result := <-observer.results:
+			if result == string(conversationDrainResultNoDirty) {
+				goto remoteDrainComplete
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for the successor remote drain to complete empty")
+		}
+	}
+
+remoteDrainComplete:
+
+	close(releaseMutation)
+	if err := <-admitDone; err != nil {
+		t.Fatalf("old AdmitActiveBatch() error = %v", err)
+	}
+	waitUntil(t, time.Second, func() bool {
+		return store.totalTouchPatches() == 1
+	})
+	if err := lifecycle.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+}
+
+type appHandoffChannelObserver struct {
+	results chan string
+}
+
+func (*appHandoffChannelObserver) ObserveConversationAuthorityAdmit(conversationAuthorityAdmitEvent) {
+}
+
+func (*appHandoffChannelObserver) ObserveConversationAuthorityCachePressure(conversationAuthorityCachePressureEvent) {
+}
+
+func (*appHandoffChannelObserver) ObserveConversationAuthorityList(conversationAuthorityListEvent) {
+}
+
+func (o *appHandoffChannelObserver) ObserveConversationAuthorityHandoff(event conversationAuthorityHandoffEvent) {
+	if o == nil || o.results == nil {
+		return
+	}
+	o.results <- event.Result
+}
+
 func TestConversationAuthorityRouteLifecycleIgnoresStaleRouteEvents(t *testing.T) {
 	currentTarget := conversationusecase.RouteTarget{HashSlot: 7, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 9, ConfigEpoch: 3, RouteRevision: 10, AuthorityEpoch: 20}
 	staleTarget := conversationusecase.RouteTarget{HashSlot: 7, SlotID: 2, LeaderNodeID: 2, LeaderTerm: 9, ConfigEpoch: 3, RouteRevision: 9, AuthorityEpoch: 99}
@@ -4121,126 +4398,6 @@ func TestConversationAuthorityRouteLifecyclePeriodicReconcileRepairsDroppedAutho
 	})
 }
 
-func TestDeliveryWorkerGroupStopKeepsDependenciesRunningWhenDrainFails(t *testing.T) {
-	retry := &recordingWorkerRuntime{}
-	manager := &recordingWorkerRuntime{stopErr: context.DeadlineExceeded}
-	group := deliveryWorkerGroup{retry, manager}
-
-	err := group.Stop(context.Background())
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Stop() error = %v, want deadline exceeded", err)
-	}
-	if manager.stopCount != 1 {
-		t.Fatalf("manager stop count = %d, want 1", manager.stopCount)
-	}
-	if retry.stopCount != 0 {
-		t.Fatalf("retry stop count = %d, want dependency kept running", retry.stopCount)
-	}
-}
-
-func TestAppSubscriberPlannerReturnsPersonChannelUIDs(t *testing.T) {
-	channelID := runtimechannelid.EncodePersonChannel("u1", "u2")
-	page, err := appSubscriberPlanner{}.NextPartitionPage(context.Background(), runtimedelivery.FanoutTask{
-		Envelope: runtimedelivery.Envelope{ChannelID: channelID, ChannelType: frame.ChannelTypePerson},
-	}, "", 512)
-	if err != nil {
-		t.Fatalf("NextPartitionPage() error = %v", err)
-	}
-	if !page.Done {
-		t.Fatalf("Done = false, want true")
-	}
-	if len(page.UIDs) != 2 || page.UIDs[0] == page.UIDs[1] {
-		t.Fatalf("UIDs = %#v, want two distinct participants", page.UIDs)
-	}
-	want := map[string]bool{"u1": true, "u2": true}
-	for _, uid := range page.UIDs {
-		if !want[uid] {
-			t.Fatalf("unexpected UID %q in %#v", uid, page.UIDs)
-		}
-	}
-}
-
-func TestDeliveryRuntimeAdapterScopesPersonChannelAcrossPartitions(t *testing.T) {
-	runner := &appRecordingFanoutRunner{}
-	manager := runtimedelivery.NewManager(runtimedelivery.ManagerOptions{
-		Planner: runtimedelivery.NewPlanner(runtimedelivery.PlannerOptions{
-			Partitioner: appStaticDeliveryPartitioner{
-				partitions: []runtimedelivery.Partition{
-					{ID: 1, LeaderNodeID: 1},
-					{ID: 2, LeaderNodeID: 2},
-					{ID: 3, LeaderNodeID: 3},
-				},
-			},
-		}),
-		Runner: runner,
-	})
-	if err := manager.Start(context.Background()); err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	defer func() {
-		stopCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		if err := manager.Stop(stopCtx); err != nil {
-			t.Fatalf("Stop() error = %v", err)
-		}
-	}()
-	channelID := runtimechannelid.EncodePersonChannel("u1", "u2")
-
-	err := deliveryRuntimeAdapter{manager: manager}.SubmitCommitted(context.Background(), messageevents.MessageCommitted{
-		MessageID:   1,
-		MessageSeq:  1,
-		ChannelID:   channelID,
-		ChannelType: frame.ChannelTypePerson,
-		FromUID:     "u1",
-	})
-	if err != nil {
-		t.Fatalf("SubmitCommitted() error = %v", err)
-	}
-	tasks := waitAppFanoutTasks(t, runner, 1, time.Second)
-	if len(tasks) != 1 {
-		t.Fatalf("fanout tasks = %d, want 1 scoped person task", len(tasks))
-	}
-	got := tasks[0].Envelope.MessageScopedUIDs
-	if len(got) != 2 {
-		t.Fatalf("MessageScopedUIDs = %#v, want two participants", got)
-	}
-	want := map[string]bool{"u1": true, "u2": true}
-	for _, uid := range got {
-		if !want[uid] {
-			t.Fatalf("unexpected scoped UID %q in %#v", uid, got)
-		}
-	}
-}
-
-func waitAppDeliveryPendingAckCount(t *testing.T, app *App, want int, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	var got int
-	for time.Now().Before(deadline) {
-		got = app.deliveryManager.PendingAckCount()
-		if got == want {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatalf("pending ack count = %d, want %d", got, want)
-}
-
-func waitAppFanoutTasks(t *testing.T, runner *appRecordingFanoutRunner, want int, timeout time.Duration) []runtimedelivery.FanoutTask {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	var tasks []runtimedelivery.FanoutTask
-	for time.Now().Before(deadline) {
-		tasks = runner.snapshot()
-		if len(tasks) == want {
-			return tasks
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatalf("fanout tasks = %d, want %d", len(tasks), want)
-	return nil
-}
-
 func TestDeliveryEnabledPersonSendWritesRecvAndRecvackClearsPending(t *testing.T) {
 	cluster := newFakePresenceCluster(1, nil)
 	cluster.snapshot = readyFakeClusterSnapshot(1, 16)
@@ -4323,8 +4480,8 @@ func TestDeliveryEnabledGroupSendUsesSubscriberSource(t *testing.T) {
 		},
 	}
 	subscribers := &fakeDeliverySubscriberSource{
-		pages: []runtimedelivery.UIDPage{
-			{UIDs: []string{"u2"}, Done: true},
+		pages: []channelappend.SubscriberPage{
+			{Recipients: []channelappend.Recipient{{UID: "u2"}}, Done: true},
 		},
 	}
 	app, err := newTestApp(t,
@@ -4390,11 +4547,8 @@ func TestDeliveryEnabledGroupSendUsesSubscriberSource(t *testing.T) {
 		t.Fatalf("subscriber requests = %d, want 1", len(subscribers.requests))
 	}
 	req := subscribers.requests[0]
-	if req.ChannelID != "g1" || req.ChannelType != frame.ChannelTypeGroup || req.Limit != app.cfg.Delivery.FanoutPageSize {
+	if req.ChannelID.ID != "g1" || req.ChannelID.Type != frame.ChannelTypeGroup || req.Limit != app.cfg.Delivery.FanoutPageSize {
 		t.Fatalf("subscriber request = %#v, want group channel with configured page size", req)
-	}
-	if req.Partition != (runtimedelivery.Partition{}) {
-		t.Fatalf("subscriber partition = %#v, want recipient-authority unpartitioned scan", req.Partition)
 	}
 
 	if err := app.Handler().OnFrame(gateway.Context{Session: recipient, RequestContext: context.Background()}, &frame.RecvackPacket{
@@ -4406,7 +4560,7 @@ func TestDeliveryEnabledGroupSendUsesSubscriberSource(t *testing.T) {
 	waitAppDeliveryPendingAckCount(t, app, 0, time.Second)
 }
 
-func TestDeliveryMetaStoreWritesBenchDataAndFiltersSubscriberPages(t *testing.T) {
+func TestDeliveryMetaStoreWritesBenchDataAndPagesSubscribers(t *testing.T) {
 	const hashSlotCount = 16
 	slotThreeUID := testUIDForHashSlot(t, 3, hashSlotCount)
 	slotNineUID := testUIDForHashSlot(t, 9, hashSlotCount)
@@ -4454,76 +4608,64 @@ func TestDeliveryMetaStoreWritesBenchDataAndFiltersSubscriberPages(t *testing.T)
 		t.Fatalf("removed = %#v accepted=%d, want one subscriber at mutation version 3", node.removed, removedSubscribers)
 	}
 
-	page, err := store.ListSubscribers(context.Background(), runtimedelivery.SubscriberPageRequest{
-		ChannelID:   "g1",
-		ChannelType: frame.ChannelTypeGroup,
-		Partition:   runtimedelivery.Partition{HashSlotStart: 3, HashSlotEnd: 3},
-		Limit:       10,
+	page, err := store.NextSubscriberPage(context.Background(), channelappend.SubscriberPageRequest{
+		ChannelID: channelappend.ChannelID{ID: "g1", Type: frame.ChannelTypeGroup},
+		Limit:     10,
 	})
 	if err != nil {
-		t.Fatalf("ListSubscribers() error = %v", err)
+		t.Fatalf("NextSubscriberPage() error = %v", err)
 	}
-	if len(page.UIDs) != 1 || page.UIDs[0] != slotThreeUID || !page.Done {
-		t.Fatalf("slot-filtered page = %#v, want only slot 3 uid", page)
+	if len(page.Recipients) != 2 || page.Recipients[0].UID != slotThreeUID || page.Recipients[1].UID != slotNineUID || !page.Done {
+		t.Fatalf("subscriber page = %#v, want both durable subscribers", page)
 	}
-	first, err := store.ListSubscribers(context.Background(), runtimedelivery.SubscriberPageRequest{
-		ChannelID:   "g1",
-		ChannelType: frame.ChannelTypeGroup,
-		Partition:   runtimedelivery.Partition{HashSlotStart: 0, HashSlotEnd: hashSlotCount - 1},
-		Limit:       1,
+	first, err := store.NextSubscriberPage(context.Background(), channelappend.SubscriberPageRequest{
+		ChannelID: channelappend.ChannelID{ID: "g1", Type: frame.ChannelTypeGroup},
+		Limit:     1,
 	})
 	if err != nil {
-		t.Fatalf("ListSubscribers(first) error = %v", err)
+		t.Fatalf("NextSubscriberPage(first) error = %v", err)
 	}
-	if len(first.UIDs) != 1 || first.NextCursor == "" || first.Done {
+	if len(first.Recipients) != 1 || first.Cursor == "" || first.Done {
 		t.Fatalf("first page = %#v, want one uid and continuation", first)
 	}
-	second, err := store.ListSubscribers(context.Background(), runtimedelivery.SubscriberPageRequest{
-		ChannelID:   "g1",
-		ChannelType: frame.ChannelTypeGroup,
-		Partition:   runtimedelivery.Partition{HashSlotStart: 0, HashSlotEnd: hashSlotCount - 1},
-		Cursor:      first.NextCursor,
-		Limit:       1,
+	second, err := store.NextSubscriberPage(context.Background(), channelappend.SubscriberPageRequest{
+		ChannelID: channelappend.ChannelID{ID: "g1", Type: frame.ChannelTypeGroup},
+		Cursor:    first.Cursor,
+		Limit:     1,
 	})
 	if err != nil {
-		t.Fatalf("ListSubscribers(second) error = %v", err)
+		t.Fatalf("NextSubscriberPage(second) error = %v", err)
 	}
-	if len(second.UIDs) != 1 || !second.Done {
+	if len(second.Recipients) != 1 || !second.Done {
 		t.Fatalf("second page = %#v, want final uid", second)
 	}
 }
 
-func TestDeliveryMetaStoreCachesSubscriberSnapshotAcrossPartitions(t *testing.T) {
-	const hashSlotCount = 16
-	slotThreeUID := testUIDForHashSlot(t, 3, hashSlotCount)
-	slotNineUID := testUIDForHashSlot(t, 9, hashSlotCount)
+func TestDeliveryMetaStoreCachesSubscriberSnapshotAcrossPages(t *testing.T) {
 	node := &recordingDeliveryMetaNode{
-		snapshot:    readyFakeClusterSnapshot(1, hashSlotCount),
-		subscribers: map[string][]string{"g1": []string{slotThreeUID, slotNineUID}},
+		snapshot:    readyFakeClusterSnapshot(1, 16),
+		subscribers: map[string][]string{"g1": {"u1", "u2"}},
 	}
 	store := newDeliveryMetaStore(node)
 
-	first, err := store.ListSubscribers(context.Background(), runtimedelivery.SubscriberPageRequest{
-		ChannelID:   "g1",
-		ChannelType: frame.ChannelTypeGroup,
-		Partition:   runtimedelivery.Partition{HashSlotStart: 3, HashSlotEnd: 3},
-		Limit:       10,
+	first, err := store.NextSubscriberPage(context.Background(), channelappend.SubscriberPageRequest{
+		ChannelID: channelappend.ChannelID{ID: "g1", Type: frame.ChannelTypeGroup},
+		Limit:     1,
 	})
 	if err != nil {
-		t.Fatalf("ListSubscribers(first) error = %v", err)
+		t.Fatalf("NextSubscriberPage(first) error = %v", err)
 	}
-	second, err := store.ListSubscribers(context.Background(), runtimedelivery.SubscriberPageRequest{
-		ChannelID:   "g1",
-		ChannelType: frame.ChannelTypeGroup,
-		Partition:   runtimedelivery.Partition{HashSlotStart: 9, HashSlotEnd: 9},
-		Limit:       10,
+	second, err := store.NextSubscriberPage(context.Background(), channelappend.SubscriberPageRequest{
+		ChannelID: channelappend.ChannelID{ID: "g1", Type: frame.ChannelTypeGroup},
+		Cursor:    first.Cursor,
+		Limit:     1,
 	})
 	if err != nil {
-		t.Fatalf("ListSubscribers(second) error = %v", err)
+		t.Fatalf("NextSubscriberPage(second) error = %v", err)
 	}
 
-	if len(first.UIDs) != 1 || first.UIDs[0] != slotThreeUID || len(second.UIDs) != 1 || second.UIDs[0] != slotNineUID {
-		t.Fatalf("partition pages first=%#v second=%#v, want cached slot-specific results", first, second)
+	if len(first.Recipients) != 1 || first.Recipients[0].UID != "u1" || len(second.Recipients) != 1 || second.Recipients[0].UID != "u2" {
+		t.Fatalf("pages first=%#v second=%#v, want cached subscriber order", first, second)
 	}
 	if node.listCalls != 1 {
 		t.Fatalf("subscriber list calls = %d, want one cached channel snapshot read", node.listCalls)
@@ -4536,8 +4678,9 @@ func TestDeliveryMetaStoreInvalidatesSubscriberCacheAfterMutation(t *testing.T) 
 		subscribers: map[string][]string{"g1": []string{"u1"}},
 	}
 	store := newDeliveryMetaStore(node)
-	if _, err := store.ListSubscribers(context.Background(), runtimedelivery.SubscriberPageRequest{ChannelID: "g1", ChannelType: frame.ChannelTypeGroup, Limit: 10}); err != nil {
-		t.Fatalf("ListSubscribers(before) error = %v", err)
+	request := channelappend.SubscriberPageRequest{ChannelID: channelappend.ChannelID{ID: "g1", Type: frame.ChannelTypeGroup}, Limit: 10}
+	if _, err := store.NextSubscriberPage(context.Background(), request); err != nil {
+		t.Fatalf("NextSubscriberPage(before) error = %v", err)
 	}
 	if _, err := store.AddSubscribers(context.Background(), []accessapi.BenchSubscriberMutation{{
 		ChannelID:   "g1",
@@ -4549,11 +4692,11 @@ func TestDeliveryMetaStoreInvalidatesSubscriberCacheAfterMutation(t *testing.T) 
 	node.mu.Lock()
 	node.subscribers["g1"] = []string{"u1", "u2"}
 	node.mu.Unlock()
-	after, err := store.ListSubscribers(context.Background(), runtimedelivery.SubscriberPageRequest{ChannelID: "g1", ChannelType: frame.ChannelTypeGroup, Limit: 10})
+	after, err := store.NextSubscriberPage(context.Background(), request)
 	if err != nil {
-		t.Fatalf("ListSubscribers(after) error = %v", err)
+		t.Fatalf("NextSubscriberPage(after) error = %v", err)
 	}
-	if len(after.UIDs) != 2 || after.UIDs[1] != "u2" {
+	if len(after.Recipients) != 2 || after.Recipients[1].UID != "u2" {
 		t.Fatalf("after mutation page = %#v, want refreshed subscribers", after)
 	}
 	if node.listCalls != 2 {
@@ -4659,322 +4802,6 @@ func TestNewWiresPresenceWhenGatewayEnabled(t *testing.T) {
 	}
 	if _, err := app.Handler().OnSessionActivate(nil); !errors.Is(err, accessgateway.ErrUnauthenticatedSession) {
 		t.Fatalf("OnSessionActivate(nil) error = %v, want unauthenticated session instead of missing presence", err)
-	}
-}
-
-func TestLocalOwnerPusherWritesRecvPacketAndBindsPendingAck(t *testing.T) {
-	reg := online.NewRegistry(online.RegistryOptions{ShardCount: 1})
-	session := &recordingSessionHandle{}
-	route := online.OwnerRoute{UID: "u1", OwnerNodeID: 1, OwnerBootID: 7, OwnerSeq: 11, SessionID: 101, ConnectedUnix: 1001}
-	if err := reg.RegisterPending(online.LocalSession{Route: route, Session: session}); err != nil {
-		t.Fatalf("RegisterPending() error = %v", err)
-	}
-	if err := reg.MarkActive(route.SessionID); err != nil {
-		t.Fatalf("MarkActive() error = %v", err)
-	}
-	manager := runtimedelivery.NewManager(runtimedelivery.ManagerOptions{})
-	pusher := localOwnerPusher{online: reg, delivery: manager}
-	env := runtimedelivery.Envelope{
-		MessageID:   9001,
-		MessageSeq:  42,
-		ChannelID:   "ch1",
-		ChannelType: 2,
-		FromUID:     "sender",
-		ClientMsgNo: "client-1",
-		RedDot:      true,
-		Payload:     []byte("hello"),
-	}
-
-	result, err := pusher.Push(context.Background(), runtimedelivery.PushCommand{
-		OwnerNodeID: 1,
-		Envelope:    env,
-		Routes: []runtimedelivery.Route{{
-			UID:         "u1",
-			OwnerNodeID: 1,
-			OwnerBootID: 7,
-			OwnerSeq:    11,
-			SessionID:   101,
-		}},
-	})
-	if err != nil {
-		t.Fatalf("Push() error = %v", err)
-	}
-	if len(result.Accepted) != 1 || len(result.Retryable) != 0 || len(result.Dropped) != 0 {
-		t.Fatalf("push result = %#v, want one accepted", result)
-	}
-	if len(session.writes) != 1 {
-		t.Fatalf("delivery writes = %d, want 1", len(session.writes))
-	}
-	recv, ok := session.writes[0].(*frame.RecvPacket)
-	if !ok {
-		t.Fatalf("delivery write = %T, want *frame.RecvPacket", session.writes[0])
-	}
-	if recv.MessageID != int64(env.MessageID) || recv.MessageSeq != env.MessageSeq || recv.ChannelID != env.ChannelID ||
-		recv.ChannelType != env.ChannelType || recv.FromUID != env.FromUID || recv.ClientMsgNo != env.ClientMsgNo ||
-		string(recv.Payload) != "hello" || !recv.RedDot {
-		t.Fatalf("recv packet = %#v", recv)
-	}
-	env.Payload[0] = 'H'
-	if string(recv.Payload) != "hello" {
-		t.Fatalf("recv payload = %q, want cloned hello", string(recv.Payload))
-	}
-	if manager.PendingAckCount() != 1 {
-		t.Fatalf("pending ack count = %d, want 1", manager.PendingAckCount())
-	}
-}
-
-func TestBuildRecvPacketExposesSourceChannelForRealtimeCommands(t *testing.T) {
-	group, err := buildRecvPacket(runtimedelivery.Envelope{
-		MessageID: 1, ChannelID: runtimechannelid.ToCommandChannel("room-1"),
-		ChannelType: frame.ChannelTypeGroup,
-	}, "u1", []byte("cmd"), 1)
-	if err != nil {
-		t.Fatalf("buildRecvPacket(group) error = %v", err)
-	}
-	if group.ChannelID != "room-1" || !group.NoPersist || !group.SyncOnce {
-		t.Fatalf("group command packet = %#v, want source channel and command flags", group)
-	}
-
-	personSource := runtimechannelid.EncodePersonChannel("u1", "u2")
-	person, err := buildRecvPacket(runtimedelivery.Envelope{
-		MessageID: 2, ChannelID: runtimechannelid.ToCommandChannel(personSource),
-		ChannelType: frame.ChannelTypePerson,
-	}, "u2", []byte("cmd"), 1)
-	if err != nil {
-		t.Fatalf("buildRecvPacket(person) error = %v", err)
-	}
-	if person.ChannelID != "u1" || !person.NoPersist || !person.SyncOnce {
-		t.Fatalf("person command packet = %#v, want peer source view and command flags", person)
-	}
-}
-
-func TestLocalOwnerPusherDropsMissingOrInactiveSession(t *testing.T) {
-	reg := online.NewRegistry(online.RegistryOptions{ShardCount: 1})
-	inactiveRoute := online.OwnerRoute{UID: "u1", OwnerNodeID: 1, OwnerBootID: 7, OwnerSeq: 11, SessionID: 101, ConnectedUnix: 1001}
-	if err := reg.RegisterPending(online.LocalSession{Route: inactiveRoute, Session: &recordingSessionHandle{}}); err != nil {
-		t.Fatalf("RegisterPending() error = %v", err)
-	}
-	pusher := localOwnerPusher{online: reg, delivery: runtimedelivery.NewManager(runtimedelivery.ManagerOptions{})}
-
-	result, err := pusher.Push(context.Background(), runtimedelivery.PushCommand{
-		OwnerNodeID: 1,
-		Envelope:    runtimedelivery.Envelope{MessageID: 1, MessageSeq: 1},
-		Routes: []runtimedelivery.Route{
-			{UID: "u1", OwnerNodeID: 1, OwnerBootID: 7, OwnerSeq: 11, SessionID: 101},
-			{UID: "missing", OwnerNodeID: 1, OwnerBootID: 7, OwnerSeq: 11, SessionID: 102},
-		},
-	})
-	if err != nil {
-		t.Fatalf("Push() error = %v", err)
-	}
-	if len(result.Dropped) != 2 || len(result.Accepted) != 0 || len(result.Retryable) != 0 {
-		t.Fatalf("push result = %#v, want two dropped", result)
-	}
-}
-
-func TestLocalOwnerPusherDropsWhenPendingAckLimitReached(t *testing.T) {
-	reg := online.NewRegistry(online.RegistryOptions{ShardCount: 1})
-	session := &recordingSessionHandle{}
-	route := online.OwnerRoute{UID: "u1", OwnerNodeID: 1, OwnerBootID: 7, OwnerSeq: 11, SessionID: 101, ConnectedUnix: 1001}
-	if err := reg.RegisterPending(online.LocalSession{Route: route, Session: session}); err != nil {
-		t.Fatalf("RegisterPending() error = %v", err)
-	}
-	if err := reg.MarkActive(route.SessionID); err != nil {
-		t.Fatalf("MarkActive() error = %v", err)
-	}
-	manager := runtimedelivery.NewManager(runtimedelivery.ManagerOptions{
-		Acks: runtimedelivery.NewAckTracker(runtimedelivery.AckTrackerOptions{ShardCount: 1, MaxPendingPerSession: 1}),
-	})
-	if !manager.BindPendingAck(runtimedelivery.PendingRecvAck{UID: "u1", SessionID: 101, MessageID: 1}) {
-		t.Fatalf("preload pending ack failed")
-	}
-	pusher := localOwnerPusher{online: reg, delivery: manager}
-
-	result, err := pusher.Push(context.Background(), runtimedelivery.PushCommand{
-		OwnerNodeID: 1,
-		Envelope:    runtimedelivery.Envelope{MessageID: 2, MessageSeq: 2},
-		Routes:      []runtimedelivery.Route{{UID: "u1", OwnerNodeID: 1, OwnerBootID: 7, OwnerSeq: 11, SessionID: 101}},
-	})
-	if err != nil {
-		t.Fatalf("Push() error = %v", err)
-	}
-	if len(result.Dropped) != 1 || len(result.Accepted) != 0 || len(result.Retryable) != 0 {
-		t.Fatalf("push result = %#v, want one dropped", result)
-	}
-	if len(session.writes) != 0 {
-		t.Fatalf("delivery writes = %d, want 0", len(session.writes))
-	}
-	if manager.PendingAckCount() != 1 {
-		t.Fatalf("pending ack count = %d, want preload only", manager.PendingAckCount())
-	}
-}
-
-func TestLocalOwnerPusherMarksWriteErrorRetryable(t *testing.T) {
-	reg := online.NewRegistry(online.RegistryOptions{ShardCount: 1})
-	session := &recordingSessionHandle{writeErr: errors.New("write failed")}
-	route := online.OwnerRoute{UID: "u1", OwnerNodeID: 1, OwnerBootID: 7, OwnerSeq: 11, SessionID: 101, ConnectedUnix: 1001}
-	if err := reg.RegisterPending(online.LocalSession{Route: route, Session: session}); err != nil {
-		t.Fatalf("RegisterPending() error = %v", err)
-	}
-	if err := reg.MarkActive(route.SessionID); err != nil {
-		t.Fatalf("MarkActive() error = %v", err)
-	}
-	pusher := localOwnerPusher{online: reg, delivery: runtimedelivery.NewManager(runtimedelivery.ManagerOptions{})}
-
-	result, err := pusher.Push(context.Background(), runtimedelivery.PushCommand{
-		OwnerNodeID: 1,
-		Envelope:    runtimedelivery.Envelope{MessageID: 1, MessageSeq: 1},
-		Routes:      []runtimedelivery.Route{{UID: "u1", OwnerNodeID: 1, OwnerBootID: 7, OwnerSeq: 11, SessionID: 101}},
-	})
-	if err != nil {
-		t.Fatalf("Push() error = %v", err)
-	}
-	if len(result.Retryable) != 1 || len(result.Accepted) != 0 || len(result.Dropped) != 0 {
-		t.Fatalf("push result = %#v, want one retryable", result)
-	}
-	if pusher.delivery.PendingAckCount() != 0 {
-		t.Fatalf("pending ack count = %d, want 0 after write error", pusher.delivery.PendingAckCount())
-	}
-}
-
-func TestLocalOwnerPusherDropsTerminalWriteErrors(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-	}{
-		{name: "session closed", err: session.ErrSessionClosed},
-		{name: "outbound overflow", err: gatewaytransport.ErrOutboundBytesExceeded},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			reg := online.NewRegistry(online.RegistryOptions{ShardCount: 1})
-			sessionHandle := &recordingSessionHandle{writeErr: tt.err}
-			route := online.OwnerRoute{UID: "u1", OwnerNodeID: 1, OwnerBootID: 7, OwnerSeq: 11, SessionID: 101, ConnectedUnix: 1001}
-			if err := reg.RegisterPending(online.LocalSession{Route: route, Session: sessionHandle}); err != nil {
-				t.Fatalf("RegisterPending() error = %v", err)
-			}
-			if err := reg.MarkActive(route.SessionID); err != nil {
-				t.Fatalf("MarkActive() error = %v", err)
-			}
-			manager := runtimedelivery.NewManager(runtimedelivery.ManagerOptions{})
-			pusher := localOwnerPusher{online: reg, delivery: manager}
-
-			result, err := pusher.Push(context.Background(), runtimedelivery.PushCommand{
-				OwnerNodeID: 1,
-				Envelope:    runtimedelivery.Envelope{MessageID: 1, MessageSeq: 1},
-				Routes:      []runtimedelivery.Route{{UID: "u1", OwnerNodeID: 1, OwnerBootID: 7, OwnerSeq: 11, SessionID: 101}},
-			})
-			if err != nil {
-				t.Fatalf("Push() error = %v", err)
-			}
-			if len(result.Dropped) != 1 || len(result.Accepted) != 0 || len(result.Retryable) != 0 {
-				t.Fatalf("push result = %#v, want one dropped", result)
-			}
-			if manager.PendingAckCount() != 0 {
-				t.Fatalf("pending ack count = %d, want 0 after terminal write error", manager.PendingAckCount())
-			}
-		})
-	}
-}
-
-func TestLocalOwnerPusherExpiresPendingAcksDuringPushActivity(t *testing.T) {
-	reg := online.NewRegistry(online.RegistryOptions{ShardCount: 1})
-	session := &recordingSessionHandle{}
-	route := online.OwnerRoute{UID: "u1", OwnerNodeID: 1, OwnerBootID: 7, OwnerSeq: 11, SessionID: 101, ConnectedUnix: 1001}
-	if err := reg.RegisterPending(online.LocalSession{Route: route, Session: session}); err != nil {
-		t.Fatalf("RegisterPending() error = %v", err)
-	}
-	if err := reg.MarkActive(route.SessionID); err != nil {
-		t.Fatalf("MarkActive() error = %v", err)
-	}
-	now := int64(200)
-	tracker := runtimedelivery.NewAckTracker(runtimedelivery.AckTrackerOptions{
-		ShardCount: 1,
-		Now: func() int64 {
-			return now
-		},
-	})
-	manager := runtimedelivery.NewManager(runtimedelivery.ManagerOptions{Acks: tracker})
-	manager.BindPendingAck(runtimedelivery.PendingRecvAck{UID: "u1", SessionID: 101, MessageID: 1, MessageSeq: 1, DeliveredAt: 100})
-	pusher := localOwnerPusher{online: reg, delivery: manager, pendingAckTTL: 50 * time.Second}
-
-	result, err := pusher.Push(context.Background(), runtimedelivery.PushCommand{
-		OwnerNodeID: 1,
-		Envelope:    runtimedelivery.Envelope{MessageID: 2, MessageSeq: 2},
-		Routes:      []runtimedelivery.Route{{UID: "u1", OwnerNodeID: 1, OwnerBootID: 7, OwnerSeq: 11, SessionID: 101}},
-	})
-	if err != nil {
-		t.Fatalf("Push() error = %v", err)
-	}
-	if len(result.Accepted) != 1 {
-		t.Fatalf("accepted routes = %d, want 1", len(result.Accepted))
-	}
-	if _, ok := tracker.Ack(runtimedelivery.Recvack{UID: "u1", SessionID: 101, MessageID: 1}); ok {
-		t.Fatalf("old pending ack still exists after delivery activity expiration")
-	}
-	if pending, ok := tracker.Ack(runtimedelivery.Recvack{UID: "u1", SessionID: 101, MessageID: 2}); !ok || pending.MessageID != 2 {
-		t.Fatalf("new pending ack = %#v, %v, want message 2 true", pending, ok)
-	}
-}
-
-func TestLocalOwnerPusherDropsOverflowMessageID(t *testing.T) {
-	reg := online.NewRegistry(online.RegistryOptions{ShardCount: 1})
-	session := &recordingSessionHandle{}
-	route := online.OwnerRoute{UID: "u1", OwnerNodeID: 1, OwnerBootID: 7, OwnerSeq: 11, SessionID: 101, ConnectedUnix: 1001}
-	if err := reg.RegisterPending(online.LocalSession{Route: route, Session: session}); err != nil {
-		t.Fatalf("RegisterPending() error = %v", err)
-	}
-	if err := reg.MarkActive(route.SessionID); err != nil {
-		t.Fatalf("MarkActive() error = %v", err)
-	}
-	manager := runtimedelivery.NewManager(runtimedelivery.ManagerOptions{})
-	pusher := localOwnerPusher{online: reg, delivery: manager}
-
-	result, err := pusher.Push(context.Background(), runtimedelivery.PushCommand{
-		OwnerNodeID: 1,
-		Envelope:    runtimedelivery.Envelope{MessageID: uint64(1 << 63), MessageSeq: 1},
-		Routes:      []runtimedelivery.Route{{UID: "u1", OwnerNodeID: 1, OwnerBootID: 7, OwnerSeq: 11, SessionID: 101}},
-	})
-	if err != nil {
-		t.Fatalf("Push() error = %v", err)
-	}
-	if len(result.Dropped) != 1 || len(result.Accepted) != 0 || len(result.Retryable) != 0 {
-		t.Fatalf("push result = %#v, want one dropped", result)
-	}
-	if len(session.writes) != 0 {
-		t.Fatalf("delivery writes = %d, want 0", len(session.writes))
-	}
-	if manager.PendingAckCount() != 0 {
-		t.Fatalf("pending ack count = %d, want 0", manager.PendingAckCount())
-	}
-}
-
-func TestLocalOwnerPusherDropsIncompleteRouteIdentity(t *testing.T) {
-	reg := online.NewRegistry(online.RegistryOptions{ShardCount: 1})
-	session := &recordingSessionHandle{}
-	route := online.OwnerRoute{UID: "u1", OwnerNodeID: 1, OwnerBootID: 7, OwnerSeq: 11, SessionID: 101, ConnectedUnix: 1001}
-	if err := reg.RegisterPending(online.LocalSession{Route: route, Session: session}); err != nil {
-		t.Fatalf("RegisterPending() error = %v", err)
-	}
-	if err := reg.MarkActive(route.SessionID); err != nil {
-		t.Fatalf("MarkActive() error = %v", err)
-	}
-	pusher := localOwnerPusher{online: reg, delivery: runtimedelivery.NewManager(runtimedelivery.ManagerOptions{})}
-
-	result, err := pusher.Push(context.Background(), runtimedelivery.PushCommand{
-		OwnerNodeID: 1,
-		Envelope:    runtimedelivery.Envelope{MessageID: 1, MessageSeq: 1},
-		Routes:      []runtimedelivery.Route{{UID: "u1", OwnerNodeID: 1, OwnerSeq: 11, SessionID: 101}},
-	})
-	if err != nil {
-		t.Fatalf("Push() error = %v", err)
-	}
-	if len(result.Dropped) != 1 || len(result.Accepted) != 0 || len(result.Retryable) != 0 {
-		t.Fatalf("push result = %#v, want incomplete identity dropped", result)
-	}
-	if len(session.writes) != 0 {
-		t.Fatalf("delivery writes = %d, want 0", len(session.writes))
 	}
 }
 
@@ -6386,6 +6213,120 @@ func TestStopOrderIncludesAPIBeforeCluster(t *testing.T) {
 	}
 }
 
+func TestStopDeadlineKeepsChannelAppendDependenciesRunningUntilRetryDrain(t *testing.T) {
+	calls := make([]string, 0, 12)
+	appender := newLifecycleBlockingChannelAppender()
+	t.Cleanup(appender.release)
+	channelAppends := channelappend.New(channelappend.Options{
+		LocalNodeID: 1,
+		MessageID:   &lifecycleMessageIDAllocator{next: 100},
+		Appender:    appender,
+	})
+	app := &App{
+		cluster:                    &fakeCluster{calls: &calls},
+		conversationRouteLifecycle: &recordingWorkerRuntime{name: "conversation_route", calls: &calls},
+		conversationActiveWorker:   &recordingWorkerRuntime{name: "conversation_active", calls: &calls},
+		deliveryWorker:             &recordingWorkerRuntime{name: "delivery", calls: &calls},
+		channelAppends:             channelAppends,
+	}
+	if err := app.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	future, err := submitLifecycleBlockedAppend(channelAppends)
+	if err != nil {
+		t.Fatalf("SubmitLocal() error = %v", err)
+	}
+	appender.waitStarted(t)
+
+	firstStopCtx, cancelFirstStop := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelFirstStop()
+	if err := app.Stop(firstStopCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Stop() error = %v, want context deadline exceeded", err)
+	}
+	if got := joinCalls(calls); got != "cluster.start,conversation_route.start,conversation_active.start,delivery.start" {
+		t.Fatalf("calls after timed-out Stop = %s, want channel append dependencies still running", got)
+	}
+
+	appender.release()
+	secondStopCtx, cancelSecondStop := context.WithTimeout(context.Background(), time.Second)
+	defer cancelSecondStop()
+	if err := app.Stop(secondStopCtx); err != nil {
+		t.Fatalf("second Stop() error = %v", err)
+	}
+	results, err := future.Wait(secondStopCtx)
+	if err != nil {
+		t.Fatalf("Future.Wait() error = %v", err)
+	}
+	if len(results) != 1 || results[0].Err != nil || results[0].Result.Reason != channelappend.ReasonSuccess {
+		t.Fatalf("append results = %#v, want one success", results)
+	}
+	if got := joinCalls(calls); got != "cluster.start,conversation_route.start,conversation_active.start,delivery.start,delivery.stop,conversation_active.stop,conversation_route.stop,cluster.stop" {
+		t.Fatalf("calls after retry drain = %s, want dependencies stopped after channel append", got)
+	}
+}
+
+func TestRollbackDeadlineKeepsChannelAppendDependenciesRunningUntilStopRetry(t *testing.T) {
+	calls := make([]string, 0, 12)
+	appender := newLifecycleBlockingChannelAppender()
+	t.Cleanup(appender.release)
+	channelAppends := channelappend.New(channelappend.Options{
+		LocalNodeID: 1,
+		MessageID:   &lifecycleMessageIDAllocator{next: 200},
+		Appender:    appender,
+	})
+	startFailure := errors.New("top start failed")
+	var future *channelappend.Future
+	var submitErr error
+	top := &recordingWorkerRuntime{
+		name:     "top",
+		calls:    &calls,
+		startErr: startFailure,
+		onStart: func() {
+			future, submitErr = submitLifecycleBlockedAppend(channelAppends)
+			if submitErr != nil {
+				t.Fatalf("SubmitLocal() error = %v", submitErr)
+			}
+			appender.waitStarted(t)
+		},
+	}
+	app := &App{
+		cluster:                    &fakeCluster{calls: &calls},
+		conversationRouteLifecycle: &recordingWorkerRuntime{name: "conversation_route", calls: &calls},
+		conversationActiveWorker:   &recordingWorkerRuntime{name: "conversation_active", calls: &calls},
+		deliveryWorker:             &recordingWorkerRuntime{name: "delivery", calls: &calls},
+		channelAppends:             channelAppends,
+		top:                        top,
+	}
+
+	startCtx, cancelStart := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancelStart()
+	err := app.Start(startCtx)
+	if !errors.Is(err, startFailure) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Start() error = %v, want start failure and rollback deadline", err)
+	}
+	if got := joinCalls(calls); got != "cluster.start,conversation_route.start,conversation_active.start,delivery.start,top.start" {
+		t.Fatalf("calls after timed-out rollback = %s, want channel append dependencies still running", got)
+	}
+
+	appender.release()
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), time.Second)
+	defer cancelStop()
+	if err := app.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop() retry error = %v", err)
+	}
+	results, err := future.Wait(stopCtx)
+	if err != nil {
+		t.Fatalf("Future.Wait() error = %v", err)
+	}
+	if len(results) != 1 || results[0].Err != nil || results[0].Result.Reason != channelappend.ReasonSuccess {
+		t.Fatalf("append results = %#v, want one success", results)
+	}
+	if got := joinCalls(calls); got != "cluster.start,conversation_route.start,conversation_active.start,delivery.start,top.start,delivery.stop,conversation_active.stop,conversation_route.stop,cluster.stop" {
+		t.Fatalf("calls after Stop retry = %s, want dependencies stopped after channel append", got)
+	}
+}
+
 func TestConcurrentStartStopCannotLeaveGatewayRunningAfterStopReturns(t *testing.T) {
 	cluster := newBlockingCluster()
 	gateway := newStateGateway()
@@ -6468,6 +6409,19 @@ func TestNewSeedsMessageIDsFromEffectiveClusterNodeID(t *testing.T) {
 	requireSnowflakeMessageIDNode(t, int64(result.MessageID), 7)
 }
 
+func TestNodeMessageIDsRejectFutureRestoredFence(t *testing.T) {
+	ids, err := newNodeMessageIDs(7)
+	if err != nil {
+		t.Fatalf("newNodeMessageIDs(): %v", err)
+	}
+	first := ids.Next()
+	futureTimestamp := (first >> 22) + 1_000
+	restoredMax := (futureTimestamp << 22) | (uint64(1023) << 12) | 4095
+	if err := ids.SetFloor(restoredMax); err == nil {
+		t.Fatal("SetFloor(future restored fence) error = nil")
+	}
+}
+
 func requireSnowflakeMessageIDNode(t testing.TB, messageID int64, nodeID uint64) {
 	t.Helper()
 	if messageID <= 0 {
@@ -6485,80 +6439,6 @@ const (
 	realDiskThreeNodeConvergenceTimeout  = 30 * time.Second
 )
 
-func TestStaticMultiNodeClusterStartsControllerVoters(t *testing.T) {
-	addrs := []string{freeSendackSmokeTCPAddr(t), freeSendackSmokeTCPAddr(t), freeSendackSmokeTCPAddr(t)}
-	voters := []clusterpkg.ControlVoter{
-		{NodeID: 1, Addr: addrs[0]},
-		{NodeID: 2, Addr: addrs[1]},
-		{NodeID: 3, Addr: addrs[2]},
-	}
-	apps := make([]*App, 0, len(voters))
-	for _, voter := range voters {
-		cfg := Config{
-			NodeID:  voter.NodeID,
-			DataDir: shortAppTestDataDir(t),
-			Cluster: clusterpkg.Config{
-				NodeID:     voter.NodeID,
-				ListenAddr: voter.Addr,
-				DataDir:    shortAppTestDataDir(t),
-				Control: clusterpkg.ControlConfig{
-					ClusterID:      "internal-app-static-three",
-					Voters:         voters,
-					AllowBootstrap: true,
-				},
-				Slots: clusterpkg.SlotConfig{
-					InitialSlotCount: 1,
-					HashSlotCount:    4,
-					ReplicaCount:     3,
-				},
-				Channel:  clusterpkg.ChannelConfig{TickInterval: time.Millisecond},
-				Timeouts: clusterpkg.TimeoutConfig{Start: realDiskThreeNodeClusterStartTimeout},
-			},
-		}
-		app, err := newTestApp(t, cfg)
-		if err != nil {
-			t.Fatalf("New(node=%d) error = %v", voter.NodeID, err)
-		}
-		apps = append(apps, app)
-	}
-
-	startCtx, cancel := context.WithTimeout(context.Background(), realDiskThreeNodeAppStartTimeout)
-	defer cancel()
-	errs := make(chan error, len(apps))
-	for _, app := range apps {
-		app := app
-		go func() { errs <- app.Start(startCtx) }()
-		t.Cleanup(func() {
-			stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer stopCancel()
-			_ = app.Stop(stopCtx)
-		})
-	}
-	for range apps {
-		if err := <-errs; err != nil {
-			t.Fatalf("Start() error = %v", err)
-		}
-	}
-
-	nodes := make([]*clusterpkg.Node, 0, len(apps))
-	for _, app := range apps {
-		node, ok := app.cluster.(*clusterpkg.Node)
-		if !ok {
-			t.Fatalf("cluster runtime = %T, want *clusterpkg.Node", app.cluster)
-		}
-		nodes = append(nodes, node)
-	}
-	waitAppClusterSnapshotsConverge(t, nodes)
-
-	ack := sendDefaultMetaSmokePacket(t, apps[0], channelruntime.ChannelID{ID: "room-static-three", Type: 1}, 1, "client-static-three-1")
-	if ack.ReasonCode != frame.ReasonSuccess {
-		t.Fatalf("sendack reason = %v, want %v", ack.ReasonCode, frame.ReasonSuccess)
-	}
-	if ack.MessageSeq != 1 {
-		t.Fatalf("sendack message seq = %d, want 1", ack.MessageSeq)
-	}
-}
-
 type fakeCluster struct {
 	calls      *[]string
 	startErr   error
@@ -6566,6 +6446,101 @@ type fakeCluster struct {
 	clusterID  string
 	listenAddr string
 	nodeCount  int
+}
+
+type fakeWorkerRuntime struct {
+	name  string
+	calls *[]string
+}
+
+func (f *fakeWorkerRuntime) Start(context.Context) error {
+	if f.calls != nil {
+		*f.calls = append(*f.calls, f.name+".start")
+	}
+	return nil
+}
+
+func (f *fakeWorkerRuntime) Stop(context.Context) error {
+	if f.calls != nil {
+		*f.calls = append(*f.calls, f.name+".stop")
+	}
+	return nil
+}
+
+type lifecycleMessageIDAllocator struct {
+	mu   sync.Mutex
+	next uint64
+}
+
+func (a *lifecycleMessageIDAllocator) Next() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.next++
+	return a.next
+}
+
+type lifecycleBlockingChannelAppender struct {
+	started     chan struct{}
+	releaseCh   chan struct{}
+	releaseOnce sync.Once
+}
+
+func newLifecycleBlockingChannelAppender() *lifecycleBlockingChannelAppender {
+	return &lifecycleBlockingChannelAppender{
+		started:   make(chan struct{}, 1),
+		releaseCh: make(chan struct{}),
+	}
+}
+
+func (a *lifecycleBlockingChannelAppender) AppendBatch(ctx context.Context, req channelappend.AppendBatchRequest) (channelappend.AppendBatchResult, error) {
+	select {
+	case a.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-a.releaseCh:
+	case <-ctx.Done():
+		return channelappend.AppendBatchResult{}, ctx.Err()
+	}
+	items := make([]channelappend.AppendBatchItemResult, 0, len(req.Messages))
+	for index, message := range req.Messages {
+		items = append(items, channelappend.AppendBatchItemResult{
+			MessageID:  message.MessageID,
+			MessageSeq: uint64(index + 1),
+			Message:    message,
+		})
+	}
+	return channelappend.AppendBatchResult{Items: items}, nil
+}
+
+func (a *lifecycleBlockingChannelAppender) waitStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-a.started:
+	case <-time.After(time.Second):
+		t.Fatal("channel append did not start")
+	}
+}
+
+func (a *lifecycleBlockingChannelAppender) release() {
+	a.releaseOnce.Do(func() { close(a.releaseCh) })
+}
+
+func submitLifecycleBlockedAppend(group *channelappend.Group) (*channelappend.Future, error) {
+	return group.SubmitLocal(context.Background(), channelappend.AuthorityTarget{
+		ChannelID:    channelappend.ChannelID{ID: "lifecycle-room", Type: 2},
+		ChannelKey:   "lifecycle-room",
+		LeaderNodeID: 1,
+	}, []channelappend.SendBatchItem{{
+		Command: channelappend.SendCommand{
+			FromUID:     "lifecycle-u1",
+			ClientMsgNo: "lifecycle-message-1",
+			ChannelID:   "lifecycle-room",
+			ChannelType: 2,
+			ChannelKey:  "lifecycle-room",
+			Payload:     []byte("lifecycle payload"),
+		},
+	}})
 }
 
 func (f *fakeCluster) Start(context.Context) error {
@@ -6836,6 +6811,10 @@ func (f *fakeManagerCluster) GetChannelMetadata(_ context.Context, channelID str
 	return metadb.Channel{}, metadb.ErrNotFound
 }
 
+func (f *fakeManagerCluster) GetChannelMetadataAuthoritative(ctx context.Context, channelID string, channelType int64) (metadb.Channel, error) {
+	return f.GetChannelMetadata(ctx, channelID, channelType)
+}
+
 func (f *fakeManagerCluster) UpsertChannelMetadata(_ context.Context, channel metadb.Channel) error {
 	f.channelPages[1] = append(f.channelPages[1], channel)
 	return nil
@@ -6899,6 +6878,23 @@ func (f *fakeManagerCluster) ListChannelSubscribersPage(_ context.Context, _ str
 		next = page[len(page)-1]
 	}
 	return page, next, end >= len(f.systemUIDs), nil
+}
+
+func (f *fakeManagerCluster) ListChannelSubscribersAuthoritative(ctx context.Context, channelID string, channelType int64, afterUID string, limit int) ([]string, string, bool, error) {
+	return f.ListChannelSubscribersPage(ctx, channelID, channelType, afterUID, limit)
+}
+
+func (f *fakeManagerCluster) ContainsChannelSubscriberAuthoritative(_ context.Context, _ string, _ int64, uid string) (bool, error) {
+	for _, existing := range f.systemUIDs {
+		if existing == uid {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (f *fakeManagerCluster) HasChannelSubscribersAuthoritative(context.Context, string, int64) (bool, error) {
+	return len(f.systemUIDs) > 0, nil
 }
 
 func (f *fakeManagerCluster) ListConversationActivePage(_ context.Context, kind metadb.ConversationKind, uid string, after metadb.ConversationActiveCursor, limit int) ([]metadb.ConversationState, metadb.ConversationActiveCursor, bool, error) {
@@ -7375,6 +7371,34 @@ func (s *appRecordingConversationAuthorityStore) TouchConversationActiveAtBatch(
 	return nil
 }
 
+func (s *appRecordingConversationAuthorityStore) HideConversationsBatch(ctx context.Context, deletes []metadb.ConversationDelete) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.rows == nil {
+		s.rows = make(map[metadb.ConversationKey]metadb.ConversationState)
+	}
+	for _, req := range deletes {
+		key := metadb.ConversationKey{ChannelID: req.ChannelID, ChannelType: req.ChannelType}
+		row := s.rows[key]
+		if row.UID == "" {
+			row = metadb.ConversationState{UID: req.UID, Kind: req.Kind, ChannelID: req.ChannelID, ChannelType: req.ChannelType}
+		}
+		if req.DeletedToSeq <= row.DeletedToSeq {
+			continue
+		}
+		row.DeletedToSeq = req.DeletedToSeq
+		row.ActiveAt = 0
+		if req.UpdatedAt > row.UpdatedAt {
+			row.UpdatedAt = req.UpdatedAt
+		}
+		s.rows[key] = row
+	}
+	return nil
+}
+
 func (s *appRecordingConversationAuthorityStore) UpsertConversationStatesBatch(ctx context.Context, states []metadb.ConversationState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -7420,10 +7444,11 @@ func (s *appRecordingConversationAuthorityStore) lastTouchDeadlineWithin(timeout
 }
 
 type recordingConversationAuthorityRouteNode struct {
-	nodeID  uint64
-	routes  map[string]clusterpkg.Route
-	watch   <-chan clusterpkg.RouteAuthorityEvent
-	handler clusterpkg.NodeRPCHandler
+	nodeID                uint64
+	routes                map[string]clusterpkg.Route
+	watch                 <-chan clusterpkg.RouteAuthorityEvent
+	handler               clusterpkg.NodeRPCHandler
+	routeKeysPartialCalls int
 }
 
 func (n *recordingConversationAuthorityRouteNode) NodeID() uint64 {
@@ -7436,6 +7461,16 @@ func (n *recordingConversationAuthorityRouteNode) RouteKey(uid string) (clusterp
 		return clusterpkg.Route{}, clusterpkg.ErrRouteNotReady
 	}
 	return route, nil
+}
+
+func (n *recordingConversationAuthorityRouteNode) RouteKeysPartial(uids []string) ([]clusterpkg.RouteKeyResult, error) {
+	n.routeKeysPartialCalls++
+	results := make([]clusterpkg.RouteKeyResult, len(uids))
+	for index, uid := range uids {
+		route, err := n.RouteKey(uid)
+		results[index] = clusterpkg.RouteKeyResult{Route: route, Err: err}
+	}
+	return results, nil
 }
 
 func (n *recordingConversationAuthorityRouteNode) CallRPC(ctx context.Context, _ uint64, _ uint8, payload []byte) ([]byte, error) {
@@ -7546,6 +7581,10 @@ func (n *recordingDeliveryMetaNode) GetChannelMetadata(_ context.Context, channe
 	return metadb.Channel{}, metadb.ErrNotFound
 }
 
+func (n *recordingDeliveryMetaNode) GetChannelMetadataAuthoritative(ctx context.Context, channelID string, channelType int64) (metadb.Channel, error) {
+	return n.GetChannelMetadata(ctx, channelID, channelType)
+}
+
 func (n *recordingDeliveryMetaNode) DeleteChannelMetadata(_ context.Context, channelID string, channelType int64) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -7609,6 +7648,27 @@ func (n *recordingDeliveryMetaNode) ListChannelSubscribersPage(_ context.Context
 		return page, "", true, nil
 	}
 	return page, page[len(page)-1], false, nil
+}
+
+func (n *recordingDeliveryMetaNode) ListChannelSubscribersAuthoritative(ctx context.Context, channelID string, channelType int64, afterUID string, limit int) ([]string, string, bool, error) {
+	return n.ListChannelSubscribersPage(ctx, channelID, channelType, afterUID, limit)
+}
+
+func (n *recordingDeliveryMetaNode) ContainsChannelSubscriberAuthoritative(_ context.Context, channelID string, _ int64, uid string) (bool, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, existing := range n.subscribers[channelID] {
+		if existing == uid {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (n *recordingDeliveryMetaNode) HasChannelSubscribersAuthoritative(_ context.Context, channelID string, _ int64) (bool, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return len(n.subscribers[channelID]) > 0, nil
 }
 
 func (n *recordingDeliveryMetaNode) UpsertUserChannelMemberships(_ context.Context, channelID string, channelType int64, uids []string, joinSeq uint64, updatedAt int64) error {
@@ -7938,6 +7998,10 @@ func (f *fakeConversationFallbackCluster) TouchConversationActiveAtBatch(context
 	return errors.New("unexpected authority active patch fallback write")
 }
 
+func (f *fakeConversationFallbackCluster) HideConversationsBatch(context.Context, []metadb.ConversationDelete) error {
+	return errors.New("unexpected authority conversation hide fallback write")
+}
+
 func (f *fakeConversationFallbackCluster) ListChannelSubscribersPage(_ context.Context, channelID string, _ int64, afterUID string, limit int) ([]string, string, bool, error) {
 	f.mu.Lock()
 	uids := append([]string(nil), f.subscribers[channelID]...)
@@ -8175,21 +8239,8 @@ type recordingSessionHandle struct {
 }
 
 type fakeDeliverySubscriberSource struct {
-	requests []runtimedelivery.SubscriberPageRequest
-	pages    []runtimedelivery.UIDPage
-}
-
-type appStaticDeliveryPartitioner struct {
-	partitions []runtimedelivery.Partition
-}
-
-func (p appStaticDeliveryPartitioner) Partitions(context.Context) ([]runtimedelivery.Partition, error) {
-	return append([]runtimedelivery.Partition(nil), p.partitions...), nil
-}
-
-type appRecordingFanoutRunner struct {
-	mu    sync.Mutex
-	tasks []runtimedelivery.FanoutTask
+	requests []channelappend.SubscriberPageRequest
+	pages    []channelappend.SubscriberPage
 }
 
 type recordingWorkerRuntime struct {
@@ -8225,23 +8276,10 @@ func (r *recordingWorkerRuntime) Stop(context.Context) error {
 	return r.stopErr
 }
 
-func (r *appRecordingFanoutRunner) RunTask(_ context.Context, task runtimedelivery.FanoutTask) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.tasks = append(r.tasks, task)
-	return nil
-}
-
-func (r *appRecordingFanoutRunner) snapshot() []runtimedelivery.FanoutTask {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]runtimedelivery.FanoutTask(nil), r.tasks...)
-}
-
-func (s *fakeDeliverySubscriberSource) ListSubscribers(_ context.Context, req runtimedelivery.SubscriberPageRequest) (runtimedelivery.UIDPage, error) {
+func (s *fakeDeliverySubscriberSource) NextSubscriberPage(_ context.Context, req channelappend.SubscriberPageRequest) (channelappend.SubscriberPage, error) {
 	s.requests = append(s.requests, req)
 	if len(s.pages) == 0 {
-		return runtimedelivery.UIDPage{Done: true}, nil
+		return channelappend.SubscriberPage{Done: true}, nil
 	}
 	page := s.pages[0]
 	s.pages = s.pages[1:]
@@ -8349,7 +8387,7 @@ func ownerRouteSessionIDs(routes []online.OwnerRoute) []uint64 {
 
 func appLogEntriesForEvent(logger *recordingAppLogger, level, event string) []recordedAppLogEntry {
 	entries := make([]recordedAppLogEntry, 0)
-	for _, entry := range logger.entries {
+	for _, entry := range logger.entriesSnapshot() {
 		if entry.level != level {
 			continue
 		}
@@ -8497,6 +8535,7 @@ func (f *fakeGateway) ListenerAddr(name string) string { return f.listenerAddrs[
 type gatewayAdmissionStub struct {
 	accepting        bool
 	acceptingChanged bool
+	disconnectCount  int
 }
 
 func (g *gatewayAdmissionStub) Start() error {
@@ -8516,11 +8555,16 @@ func (g *gatewayAdmissionStub) AcceptingNewSessions() bool {
 	return g.accepting
 }
 
+func (g *gatewayAdmissionStub) DisconnectAll() {
+	g.disconnectCount++
+}
+
 func (g *gatewayAdmissionStub) SessionSummary() gatewaycore.SessionSummary {
 	return gatewaycore.SessionSummary{AcceptingNewSessions: g.accepting}
 }
 
 type recordingAppLogger struct {
+	mu        sync.RWMutex
 	syncCalls int
 	entries   []recordedAppLogEntry
 }
@@ -8546,6 +8590,8 @@ func (r *recordingAppLogger) With(...wklog.Field) wklog.Logger {
 }
 
 func (r *recordingAppLogger) log(level, msg string, fields ...wklog.Field) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.entries = append(r.entries, recordedAppLogEntry{
 		level:  level,
 		msg:    msg,
@@ -8554,8 +8600,30 @@ func (r *recordingAppLogger) log(level, msg string, fields ...wklog.Field) {
 }
 
 func (r *recordingAppLogger) Sync() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.syncCalls++
 	return nil
+}
+
+func (r *recordingAppLogger) entriesSnapshot() []recordedAppLogEntry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	entries := make([]recordedAppLogEntry, len(r.entries))
+	for i, entry := range r.entries {
+		entries[i] = recordedAppLogEntry{
+			level:  entry.level,
+			msg:    entry.msg,
+			fields: append([]wklog.Field(nil), entry.fields...),
+		}
+	}
+	return entries
+}
+
+func (r *recordingAppLogger) syncCallCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.syncCalls
 }
 
 type fakeAPI struct {

@@ -1,3 +1,5 @@
+name: Safety Automation - Publish SLSA Go Release
+
 # This workflow uses actions that are not certified by GitHub.
 # They are provided by a third-party and are governed by
 # separate terms of service, privacy policy, and support
@@ -11,7 +13,6 @@
 # The provenance file can be verified using https://github.com/slsa-framework/slsa-verifier.
 # For more information about SLSA and how it improves the supply-chain, visit slsa.dev.
 
-name: SLSA Go releaser
 on:
   workflow_dispatch:
   release:
@@ -29,9 +30,10 @@ jobs:
       release-notes: ${{ steps.extract.outputs.notes }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Extract changelog for version
         id: extract
@@ -124,6 +126,7 @@ jobs:
         uses: actions/checkout@ec3a7ce113134d7a93b817d10a8272cb61118579 # tag=v2.3.4
         with:
           fetch-depth: 0
+          persist-credentials: false
       - id: ldflags
         run: |
           echo "commit-date=$(git log --date=iso8601-strict -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
@@ -145,7 +148,7 @@ jobs:
         arch:
           - amd64
           - arm64
-    uses: slsa-framework/slsa-github-generator/.github/workflows/builder_go_slsa3.yml@v2.0.0
+    uses: slsa-framework/slsa-github-generator/.github/workflows/builder_go_slsa3.yml@5a775b367a56d5bd118a224a811bba288150a563 # v2.0.0
     with:
       go-version: ">=1.22.0"
       # Optional: only needed if using ldflags.
@@ -159,7 +162,7 @@ jobs:
     permissions: read-all
     steps:
       - name: Install the verifier
-        uses: slsa-framework/slsa-verifier/actions/installer@v2.6.0
+        uses: slsa-framework/slsa-verifier/actions/installer@3714a2a4684014deb874a0e737dffa0ee02dd647 # v2.6.0
 
       - name: Download assets
         env:

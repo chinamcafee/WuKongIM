@@ -4,7 +4,8 @@
 
 `internal/usecase/management` builds entry-independent read models for the
 new manager API. It currently owns the node list, Slot list, business channel
-list, channel runtime metadata list, Controller/Slot distributed log pages,
+list/detail/create/flag-patch and subscriber/allowlist/denylist page, exact-read,
+and mutation orchestration, channel runtime metadata list, Controller/Slot distributed log pages,
 Controller task audit history, Controller Raft status and explicit compaction orchestration,
 Controller voter promotion validation, Slot Raft
 explicit compaction orchestration, Slot leader-transfer intent
@@ -34,7 +35,10 @@ user management, and system UID projections/actions used by
 `GET /manager/nodes/:node_id/diagnostics`,
 `GET /manager/nodes/:node_id/config`,
 `GET /manager/slots`, `POST /manager/slots/:slot_id/leader-transfer`,
-`GET /manager/channels`,
+`GET /manager/channels`, `POST /manager/channels`,
+`GET|PATCH /manager/channels/:channel_type/:channel_id`,
+`GET /manager/channels/:channel_type/:channel_id/{subscribers|allowlist|denylist}`,
+`POST /manager/channels/:channel_type/:channel_id/{subscribers|allowlist|denylist}/{add|remove}`,
 `GET /manager/channel-runtime-meta`, `GET /manager/controller/logs`,
 `/manager/channel-migrations*`,
 `GET /manager/controller/tasks`, `GET /manager/controller/tasks/:task_id`,
@@ -51,6 +55,11 @@ user management, and system UID projections/actions used by
 `/manager/nodes/:node_id/plugins*`, `/manager/plugin-bindings`,
 `/manager/db/inspect*`, `/manager/diagnostics*`, `/manager/users*`, and
 `/manager/system-users*`.
+
+The package also owns the entry-independent `GoroutineSnapshot` read model used
+between app-local registry projection, node RPC, and Manager HTTP. Access
+adapters depend on this bounded DTO rather than on the concrete
+`pkg/goroutine.Registry` runtime type.
 
 `Options` remains the composition-root facade, while `App` stores its port
 inventory in node, channel, user, message, and operations dependency groups.
@@ -128,7 +137,8 @@ another node's config.
 The DTO carries stable group/item fields but does not own HTTP JSON tags;
 `internal/access/manager` owns the public response shape. Redaction and the
 allowlist are performed by the app-local snapshot provider before values enter
-this usecase.
+this usecase. Each item also carries a bounded source classification (`toml`,
+`env`, `default`, or `derived`) for the normalized effective value.
 
 ## Controller Voter Promotion Flow
 
@@ -538,17 +548,44 @@ filesystem paths itself. It validates `node_id` and `limit` bounds, then
 delegates source discovery, cursor handling, rotation detection, filtering, and
 entry parsing to the narrow `ApplicationLogReader` port.
 
-## Business Channel List Flow
+## Operations MCP Administration Flow
+
+```text
+authenticated Manager operator
+  -> read status or revision-fenced mutation
+  -> complete Controller OpsMCP desired-state replacement
+  -> every Manager observes the same owner/enabled/credential metadata
+```
+
+The management usecase generates a 256-bit opaque `wko_*` token, returns it
+only in the successful creation response, and persists only its credential ID,
+SHA-256 digest, and creation time. Token creation, revocation, owner selection,
+start, and stop require an idempotency key and expected Controller revision.
+Creation retries can replay the one-time token from bounded process memory for
+five minutes. At most two tokens may coexist; they do not expire, but status
+marks tokens older than 90 days for rotation.
+
+MCP can start only with an active owner and at least one token. The owner can
+change only while stopped, and the last token cannot be revoked while enabled.
+An owner must also be Controller-alive; status includes a safe eligible-owner
+list so `cluster.mcp:r/w` does not require `cluster.node:r`. Stopping persists
+a 30-second profile transition fence. Status and audit results expose no token
+digest. The audit page is a bounded newest-first aggregate of available
+alive/suspect nodes' local ingress/owner records.
+
+## Business Channel Management Flow
 
 ```text
 manager HTTP handler
-  -> management.App.ListBusinessChannels
+  -> management.App.ListBusinessChannels/GetBusinessChannel
+  -> management.App.CreateBusinessChannel/UpdateBusinessChannel
+  -> management.App.ListBusinessChannelMembers/MutateBusinessChannelMembers
   -> local node_id: ControlSnapshotReader.LocalControlSnapshot
   -> remote node_id: RemoteBusinessChannelReader.NodeBusinessChannels
-  -> ControlSnapshotReader.LocalControlSnapshot
-  -> ChannelBusinessReader.ScanChannelsSlotPage
-  -> Slot metadata channel rows
-  -> filtered manager channel DTO rows
+  -> ChannelBusinessReader.ScanChannelsSlotPage (list)
+  -> ChannelBusinessOperator (detail, create, flag patch, member sets)
+     using management-owned DTOs adapted only in internal/app
+  -> authoritative Slot metadata
 ```
 
 The business channel projection scans channel metadata by physical Slot,
@@ -558,8 +595,21 @@ or local `node_id` requests scan this node's Slot metadata; non-local requests
 delegate the whole page request to a narrow remote channel reader port. The read
 model derives display `slot_id` and `hash_slot` values from the selected node's
 cluster control snapshot and keeps cursor state bound to the requested filter
-values. Channel detail, member, and mutation operation routes are outside this
-migration step.
+values.
+
+Detail validates the parent channel and joins subscriber/allowlist/denylist
+non-emptiness. Member reads either page by UID cursor or perform one exact UID
+point lookup; cursors are bound to channel ID, type, and list kind. Member
+writes normalize and de-duplicate at most 500 UIDs, reject the complete batch
+when any UID is invalid, reject ordinary subscriber writes for person
+channels, and return exact requested/changed set counts. Parent metadata must
+already exist. The first allowlist or denylist add may create its internal
+derived channel only after that validation; a remove from a missing derived
+list is a no-op and does not create it. Ordinary subscriber writes keep the
+existing synchronous UID-owned reverse membership projection; access-list
+writes do not. Create-only and existing-only flag patch semantics are enforced
+inside the Slot FSM so concurrent requests cannot turn create into upsert or
+replace unrelated channel/subscriber metadata.
 
 ## Channel Runtime Metadata Flow
 

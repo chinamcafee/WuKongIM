@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -14,12 +15,15 @@ import (
 
 	accessapi "github.com/WuKongIM/WuKongIM/internal/access/api"
 	accessgateway "github.com/WuKongIM/WuKongIM/internal/access/gateway"
+	accessops "github.com/WuKongIM/WuKongIM/internal/access/opsmcp"
 	clusterinfra "github.com/WuKongIM/WuKongIM/internal/infra/cluster"
 	obsdiagnostics "github.com/WuKongIM/WuKongIM/internal/observability/diagnostics"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/channelappend"
 	runtimedelivery "github.com/WuKongIM/WuKongIM/internal/runtime/delivery"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/online"
+	runtimeops "github.com/WuKongIM/WuKongIM/internal/runtime/opsmcp"
 	authoritypresence "github.com/WuKongIM/WuKongIM/internal/runtime/presence"
+	backupusecase "github.com/WuKongIM/WuKongIM/internal/usecase/backup"
 	channelusecase "github.com/WuKongIM/WuKongIM/internal/usecase/channel"
 	cmdsyncusecase "github.com/WuKongIM/WuKongIM/internal/usecase/cmdsync"
 	conversationusecase "github.com/WuKongIM/WuKongIM/internal/usecase/conversation"
@@ -30,6 +34,7 @@ import (
 	userusecase "github.com/WuKongIM/WuKongIM/internal/usecase/user"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster"
 	"github.com/WuKongIM/WuKongIM/pkg/gateway"
+	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 	obsmetrics "github.com/WuKongIM/WuKongIM/pkg/metrics"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/bwmarrin/snowflake"
@@ -75,18 +80,24 @@ type Option func(*App)
 
 // App is the internal composition root for cluster, message, and gateway runtimes.
 type App struct {
-	cfg                         Config
-	cluster                     ClusterRuntime
-	api                         APIRuntime
-	manager                     ManagerRuntime
-	gateway                     GatewayRuntime
-	handler                     *accessgateway.Handler
-	messages                    *message.App
-	apiMessages                 accessapi.MessageUsecase
-	channelAppends              *channelappend.Group
-	channelAppendRouter         *channelappend.Router
-	channelAppendDeliveryWorker *channelappend.RecipientDeliveryWorker
-	channelAppendMetadata       *clusterinfra.ChannelAppendMetadataCache
+	cfg     Config
+	cluster ClusterRuntime
+	api     APIRuntime
+	manager ManagerRuntime
+	// opsMCPEndpoint serves stateless MCP on every configured Manager listener.
+	opsMCPEndpoint *accessops.Endpoint
+	// opsMCPCalls owns node-local rate budgets and rotated audit output.
+	opsMCPCalls           *runtimeops.CallControl
+	gateway               GatewayRuntime
+	handler               *accessgateway.Handler
+	messages              *message.App
+	apiMessages           accessapi.MessageUsecase
+	channelAppends        *channelappend.Group
+	channelAppendRouter   *channelappend.Router
+	channelAppendMetadata *clusterinfra.ChannelAppendMetadataCache
+	// messageIDs owns the node-scoped allocator so activated restore fences can
+	// be installed before ordinary traffic starts.
+	messageIDs *nodeMessageIDs
 	// pluginRuntime owns the node-local plugin process/socket runtime.
 	pluginRuntime WorkerRuntime
 	// pluginHook owns the bounded PersistAfter worker that drains durable commit side effects.
@@ -115,10 +126,10 @@ type App struct {
 	// by WKProto CONNECT authentication.
 	gatewayTokenMetadata gatewayTokenMetadataReader
 	delivery             *deliveryusecase.App
-	deliveryManager      *runtimedelivery.Manager
-	deliveryRetry        *runtimedelivery.RetryScheduler
-	deliveryWorker       WorkerRuntime
-	localOwnerPusher     *localOwnerPusher
+	// onlineDelivery owns canonical recipient-plan processing and owner-local ACK state.
+	onlineDelivery *runtimedelivery.Runtime
+	// deliveryWorker owns the canonical delivery runtime lifecycle.
+	deliveryWorker WorkerRuntime
 	// seedJoinLoop retries pre-membership JoinNode RPCs and gates entry startup until admission is observed.
 	seedJoinLoop                seedJoinRuntime
 	conversationRouteLifecycle  WorkerRuntime
@@ -126,7 +137,7 @@ type App struct {
 	conversationAuthority       *conversationAuthority
 	conversationAuthorityClient *clusterinfra.ConversationAuthorityClient
 	// deliverySubscribers scans durable non-person channel subscribers when provided.
-	deliverySubscribers     runtimedelivery.ChannelSubscriberSource
+	deliverySubscribers     channelappend.SubscriberSource
 	deliveryMeta            *deliveryMetaStore
 	presence                *presence.App
 	presenceAuthorityClient *clusterinfra.PresenceAuthorityClient
@@ -134,6 +145,10 @@ type App struct {
 	presenceDirectory       *authoritypresence.Directory
 	presenceWorker          WorkerRuntime
 	metrics                 *obsmetrics.Registry
+	// goroutines is the always-on process supervisor shared by first-party runtimes.
+	goroutines *goruntimeregistry.Registry
+	// goroutineBaseline excludes tasks that predate this App from its shutdown wait.
+	goroutineBaseline goruntimeregistry.Baseline
 	// channelRuntimeSummary aggregates active Channel runtime counts for manager node reads.
 	channelRuntimeSummary *channelRuntimeSummaryCollector
 	// top is the optional node-local collector used by /top/v1/snapshot.
@@ -150,7 +165,20 @@ type App struct {
 	diagnosticsRestore func()
 	// controllerTaskAudit stores retained Controller task history for manager reads.
 	controllerTaskAudit *controllerTaskAuditRuntime
-	logger              wklog.Logger
+	// backup owns Manager-facing scheduled full-backup operations.
+	backup *backupusecase.ManagementService
+	// scheduledBackup owns the durable plan and job state machine.
+	scheduledBackup *backupusecase.ScheduledService
+	// restore owns current-cluster maintenance restore admission.
+	restore *backupusecase.RestoreService
+	// backupRuntime owns leader-only scheduling and resumable backup/restore work.
+	backupRuntime WorkerRuntime
+	// restoreMaintenance mirrors the Controller fence for entry quiescence.
+	restoreMaintenance atomic.Bool
+	// restoreSideEffectsMu serializes drain/suspend/resume around one restore.
+	restoreSideEffectsMu        sync.Mutex
+	restoreSideEffectsSuspended bool
+	logger                      wklog.Logger
 	// startupConsole renders the human-facing startup lifecycle when console output is enabled.
 	startupConsole *startupConsole
 
@@ -167,6 +195,7 @@ type App struct {
 	pluginRuntimeStarted      bool
 	pluginHookStarted         bool
 	webhookStarted            bool
+	backupRuntimeStarted      bool
 	apiStarted                bool
 	managerStarted            bool
 	prometheusStarted         bool
@@ -180,7 +209,9 @@ func New(cfg Config, opts ...Option) (*App, error) {
 	constructionOK := false
 	defer func() {
 		if !constructionOK {
-			app.restoreDiagnosticsSink()
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = app.Stop(cleanupCtx)
 		}
 	}()
 
@@ -195,11 +226,20 @@ func New(cfg Config, opts ...Option) (*App, error) {
 
 	clusterCfg := defaultClusterConfig(app.cfg)
 	clusterCfg.Logger = app.logger.Named("cluster")
+	clusterCfg.MaintenanceObserver = appMaintenanceObserver{
+		app: app, next: clusterCfg.MaintenanceObserver,
+	}
 	app.wireControllerTaskAudit(&clusterCfg)
 	app.configureObservability(&clusterCfg)
+	app.goroutineBaseline = app.goroutines.Baseline()
 	if err := app.ensureCluster(clusterCfg); err != nil {
 		return nil, err
 	}
+	messageIDs, err := newNodeMessageIDs(clusterCfg.NodeID)
+	if err != nil {
+		return nil, fmt.Errorf("internal/app: create message id generator: %w", err)
+	}
+	app.messageIDs = messageIDs
 
 	app.ensureOnlineRegistry()
 	if err := app.wireWebhook(); err != nil {
@@ -211,6 +251,9 @@ func New(cfg Config, opts ...Option) (*App, error) {
 	app.wireConversationAuthority()
 	app.wireConversations(conversationReadStore)
 	app.wirePresence()
+	if err := app.wireBackup(clusterCfg); err != nil {
+		return nil, err
+	}
 	app.wireManagerConnectionRPC()
 	app.wireManagerLogRPC()
 	app.wireManagerControllerRaftRPC()
@@ -223,13 +266,14 @@ func New(cfg Config, opts ...Option) (*App, error) {
 	app.wireManagerDBInspectRPC()
 	app.wireManagerDiagnosticsRPC()
 	app.wireManagerTaskAuditRPC()
+	app.wireManagerGoroutineRPC()
 	app.wireNodeLifecycleRPC()
 	app.wireSeedJoinLoop()
 	app.wireUsers()
-	app.wireDelivery()
 	if err := app.wirePluginSubsystem(clusterCfg.NodeID); err != nil {
 		return nil, err
 	}
+	app.wireDelivery()
 	app.wireManagerPluginRPC()
 	if err := app.wireChannelAppend(clusterCfg.NodeID); err != nil {
 		return nil, err
@@ -276,6 +320,11 @@ func WithGateway(gateway GatewayRuntime) Option {
 	return func(a *App) { a.gateway = gateway }
 }
 
+// WithGoroutineRegistry overrides the process goroutine supervisor.
+func WithGoroutineRegistry(registry *goruntimeregistry.Registry) Option {
+	return func(a *App) { a.goroutines = registry }
+}
+
 // WithMessages overrides the message usecase app.
 func WithMessages(messages *message.App) Option {
 	return func(a *App) { a.messages = messages }
@@ -301,8 +350,8 @@ func WithOnlineRegistry(reg *online.Registry) Option {
 	return func(a *App) { a.online = reg }
 }
 
-// WithDeliverySubscriberSource overrides the durable subscriber source used by delivery fanout.
-func WithDeliverySubscriberSource(source runtimedelivery.ChannelSubscriberSource) Option {
+// WithDeliverySubscriberSource overrides the durable subscriber source used by channelappend.
+func WithDeliverySubscriberSource(source channelappend.SubscriberSource) Option {
 	return func(a *App) { a.deliverySubscribers = source }
 }
 
@@ -688,6 +737,8 @@ func normalizeWebsocketAddress(addr string) string {
 type nodeMessageIDs struct {
 	// node is the Snowflake generator bound to the effective cluster node id.
 	node *snowflake.Node
+	// floor is the greatest naturally generated message ID in this process.
+	floor atomic.Uint64
 }
 
 func newNodeMessageIDs(nodeID uint64) (*nodeMessageIDs, error) {
@@ -699,7 +750,42 @@ func newNodeMessageIDs(nodeID uint64) (*nodeMessageIDs, error) {
 }
 
 func (g *nodeMessageIDs) Next() uint64 {
-	return uint64(g.node.Generate())
+	for {
+		raw := uint64(g.node.Generate())
+		floor := g.floor.Load()
+		if raw <= floor {
+			continue
+		}
+		if g.floor.CompareAndSwap(floor, raw) {
+			return raw
+		}
+	}
+}
+
+// SetFloor proves the natural clock-derived allocator is already above every
+// restored durable message ID. It never synthesizes future IDs that a restart
+// could later reuse before the wall clock catches up.
+func (g *nodeMessageIDs) SetFloor(floor uint64) error {
+	if g == nil || g.node == nil {
+		return fmt.Errorf("internal/app: message ID allocator is unavailable")
+	}
+	current := g.floor.Load()
+	if floor <= current {
+		return nil
+	}
+	probe := uint64(g.node.Generate())
+	if probe <= floor {
+		return fmt.Errorf("internal/app: natural Snowflake clock has not advanced above restored message ID fence %d", floor)
+	}
+	for {
+		current = g.floor.Load()
+		if probe <= current {
+			return nil
+		}
+		if g.floor.CompareAndSwap(current, probe) {
+			return nil
+		}
+	}
 }
 
 type nodeRPCHandlerFunc func(context.Context, []byte) ([]byte, error)
@@ -710,11 +796,6 @@ func (f nodeRPCHandlerFunc) HandleRPC(ctx context.Context, payload []byte) ([]by
 
 type nodeRPCRegistrar interface {
 	RegisterRPC(uint8, cluster.NodeRPCHandler)
-}
-
-type presenceDirectoryAuthority struct {
-	// directory stores authoritative virtual routes for locally led hash slots.
-	directory *authoritypresence.Directory
 }
 
 type presenceOwnerActions struct {
@@ -753,55 +834,6 @@ func (p activationTimeoutPresence) Touch(ctx context.Context, cmd presence.Touch
 		return nil
 	}
 	return p.next.Touch(ctx, cmd)
-}
-
-func (a presenceDirectoryAuthority) RegisterRoute(ctx context.Context, target presence.RouteTarget, route presence.Route) (presence.RegisterResult, error) {
-	if err := ctx.Err(); err != nil {
-		return presence.RegisterResult{}, err
-	}
-	return a.directory.RegisterRoute(target, route)
-}
-
-func (a presenceDirectoryAuthority) CommitRoute(ctx context.Context, target presence.RouteTarget, token string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return a.directory.CommitRoute(target, presence.PendingRouteToken(token))
-}
-
-func (a presenceDirectoryAuthority) AbortRoute(ctx context.Context, target presence.RouteTarget, token string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return a.directory.AbortRoute(target, presence.PendingRouteToken(token))
-}
-
-func (a presenceDirectoryAuthority) UnregisterRoute(ctx context.Context, target presence.RouteTarget, identity presence.RouteIdentity, ownerSeq uint64) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return a.directory.UnregisterRoute(target, identity, ownerSeq)
-}
-
-func (a presenceDirectoryAuthority) EndpointsByUID(ctx context.Context, target presence.RouteTarget, uid string) ([]presence.Route, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return a.directory.EndpointsByUID(target, uid)
-}
-
-func (a presenceDirectoryAuthority) EndpointsByUIDs(ctx context.Context, target presence.RouteTarget, uids []string) ([]presence.Route, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return a.directory.EndpointsByUIDs(target, uids)
-}
-
-func (a presenceDirectoryAuthority) TouchRoutes(ctx context.Context, target presence.RouteTarget, routes []presence.Route) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return a.directory.TouchRoutes(target, routes)
 }
 
 func (a presenceOwnerActions) ApplyRouteAction(ctx context.Context, action presence.RouteAction) error {

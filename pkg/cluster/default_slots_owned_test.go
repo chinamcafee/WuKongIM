@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"testing"
 
 	clusternet "github.com/WuKongIM/WuKongIM/pkg/cluster/net"
@@ -38,6 +39,31 @@ func TestNetworkSlotTransportUsesOwnedSenderWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestNetworkSlotTransportAttemptsEveryPeerAfterOneSendFails(t *testing.T) {
+	sendErr := errors.New("peer unavailable")
+	sender := &failFirstSlotSender{err: sendErr}
+	transport := networkSlotTransport{sender: sender}
+
+	err := transport.Send(context.Background(), []multiraft.Envelope{
+		{SlotID: 7, Message: raftpb.Message{From: 1, To: 2, Type: raftpb.MsgVote, Term: 4}},
+		{SlotID: 7, Message: raftpb.Message{From: 1, To: 3, Type: raftpb.MsgVote, Term: 4}},
+	})
+
+	if !errors.Is(err, sendErr) {
+		t.Fatalf("Send() error = %v, want %v", err, sendErr)
+	}
+	if len(sender.nodeIDs) != 2 {
+		t.Fatalf("attempted nodes = %v, want both Raft peers despite one failure", sender.nodeIDs)
+	}
+	seen := map[uint64]bool{}
+	for _, nodeID := range sender.nodeIDs {
+		seen[nodeID] = true
+	}
+	if !seen[2] || !seen[3] {
+		t.Fatalf("attempted nodes = %v, want nodes 2 and 3", sender.nodeIDs)
+	}
+}
+
 func TestNetworkSlotTransportOwnsReadyMessagePayloads(t *testing.T) {
 	var transport any = networkSlotTransport{}
 	owner, ok := transport.(multiraft.ReadyMessagePayloadOwner)
@@ -46,6 +72,27 @@ func TestNetworkSlotTransportOwnsReadyMessagePayloads(t *testing.T) {
 	}
 	if !owner.OwnsReadyMessagePayloads() {
 		t.Fatal("networkSlotTransport should own Ready message payloads")
+	}
+}
+
+func TestNetworkSlotTransportAttemptsEveryTargetAfterSendErrors(t *testing.T) {
+	sendErr := errors.New("peer unavailable")
+	sender := &failingSlotSender{err: sendErr}
+	transport := networkSlotTransport{sender: sender}
+
+	err := transport.Send(context.Background(), []multiraft.Envelope{
+		{SlotID: 7, Message: raftpb.Message{From: 2, To: 1, Type: raftpb.MsgVote, Term: 3}},
+		{SlotID: 7, Message: raftpb.Message{From: 2, To: 3, Type: raftpb.MsgVote, Term: 3}},
+		{SlotID: 8, Message: raftpb.Message{From: 2, To: 4, Type: raftpb.MsgHeartbeat, Term: 5}},
+	})
+
+	if !errors.Is(err, sendErr) {
+		t.Fatalf("Send() error = %v, want %v", err, sendErr)
+	}
+	got := append([]uint64(nil), sender.nodeIDs...)
+	slices.Sort(got)
+	if want := []uint64{1, 3, 4}; !slices.Equal(got, want) {
+		t.Fatalf("attempted node IDs = %v, want %v", got, want)
 	}
 }
 
@@ -90,6 +137,29 @@ type recordingOwnedSlotSender struct {
 	payload        []byte
 	sendCount      int
 	ownedSendCount int
+}
+
+type failFirstSlotSender struct {
+	err     error
+	nodeIDs []uint64
+}
+
+type failingSlotSender struct {
+	err     error
+	nodeIDs []uint64
+}
+
+func (s *failFirstSlotSender) Send(_ context.Context, nodeID uint64, _ uint8, _ []byte) error {
+	s.nodeIDs = append(s.nodeIDs, nodeID)
+	if len(s.nodeIDs) == 1 {
+		return s.err
+	}
+	return nil
+}
+
+func (s *failingSlotSender) Send(_ context.Context, nodeID uint64, _ uint8, _ []byte) error {
+	s.nodeIDs = append(s.nodeIDs, nodeID)
+	return s.err
 }
 
 func (s *recordingOwnedSlotSender) Send(context.Context, uint64, uint8, []byte) error {

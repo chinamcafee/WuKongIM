@@ -39,6 +39,43 @@ func (s *ClusterState) Normalize() {
 		sort.Slice(s.Tasks[i].ObservedLearners, func(a, b int) bool { return s.Tasks[i].ObservedLearners[a] < s.Tasks[i].ObservedLearners[b] })
 		normalizeTaskProgress(&s.Tasks[i])
 	}
+	if s.ScheduledBackup != nil {
+		if s.ScheduledBackup.History == nil {
+			s.ScheduledBackup.History = []BackupTaskRecord{}
+		}
+		if s.ScheduledBackup.ActiveBackup != nil {
+			if s.ScheduledBackup.ActiveBackup.Slots == nil {
+				s.ScheduledBackup.ActiveBackup.Slots = []BackupSlotProgress{}
+			}
+			sort.Slice(s.ScheduledBackup.ActiveBackup.Slots, func(i, j int) bool {
+				return s.ScheduledBackup.ActiveBackup.Slots[i].HashSlot <
+					s.ScheduledBackup.ActiveBackup.Slots[j].HashSlot
+			})
+		}
+		if s.ScheduledBackup.ActiveRestore != nil {
+			if s.ScheduledBackup.ActiveRestore.Slots == nil {
+				s.ScheduledBackup.ActiveRestore.Slots = []RestoreSlotProgress{}
+			}
+			for i := range s.ScheduledBackup.ActiveRestore.Slots {
+				sort.Slice(s.ScheduledBackup.ActiveRestore.Slots[i].ReplicaNodeIDs, func(a, b int) bool {
+					return s.ScheduledBackup.ActiveRestore.Slots[i].ReplicaNodeIDs[a] <
+						s.ScheduledBackup.ActiveRestore.Slots[i].ReplicaNodeIDs[b]
+				})
+			}
+			sort.Slice(s.ScheduledBackup.ActiveRestore.Slots, func(i, j int) bool {
+				return s.ScheduledBackup.ActiveRestore.Slots[i].HashSlot <
+					s.ScheduledBackup.ActiveRestore.Slots[j].HashSlot
+			})
+		}
+	}
+	if s.OpsMCP != nil {
+		if s.OpsMCP.Credentials == nil {
+			s.OpsMCP.Credentials = []OpsMCPCredential{}
+		}
+		sort.Slice(s.OpsMCP.Credentials, func(i, j int) bool {
+			return s.OpsMCP.Credentials[i].ID < s.OpsMCP.Credentials[j].ID
+		})
+	}
 	sort.Slice(s.Controllers, func(i, j int) bool { return s.Controllers[i].NodeID < s.Controllers[j].NodeID })
 	sort.Slice(s.Nodes, func(i, j int) bool { return s.Nodes[i].NodeID < s.Nodes[j].NodeID })
 	sort.Slice(s.Slots, func(i, j int) bool { return s.Slots[i].SlotID < s.Slots[j].SlotID })
@@ -76,6 +113,14 @@ func (s ClusterState) Clone() ClusterState {
 		out.Tasks[i].ParticipantProgress = cloneSlice(s.Tasks[i].ParticipantProgress)
 		out.Tasks[i].ObservedVoters = cloneUint64s(s.Tasks[i].ObservedVoters)
 		out.Tasks[i].ObservedLearners = cloneUint64s(s.Tasks[i].ObservedLearners)
+	}
+	if s.ScheduledBackup != nil {
+		scheduledBackup := s.ScheduledBackup.Clone()
+		out.ScheduledBackup = &scheduledBackup
+	}
+	if s.OpsMCP != nil {
+		opsMCP := s.OpsMCP.Clone()
+		out.OpsMCP = &opsMCP
 	}
 	return out
 }

@@ -30,7 +30,7 @@ type LogCompactionResult struct {
 	BeforeSnapshotIndex uint64
 	// AfterSnapshotIndex is the persisted snapshot index after the attempt.
 	AfterSnapshotIndex uint64
-	// Compacted reports whether a new snapshot was created and local entries were compacted.
+	// Compacted reports whether the recovery snapshot advanced.
 	Compacted bool
 	// SkippedReason explains why no new snapshot was created when Compacted is false.
 	SkippedReason string
@@ -51,11 +51,11 @@ func newLogCompactor(cfg LogCompactionConfig, lastSnapshotIdx uint64) *logCompac
 	}
 }
 
-func (c *logCompactor) shouldCompact(applied uint64) bool {
-	if c == nil || !c.cfg.Enabled || applied == 0 {
+func (c *logCompactor) shouldCompact(target uint64) bool {
+	if c == nil || !c.cfg.Enabled || target == 0 {
 		return false
 	}
-	if applied < c.lastSnapshotIdx || applied-c.lastSnapshotIdx < c.cfg.TriggerEntries {
+	if target < c.lastSnapshotIdx || target-c.lastSnapshotIdx < c.cfg.TriggerEntries {
 		return false
 	}
 	now := c.now()
@@ -80,7 +80,19 @@ func (c *logCompactor) recordSnapshot(index uint64) {
 	c.lastSnapshotIdx = index
 }
 
-func (g *slot) compactLog(ctx context.Context, applied uint64) error {
+func (g *slot) compactLog(ctx context.Context, applied uint64) (bool, error) {
+	if g == nil || applied == 0 {
+		return false, nil
+	}
+	err := g.compactLogAt(ctx, applied, false)
+	return err == nil, err
+}
+
+func (g *slot) compactLogAt(
+	ctx context.Context,
+	applied uint64,
+	replaceExternal bool,
+) error {
 	if g == nil || applied == 0 {
 		return nil
 	}
@@ -102,8 +114,14 @@ func (g *slot) compactLog(ctx context.Context, applied uint64) error {
 			ConfState: confState,
 		},
 	}
-	if err := g.storage.Save(ctx, PersistentState{Snapshot: &snap}); err != nil {
-		return err
+	var persistErr error
+	if replacer, ok := g.storage.(ExternalSnapshotStorage); replaceExternal && ok {
+		persistErr = replacer.ReplaceSnapshot(ctx, snap)
+	} else {
+		persistErr = g.storage.Save(ctx, PersistentState{Snapshot: &snap})
+	}
+	if persistErr != nil {
+		return persistErr
 	}
 	if _, err := g.storageView.memory.CreateSnapshot(applied, &snap.Metadata.ConfState, snap.Data); err != nil && !errors.Is(err, raft.ErrSnapOutOfDate) {
 		return err
@@ -124,10 +142,7 @@ func (g *slot) compactLogManually(ctx context.Context, applied uint64) (LogCompa
 		SlotID:       g.id,
 		AppliedIndex: applied,
 	}
-	snapshotIndex, _, err := storageSnapshotBoundary(ctx, g.storage)
-	if err != nil {
-		return result, err
-	}
+	snapshotIndex := g.compactor.lastSnapshotIdx
 	if snapshotIndex > 0 {
 		result.BeforeSnapshotIndex = snapshotIndex
 		result.AfterSnapshotIndex = snapshotIndex
@@ -140,31 +155,21 @@ func (g *slot) compactLogManually(ctx context.Context, applied uint64) (LogCompa
 		result.SkippedReason = LogCompactionSkippedNoAppliedIndex
 		return result, nil
 	}
-	if applied <= result.BeforeSnapshotIndex {
+	firstIndex, err := g.storage.FirstIndex(ctx)
+	if err != nil {
+		return result, err
+	}
+	snapshotUpToDate := applied <= result.BeforeSnapshotIndex
+	logUpToDate := firstIndex > applied
+	if snapshotUpToDate && logUpToDate {
 		result.SkippedReason = LogCompactionSkippedUpToDate
 		return result, nil
 	}
-	if err := g.compactLog(ctx, applied); err != nil {
+	if err := g.compactLogAt(ctx, applied, false); err != nil {
 		return result, err
 	}
 	result.AfterSnapshotIndex = applied
 	result.Compacted = true
 	g.compactor.recordSnapshot(applied)
 	return result, nil
-}
-
-func storageSnapshotBoundary(ctx context.Context, storage Storage) (uint64, uint64, error) {
-	first, err := storage.FirstIndex(ctx)
-	if err != nil {
-		return 0, 0, err
-	}
-	if first <= 1 {
-		return 0, 0, nil
-	}
-	snapshotIndex := first - 1
-	snapshotTerm, err := storage.Term(ctx, snapshotIndex)
-	if err != nil {
-		return 0, 0, err
-	}
-	return snapshotIndex, snapshotTerm, nil
 }

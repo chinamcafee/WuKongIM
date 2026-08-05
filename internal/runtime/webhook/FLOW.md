@@ -30,6 +30,12 @@ requeue an explicit set of 1–100 dead-letter IDs with
 `POST /manager/webhooks/outbox/replay`. Replay requires `cluster.webhook:w` when
 Manager auth is enabled and never accepts an unbounded “replay all” request.
 
+`msg.offline`
+  -> canonical Online Delivery classifies offline recipients after presence
+  -> batch observer passes bounded UID chunks to the app adapter
+  -> webhook runtime syncs each `OfflineMessage` chunk into the durable outbox
+  -> bounded outbox workers send one JSON object to `{HTTPAddr}?event=msg.offline`
+
 ## Best-Effort Presence Flow
 
 `user.onlinestatus` is mapped to the legacy-compatible status string, admitted to

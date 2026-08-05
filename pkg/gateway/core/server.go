@@ -14,6 +14,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/gateway/session"
 	"github.com/WuKongIM/WuKongIM/pkg/gateway/transport"
 	gatewaytypes "github.com/WuKongIM/WuKongIM/pkg/gateway/types"
+	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 	"github.com/WuKongIM/WuKongIM/pkg/observability/sendtrace"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -1019,7 +1020,7 @@ func (s *Server) startIdleMonitor() {
 	s.workerWG.Add(1)
 	s.mu.Unlock()
 
-	go func() {
+	goruntimeregistry.SafeGo(nil, goruntimeregistry.TaskGatewayIdleMonitor, func() {
 		defer s.workerWG.Done()
 
 		timer := time.NewTimer(tracker.nextWait(time.Now()))
@@ -1034,7 +1035,7 @@ func (s *Server) startIdleMonitor() {
 				timer.Reset(tracker.nextWait(time.Now()))
 			}
 		}
-	}()
+	})
 }
 
 func (s *Server) closeIdleSessions(now time.Time) {
@@ -1346,6 +1347,23 @@ func (s *Server) SetAcceptingNewSessions(accepting bool) {
 		return
 	}
 	s.accepting.Store(accepting)
+}
+
+// DisconnectAll closes every currently tracked client session without
+// stopping listeners, allowing maintenance to keep the process manageable.
+func (s *Server) DisconnectAll(reason gatewaytypes.CloseReason) {
+	if s == nil {
+		return
+	}
+	s.mu.RLock()
+	states := make([]*sessionState, 0, len(s.states))
+	for _, state := range s.states {
+		states = append(states, state)
+	}
+	s.mu.RUnlock()
+	for _, state := range states {
+		state.close(reason, nil)
+	}
 }
 
 // AcceptingNewSessions reports whether gateway admission accepts newly opened connections.

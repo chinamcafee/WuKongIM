@@ -28,7 +28,8 @@ Current flow:
 9. Subscriber mutations sort and de-duplicate UIDs, keep channel-owned
    subscriber rows through the table runtime, update the channel subscriber
    count and mutation version in the same commit, and invalidate the channel
-   cache.
+   cache. Counted batch mutations populate exact requested and changed counts
+   only while the same atomic commit evaluates set membership.
    The shard mutation lock makes simultaneous additions of the same UID
    idempotent: only the first creates a row and increments the count.
 10. User channel membership rows are UID-owned reverse membership records keyed
@@ -67,7 +68,8 @@ Current flow:
    stores the active `task_id`; slot-scoped active-task reads page through that
    active index instead of scanning the primary table. Guarded
    task/runtime-meta mutations keep read-your-writes overlays before committing
-   both records atomically, and task owner claims are fenced so only the same
+   both records atomically and advance `RouteGeneration` whenever the projected
+   runtime route changes; task owner claims are fenced so only the same
    owner, an unowned task, or a task whose previous owner lease has expired at
    the claim request's `now_ms` can take ownership.
 16. Hash-slot migration state uses the table runtime with a legacy primary key
@@ -78,10 +80,19 @@ Current flow:
    order, uses table overlays for ordinary runtime tables, validates guards
    against read-your-writes overlays for runtime metadata and channel migration
    tasks, commits once, then publishes or invalidates channel cache entries.
+   Conditional channel create returns not-applied for an existing row, and the
+   business-flag patch returns not-applied for a missing row while preserving
+   every stored field except `Ban`, `Disband`, and `SendBan`.
 18. Hash-slot snapshots export row, index, and system spans for selected hash
     slots into a checksummed payload; imports validate the payload, lock slots
     in sorted order, replace existing spans, write entries in one sync commit,
     and clear the channel cache.
+    Backup callers can open the same portable format from a pinned Pebble read
+    view; counting and encoding scan the stable view without accumulating the
+    full payload or blocking later metadata writes. The stream header exposes
+    the exact entry count, and header inspection returns a replacement reader
+    so publication can authenticate the count without consuming or rescanning
+    the payload.
 19. Preserving snapshot imports keep local hash-slot migration rows when they
     already exist, while still importing incoming migration rows that are not
     present locally.
@@ -97,5 +108,11 @@ Current flow:
     `ConversationKindNormal`, and legacy `CMDConversation*` compatibility
     methods map to `ConversationKindCMD`; neither path registers or writes a
     second conversation table.
+
+Restore-only target installation writes portable metadata snapshot rows into a
+fresh isolated database, applies strictly ordered Slot FSM commands, and can
+export the resulting hash-slot view in canonical key order. Production restore
+uses that export digest as the replica and final-verification fence; it never
+mutates a pre-existing nonempty generation.
 
 Storage code in this package must not import Pebble directly.

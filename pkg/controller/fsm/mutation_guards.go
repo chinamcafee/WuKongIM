@@ -94,6 +94,24 @@ func isNonBootstrapIdempotent(current state.ClusterState, cmd command.Command) b
 		return reflect.DeepEqual(current.Controllers, candidate.Controllers)
 	case command.KindReplaceHashSlotTable:
 		return cmd.HashSlots != nil && reflect.DeepEqual(current.HashSlots, cloneHashSlotTable(*cmd.HashSlots))
+	case command.KindReplaceScheduledBackupState:
+		if cmd.ScheduledBackup == nil {
+			return false
+		}
+		candidate := cmd.ScheduledBackup.Clone()
+		wrapped := current.Clone()
+		wrapped.ScheduledBackup = &candidate
+		wrapped.Normalize()
+		return reflect.DeepEqual(current.ScheduledBackup, wrapped.ScheduledBackup)
+	case command.KindReplaceOpsMCPState:
+		if cmd.OpsMCP == nil {
+			return false
+		}
+		candidate := cmd.OpsMCP.Clone()
+		wrapped := current.Clone()
+		wrapped.OpsMCP = &candidate
+		wrapped.Normalize()
+		return reflect.DeepEqual(current.OpsMCP, wrapped.OpsMCP)
 	case command.KindCompleteTask:
 		return cmd.TaskResult != nil && cmd.TaskResult.TaskID != "" && findTaskByID(current.Tasks, cmd.TaskResult.TaskID) < 0
 	default:

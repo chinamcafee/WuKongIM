@@ -7,7 +7,9 @@ listen_addr = "127.0.0.1:7001"
 id = "wukongim-single"
 nodes = [{ id = 1, addr = "127.0.0.1:7001" }]
 join_token = "change-me"
-initial_slot_count = 1
+# Logical Slot Raft Group count created by the initial Controller snapshot.
+initial_slot_count = 10
+# Stable physical hash-slot fence count used to route keys to logical Slot Raft Groups.
 hash_slot_count = 256
 slot_replica_n = 1
 node_health_report_interval = "5s"
@@ -15,7 +17,12 @@ node_health_report_ttl = "30s"
 channel_reactor_count = 0
 channel_store_append_workers = 0
 channel_store_apply_workers = 0
-channel_rpc_workers = 50
+# Bounds blocking replication RPC work. The 160-worker default avoids the scheduler
+# and allocation overhead observed with oversized pools while retaining burst headroom.
+channel_rpc_workers = 160
+# Maximum same-target Pull or PullHint items coalesced into one bounded
+# replication transport call. Zero uses the runtime default.
+channel_rpc_batch_max_items = 16
 max_channels = 0
 channel_append_batch_max_records = 0
 channel_append_batch_max_wait = "0"
@@ -25,7 +32,9 @@ commit_coordinator_flush_window = "200us"
 commit_coordinator_max_requests = 0
 commit_coordinator_max_records = 0
 commit_coordinator_max_bytes = 0
-commit_coordinator_shards = 0
+# Four partition-hashed coordinators preserve per-channel append locking and
+# synchronous durable commits while allowing unrelated channels to commit concurrently.
+commit_coordinator_shards = 4
 
 [channel]
 message_retention_physical_gc_enable = false
@@ -142,12 +151,18 @@ authority_cache_max_rows_per_uid = 4096
 authority_cache_max_rows = 100000
 authority_list_db_window_max = 1000
 authority_handoff_timeout = "3s"
+# Coalesces receiver-only active_at persistence while keeping the latest
+# activity visible in the UID authority cache. Delete barriers invalidate the
+# cached durable baseline before any later message can reuse this cooldown.
+authority_active_cooldown = "2h"
 authority_flush_interval = "1s"
 authority_flush_timeout = "5s"
 # Maximum dirty active rows persisted by one periodic, pressure-woken, or authority-handoff flush attempt.
-authority_flush_batch_rows = 128
+authority_flush_batch_rows = 512
 authority_admit_batch_rows = 512
 authority_admit_concurrency = 16
+
+
 
 [delivery]
 enable = true
@@ -167,6 +182,8 @@ recipient_worker_concurrency = 100
 shard_count = 0
 advance_pool_size = 0
 effect_pool_size = 0
+# Deprecated compatibility input. Canonical Online Delivery plans admit all
+# exact-target groups together and ignore this value.
 recipient_authority_dispatch_concurrency = 0
 
 [webhook]

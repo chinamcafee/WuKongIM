@@ -3,6 +3,7 @@ package channelappend
 import (
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
 	"strings"
 	"sync"
@@ -72,6 +73,279 @@ func TestRouterResolvesSameChannelBatchOnce(t *testing.T) {
 	}
 	if local.calls != 1 || len(local.items) != 2 {
 		t.Fatalf("local calls/items = %d/%d, want one submit with both items", local.calls, len(local.items))
+	}
+}
+
+func TestRouterSendBatchResolvesIndependentChannelsWithBoundedConcurrency(t *testing.T) {
+	resolver := newRouterControlledResolver(4)
+	local := &routerLocalSubmitterForTest{}
+	router := NewRouter(RouterOptions{
+		LocalNodeID:                   7,
+		Resolver:                      resolver,
+		Local:                         local,
+		MaxConcurrentResolvesPerBatch: 2,
+		MaxConcurrentGroupsPerBatch:   1,
+	})
+	done := make(chan []SendBatchItemResult, 1)
+	go func() {
+		done <- router.SendBatch([]SendBatchItem{
+			routerItem("u0", "a", 2),
+			routerItem("u1", "b", 2),
+			routerItem("u2", "c", 2),
+			routerItem("u3", "d", 2),
+		})
+	}()
+
+	_ = resolver.nextCall(t)
+	_ = resolver.nextCall(t)
+	select {
+	case channelID := <-resolver.entered:
+		t.Fatalf("third channel %q resolved before a concurrency slot was released", channelID.ID)
+	default:
+	}
+	resolver.releaseOne()
+	_ = resolver.nextCall(t)
+	resolver.releaseOne()
+	_ = resolver.nextCall(t)
+	resolver.releaseOne()
+	resolver.releaseOne()
+
+	select {
+	case results := <-done:
+		if len(results) != 4 {
+			t.Fatalf("results len = %d, want 4", len(results))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SendBatch did not finish after all authority resolutions completed")
+	}
+	if got := resolver.maxConcurrentCalls(); got != 2 {
+		t.Fatalf("max concurrent resolves = %d, want 2", got)
+	}
+}
+
+func TestNewRouterUsesBoundedConcurrentBatchDefaults(t *testing.T) {
+	router := NewRouter(RouterOptions{})
+	if router.maxConcurrentResolvesPerBatch != defaultRouterMaxConcurrentResolvesPerBatch {
+		t.Fatalf(
+			"default concurrent resolves = %d, want %d",
+			router.maxConcurrentResolvesPerBatch,
+			defaultRouterMaxConcurrentResolvesPerBatch,
+		)
+	}
+	if router.maxConcurrentGroupsPerBatch != defaultRouterMaxConcurrentGroupsPerBatch {
+		t.Fatalf(
+			"default concurrent groups = %d, want %d",
+			router.maxConcurrentGroupsPerBatch,
+			defaultRouterMaxConcurrentGroupsPerBatch,
+		)
+	}
+}
+
+func TestRouterConcurrentResolvePreservesItemAlignedSuccessAndErrors(t *testing.T) {
+	targetA := routerTarget("a", 2, 7)
+	targetD := routerTarget("d", 2, 7)
+	resolver := &routerResolverForTest{targetsByChannel: map[ChannelID]AuthorityTarget{
+		targetA.ChannelID:    targetA,
+		{ID: "bad", Type: 2}: routerTarget("other", 2, 7),
+		targetD.ChannelID:    targetD,
+	}}
+	router := NewRouter(RouterOptions{
+		LocalNodeID:                   7,
+		Resolver:                      resolver,
+		Local:                         routerImmediateLocalSubmitter{},
+		MaxRouteAttempts:              1,
+		MaxConcurrentResolvesPerBatch: 3,
+		MaxConcurrentGroupsPerBatch:   2,
+	})
+
+	results := router.SendBatch([]SendBatchItem{
+		routerItem("u0", "a", 2),
+		routerItem("u1", "bad", 2),
+		routerItem("u2", "d", 2),
+		routerItem("u3", "a", 2),
+	})
+
+	if len(results) != 4 {
+		t.Fatalf("results len = %d, want 4", len(results))
+	}
+	if results[0].Err != nil || results[0].Result.MessageID != 1 {
+		t.Fatalf("results[0] = %+v, want channel a success for u0", results[0])
+	}
+	if !errors.Is(results[1].Err, ErrStaleRoute) {
+		t.Fatalf("results[1] = %+v, want bad-channel stale route", results[1])
+	}
+	if results[2].Err != nil || results[2].Result.MessageID != 3 {
+		t.Fatalf("results[2] = %+v, want channel d success for u2", results[2])
+	}
+	if results[3].Err != nil || results[3].Result.MessageID != 4 {
+		t.Fatalf("results[3] = %+v, want grouped channel a success for u3", results[3])
+	}
+}
+
+func TestRouterSendBatchRunsIndependentChannelGroupsWithBoundedConcurrency(t *testing.T) {
+	targets := make(map[ChannelID]AuthorityTarget, 4)
+	for _, channelID := range []string{"a", "b", "c", "d"} {
+		target := routerTarget(channelID, 2, 7)
+		targets[target.ChannelID] = target
+	}
+	resolver := &routerResolverForTest{targetsByChannel: targets}
+	local := newRouterControlledLocalSubmitter(4)
+	router := NewRouter(RouterOptions{
+		LocalNodeID:                 7,
+		Resolver:                    resolver,
+		Local:                       local,
+		MaxConcurrentGroupsPerBatch: 2,
+	})
+	items := []SendBatchItem{
+		routerItem("u0", "a", 2),
+		routerItem("u1", "b", 2),
+		routerItem("u2", "a", 2),
+		routerItem("u3", "c", 2),
+		routerItem("u4", "d", 2),
+	}
+	done := make(chan []SendBatchItemResult, 1)
+	go func() {
+		done <- router.SendBatch(items)
+	}()
+
+	first := local.nextCall(t)
+	second := local.nextCall(t)
+	select {
+	case call := <-local.entered:
+		t.Fatalf("third group %q entered before a concurrency slot was released", call.target.ChannelID.ID)
+	default:
+	}
+	local.complete(first, controlledRouterResults(first.items))
+	third := local.nextCall(t)
+	local.complete(second, controlledRouterResults(second.items))
+	fourth := local.nextCall(t)
+	local.complete(fourth, controlledRouterResults(fourth.items))
+	local.complete(third, controlledRouterResults(third.items))
+
+	var results []SendBatchItemResult
+	select {
+	case results = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("SendBatch did not finish after every group completed")
+	}
+	if len(results) != len(items) {
+		t.Fatalf("results len = %d, want %d", len(results), len(items))
+	}
+	for index, result := range results {
+		wantID := uint64(index + 1)
+		if result.Err != nil || result.Result.MessageID != wantID {
+			t.Fatalf("results[%d] = %+v, want message id %d", index, result, wantID)
+		}
+	}
+	if got := local.maxConcurrentCalls(); got != 2 {
+		t.Fatalf("max concurrent groups = %d, want 2", got)
+	}
+	calls := local.callsSnapshot()
+	if len(calls) != 4 {
+		t.Fatalf("local calls = %d, want one per canonical channel", len(calls))
+	}
+	for _, call := range calls {
+		if call.target.ChannelID.ID != "a" {
+			continue
+		}
+		if len(call.items) != 2 || call.items[0].Command.FromUID != "u0" || call.items[1].Command.FromUID != "u2" {
+			t.Fatalf("channel a items = %+v, want u0 then u2", call.items)
+		}
+		return
+	}
+	t.Fatal("channel a group was not submitted")
+}
+
+func TestRouterSendBatchSerializesRemoteGroupsWithinSameLeaderOutboundLane(t *testing.T) {
+	targetA := routerTarget("remote-a", 2, 8)
+	targetB := routerTarget("remote-b", 2, 8)
+	resolver := &routerResolverForTest{targetsByChannel: map[ChannelID]AuthorityTarget{
+		targetA.ChannelID: targetA,
+		targetB.ChannelID: targetB,
+	}}
+	remote := newRouterControlledRemoteForwarder(2)
+	router := NewRouter(RouterOptions{
+		LocalNodeID:                 7,
+		Resolver:                    resolver,
+		Remote:                      remote,
+		MaxOutboundPerNode:          1,
+		MaxConcurrentGroupsPerBatch: 2,
+	})
+	done := make(chan []SendBatchItemResult, 1)
+	go func() {
+		done <- router.SendBatch([]SendBatchItem{
+			routerItem("u0", "remote-a", 2),
+			routerItem("u1", "remote-b", 2),
+		})
+	}()
+
+	first := remote.nextCall(t)
+	if first.target.ChannelID != targetA.ChannelID {
+		t.Fatalf("first remote group = %#v, want channel %#v", first.target.ChannelID, targetA.ChannelID)
+	}
+	select {
+	case call := <-remote.entered:
+		t.Fatalf("second remote group %q entered while the same-leader outbound lane was occupied", call.target.ChannelID.ID)
+	case <-time.After(50 * time.Millisecond):
+	}
+	remote.complete(first)
+	second := remote.nextCall(t)
+	if second.target.ChannelID != targetB.ChannelID {
+		t.Fatalf("second remote group = %#v, want channel %#v", second.target.ChannelID, targetB.ChannelID)
+	}
+	remote.complete(second)
+
+	select {
+	case results := <-done:
+		if len(results) != 2 || results[0].Err != nil || results[0].Result.MessageID != 1 || results[1].Err != nil || results[1].Result.MessageID != 2 {
+			t.Fatalf("results = %#v, want both remote groups to succeed in input order", results)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SendBatch did not finish after both remote groups completed")
+	}
+	if got := remote.maxConcurrentCalls(); got != 1 {
+		t.Fatalf("max concurrent remote calls = %d, want 1 for the same leader", got)
+	}
+}
+
+func TestRouterSendBatchRetriesOnlyFailedConcurrentGroupAndPreservesInputOrder(t *testing.T) {
+	targetA := routerTarget("retry-a", 2, 7)
+	targetB := routerTarget("retry-b", 2, 7)
+	resolver := &routerResolverForTest{targetsByChannel: map[ChannelID]AuthorityTarget{
+		targetA.ChannelID: targetA,
+		targetB.ChannelID: targetB,
+	}}
+	local := &routerRetryingLocalSubmitterForTest{retryChannel: targetA.ChannelID}
+	router := NewRouter(RouterOptions{
+		LocalNodeID:                 7,
+		Resolver:                    resolver,
+		Local:                       local,
+		RetryBackoff:                time.Millisecond,
+		MaxConcurrentGroupsPerBatch: 2,
+	})
+
+	results := router.SendBatch([]SendBatchItem{
+		routerItem("u0", "retry-a", 2),
+		routerItem("u1", "retry-b", 2),
+		routerItem("u2", "retry-a", 2),
+	})
+
+	if len(results) != 3 {
+		t.Fatalf("results len = %d, want 3", len(results))
+	}
+	for index, wantMessageID := range []uint64{1, 2, 3} {
+		if results[index].Err != nil || results[index].Result.MessageID != wantMessageID {
+			t.Fatalf("results[%d] = %+v, want message id %d", index, results[index], wantMessageID)
+		}
+	}
+	if got := local.callsFor(targetA.ChannelID); got != 2 {
+		t.Fatalf("retry-a calls = %d, want one failed call and one retry", got)
+	}
+	if got := local.callsFor(targetB.ChannelID); got != 1 {
+		t.Fatalf("retry-b calls = %d, want successful group submitted only once", got)
+	}
+	if resolver.calls != 3 {
+		t.Fatalf("resolver calls = %d, want retry-a resolved twice and retry-b once", resolver.calls)
 	}
 }
 
@@ -241,7 +515,31 @@ func TestRouterRetriesRouteErrorsWithinDeadline(t *testing.T) {
 			if resolver.calls != 2 || local.calls != 2 {
 				t.Fatalf("resolver/local calls = %d/%d, want retry through fresh resolve and submit", resolver.calls, local.calls)
 			}
+			if len(resolver.invalidated) != 1 || resolver.invalidated[0].ChannelID != target.ChannelID {
+				t.Fatalf("invalidated targets = %#v, want exact failed authority", resolver.invalidated)
+			}
 		})
+	}
+}
+
+func TestRouterInvalidatesFailedAuthorityAfterRetryBudgetIsExhausted(t *testing.T) {
+	target := routerTarget("terminal-stale", 2, 7)
+	resolver := &routerResolverForTest{targets: []AuthorityTarget{target}}
+	local := &routerLocalSubmitterForTest{errs: []error{ErrStaleRoute}}
+	router := NewRouter(RouterOptions{
+		LocalNodeID:      7,
+		Resolver:         resolver,
+		Local:            local,
+		MaxRouteAttempts: 1,
+	})
+
+	results := router.SendBatch([]SendBatchItem{routerItem("u1", "terminal-stale", 2)})
+
+	if len(results) != 1 || !errors.Is(results[0].Err, ErrStaleRoute) {
+		t.Fatalf("results = %#v, want terminal stale route", results)
+	}
+	if len(resolver.invalidated) != 1 || resolver.invalidated[0] != target {
+		t.Fatalf("invalidated targets = %#v, want exact terminal failed authority", resolver.invalidated)
 	}
 }
 
@@ -435,6 +733,87 @@ func TestRouterRejectsMissingChannelWithoutResolve(t *testing.T) {
 	}
 }
 
+func BenchmarkRouterSubmitResolvedGroupsNoLeaderOverflow(b *testing.B) {
+	const groupCount = 32
+	groups := make([]routerBatchGroup, groupCount)
+	for index := range groups {
+		channelID := ChannelID{ID: "remote-" + string(rune('a'+index)), Type: 2}
+		groups[index] = routerBatchGroup{
+			target: AuthorityTarget{
+				ChannelID:    channelID,
+				ChannelKey:   channelKey(channelID),
+				LeaderNodeID: 8,
+				Epoch:        1,
+				LeaderEpoch:  1,
+			},
+			indexes: []int{index},
+			items:   []SendBatchItem{routerItem("u0", channelID.ID, channelID.Type)},
+		}
+	}
+	router := NewRouter(RouterOptions{
+		LocalNodeID:                 7,
+		Remote:                      routerImmediateRemoteForwarder{},
+		MaxOutboundPerNode:          1024,
+		MaxConcurrentGroupsPerBatch: 3,
+	})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		results := router.submitResolvedGroups(groups)
+		if len(results) != groupCount {
+			b.Fatalf("results len = %d, want %d", len(results), groupCount)
+		}
+	}
+}
+
+func BenchmarkRouterCloudMediumColdBatch250Messages(b *testing.B) {
+	const (
+		authorityDelay = 200 * time.Microsecond
+		leaderNodeID   = 7
+	)
+	items := make([]SendBatchItem, 0, 250)
+	for index := range 125 {
+		items = append(items, routerItem(
+			fmt.Sprintf("person-%03d", index),
+			fmt.Sprintf("person-%03d", index),
+			1,
+		))
+	}
+	for profileIndex, messageCount := range []int{60, 42, 18, 5} {
+		for messageIndex := 0; messageIndex < messageCount; messageIndex++ {
+			items = append(items, routerItem(
+				fmt.Sprintf("sender-%03d", messageIndex),
+				fmt.Sprintf("group-%d", profileIndex),
+				2,
+			))
+		}
+	}
+	if len(items) != 250 {
+		b.Fatalf("benchmark items = %d, want 250", len(items))
+	}
+
+	for _, maxConcurrent := range []int{1, defaultRouterMaxConcurrentResolvesPerBatch} {
+		b.Run(fmt.Sprintf("resolve-concurrency-%d", maxConcurrent), func(b *testing.B) {
+			router := NewRouter(RouterOptions{
+				LocalNodeID:                   leaderNodeID,
+				Resolver:                      routerDelayedResolver{delay: authorityDelay, leaderNodeID: leaderNodeID},
+				Local:                         routerImmediateLocalSubmitter{},
+				MaxConcurrentResolvesPerBatch: maxConcurrent,
+				MaxConcurrentGroupsPerBatch:   1,
+			})
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				batch := append([]SendBatchItem(nil), items...)
+				results := router.SendBatch(batch)
+				if len(results) != len(items) {
+					b.Fatalf("results len = %d, want %d", len(results), len(items))
+				}
+			}
+		})
+	}
+}
+
 func routerTarget(channelID string, channelType uint8, leader uint64) AuthorityTarget {
 	return AuthorityTarget{
 		ChannelID:    ChannelID{ID: channelID, Type: channelType},
@@ -459,14 +838,69 @@ func routerItem(uid, channelID string, channelType uint8) SendBatchItem {
 }
 
 type routerResolverForTest struct {
+	mu               sync.Mutex
 	targetsByChannel map[ChannelID]AuthorityTarget
 	targets          []AuthorityTarget
 	errs             []error
 	lastID           ChannelID
 	calls            int
+	invalidated      []AuthorityTarget
+}
+
+type routerControlledResolver struct {
+	mu          sync.Mutex
+	entered     chan ChannelID
+	release     chan struct{}
+	inFlight    int
+	maxInFlight int
+}
+
+func newRouterControlledResolver(capacity int) *routerControlledResolver {
+	return &routerControlledResolver{
+		entered: make(chan ChannelID, capacity),
+		release: make(chan struct{}, capacity),
+	}
+}
+
+func (r *routerControlledResolver) ResolveAppendAuthority(_ context.Context, id ChannelID) (AuthorityTarget, error) {
+	r.mu.Lock()
+	r.inFlight++
+	if r.inFlight > r.maxInFlight {
+		r.maxInFlight = r.inFlight
+	}
+	r.mu.Unlock()
+	r.entered <- id
+	<-r.release
+	r.mu.Lock()
+	r.inFlight--
+	r.mu.Unlock()
+	return routerTarget(id.ID, id.Type, 7), nil
+}
+
+func (r *routerControlledResolver) nextCall(t *testing.T) ChannelID {
+	t.Helper()
+	select {
+	case channelID := <-r.entered:
+		return channelID
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for authority resolution")
+		return ChannelID{}
+	}
+}
+
+func (r *routerControlledResolver) releaseOne() {
+	r.release <- struct{}{}
+}
+
+func (r *routerControlledResolver) maxConcurrentCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.maxInFlight
 }
 
 func (r *routerResolverForTest) ResolveAppendAuthority(_ context.Context, id ChannelID) (AuthorityTarget, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	call := r.calls
 	r.calls++
 	r.lastID = id
@@ -482,6 +916,14 @@ func (r *routerResolverForTest) ResolveAppendAuthority(_ context.Context, id Cha
 	return AuthorityTarget{}, ErrRouteNotReady
 }
 
+func (r *routerResolverForTest) InvalidateAppendAuthority(id ChannelID, target AuthorityTarget) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if target.ChannelID == id {
+		r.invalidated = append(r.invalidated, target)
+	}
+}
+
 type routerLocalSubmitterForTest struct {
 	results       []SendBatchItemResult
 	errs          []error
@@ -491,6 +933,206 @@ type routerLocalSubmitterForTest struct {
 	calls         int
 	onSubmit      func()
 	completeDelay time.Duration
+}
+
+type routerControlledSubmitCall struct {
+	target AuthorityTarget
+	items  []SendBatchItem
+	future *Future
+	once   sync.Once
+}
+
+type routerControlledLocalSubmitter struct {
+	mu          sync.Mutex
+	entered     chan *routerControlledSubmitCall
+	calls       []*routerControlledSubmitCall
+	inFlight    int
+	maxInFlight int
+}
+
+type routerControlledRemoteCall struct {
+	target  AuthorityTarget
+	items   []SendBatchItem
+	release chan struct{}
+	once    sync.Once
+}
+
+type routerControlledRemoteForwarder struct {
+	mu          sync.Mutex
+	entered     chan *routerControlledRemoteCall
+	inFlight    int
+	maxInFlight int
+}
+
+type routerRetryingLocalSubmitterForTest struct {
+	mu           sync.Mutex
+	retryChannel ChannelID
+	calls        map[ChannelID]int
+}
+
+func (s *routerRetryingLocalSubmitterForTest) SubmitLocal(_ context.Context, target AuthorityTarget, items []SendBatchItem) (*Future, error) {
+	s.mu.Lock()
+	if s.calls == nil {
+		s.calls = make(map[ChannelID]int)
+	}
+	s.calls[target.ChannelID]++
+	call := s.calls[target.ChannelID]
+	s.mu.Unlock()
+	if target.ChannelID == s.retryChannel && call == 1 {
+		return nil, ErrNotLeader
+	}
+	future := newFuture(len(items))
+	future.complete(controlledRouterResults(items))
+	return future, nil
+}
+
+func (s *routerRetryingLocalSubmitterForTest) callsFor(channelID ChannelID) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls[channelID]
+}
+
+type routerImmediateRemoteForwarder struct{}
+
+func (routerImmediateRemoteForwarder) ForwardSendBatch(_ context.Context, _ AuthorityTarget, items []SendBatchItem) []SendBatchItemResult {
+	return controlledRouterResults(items)
+}
+
+type routerImmediateLocalSubmitter struct{}
+
+func (routerImmediateLocalSubmitter) SubmitLocal(_ context.Context, _ AuthorityTarget, items []SendBatchItem) (*Future, error) {
+	future := newFuture(len(items))
+	future.complete(controlledRouterResults(items))
+	return future, nil
+}
+
+type routerDelayedResolver struct {
+	delay        time.Duration
+	leaderNodeID uint64
+}
+
+func (r routerDelayedResolver) ResolveAppendAuthority(_ context.Context, id ChannelID) (AuthorityTarget, error) {
+	time.Sleep(r.delay)
+	return routerTarget(id.ID, id.Type, r.leaderNodeID), nil
+}
+
+func newRouterControlledRemoteForwarder(capacity int) *routerControlledRemoteForwarder {
+	return &routerControlledRemoteForwarder{entered: make(chan *routerControlledRemoteCall, capacity)}
+}
+
+func (r *routerControlledRemoteForwarder) ForwardSendBatch(_ context.Context, target AuthorityTarget, items []SendBatchItem) []SendBatchItemResult {
+	call := &routerControlledRemoteCall{
+		target:  target,
+		items:   append([]SendBatchItem(nil), items...),
+		release: make(chan struct{}),
+	}
+	r.mu.Lock()
+	r.inFlight++
+	if r.inFlight > r.maxInFlight {
+		r.maxInFlight = r.inFlight
+	}
+	r.mu.Unlock()
+	r.entered <- call
+	<-call.release
+	r.mu.Lock()
+	r.inFlight--
+	r.mu.Unlock()
+	return controlledRouterResults(call.items)
+}
+
+func (r *routerControlledRemoteForwarder) nextCall(t *testing.T) *routerControlledRemoteCall {
+	t.Helper()
+	select {
+	case call := <-r.entered:
+		return call
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for remote routed group")
+		return nil
+	}
+}
+
+func (r *routerControlledRemoteForwarder) complete(call *routerControlledRemoteCall) {
+	call.once.Do(func() { close(call.release) })
+}
+
+func (r *routerControlledRemoteForwarder) maxConcurrentCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.maxInFlight
+}
+
+func newRouterControlledLocalSubmitter(capacity int) *routerControlledLocalSubmitter {
+	return &routerControlledLocalSubmitter{entered: make(chan *routerControlledSubmitCall, capacity)}
+}
+
+func (s *routerControlledLocalSubmitter) SubmitLocal(_ context.Context, target AuthorityTarget, items []SendBatchItem) (*Future, error) {
+	call := &routerControlledSubmitCall{
+		target: target,
+		items:  append([]SendBatchItem(nil), items...),
+		future: newFuture(len(items)),
+	}
+	s.mu.Lock()
+	s.calls = append(s.calls, call)
+	s.inFlight++
+	if s.inFlight > s.maxInFlight {
+		s.maxInFlight = s.inFlight
+	}
+	s.mu.Unlock()
+	s.entered <- call
+	return call.future, nil
+}
+
+func (s *routerControlledLocalSubmitter) nextCall(t *testing.T) *routerControlledSubmitCall {
+	t.Helper()
+	select {
+	case call := <-s.entered:
+		return call
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for routed group")
+		return nil
+	}
+}
+
+func (s *routerControlledLocalSubmitter) complete(call *routerControlledSubmitCall, results []SendBatchItemResult) {
+	call.once.Do(func() {
+		s.mu.Lock()
+		s.inFlight--
+		s.mu.Unlock()
+		call.future.complete(results)
+	})
+}
+
+func (s *routerControlledLocalSubmitter) maxConcurrentCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.maxInFlight
+}
+
+func (s *routerControlledLocalSubmitter) callsSnapshot() []*routerControlledSubmitCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]*routerControlledSubmitCall(nil), s.calls...)
+}
+
+func controlledRouterResults(items []SendBatchItem) []SendBatchItemResult {
+	results := make([]SendBatchItemResult, len(items))
+	for index, item := range items {
+		var messageID uint64
+		switch item.Command.FromUID {
+		case "u0":
+			messageID = 1
+		case "u1":
+			messageID = 2
+		case "u2":
+			messageID = 3
+		case "u3":
+			messageID = 4
+		case "u4":
+			messageID = 5
+		}
+		results[index] = SendBatchItemResult{Result: SendResult{MessageID: messageID, Reason: ReasonSuccess}}
+	}
+	return results
 }
 
 func (s *routerLocalSubmitterForTest) SubmitLocal(_ context.Context, target AuthorityTarget, items []SendBatchItem) (*Future, error) {

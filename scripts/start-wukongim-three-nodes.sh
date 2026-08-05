@@ -18,6 +18,7 @@ PROMETHEUS_SCRAPE_INTERVAL="${WK_WUKONGIM_THREE_NODES_PROMETHEUS_SCRAPE_INTERVAL
 PROMETHEUS_SOURCE_REF="${WK_PROMETHEUS_SOURCE_REF:-${WK_PROMETHEUS_EMBED_VERSION:-v3.12.0}}"
 PROMETHEUS_REPO="${WK_PROMETHEUS_REPO:-https://github.com/prometheus/prometheus.git}"
 PROMETHEUS_EMBED_DIR="${WK_PROMETHEUS_EMBED_DIR:-$ROOT_DIR/internal/app/prometheus_embedded}"
+BUILD_TAGS="${WK_WUKONGIM_THREE_NODES_BUILD_TAGS:-}"
 PID_DIR="${WK_WUKONGIM_THREE_NODES_PID_DIR:-}"
 ALLOW_NODE_EXIT="${WK_WUKONGIM_THREE_NODES_ALLOW_NODE_EXIT:-}"
 BUILD=1
@@ -37,6 +38,7 @@ METRICS_TARGETS=(
 )
 PIDS=()
 ALLOW_NODE_EXIT_VALUES=()
+BUILD_COMMAND=()
 
 usage() {
   cat <<'USAGE'
@@ -53,6 +55,7 @@ to keep only the node metrics endpoints.
 Options:
   --clean                Remove the node data directories and log dir before start.
   --no-build             Reuse --bin instead of running go build.
+  --build-tags TAGS      Optional comma-separated Go build tags.
   --bin PATH             Binary path. Default: WK_WUKONGIM_THREE_NODES_BIN or data/wukongim-three-nodes/wukongim.
   --log-dir DIR          Per-node log directory. Default: WK_WUKONGIM_THREE_NODES_LOG_DIR or data/wukongim-three-node-logs.
   --data-root DIR        Parent for isolated node data directories. Default: WK_WUKONGIM_THREE_NODES_DATA_ROOT or data/.
@@ -184,10 +187,49 @@ prometheus_node_env_preview() {
   printf 'WK_METRICS_ENABLE=true WK_PROMETHEUS_ENABLE=false'
 }
 
+prepare_build_command() {
+  local git_dir=""
+  local git_work_tree=""
+  local build_env=("GOWORK=off")
+  BUILD_COMMAND=()
+  if [[ "$BUILD" -eq 0 ]]; then
+    return
+  fi
+  # Go otherwise reads the primary checkout's HEAD when this script runs from a linked worktree.
+  if git_dir="$(git -C "$ROOT_DIR" rev-parse --absolute-git-dir 2>/dev/null)" &&
+    git_work_tree="$(git -C "$ROOT_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
+    build_env+=("GIT_DIR=$git_dir" "GIT_WORK_TREE=$git_work_tree")
+  fi
+  if [[ -n "$BUILD_TAGS" ]]; then
+    BUILD_COMMAND=(env "${build_env[@]}" go build -buildvcs=true "-tags=$BUILD_TAGS" -o "$BIN_PATH" ./cmd/wukongim)
+  else
+    BUILD_COMMAND=(env "${build_env[@]}" go build -buildvcs=true -o "$BIN_PATH" ./cmd/wukongim)
+  fi
+}
+
+print_shell_command() {
+  local label="$1"
+  local separator=""
+  local arg
+  shift
+  printf '%s' "$label"
+  for arg in "$@"; do
+    printf '%s' "$separator"
+    printf '%q' "$arg"
+    separator=" "
+  done
+  printf '\n'
+}
+
+node_env_preview() {
+  local node="$1"
+  printf '%s' "$(prometheus_node_env_preview "$node")"
+}
+
 print_plan() {
   printf 'repo_root=%s\n' "$ROOT_DIR"
   if [[ "$BUILD" -eq 1 ]]; then
-    printf 'build_cmd=go build -o %s ./cmd/wukongim\n' "$BIN_PATH"
+    print_shell_command 'build_cmd=' "${BUILD_COMMAND[@]}"
   else
     printf 'build_cmd=<disabled>\n'
   fi
@@ -218,7 +260,7 @@ print_plan() {
       printf 'node%s_pid_file=%s\n' "$node" "$(pid_file "$node")"
     fi
     printf 'node%s_ready=%s\n' "$node" "${READY_URLS[$i]}"
-    printf 'node%s_env=%s\n' "$node" "$(prometheus_node_env_preview "$node")"
+    printf 'node%s_env=%s\n' "$node" "$(node_env_preview "$node")"
     printf 'node%s_cmd=%s -config %s\n' "$node" "$BIN_PATH" "$(config_path "$node")"
   done
 }
@@ -269,6 +311,11 @@ while [[ $# -gt 0 ]]; do
     --no-build)
       BUILD=0
       shift
+      ;;
+    --build-tags)
+      [[ $# -ge 2 ]] || die '--build-tags requires a value'
+      BUILD_TAGS="$2"
+      shift 2
       ;;
     --bin)
       [[ $# -ge 2 ]] || die '--bin requires a value'
@@ -347,6 +394,7 @@ require_uint '--poll' "$POLL_INTERVAL"
 require_bool 'prometheus enable' "$PROMETHEUS_ENABLE"
 [[ -n "$DATA_ROOT" ]] || die '--data-root must not be empty'
 parse_allow_node_exit
+prepare_build_command
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   print_plan
@@ -409,7 +457,7 @@ if [[ "$BUILD" -eq 1 ]]; then
   log "building $BIN_PATH"
   (
     cd "$ROOT_DIR"
-    go build -o "$BIN_PATH" ./cmd/wukongim
+    "${BUILD_COMMAND[@]}"
   )
 elif [[ ! -x "$BIN_PATH" ]]; then
   die "--no-build requested but binary is not executable: $BIN_PATH"

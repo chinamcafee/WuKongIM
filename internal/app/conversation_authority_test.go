@@ -9,10 +9,12 @@ import (
 	accessnode "github.com/WuKongIM/WuKongIM/internal/access/node"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/conversationactive"
 	conversationusecase "github.com/WuKongIM/WuKongIM/internal/usecase/conversation"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/propose"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 )
 
 var _ accessnode.ConversationAuthority = (*conversationAuthority)(nil)
+var _ accessnode.ConversationBatchAuthority = (*conversationAuthority)(nil)
 
 func TestConversationAuthorityRuntimeListSeesCacheBeforeFlush(t *testing.T) {
 	store := &recordingConversationAuthorityStore{}
@@ -182,6 +184,273 @@ func TestConversationAuthorityAdmitActiveBatchActiveFastPathSkipsCurrentRouteLoo
 	}
 }
 
+func TestConversationAuthorityDrainWaitsForReservedSingleAdmission(t *testing.T) {
+	store := &recordingConversationAuthorityStore{}
+	authority := newConversationAuthority(conversationAuthorityOptions{LocalNodeID: 1, Store: store, MaxRows: 10})
+	target := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 9, ConfigEpoch: 3}
+	authority.markActive(target)
+
+	mutationReady := make(chan struct{})
+	releaseMutation := make(chan struct{})
+	authority.beforeActiveMutation = func() {
+		close(mutationReady)
+		<-releaseMutation
+	}
+	admitDone := make(chan error, 1)
+	go func() {
+		admitDone <- authority.AdmitActiveBatch(context.Background(), target, conversationactive.ActiveBatch{
+			Kind:        metadb.ConversationKindNormal,
+			SenderUID:   "alice",
+			ChannelID:   "reserved-single",
+			ChannelType: 2,
+			MessageSeq:  7,
+			ActiveAtMS:  100,
+		})
+	}()
+	<-mutationReady
+	authority.mu.Lock()
+	reserved, hasReservation := authority.admissions[targetKey(target)]
+	inFlight := 0
+	if hasReservation {
+		inFlight = reserved.inFlight
+	}
+	authority.mu.Unlock()
+	if inFlight != 1 {
+		close(releaseMutation)
+		<-admitDone
+		t.Fatalf("single-target reservations = %d, want 1", inFlight)
+	}
+
+	type drainOutcome struct {
+		result conversationDrainResult
+		err    error
+	}
+	drainDone := make(chan drainOutcome, 1)
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), time.Second)
+	defer cancelDrain()
+	go func() {
+		result, err := authority.DrainAuthority(drainCtx, target)
+		drainDone <- drainOutcome{result: result, err: err}
+	}()
+
+	select {
+	case outcome := <-drainDone:
+		close(releaseMutation)
+		<-admitDone
+		t.Fatalf("DrainAuthority() completed before reserved single mutation: result=%q err=%v", outcome.result, outcome.err)
+	case <-time.After(20 * time.Millisecond):
+		close(releaseMutation)
+	}
+	if err := <-admitDone; err != nil {
+		t.Fatalf("AdmitActiveBatch() error = %v", err)
+	}
+	outcome := <-drainDone
+	if outcome.err != nil || outcome.result != conversationDrainResultDrained {
+		t.Fatalf("DrainAuthority() = %q, %v, want drained after admission", outcome.result, outcome.err)
+	}
+	if len(store.touched) != 1 || store.touched[0].ChannelID != "reserved-single" {
+		t.Fatalf("durable touches = %#v, want admitted row drained before handoff", store.touched)
+	}
+	if _, ok := authority.active.EntryForTest(metadb.ConversationKindNormal, "alice", "reserved-single", 2); ok {
+		t.Fatal("reserved single admission remained cached after drain")
+	}
+}
+
+func TestConversationAuthorityAdmissionObserverCanReenterList(t *testing.T) {
+	target := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 9, ConfigEpoch: 3}
+	observer := &reentrantConversationAdmissionObserver{
+		target: target,
+		uid:    "alice",
+		done:   make(chan error, 1),
+	}
+	authority := newConversationAuthority(conversationAuthorityOptions{
+		LocalNodeID: 1,
+		Store:       &recordingConversationAuthorityStore{},
+		MaxRows:     10,
+		Observer:    observer,
+	})
+	observer.authority = authority
+	authority.markActive(target)
+
+	admitDone := make(chan error, 1)
+	go func() {
+		admitDone <- authority.AdmitActiveBatch(context.Background(), target, conversationactive.ActiveBatch{
+			Kind:        metadb.ConversationKindNormal,
+			SenderUID:   "alice",
+			ChannelID:   "observer-reentry",
+			ChannelType: 2,
+			MessageSeq:  7,
+			ActiveAtMS:  100,
+		})
+	}()
+	select {
+	case err := <-admitDone:
+		if err != nil {
+			t.Fatalf("AdmitActiveBatch() error = %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("AdmitActiveBatch() did not return; runtime observer likely reentered while authority lock was held")
+	}
+	select {
+	case err := <-observer.done:
+		if err != nil {
+			t.Fatalf("runtime observer reentrant list error = %v", err)
+		}
+	default:
+		t.Fatal("runtime admission observer did not reenter list")
+	}
+}
+
+func TestConversationAuthorityDrainWaitsForReservedPatchAdmission(t *testing.T) {
+	store := &recordingConversationAuthorityStore{}
+	authority := newConversationAuthority(conversationAuthorityOptions{LocalNodeID: 1, Store: store, MaxRows: 10})
+	target := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 9, ConfigEpoch: 3}
+	authority.markActive(target)
+	mutationReady := make(chan struct{})
+	releaseMutation := make(chan struct{})
+	authority.beforeActiveMutation = func() {
+		close(mutationReady)
+		<-releaseMutation
+	}
+	admitDone := make(chan error, 1)
+	go func() {
+		admitDone <- authority.AdmitPatches(context.Background(), target, []conversationusecase.ActivePatch{{
+			UID: "alice", Kind: metadb.ConversationKindNormal, ChannelID: "reserved-patch", ChannelType: 2, ActiveAt: 100, MessageSeq: 7,
+		}})
+	}()
+	<-mutationReady
+
+	type drainOutcome struct {
+		result conversationDrainResult
+		err    error
+	}
+	drainDone := make(chan drainOutcome, 1)
+	go func() {
+		result, err := authority.DrainAuthority(context.Background(), target)
+		drainDone <- drainOutcome{result: result, err: err}
+	}()
+	select {
+	case outcome := <-drainDone:
+		close(releaseMutation)
+		<-admitDone
+		t.Fatalf("DrainAuthority() completed before reserved patch mutation: result=%q err=%v", outcome.result, outcome.err)
+	case <-time.After(20 * time.Millisecond):
+		close(releaseMutation)
+	}
+	if err := <-admitDone; err != nil {
+		t.Fatalf("AdmitPatches() error = %v", err)
+	}
+	outcome := <-drainDone
+	if outcome.err != nil || outcome.result != conversationDrainResultDrained {
+		t.Fatalf("DrainAuthority() = %q, %v, want drained after patch admission", outcome.result, outcome.err)
+	}
+	if len(store.touched) != 1 || store.touched[0].ChannelID != "reserved-patch" {
+		t.Fatalf("durable touches = %#v, want patch drained before handoff", store.touched)
+	}
+}
+
+func TestConversationAuthorityDrainReservationWaitHonorsContext(t *testing.T) {
+	authority := newConversationAuthority(conversationAuthorityOptions{LocalNodeID: 1, Store: &recordingConversationAuthorityStore{}, MaxRows: 10})
+	target := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 9, ConfigEpoch: 3}
+	authority.markActive(target)
+	mutationReady := make(chan struct{})
+	releaseMutation := make(chan struct{})
+	authority.beforeActiveMutation = func() {
+		close(mutationReady)
+		<-releaseMutation
+	}
+	admitDone := make(chan error, 1)
+	go func() {
+		admitDone <- authority.AdmitPatches(context.Background(), target, []conversationusecase.ActivePatch{{
+			UID: "alice", Kind: metadb.ConversationKindNormal, ChannelID: "bounded-wait", ChannelType: 2, ActiveAt: 100, MessageSeq: 7,
+		}})
+	}()
+	<-mutationReady
+
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	result, err := authority.DrainAuthority(drainCtx, target)
+	cancelDrain()
+	if !errors.Is(err, context.DeadlineExceeded) || result != conversationDrainResultBusy {
+		close(releaseMutation)
+		<-admitDone
+		t.Fatalf("DrainAuthority() = %q, %v, want busy deadline while reservation remains", result, err)
+	}
+	close(releaseMutation)
+	if err := <-admitDone; err != nil {
+		t.Fatalf("AdmitPatches() error = %v", err)
+	}
+	if result, err := authority.finishDrainingAuthority(context.Background(), target); err != nil || result != conversationDrainResultDrained {
+		t.Fatalf("finishDrainingAuthority() = %q, %v, want later bounded drain", result, err)
+	}
+}
+
+func TestConversationAuthorityOldReservationDoesNotBlockNewExactTargetSameHashSlot(t *testing.T) {
+	authority := newConversationAuthority(conversationAuthorityOptions{LocalNodeID: 1, Store: &recordingConversationAuthorityStore{}, MaxRows: 10})
+	oldTarget := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 9, ConfigEpoch: 3}
+	newTarget := oldTarget
+	newTarget.LeaderTerm++
+	authority.markActive(oldTarget)
+	mutationReady := make(chan struct{})
+	releaseMutation := make(chan struct{})
+	authority.beforeActiveMutation = func() {
+		close(mutationReady)
+		<-releaseMutation
+	}
+	admitDone := make(chan error, 1)
+	go func() {
+		admitDone <- authority.AdmitActiveBatch(context.Background(), oldTarget, conversationactive.ActiveBatch{
+			Kind: metadb.ConversationKindNormal, SenderUID: "old", ChannelID: "old-tenure", ChannelType: 2, MessageSeq: 7, ActiveAtMS: 100,
+		})
+	}()
+	<-mutationReady
+
+	type beginOutcome struct {
+		result conversationDrainResult
+		err    error
+	}
+	beginDone := make(chan beginOutcome, 1)
+	go func() {
+		if _, err := authority.beginDrainAuthority(oldTarget); err != nil {
+			beginDone <- beginOutcome{err: err}
+			return
+		}
+		result, err := authority.flushDrainingAuthority(context.Background(), oldTarget)
+		beginDone <- beginOutcome{result: result, err: err}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		authority.mu.Lock()
+		draining := authority.targets[targetKey(oldTarget)] == conversationAuthorityDraining
+		authority.mu.Unlock()
+		if draining {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(releaseMutation)
+			<-admitDone
+			t.Fatal("old target was not marked draining")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	authority.markActive(newTarget)
+	reserved, err := authority.reserveAdmissionTarget(newTarget)
+	if err != nil {
+		close(releaseMutation)
+		<-admitDone
+		t.Fatalf("reserveAdmissionTarget(newTarget) error = %v", err)
+	}
+	authority.releaseAdmissionTarget(reserved)
+	close(releaseMutation)
+	if err := <-admitDone; err != nil {
+		t.Fatalf("old AdmitActiveBatch() error = %v", err)
+	}
+	outcome := <-beginDone
+	if outcome.err != nil || outcome.result != conversationDrainResultTransferred {
+		t.Fatalf("flushDrainingAuthority(oldTarget) = %q, %v, want transferred after new target publish", outcome.result, outcome.err)
+	}
+}
+
 func TestConversationAuthorityAdmitActiveBatchRejectsInvalidKind(t *testing.T) {
 	target := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 9, ConfigEpoch: 3, RouteRevision: 10, AuthorityEpoch: 20}
 	authority := newConversationAuthority(conversationAuthorityOptions{
@@ -207,6 +476,235 @@ func TestConversationAuthorityAdmitActiveBatchRejectsInvalidKind(t *testing.T) {
 	}
 	if len(page.Rows) != 0 {
 		t.Fatalf("rows = %#v, want invalid batch kept out of cache", page.Rows)
+	}
+}
+
+func TestConversationAuthorityAdmitActiveBatchesKeepsAlignedTargetResults(t *testing.T) {
+	authority := newConversationAuthority(conversationAuthorityOptions{
+		LocalNodeID: 1,
+		Store:       &recordingConversationAuthorityStore{},
+		MaxRows:     10,
+	})
+	first := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 11, LeaderNodeID: 1, LeaderTerm: 7, ConfigEpoch: 3, RouteRevision: 10, AuthorityEpoch: 20}
+	second := conversationusecase.RouteTarget{HashSlot: 2, SlotID: 12, LeaderNodeID: 1, LeaderTerm: 8, ConfigEpoch: 4, RouteRevision: 11, AuthorityEpoch: 21}
+	staleSecond := second
+	staleSecond.LeaderTerm--
+	authority.markActive(first)
+	authority.markActive(second)
+
+	results := authority.AdmitActiveBatches(context.Background(), []accessnode.ConversationActiveBatchGroup{
+		{Target: first, Batch: conversationactive.ActiveBatch{Kind: metadb.ConversationKindNormal, SenderUID: "alice", ChannelID: "room", ChannelType: 2, MessageSeq: 7, ActiveAtMS: 100}},
+		{Target: staleSecond, Batch: conversationactive.ActiveBatch{Kind: metadb.ConversationKindNormal, Recipients: []conversationactive.ActiveEntry{{UID: "stale"}}, ChannelID: "room", ChannelType: 2, MessageSeq: 7, ActiveAtMS: 100}},
+		{Target: second, Batch: conversationactive.ActiveBatch{Kind: metadb.ConversationKindNormal, Recipients: []conversationactive.ActiveEntry{{UID: "bob"}}, ChannelID: "room", ChannelType: 2, MessageSeq: 7, ActiveAtMS: 100}},
+	})
+	if len(results) != 3 {
+		t.Fatalf("AdmitActiveBatches() result count = %d, want 3", len(results))
+	}
+	if results[0].Err != nil || !errors.Is(results[1].Err, conversationusecase.ErrStaleRoute) || results[2].Err != nil {
+		t.Fatalf("AdmitActiveBatches() results = %+v, want [ok stale_route ok]", results)
+	}
+
+	for _, uid := range []string{"alice", "bob"} {
+		if _, ok := authority.active.EntryForTest(metadb.ConversationKindNormal, uid, "room", 2); !ok {
+			t.Fatalf("valid sibling %q was not admitted", uid)
+		}
+	}
+	if _, ok := authority.active.EntryForTest(metadb.ConversationKindNormal, "stale", "room", 2); ok {
+		t.Fatal("stale sibling was admitted")
+	}
+}
+
+func TestConversationAuthorityDrainWaitsForReservedBulkAdmission(t *testing.T) {
+	store := &recordingConversationAuthorityStore{}
+	authority := newConversationAuthority(conversationAuthorityOptions{LocalNodeID: 1, Store: store, MaxRows: 10})
+	target := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 9, ConfigEpoch: 3}
+	authority.markActive(target)
+
+	mutationReady := make(chan struct{})
+	releaseMutation := make(chan struct{})
+	authority.beforeActiveMutation = func() {
+		close(mutationReady)
+		<-releaseMutation
+	}
+	admitDone := make(chan []accessnode.ConversationActiveBatchResult, 1)
+	go func() {
+		admitDone <- authority.AdmitActiveBatches(context.Background(), []accessnode.ConversationActiveBatchGroup{
+			{Target: target, Batch: conversationactive.ActiveBatch{Kind: metadb.ConversationKindNormal, SenderUID: "alice", ChannelID: "reserved-bulk-a", ChannelType: 2, MessageSeq: 7, ActiveAtMS: 100}},
+			{Target: target, Batch: conversationactive.ActiveBatch{Kind: metadb.ConversationKindNormal, Recipients: []conversationactive.ActiveEntry{{UID: "bob"}}, ChannelID: "reserved-bulk-b", ChannelType: 2, MessageSeq: 8, ActiveAtMS: 110}},
+		})
+	}()
+	<-mutationReady
+	authority.mu.Lock()
+	reserved, hasReservation := authority.admissions[targetKey(target)]
+	inFlight := 0
+	if hasReservation {
+		inFlight = reserved.inFlight
+	}
+	authority.mu.Unlock()
+	if inFlight != 1 {
+		close(releaseMutation)
+		<-admitDone
+		t.Fatalf("same-target bulk reservations = %d, want 1", inFlight)
+	}
+
+	type drainOutcome struct {
+		result conversationDrainResult
+		err    error
+	}
+	drainDone := make(chan drainOutcome, 1)
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), time.Second)
+	defer cancelDrain()
+	go func() {
+		result, err := authority.DrainAuthority(drainCtx, target)
+		drainDone <- drainOutcome{result: result, err: err}
+	}()
+
+	select {
+	case outcome := <-drainDone:
+		close(releaseMutation)
+		<-admitDone
+		t.Fatalf("DrainAuthority() completed before reserved bulk mutation: result=%q err=%v", outcome.result, outcome.err)
+	case <-time.After(20 * time.Millisecond):
+		close(releaseMutation)
+	}
+	results := <-admitDone
+	if len(results) != 2 || results[0].Err != nil || results[1].Err != nil {
+		t.Fatalf("AdmitActiveBatches() results = %+v, want both admitted", results)
+	}
+	outcome := <-drainDone
+	if outcome.err != nil || outcome.result != conversationDrainResultDrained {
+		t.Fatalf("DrainAuthority() = %q, %v, want drained after bulk admission", outcome.result, outcome.err)
+	}
+	if len(store.touched) != 2 {
+		t.Fatalf("durable touches = %#v, want both bulk rows drained before handoff", store.touched)
+	}
+	for _, row := range []struct {
+		uid       string
+		channelID string
+	}{{uid: "alice", channelID: "reserved-bulk-a"}, {uid: "bob", channelID: "reserved-bulk-b"}} {
+		if _, ok := authority.active.EntryForTest(metadb.ConversationKindNormal, row.uid, row.channelID, 2); ok {
+			t.Fatalf("reserved bulk admission %s/%s remained cached after drain", row.uid, row.channelID)
+		}
+	}
+}
+
+func TestConversationAuthorityAdmitActiveBatchesPreservesLazyActivation(t *testing.T) {
+	first := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 11, LeaderNodeID: 1, LeaderTerm: 7, ConfigEpoch: 3, RouteRevision: 10, AuthorityEpoch: 20}
+	second := conversationusecase.RouteTarget{HashSlot: 2, SlotID: 12, LeaderNodeID: 1, LeaderTerm: 8, ConfigEpoch: 4, RouteRevision: 11, AuthorityEpoch: 21}
+	lookups := 0
+	authority := newConversationAuthority(conversationAuthorityOptions{
+		LocalNodeID: 1,
+		Store:       &recordingConversationAuthorityStore{},
+		MaxRows:     10,
+		CurrentRouteTarget: func(hashSlot uint16) (conversationusecase.RouteTarget, bool) {
+			lookups++
+			switch hashSlot {
+			case first.HashSlot:
+				return first, true
+			case second.HashSlot:
+				return second, true
+			default:
+				return conversationusecase.RouteTarget{}, false
+			}
+		},
+	})
+	results := authority.AdmitActiveBatches(context.Background(), []accessnode.ConversationActiveBatchGroup{
+		{Target: first, Batch: conversationactive.ActiveBatch{Kind: metadb.ConversationKindNormal, SenderUID: "alice", ChannelID: "room", ChannelType: 2, MessageSeq: 7, ActiveAtMS: 100}},
+		{Target: second, Batch: conversationactive.ActiveBatch{Kind: metadb.ConversationKindNormal, Recipients: []conversationactive.ActiveEntry{{UID: "bob"}}, ChannelID: "room", ChannelType: 2, MessageSeq: 7, ActiveAtMS: 100}},
+	})
+	if len(results) != 2 || results[0].Err != nil || results[1].Err != nil {
+		t.Fatalf("AdmitActiveBatches() results = %+v, want both lazily active", results)
+	}
+	if lookups != 2 {
+		t.Fatalf("current route lookups = %d, want one per initially stale hash slot", lookups)
+	}
+}
+
+func TestConversationAuthorityAdmitActiveBatchesRevalidatesSiblingAfterLazyActivation(t *testing.T) {
+	oldTarget := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 11, LeaderNodeID: 1, LeaderTerm: 7, ConfigEpoch: 3, RouteRevision: 10, AuthorityEpoch: 20}
+	newTarget := oldTarget
+	newTarget.LeaderTerm++
+	newTarget.RouteRevision++
+	newTarget.AuthorityEpoch++
+	authority := newConversationAuthority(conversationAuthorityOptions{
+		LocalNodeID: 1,
+		Store:       &recordingConversationAuthorityStore{},
+		MaxRows:     10,
+		CurrentRouteTarget: func(hashSlot uint16) (conversationusecase.RouteTarget, bool) {
+			if hashSlot != newTarget.HashSlot {
+				return conversationusecase.RouteTarget{}, false
+			}
+			return newTarget, true
+		},
+	})
+	authority.markActive(oldTarget)
+
+	results := authority.AdmitActiveBatches(context.Background(), []accessnode.ConversationActiveBatchGroup{
+		{Target: oldTarget, Batch: conversationactive.ActiveBatch{Kind: metadb.ConversationKindNormal, SenderUID: "old", ChannelID: "room", ChannelType: 2, MessageSeq: 7, ActiveAtMS: 100}},
+		{Target: newTarget, Batch: conversationactive.ActiveBatch{Kind: metadb.ConversationKindNormal, Recipients: []conversationactive.ActiveEntry{{UID: "new"}}, ChannelID: "room", ChannelType: 2, MessageSeq: 7, ActiveAtMS: 100}},
+	})
+	if len(results) != 2 || !errors.Is(results[0].Err, conversationusecase.ErrStaleRoute) || results[1].Err != nil {
+		t.Fatalf("AdmitActiveBatches() results = %+v, want [stale_route ok]", results)
+	}
+	if _, ok := authority.active.EntryForTest(metadb.ConversationKindNormal, "old", "room", 2); ok {
+		t.Fatal("old target sibling was admitted after replacement")
+	}
+	if _, ok := authority.active.EntryForTest(metadb.ConversationKindNormal, "new", "room", 2); !ok {
+		t.Fatal("current lazily activated sibling was not admitted")
+	}
+}
+
+func TestConversationAuthorityAdmitActiveBatchesCachePressureIsAtomic(t *testing.T) {
+	authority := newConversationAuthority(conversationAuthorityOptions{LocalNodeID: 1, Store: &recordingConversationAuthorityStore{}, MaxRows: 1})
+	first := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 11, LeaderNodeID: 1, LeaderTerm: 7, ConfigEpoch: 3}
+	second := conversationusecase.RouteTarget{HashSlot: 2, SlotID: 12, LeaderNodeID: 1, LeaderTerm: 8, ConfigEpoch: 4}
+	authority.markActive(first)
+	authority.markActive(second)
+	results := authority.AdmitActiveBatches(context.Background(), []accessnode.ConversationActiveBatchGroup{
+		{Target: first, Batch: conversationactive.ActiveBatch{Kind: metadb.ConversationKindNormal, SenderUID: "alice", ChannelID: "room", ChannelType: 2, MessageSeq: 7, ActiveAtMS: 100}},
+		{Target: second, Batch: conversationactive.ActiveBatch{Kind: metadb.ConversationKindNormal, Recipients: []conversationactive.ActiveEntry{{UID: "bob"}}, ChannelID: "room", ChannelType: 2, MessageSeq: 7, ActiveAtMS: 100}},
+	})
+	if len(results) != 2 || !errors.Is(results[0].Err, conversationusecase.ErrCachePressure) || !errors.Is(results[1].Err, conversationusecase.ErrCachePressure) {
+		t.Fatalf("AdmitActiveBatches() results = %+v, want cache pressure for every valid sibling", results)
+	}
+	for _, uid := range []string{"alice", "bob"} {
+		if _, ok := authority.active.EntryForTest(metadb.ConversationKindNormal, uid, "room", 2); ok {
+			t.Fatalf("cache contains %q after atomic pressure rejection", uid)
+		}
+	}
+}
+
+func TestConversationAuthorityAdmitActiveBatchesRejectsCrossHashSlotAddress(t *testing.T) {
+	authority := newConversationAuthority(conversationAuthorityOptions{LocalNodeID: 1, Store: &recordingConversationAuthorityStore{}, MaxRows: 10})
+	first := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 11, LeaderNodeID: 1, LeaderTerm: 7, ConfigEpoch: 3}
+	second := conversationusecase.RouteTarget{HashSlot: 2, SlotID: 12, LeaderNodeID: 1, LeaderTerm: 8, ConfigEpoch: 4}
+	authority.markActive(first)
+	authority.markActive(second)
+	results := authority.AdmitActiveBatches(context.Background(), []accessnode.ConversationActiveBatchGroup{
+		{Target: first, Batch: conversationactive.ActiveBatch{Kind: metadb.ConversationKindNormal, Recipients: []conversationactive.ActiveEntry{{UID: "same"}}, ChannelID: "room", ChannelType: 2, MessageSeq: 7, ActiveAtMS: 100}},
+		{Target: second, Batch: conversationactive.ActiveBatch{Kind: metadb.ConversationKindNormal, Recipients: []conversationactive.ActiveEntry{{UID: "same"}}, ChannelID: "room", ChannelType: 2, MessageSeq: 8, ActiveAtMS: 110}},
+	})
+	if len(results) != 2 || !errors.Is(results[0].Err, conversationactive.ErrHashSlotConflict) || !errors.Is(results[1].Err, conversationactive.ErrHashSlotConflict) {
+		t.Fatalf("AdmitActiveBatches() results = %+v, want hash-slot conflict for both valid siblings", results)
+	}
+	if _, ok := authority.active.EntryForTest(metadb.ConversationKindNormal, "same", "room", 2); ok {
+		t.Fatal("cache contains conflicted address after atomic rejection")
+	}
+}
+
+func TestConversationAuthorityAdmitActiveBatchesIgnoresDiagnosticTargetFields(t *testing.T) {
+	authority := newConversationAuthority(conversationAuthorityOptions{LocalNodeID: 1, Store: &recordingConversationAuthorityStore{}, MaxRows: 10})
+	target := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 11, LeaderNodeID: 1, LeaderTerm: 7, ConfigEpoch: 3, RouteRevision: 10, AuthorityEpoch: 20}
+	authority.markActive(target)
+	diagnosticOnly := target
+	diagnosticOnly.RouteRevision = 99
+	diagnosticOnly.AuthorityEpoch = 100
+	results := authority.AdmitActiveBatches(context.Background(), []accessnode.ConversationActiveBatchGroup{{
+		Target: diagnosticOnly,
+		Batch:  conversationactive.ActiveBatch{Kind: metadb.ConversationKindNormal, SenderUID: "alice", ChannelID: "room", ChannelType: 2, MessageSeq: 7, ActiveAtMS: 100},
+	}})
+	if len(results) != 1 || results[0].Err != nil {
+		t.Fatalf("AdmitActiveBatches() results = %+v, want diagnostic-only differences accepted", results)
 	}
 }
 
@@ -414,8 +912,8 @@ func TestConversationAuthorityFlushPersistsRuntimeReadFloor(t *testing.T) {
 	if err := authority.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush() error = %v", err)
 	}
-	if len(store.touched) != 1 || store.touched[0].ReadSeq != 8 || store.touched[0].DeletedToSeq != 0 || store.touched[0].MessageSeq != 0 {
-		t.Fatalf("durable patches = %#v, want flushed runtime read floor only", store.touched)
+	if len(store.touched) != 1 || store.touched[0].ReadSeq != 8 || store.touched[0].DeletedToSeq != 0 || store.touched[0].MessageSeq != 9 {
+		t.Fatalf("durable patches = %#v, want flushed runtime read floor and message fence", store.touched)
 	}
 	page, err := authority.ListConversationActiveViewForTarget(context.Background(), target, metadb.ConversationKindNormal, "u1", metadb.ConversationActiveCursor{}, 10)
 	if err != nil {
@@ -426,7 +924,257 @@ func TestConversationAuthorityFlushPersistsRuntimeReadFloor(t *testing.T) {
 	}
 }
 
-func TestConversationAuthorityCacheOnlyRowHydratesPrimaryDeleteBarrier(t *testing.T) {
+func TestConversationAuthorityHideReconcilesCooldownCacheAndAllowsNewerMessage(t *testing.T) {
+	const baselineActiveAt int64 = 1_000
+	key := metadb.ConversationKey{ChannelID: "room", ChannelType: 2}
+	baseline := metadb.ConversationState{UID: "u1", Kind: metadb.ConversationKindNormal, ChannelID: key.ChannelID, ChannelType: key.ChannelType, ActiveAt: baselineActiveAt}
+	store := &recordingConversationAuthorityStore{
+		activeRows: []metadb.ConversationState{baseline},
+		primary:    map[metadb.ConversationKey]metadb.ConversationState{key: baseline},
+	}
+	authority := newConversationAuthority(conversationAuthorityOptions{
+		LocalNodeID:    1,
+		Store:          store,
+		MaxRows:        100,
+		ActiveCooldown: 2 * time.Hour,
+	})
+	target := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 3, ConfigEpoch: 4, RouteRevision: 5}
+	authority.markActive(target)
+	insideCooldown := baselineActiveAt + int64(time.Hour/time.Millisecond)
+	if err := authority.AdmitActiveBatch(context.Background(), target, conversationactive.ActiveBatch{
+		Kind: metadb.ConversationKindNormal, ChannelID: key.ChannelID, ChannelType: uint8(key.ChannelType), MessageSeq: 9, ActiveAtMS: insideCooldown,
+		Recipients: []conversationactive.ActiveEntry{{UID: "u1"}},
+	}); err != nil {
+		t.Fatalf("AdmitActiveBatch(before hide) error = %v", err)
+	}
+	if result, err := authority.FlushActiveRows(context.Background(), 0); err != nil || result.Skipped != 1 || result.Cleared != 1 {
+		t.Fatalf("FlushActiveRows(before hide) = %+v, %v, want cooldown skip", result, err)
+	}
+
+	deleteReq := metadb.ConversationDelete{UID: "u1", Kind: metadb.ConversationKindNormal, ChannelID: key.ChannelID, ChannelType: key.ChannelType, DeletedToSeq: 9, UpdatedAt: 200}
+	if err := authority.HideConversationsForTarget(context.Background(), target, []metadb.ConversationDelete{deleteReq}); err != nil {
+		t.Fatalf("HideConversationsForTarget() error = %v", err)
+	}
+	page, err := authority.ListConversationActiveViewForTarget(context.Background(), target, metadb.ConversationKindNormal, "u1", metadb.ConversationActiveCursor{}, 10)
+	if err != nil {
+		t.Fatalf("ListConversationActiveViewForTarget(after hide) error = %v", err)
+	}
+	if len(page.Rows) != 0 {
+		t.Fatalf("rows after hide = %#v, want hidden conversation", page.Rows)
+	}
+
+	newActiveAt := baselineActiveAt + int64(90*time.Minute/time.Millisecond)
+	if err := authority.AdmitActiveBatch(context.Background(), target, conversationactive.ActiveBatch{
+		Kind: metadb.ConversationKindNormal, ChannelID: key.ChannelID, ChannelType: uint8(key.ChannelType), MessageSeq: 10, ActiveAtMS: newActiveAt,
+		Recipients: []conversationactive.ActiveEntry{{UID: "u1"}},
+	}); err != nil {
+		t.Fatalf("AdmitActiveBatch(after hide) error = %v", err)
+	}
+	if result, err := authority.FlushActiveRows(context.Background(), 0); err != nil || result.Persisted != 1 || result.Cleared != 1 {
+		t.Fatalf("FlushActiveRows(after hide) = %+v, %v, want newer message persisted", result, err)
+	}
+	state := store.primary[key]
+	if state.ActiveAt != newActiveAt || state.DeletedToSeq != 9 {
+		t.Fatalf("durable state = %+v, want newer activity above delete barrier", state)
+	}
+}
+
+func TestConversationAuthorityHideReturnsStaleAfterAuthorityMoves(t *testing.T) {
+	store := &recordingConversationAuthorityStore{}
+	authority := newConversationAuthority(conversationAuthorityOptions{LocalNodeID: 1, Store: store, MaxRows: 100})
+	oldTarget := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 3, ConfigEpoch: 4, RouteRevision: 5}
+	freshTarget := oldTarget
+	freshTarget.LeaderTerm++
+	freshTarget.RouteRevision++
+	authority.markActive(oldTarget)
+	store.beforeHide = func() { authority.markActive(freshTarget) }
+
+	err := authority.HideConversationsForTarget(context.Background(), oldTarget, []metadb.ConversationDelete{{
+		UID: "u1", Kind: metadb.ConversationKindNormal, ChannelID: "room", ChannelType: 2, DeletedToSeq: 9,
+	}})
+	if !errors.Is(err, conversationusecase.ErrStaleRoute) {
+		t.Fatalf("HideConversationsForTarget() error = %v, want ErrStaleRoute", err)
+	}
+	if len(store.hidden) != 1 {
+		t.Fatalf("durable hides = %#v, want committed idempotent barrier before stale retry", store.hidden)
+	}
+}
+
+func TestConversationAuthorityHideMapsProposalNotLeader(t *testing.T) {
+	store := &recordingConversationAuthorityStore{hideErr: propose.ErrNotLeader}
+	authority := newConversationAuthority(conversationAuthorityOptions{LocalNodeID: 1, Store: store, MaxRows: 100})
+	target := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 3, ConfigEpoch: 4, RouteRevision: 5}
+	authority.markActive(target)
+
+	err := authority.HideConversationsForTarget(context.Background(), target, []metadb.ConversationDelete{{
+		UID: "u1", Kind: metadb.ConversationKindNormal, ChannelID: "room", ChannelType: 2, DeletedToSeq: 9,
+	}})
+	if !errors.Is(err, conversationusecase.ErrNotLeader) {
+		t.Fatalf("HideConversationsForTarget() error = %v, want ErrNotLeader", err)
+	}
+}
+
+func TestConversationAuthorityHideErrorPreservesUncommittedTail(t *testing.T) {
+	store := &recordingConversationAuthorityStore{}
+	authority := newConversationAuthority(conversationAuthorityOptions{LocalNodeID: 1, Store: store, MaxRows: 100})
+	target := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 3, ConfigEpoch: 4, RouteRevision: 5}
+	authority.markActive(target)
+	patches := []conversationusecase.ActivePatch{
+		{UID: "u1", Kind: metadb.ConversationKindNormal, ChannelID: "committed-prefix", ChannelType: 2, ActiveAt: 1_000, MessageSeq: 10},
+		{UID: "u1", Kind: metadb.ConversationKindNormal, ChannelID: "uncommitted-tail", ChannelType: 2, ActiveAt: 2_000, MessageSeq: 20},
+	}
+	if err := authority.AdmitPatches(context.Background(), target, patches); err != nil {
+		t.Fatalf("AdmitPatches() error = %v", err)
+	}
+	if err := authority.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+	prefixKey := metadb.ConversationKey{ChannelID: "committed-prefix", ChannelType: 2}
+	tailKey := metadb.ConversationKey{ChannelID: "uncommitted-tail", ChannelType: 2}
+	store.beforeHide = func() {
+		prefix := store.primary[prefixKey]
+		prefix.DeletedToSeq = 10
+		prefix.ActiveAt = 0
+		store.primary[prefixKey] = prefix
+		store.activeRows = []metadb.ConversationState{store.primary[tailKey]}
+	}
+	store.hideErr = context.DeadlineExceeded
+	deletes := []metadb.ConversationDelete{
+		{UID: "u1", Kind: metadb.ConversationKindNormal, ChannelID: prefixKey.ChannelID, ChannelType: prefixKey.ChannelType, DeletedToSeq: 10},
+		{UID: "u1", Kind: metadb.ConversationKindNormal, ChannelID: tailKey.ChannelID, ChannelType: tailKey.ChannelType, DeletedToSeq: 20},
+	}
+
+	err := authority.HideConversationsForTarget(context.Background(), target, deletes)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("HideConversationsForTarget() error = %v, want DeadlineExceeded", err)
+	}
+	for _, channelID := range []string{prefixKey.ChannelID, tailKey.ChannelID} {
+		if _, ok := authority.active.EntryForTest(metadb.ConversationKindNormal, "u1", channelID, 2); !ok {
+			t.Fatalf("uncertain delete removed cache row %q before durable reconciliation", channelID)
+		}
+	}
+	if got := authority.active.DirtyCountForTest(); got != 2 {
+		t.Fatalf("dirty rows after unknown-prefix error = %d, want 2", got)
+	}
+
+	page, err := authority.ListConversationActiveViewForTarget(context.Background(), target, metadb.ConversationKindNormal, "u1", metadb.ConversationActiveCursor{}, 10)
+	if err != nil {
+		t.Fatalf("ListConversationActiveViewForTarget() error = %v", err)
+	}
+	if len(page.Rows) != 1 || page.Rows[0].ChannelID != tailKey.ChannelID {
+		t.Fatalf("rows after partial commit = %#v, want only uncommitted tail visible", page.Rows)
+	}
+	if _, ok := authority.active.EntryForTest(metadb.ConversationKindNormal, "u1", prefixKey.ChannelID, 2); ok {
+		t.Fatal("durably committed prefix survived hydration fence")
+	}
+	if _, ok := authority.active.EntryForTest(metadb.ConversationKindNormal, "u1", tailKey.ChannelID, 2); !ok {
+		t.Fatal("uncommitted tail disappeared after hydration")
+	}
+}
+
+func TestConversationAuthorityHideValidatesBeforeLazyActivation(t *testing.T) {
+	target := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 3, ConfigEpoch: 4, RouteRevision: 5}
+	routeLookups := 0
+	authority := newConversationAuthority(conversationAuthorityOptions{
+		LocalNodeID: 1,
+		Store:       &recordingConversationAuthorityStore{},
+		MaxRows:     100,
+		CurrentRouteTarget: func(uint16) (conversationusecase.RouteTarget, bool) {
+			routeLookups++
+			return target, true
+		},
+	})
+
+	err := authority.HideConversationsForTarget(context.Background(), target, []metadb.ConversationDelete{{
+		UID: "u1", Kind: metadb.ConversationKindNormal, ChannelID: "room", ChannelType: 256, DeletedToSeq: 9,
+	}})
+	if err == nil {
+		t.Fatal("HideConversationsForTarget() error = nil, want invalid channel type")
+	}
+	if routeLookups != 0 || len(authority.targets) != 0 {
+		t.Fatalf("invalid hide routeLookups=%d targets=%#v, want no authority mutation", routeLookups, authority.targets)
+	}
+}
+
+func TestConversationAuthorityActivationPurgesFormerCleanRows(t *testing.T) {
+	store := &recordingConversationAuthorityStore{}
+	authority := newConversationAuthority(conversationAuthorityOptions{LocalNodeID: 1, Store: store, MaxRows: 100})
+	oldTarget := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 3, ConfigEpoch: 4, RouteRevision: 5}
+	authority.markActive(oldTarget)
+	if err := authority.AdmitActiveBatch(context.Background(), oldTarget, conversationactive.ActiveBatch{
+		Kind: metadb.ConversationKindNormal, ChannelID: "room", ChannelType: 2, MessageSeq: 9, ActiveAtMS: 100,
+		Recipients: []conversationactive.ActiveEntry{{UID: "u1"}},
+	}); err != nil {
+		t.Fatalf("AdmitActiveBatch() error = %v", err)
+	}
+	if _, err := authority.FlushActiveRows(context.Background(), 0); err != nil {
+		t.Fatalf("FlushActiveRows() error = %v", err)
+	}
+	if _, ok := authority.active.EntryForTest(metadb.ConversationKindNormal, "u1", "room", 2); !ok {
+		t.Fatal("clean cache row missing before authority refresh")
+	}
+
+	freshTarget := oldTarget
+	freshTarget.LeaderTerm++
+	freshTarget.RouteRevision++
+	authority.markActive(freshTarget)
+	if _, ok := authority.active.EntryForTest(metadb.ConversationKindNormal, "u1", "room", 2); ok {
+		t.Fatal("former clean cache row survived authority activation")
+	}
+}
+
+func TestConversationAuthorityActivationObservesPurgeAfterPublishAndUnlock(t *testing.T) {
+	store := &recordingConversationAuthorityStore{}
+	observer := &reentrantConversationActiveCacheObserver{done: make(chan error, 1)}
+	authority := newConversationAuthority(conversationAuthorityOptions{
+		LocalNodeID: 1,
+		Store:       store,
+		MaxRows:     100,
+		Observer:    observer,
+	})
+	observer.authority = authority
+	oldTarget := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 3, ConfigEpoch: 4, RouteRevision: 5}
+	authority.markActive(oldTarget)
+	if err := authority.AdmitActiveBatch(context.Background(), oldTarget, conversationactive.ActiveBatch{
+		Kind: metadb.ConversationKindNormal, ChannelID: "room", ChannelType: 2, MessageSeq: 9, ActiveAtMS: 100,
+		Recipients: []conversationactive.ActiveEntry{{UID: "u1"}},
+	}); err != nil {
+		t.Fatalf("AdmitActiveBatch() error = %v", err)
+	}
+	if _, err := authority.FlushActiveRows(context.Background(), 0); err != nil {
+		t.Fatalf("FlushActiveRows() error = %v", err)
+	}
+
+	freshTarget := oldTarget
+	freshTarget.LeaderTerm++
+	freshTarget.RouteRevision++
+	observer.target = freshTarget
+	observer.reenter = true
+	activated := make(chan struct{})
+	go func() {
+		authority.markActive(freshTarget)
+		close(activated)
+	}()
+
+	select {
+	case <-activated:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("markActive() did not return; cache observer likely ran while authority lock was held")
+	}
+	select {
+	case err := <-observer.done:
+		if err != nil {
+			t.Fatalf("cache observer saw target before active publish: %v", err)
+		}
+	default:
+		t.Fatal("cache observer did not run after clean-row purge")
+	}
+	if _, ok := authority.active.EntryForTest(metadb.ConversationKindNormal, "u1", "room", 2); ok {
+		t.Fatal("former clean cache row survived authority activation")
+	}
+}
+
+func TestConversationAuthorityCacheOnlyRowRespectsPrimaryDeleteBarrier(t *testing.T) {
 	store := &recordingConversationAuthorityStore{
 		primary: map[metadb.ConversationKey]metadb.ConversationState{
 			{ChannelID: "hidden", ChannelType: 2}: {UID: "u1", Kind: metadb.ConversationKindNormal, ChannelID: "hidden", ChannelType: 2, DeletedToSeq: 10, ActiveAt: 0},
@@ -444,8 +1192,8 @@ func TestConversationAuthorityCacheOnlyRowHydratesPrimaryDeleteBarrier(t *testin
 	if err != nil {
 		t.Fatalf("ListConversationActiveView() error = %v", err)
 	}
-	if len(page.Rows) != 1 || page.Rows[0].ChannelID != "hidden" || page.Rows[0].DeletedToSeq != 10 || page.Rows[0].ActiveAt != 300 {
-		t.Fatalf("rows = %#v, want cache row hydrated with durable delete barrier", page.Rows)
+	if len(page.Rows) != 0 {
+		t.Fatalf("rows = %#v, want stale cache activity fenced by durable delete barrier", page.Rows)
 	}
 }
 
@@ -467,8 +1215,8 @@ func TestConversationAuthorityDBActiveRowKeepsDeleteBarrierDuringCacheOverlay(t 
 	if err != nil {
 		t.Fatalf("ListConversationActiveViewForTarget() error = %v", err)
 	}
-	if len(page.Rows) != 1 || page.Rows[0].ActiveAt != 300 || page.Rows[0].DeletedToSeq != 10 {
-		t.Fatalf("rows = %#v, want cache active time over durable delete barrier", page.Rows)
+	if len(page.Rows) != 1 || page.Rows[0].ActiveAt != 100 || page.Rows[0].DeletedToSeq != 10 {
+		t.Fatalf("rows = %#v, want durable active row without stale cache overlay", page.Rows)
 	}
 }
 
@@ -577,8 +1325,8 @@ func TestConversationAuthorityListHydratesDurableDeleteBarriers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListConversationActiveView() error = %v", err)
 	}
-	if len(page.Rows) != 1 || page.Rows[0].ChannelID != "hidden-a" || page.Rows[0].DeletedToSeq != 10 {
-		t.Fatalf("rows = %#v, want highest runtime row hydrated with durable delete barrier", page.Rows)
+	if len(page.Rows) != 1 || page.Rows[0].ChannelID != "visible" || page.Rows[0].DeletedToSeq != 0 {
+		t.Fatalf("rows = %#v, want stale hidden rows fenced before pagination", page.Rows)
 	}
 }
 
@@ -622,7 +1370,7 @@ func TestConversationAuthorityFlushUsesRuntimeTouchPatch(t *testing.T) {
 	if err := authority.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush() error = %v", err)
 	}
-	if len(store.touched) != 1 || store.touched[0].MessageSeq != 0 || store.touched[0].SparseActiveSet {
+	if len(store.touched) != 1 || store.touched[0].MessageSeq != 30 || store.touched[0].SparseActiveSet {
 		t.Fatalf("touched = %#v, want one runtime active touch patch", store.touched)
 	}
 }
@@ -764,6 +1512,12 @@ func TestConversationAuthorityListForDrainedTargetRejects(t *testing.T) {
 	if result != conversationDrainResultNoDirty {
 		t.Fatalf("DrainAuthority() result = %q, want %q", result, conversationDrainResultNoDirty)
 	}
+	authority.mu.Lock()
+	_, retained := authority.targets[targetKey(target)]
+	authority.mu.Unlock()
+	if retained {
+		t.Fatal("successful drain retained its exact target state")
+	}
 	_, err = authority.ListConversationActiveViewForTarget(context.Background(), target, metadb.ConversationKindNormal, "u1", metadb.ConversationActiveCursor{}, 10)
 	if !errors.Is(err, conversationusecase.ErrStaleRoute) {
 		t.Fatalf("ListConversationActiveViewForTarget() error = %v, want ErrStaleRoute", err)
@@ -855,6 +1609,59 @@ func TestConversationAuthorityDrainFlushesTargetDirtyRowsBeforeHandoff(t *testin
 	}
 	if len(page.Rows) != 1 || page.Rows[0].ChannelID != "b" {
 		t.Fatalf("target B rows = %#v, want target B cache row untouched by target A drain", page.Rows)
+	}
+}
+
+func TestConversationAuthorityObsoleteDrainDoesNotPurgeNewTenureCleanRow(t *testing.T) {
+	store := &recordingConversationAuthorityStore{}
+	authority := newConversationAuthority(conversationAuthorityOptions{
+		LocalNodeID:     1,
+		Store:           store,
+		ActiveCooldown:  time.Hour,
+		MaxRowsPerUID:   10,
+		MaxRows:         100,
+		ListDBWindowMax: 20,
+	})
+	oldTarget := conversationusecase.RouteTarget{HashSlot: 1, SlotID: 2, LeaderNodeID: 1, LeaderTerm: 3, RouteRevision: 3, AuthorityEpoch: 4}
+	newTarget := oldTarget
+	newTarget.LeaderTerm = 4
+	newTarget.RouteRevision = 5
+	newTarget.AuthorityEpoch = 6
+	authority.markActive(oldTarget)
+	if _, err := authority.beginDrainAuthority(oldTarget); err != nil {
+		t.Fatalf("beginDrainAuthority(oldTarget) error = %v", err)
+	}
+	authority.markActive(newTarget)
+	if err := authority.AdmitPatches(context.Background(), newTarget, []conversationusecase.ActivePatch{{
+		UID: "u1", Kind: metadb.ConversationKindNormal, ChannelID: "new-tenure", ChannelType: 2, ActiveAt: 1_000, MessageSeq: 10,
+	}}); err != nil {
+		t.Fatalf("AdmitPatches(newTarget initial) error = %v", err)
+	}
+	if err := authority.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush(newTarget initial) error = %v", err)
+	}
+	if err := authority.AdmitPatches(context.Background(), newTarget, []conversationusecase.ActivePatch{{
+		UID: "u1", Kind: metadb.ConversationKindNormal, ChannelID: "new-tenure", ChannelType: 2, ActiveAt: 1_100, MessageSeq: 11,
+	}}); err != nil {
+		t.Fatalf("AdmitPatches(newTarget cooldown) error = %v", err)
+	}
+	if got := authority.active.DirtyCountForTest(); got != 0 {
+		t.Fatalf("new-tenure dirty rows = %d, want cooldown-suppressed clean row", got)
+	}
+
+	result, err := authority.finishDrainingAuthority(context.Background(), oldTarget)
+	if err != nil {
+		t.Fatalf("finishDrainingAuthority(oldTarget) error = %v", err)
+	}
+	if result != conversationDrainResultTransferred {
+		t.Fatalf("finishDrainingAuthority(oldTarget) result = %q, want %q", result, conversationDrainResultTransferred)
+	}
+	patch, ok := authority.active.EntryForTest(metadb.ConversationKindNormal, "u1", "new-tenure", 2)
+	if !ok || patch.MessageSeq != 11 || patch.ActiveAtMS != 1_100 {
+		t.Fatalf("new-tenure cache patch = %+v ok=%v, want preserved latest clean view", patch, ok)
+	}
+	if len(store.touched) != 1 {
+		t.Fatalf("durable touches = %#v, want no obsolete-drain touch", store.touched)
 	}
 }
 
@@ -1015,6 +1822,9 @@ type recordingConversationAuthorityStore struct {
 	touched    []metadb.ConversationActivePatch
 	listErr    error
 	beforeList func()
+	beforeHide func()
+	hidden     []metadb.ConversationDelete
+	hideErr    error
 }
 
 func (s *recordingConversationAuthorityStore) ListConversationActivePage(_ context.Context, kind metadb.ConversationKind, uid string, after metadb.ConversationActiveCursor, limit int) ([]metadb.ConversationState, metadb.ConversationActiveCursor, bool, error) {
@@ -1119,6 +1929,47 @@ func (s *recordingConversationAuthorityStore) TouchConversationActiveAtBatch(ctx
 	return nil
 }
 
+func (s *recordingConversationAuthorityStore) HideConversationsBatch(ctx context.Context, deletes []metadb.ConversationDelete) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.beforeHide != nil {
+		s.beforeHide()
+	}
+	s.hidden = append(s.hidden, deletes...)
+	if s.hideErr != nil {
+		return s.hideErr
+	}
+	for _, req := range deletes {
+		key := metadb.ConversationKey{ChannelID: req.ChannelID, ChannelType: req.ChannelType}
+		state := s.primary[key]
+		if state.UID == "" {
+			state = metadb.ConversationState{UID: req.UID, Kind: req.Kind, ChannelID: req.ChannelID, ChannelType: req.ChannelType}
+		}
+		if req.DeletedToSeq <= state.DeletedToSeq {
+			continue
+		}
+		state.DeletedToSeq = req.DeletedToSeq
+		state.ActiveAt = 0
+		if req.UpdatedAt > state.UpdatedAt {
+			state.UpdatedAt = req.UpdatedAt
+		}
+		if s.primary == nil {
+			s.primary = make(map[metadb.ConversationKey]metadb.ConversationState)
+		}
+		s.primary[key] = state
+		filtered := s.activeRows[:0]
+		for _, row := range s.activeRows {
+			if row.UID == req.UID && row.Kind == req.Kind && row.ChannelID == req.ChannelID && row.ChannelType == req.ChannelType {
+				continue
+			}
+			filtered = append(filtered, row)
+		}
+		s.activeRows = filtered
+	}
+	return nil
+}
+
 func (s *recordingConversationAuthorityStore) upsertActiveRow(state metadb.ConversationState) {
 	if s.primary == nil {
 		s.primary = make(map[metadb.ConversationKey]metadb.ConversationState)
@@ -1219,6 +2070,52 @@ type reentrantConversationAuthorityObserver struct {
 	target    conversationusecase.RouteTarget
 	uid       string
 	done      chan error
+}
+
+type reentrantConversationActiveCacheObserver struct {
+	recordingConversationAuthorityObserver
+	authority *conversationAuthority
+	target    conversationusecase.RouteTarget
+	reenter   bool
+	done      chan error
+}
+
+type reentrantConversationAdmissionObserver struct {
+	recordingConversationAuthorityObserver
+	authority *conversationAuthority
+	target    conversationusecase.RouteTarget
+	uid       string
+	done      chan error
+}
+
+func (*reentrantConversationAdmissionObserver) ObserveConversationActiveCache(conversationactive.CacheObservation) {
+}
+
+func (o *reentrantConversationAdmissionObserver) ObserveConversationActiveMutation(conversationactive.MutationObservation) {
+	_, err := o.authority.ListConversationActiveViewForTarget(context.Background(), o.target, metadb.ConversationKindNormal, o.uid, metadb.ConversationActiveCursor{}, 10)
+	o.done <- err
+}
+
+func (*reentrantConversationAdmissionObserver) ObserveConversationActiveFlush(conversationactive.FlushObservation) {
+}
+
+func (*reentrantConversationAdmissionObserver) ObserveConversationActivePressure(conversationactive.PressureObservation) {
+}
+
+func (o *reentrantConversationActiveCacheObserver) ObserveConversationActiveCache(conversationactive.CacheObservation) {
+	if !o.reenter {
+		return
+	}
+	o.done <- o.authority.ensureTarget(o.target)
+}
+
+func (*reentrantConversationActiveCacheObserver) ObserveConversationActiveMutation(conversationactive.MutationObservation) {
+}
+
+func (*reentrantConversationActiveCacheObserver) ObserveConversationActiveFlush(conversationactive.FlushObservation) {
+}
+
+func (*reentrantConversationActiveCacheObserver) ObserveConversationActivePressure(conversationactive.PressureObservation) {
 }
 
 func (o *reentrantConversationAuthorityObserver) ObserveConversationAuthorityCachePressure(event conversationAuthorityCachePressureEvent) {

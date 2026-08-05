@@ -1513,6 +1513,9 @@ func TestLoadConfigExampleFile(t *testing.T) {
 	if cfg.Observability.DebugAPIEnabled {
 		t.Fatalf("Observability.DebugAPIEnabled = true, want false")
 	}
+	if cfg.Conversation.AuthorityFlushBatchRows != 512 {
+		t.Fatalf("Conversation.AuthorityFlushBatchRows = %d, want 512", cfg.Conversation.AuthorityFlushBatchRows)
+	}
 	assertExampleDiagnostics(t, cfg.Observability.Diagnostics)
 }
 
@@ -1532,6 +1535,9 @@ func TestLoadConfigRootExampleFile(t *testing.T) {
 	}
 	if cfg.Bench.APIEnabled {
 		t.Fatalf("Bench.APIEnabled = true, want false")
+	}
+	if cfg.Conversation.AuthorityFlushBatchRows != 512 {
+		t.Fatalf("Conversation.AuthorityFlushBatchRows = %d, want 512", cfg.Conversation.AuthorityFlushBatchRows)
 	}
 	assertExampleDiagnostics(t, cfg.Observability.Diagnostics)
 }
@@ -1600,6 +1606,9 @@ func TestLoadConfigMultiNodeExampleFiles(t *testing.T) {
 			}
 			if len(cfg.Gateway.Listeners) != 2 {
 				t.Fatalf("Gateway.Listeners len = %d, want 2", len(cfg.Gateway.Listeners))
+			}
+			if cfg.Conversation.AuthorityFlushBatchRows != 512 {
+				t.Fatalf("Conversation.AuthorityFlushBatchRows = %d, want 512", cfg.Conversation.AuthorityFlushBatchRows)
 			}
 			if cfg.Observability.DebugAPIEnabled {
 				t.Fatalf("Observability.DebugAPIEnabled = true, want false")

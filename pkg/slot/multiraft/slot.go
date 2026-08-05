@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	raft "go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
@@ -97,6 +98,7 @@ const (
 	controlConfigChange
 	controlTransferLeader
 	controlCompactLog
+	controlCaptureHashSlotSnapshot
 )
 
 type controlAction struct {
@@ -107,6 +109,7 @@ type controlAction struct {
 	target         NodeID
 	change         ConfigChange
 	compact        *logCompactionRequest
+	backupSnapshot *hashSlotSnapshotRequest
 	strictTransfer *strictLeaderTransferRequest
 }
 
@@ -188,13 +191,38 @@ func (r *strictLeaderTransferRequest) beginExecution() bool {
 }
 
 type logCompactionRequest struct {
-	ctx  context.Context
-	resp chan logCompactionResponse
+	ctx      context.Context
+	external bool
+	resp     chan logCompactionResponse
 }
 
 type logCompactionResponse struct {
 	result LogCompactionResult
 	err    error
+}
+
+type hashSlotSnapshotRequest struct {
+	ctx                context.Context
+	hashSlot           uint16
+	expectedLeaderTerm uint64
+	resp               chan hashSlotSnapshotResponse
+	done               atomic.Bool
+}
+
+type hashSlotSnapshotResponse struct {
+	result CapturedHashSlotSnapshot
+	err    error
+}
+
+func (r *hashSlotSnapshotRequest) finish(response hashSlotSnapshotResponse) bool {
+	if r == nil || !r.done.CompareAndSwap(false, true) {
+		if response.result.Reader != nil {
+			_ = response.result.Reader.Close()
+		}
+		return false
+	}
+	r.resp <- response
+	return true
 }
 
 type applyStateEvent struct {
@@ -407,7 +435,7 @@ func (g *slot) processControls(ctx context.Context) bool {
 		case controlPropose:
 			action.future.observeStageSince("meta_create_slot_control_wait", nil, action.future.createdAt)
 			if err := g.rawNode.Propose(action.data); err != nil {
-				action.future.resolve(Result{}, err)
+				action.future.resolve(Result{}, classifyRawProposalError(err, g.rawNode.BasicStatus()))
 				continue
 			}
 			g.mu.Lock()
@@ -486,11 +514,104 @@ func (g *slot) processControls(ctx context.Context) bool {
 				continue
 			}
 			applied := g.appliedIndex()
-			result, err := g.compactLogManually(action.compact.ctx, applied)
+			var result LogCompactionResult
+			var err error
+			if action.compact.external {
+				result = LogCompactionResult{
+					NodeID:       g.nodeID(),
+					SlotID:       g.id,
+					AppliedIndex: applied,
+				}
+				if applied == 0 {
+					err = ErrHashSlotSnapshotUnavailable
+				} else {
+					err = g.compactLogAt(action.compact.ctx, applied, true)
+					if err == nil {
+						result.Compacted = true
+						result.AfterSnapshotIndex = applied
+						g.compactor.recordSnapshot(applied)
+					}
+				}
+			} else {
+				result, err = g.compactLogManually(action.compact.ctx, applied)
+			}
 			action.compact.resp <- logCompactionResponse{result: result, err: err}
+		case controlCaptureHashSlotSnapshot:
+			request := action.backupSnapshot
+			if request == nil || request.done.Load() {
+				continue
+			}
+			if err := request.ctx.Err(); err != nil {
+				request.finish(hashSlotSnapshotResponse{err: err})
+				continue
+			}
+			if err := g.waitApplyIdle(request.ctx); err != nil {
+				request.finish(hashSlotSnapshotResponse{err: err})
+				continue
+			}
+			if err := g.currentErr(); err != nil {
+				request.finish(hashSlotSnapshotResponse{err: err})
+				continue
+			}
+			status := g.rawNode.Status()
+			if status.ID != uint64(g.nodeID()) ||
+				status.Lead != uint64(g.nodeID()) ||
+				status.Term != request.expectedLeaderTerm ||
+				status.RaftState != raft.StateLeader {
+				request.finish(hashSlotSnapshotResponse{err: ErrNotLeader})
+				continue
+			}
+			snapshotter, ok := g.stateMachine.(HashSlotSnapshotter)
+			if !ok {
+				request.finish(hashSlotSnapshotResponse{err: ErrHashSlotSnapshotUnsupported})
+				continue
+			}
+			applied := g.appliedIndex()
+			if applied == 0 {
+				request.finish(hashSlotSnapshotResponse{err: ErrHashSlotSnapshotUnavailable})
+				continue
+			}
+			commit := g.rawNode.Status().Commit
+			if commit == 0 || commit != applied {
+				request.finish(hashSlotSnapshotResponse{err: ErrHashSlotSnapshotUnavailable})
+				continue
+			}
+			appliedTerm, err := g.storageView.memory.Term(applied)
+			if err != nil {
+				request.finish(hashSlotSnapshotResponse{err: err})
+				continue
+			}
+			reader, err := snapshotter.OpenHashSlotSnapshot(request.ctx, request.hashSlot)
+			if err != nil {
+				request.finish(hashSlotSnapshotResponse{err: err})
+				continue
+			}
+			request.finish(hashSlotSnapshotResponse{result: CapturedHashSlotSnapshot{
+				SlotID:               g.id,
+				HashSlot:             request.hashSlot,
+				AppliedIndex:         applied,
+				CommitIndex:          commit,
+				AppliedTerm:          appliedTerm,
+				LeaderTerm:           status.Term,
+				CapturedAtUnixMillis: time.Now().UTC().UnixMilli(),
+				Reader:               reader,
+			}})
 		}
 	}
 	return len(controls) > 0
+}
+
+func classifyRawProposalError(err error, status raft.BasicStatus) error {
+	if !errors.Is(err, raft.ErrProposalDropped) {
+		return err
+	}
+	// etcd/raft uses one dropped-proposal error for both leadership changes and
+	// the leader's uncommitted-entry budget. Preserve that distinction so the
+	// cluster proposer retries elections/transfers without hiding backpressure.
+	if status.RaftState != raft.StateLeader || status.LeadTransferee != 0 {
+		return ErrNotLeader
+	}
+	return ErrProposalBackpressure
 }
 
 func (g *slot) executeStrictLeaderTransfer(request *strictLeaderTransferRequest, target NodeID, result PreferredLeaderTransferResult) {
@@ -726,10 +847,12 @@ func (g *slot) processReadySynchronously(ctx context.Context, ready raft.Ready) 
 	}
 	// Refresh snapshots after membership changes so future learners can restore
 	// a snapshot whose ConfState includes the latest peer set.
-	if g.compactor.shouldCompact(lastApplied) || (configChanged && g.compactor.shouldRefreshAfterConfigChange(lastApplied)) {
-		if err := g.compactLog(ctx, lastApplied); err != nil {
+	if g.compactor.shouldCompact(lastApplied) ||
+		(configChanged && g.compactor.shouldRefreshAfterConfigChange(lastApplied)) {
+		compacted, err := g.compactLog(ctx, lastApplied)
+		if err != nil {
 			g.logCompactionWarning(err, lastApplied)
-		} else {
+		} else if compacted {
 			g.compactor.recordSnapshot(lastApplied)
 		}
 	}
@@ -1637,6 +1760,23 @@ func (g *slot) waitIdleLocked() {
 	}
 }
 
+func (g *slot) proposalsQuiescent() bool {
+	if g == nil {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.processing || len(g.submittedProposals) > 0 || len(g.pendingProposals) > 0 {
+		return false
+	}
+	for _, action := range g.controls {
+		if action.kind == controlPropose {
+			return false
+		}
+	}
+	return true
+}
+
 func (g *slot) waitApplyIdle(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1644,7 +1784,7 @@ func (g *slot) waitApplyIdle(ctx context.Context) error {
 	var stop chan struct{}
 	if done := ctx.Done(); done != nil {
 		stop = make(chan struct{})
-		go func() {
+		goruntimeregistry.SafeGo(nil, goruntimeregistry.TaskSlotConditionWaiter, func() {
 			select {
 			case <-done:
 				g.mu.Lock()
@@ -1654,7 +1794,7 @@ func (g *slot) waitApplyIdle(ctx context.Context) error {
 				g.mu.Unlock()
 			case <-stop:
 			}
-		}()
+		})
 		defer close(stop)
 	}
 	g.mu.Lock()
@@ -1847,6 +1987,9 @@ func (g *slot) failPendingLocked(err error) {
 	for i := range g.controls {
 		if g.controls[i].strictTransfer != nil {
 			g.controls[i].strictTransfer.cancel(err)
+		}
+		if g.controls[i].backupSnapshot != nil {
+			g.controls[i].backupSnapshot.finish(hashSlotSnapshotResponse{err: err})
 		}
 	}
 	for _, fut := range g.submittedProposals {

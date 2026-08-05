@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode"
 
+	productconfig "github.com/WuKongIM/WuKongIM/internal/config"
 	"github.com/stretchr/testify/require"
 )
 
@@ -66,12 +67,13 @@ func (f optionFunc) apply(options *suiteOptions) {
 }
 
 type suiteOptions struct {
-	workspaceRootDir    string
-	nodeLogRootDir      string
-	managerHTTP         bool
-	dynamicJoinToken    string
-	nodeConfigOverrides map[uint64]map[string]string
-	nodeEnv             map[uint64][]string
+	workspaceRootDir       string
+	nodeLogRootDir         string
+	managerHTTP            bool
+	sharedBackupRepository bool
+	dynamicJoinToken       string
+	nodeConfigOverrides    map[uint64]map[string]string
+	nodeEnv                map[uint64][]string
 }
 
 // WithWorkspaceRootDir stores one test workspace under the provided parent directory.
@@ -92,6 +94,14 @@ func WithNodeLogRootDir(rootDir string) Option {
 func WithManagerHTTP() Option {
 	return optionFunc(func(options *suiteOptions) {
 		options.managerHTTP = true
+	})
+}
+
+// WithSharedBackupRepository mounts one workspace-scoped file repository at
+// data_dir/backup-repository for every node before any process starts.
+func WithSharedBackupRepository() Option {
+	return optionFunc(func(options *suiteOptions) {
+		options.sharedBackupRepository = true
 	})
 }
 
@@ -173,6 +183,9 @@ func (s *Suite) StartSingleNodeCluster(opts ...Option) *StartedNode {
 	ports := ReserveLoopbackPorts(s.t)
 	spec := buildNodeSpec(1, ports, workspace, options)
 	require.NoError(s.t, workspace.ensureNodeDirs(spec.ID))
+	if options.sharedBackupRepository {
+		require.NoError(s.t, workspace.ensureSharedBackupRepository(spec.ID))
+	}
 	renderedConfig := RenderSingleNodeConfig(spec)
 	require.NoError(s.t, os.WriteFile(spec.ConfigPath, []byte(renderedConfig), 0o644))
 	spec.Env = append(envFromConfig(renderedConfig), spec.Env...)
@@ -187,11 +200,12 @@ func (s *Suite) StartSingleNodeCluster(opts ...Option) *StartedNode {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	require.NoError(s.t, WaitHTTPReady(ctx, spec.APIAddr, "/readyz"), process.DumpDiagnostics())
+	_, readyErr := process.WaitHTTPReady(ctx, spec.APIAddr, "/readyz")
+	require.NoError(s.t, readyErr, process.DumpDiagnostics())
 	if nodeTokenAuthEnabled(spec) {
-		require.NoError(s.t, WaitTCPReady(ctx, spec.GatewayAddr), process.DumpDiagnostics())
+		require.NoError(s.t, process.WaitTCPReady(ctx, spec.GatewayAddr), process.DumpDiagnostics())
 	} else {
-		require.NoError(s.t, WaitWKProtoReady(ctx, spec.GatewayAddr), process.DumpDiagnostics())
+		require.NoError(s.t, process.WaitWKProtoReady(ctx, spec.GatewayAddr), process.DumpDiagnostics())
 	}
 
 	return node
@@ -215,6 +229,9 @@ func (s *Suite) StartThreeNodeCluster(opts ...Option) *StartedCluster {
 			setSpecConfigOverride(&spec, "WK_CLUSTER_JOIN_TOKEN", options.dynamicJoinToken)
 		}
 		require.NoError(s.t, workspace.ensureNodeDirs(nodeID))
+		if options.sharedBackupRepository {
+			require.NoError(s.t, workspace.ensureSharedBackupRepository(nodeID))
+		}
 		specs = append(specs, spec)
 	}
 
@@ -287,7 +304,7 @@ func (c *StartedCluster) StartSeedJoinNode(t testing.TB, cfg SeedJoinNodeConfig)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	observation, err := waitHTTPReadyDetailed(ctx, started.Spec.APIAddr, "/readyz")
+	observation, err := started.Process.WaitHTTPReady(ctx, started.Spec.APIAddr, "/readyz")
 	c.lastReadyz[started.Spec.ID] = observation
 	require.NoError(t, err, c.DumpDiagnostics())
 
@@ -320,6 +337,9 @@ func (c *StartedCluster) StartSeedJoinNodeNoWait(t testing.TB, cfg SeedJoinNodeC
 	}
 
 	require.NoError(t, c.workspace.ensureNodeDirs(spec.ID))
+	if c.options.sharedBackupRepository {
+		require.NoError(t, c.workspace.ensureSharedBackupRepository(spec.ID))
+	}
 	renderedConfig := RenderSeedJoinNodeConfig(spec, cfg)
 	require.NoError(t, os.WriteFile(spec.ConfigPath, []byte(renderedConfig), 0o644))
 	spec.Env = append(envFromConfig(renderedConfig), spec.Env...)
@@ -342,7 +362,7 @@ func (c *StartedCluster) WaitHTTPReady(ctx context.Context) error {
 		c.lastReadyz = make(map[uint64]HTTPObservation, len(c.Nodes))
 	}
 	for _, node := range c.Nodes {
-		observation, err := waitHTTPReadyDetailed(ctx, node.Spec.APIAddr, "/readyz")
+		observation, err := node.Process.WaitHTTPReady(ctx, node.Spec.APIAddr, "/readyz")
 		c.lastReadyz[node.Spec.ID] = observation
 		if err != nil {
 			return fmt.Errorf("node %d http not ready: %w", node.Spec.ID, err)
@@ -359,9 +379,9 @@ func (c *StartedCluster) WaitClusterReady(ctx context.Context) error {
 	for _, node := range c.Nodes {
 		var err error
 		if nodeTokenAuthEnabled(node.Spec) {
-			err = WaitTCPReady(ctx, node.Spec.GatewayAddr)
+			err = node.Process.WaitTCPReady(ctx, node.Spec.GatewayAddr)
 		} else {
-			err = WaitWKProtoReady(ctx, node.Spec.GatewayAddr)
+			err = node.Process.WaitWKProtoReady(ctx, node.Spec.GatewayAddr)
 		}
 		if err != nil {
 			return fmt.Errorf("node %d wkproto not ready: %w", node.Spec.ID, err)
@@ -438,9 +458,16 @@ func (c *StartedCluster) StartStoppedNode(nodeID uint64) error {
 	if !ok {
 		return fmt.Errorf("node %d not found in started cluster", nodeID)
 	}
-	if node.Process != nil && node.Process.Cmd != nil && node.Process.Cmd.Process != nil &&
-		(node.Process.Cmd.ProcessState == nil || !node.Process.Cmd.ProcessState.Exited()) {
-		return fmt.Errorf("node %d is already running", nodeID)
+	if node.Process != nil {
+		if node.Process.Running() {
+			return fmt.Errorf("node %d is already running", nodeID)
+		}
+		// Running becomes false as soon as the direct child exits, while its
+		// process-group reaper may still own plugin descendants and the node's
+		// ports/data directory. Join that cleanup before reusing the spec.
+		if err := node.Process.Stop(); err != nil {
+			return fmt.Errorf("finish stopped node %d cleanup: %w", nodeID, err)
+		}
 	}
 	process := &NodeProcess{Spec: node.Spec, BinaryPath: c.binaryPath}
 	if err := process.Start(); err != nil {
@@ -448,6 +475,73 @@ func (c *StartedCluster) StartStoppedNode(nodeID uint64) error {
 	}
 	node.Process = process
 	return nil
+}
+
+// ReconfigureStoppedNodes rewrites static-node configs while preserving their
+// data directories and non-product environment. Every node must be stopped so
+// one cluster restart cannot observe a mixed configuration generation.
+func (c *StartedCluster) ReconfigureStoppedNodes(overrides map[uint64]map[string]string) error {
+	if c == nil {
+		return fmt.Errorf("started cluster is nil")
+	}
+	if len(c.Nodes) == 0 {
+		return fmt.Errorf("started cluster has no nodes")
+	}
+	schema := schemaByEnvKey()
+	for _, node := range c.Nodes {
+		if node.Process != nil {
+			return fmt.Errorf("node %d must be stopped before cluster reconfiguration", node.Spec.ID)
+		}
+	}
+	for nodeID, nodeOverrides := range overrides {
+		node, ok := c.Node(nodeID)
+		if !ok {
+			return fmt.Errorf("node %d not found", nodeID)
+		}
+		for key, value := range nodeOverrides {
+			if _, ok := schema[key]; !ok {
+				return fmt.Errorf("unsupported config key %s", key)
+			}
+			setSpecConfigOverride(&node.Spec, key, value)
+			if c.options.nodeConfigOverrides == nil {
+				c.options.nodeConfigOverrides = make(map[uint64]map[string]string)
+			}
+			if c.options.nodeConfigOverrides[nodeID] == nil {
+				c.options.nodeConfigOverrides[nodeID] = make(map[string]string)
+			}
+			c.options.nodeConfigOverrides[nodeID][key] = value
+		}
+	}
+
+	specs := make([]NodeSpec, len(c.Nodes))
+	for index := range c.Nodes {
+		specs[index] = c.Nodes[index].Spec
+	}
+	for index := range c.Nodes {
+		rendered := RenderClusterConfig(specs[index], specs)
+		if err := os.WriteFile(specs[index].ConfigPath, []byte(rendered), 0o644); err != nil {
+			return fmt.Errorf("write node %d config: %w", specs[index].ID, err)
+		}
+		externalEnv := nonConfigEnvironment(specs[index].Env, schema)
+		specs[index].Env = append(envFromConfig(rendered), externalEnv...)
+		c.Nodes[index].Spec = specs[index]
+	}
+	c.lastReadyz = make(map[uint64]HTTPObservation, len(c.Nodes))
+	return nil
+}
+
+func nonConfigEnvironment(env []string, schema map[string]productconfig.SchemaField) []string {
+	result := make([]string, 0, len(env))
+	for _, entry := range env {
+		key, _, ok := strings.Cut(entry, "=")
+		if ok {
+			if _, isProductConfig := schema[key]; isProductConfig {
+				continue
+			}
+		}
+		result = append(result, entry)
+	}
+	return result
 }
 
 // APIAddr returns the public HTTP API listen address for the started node.
@@ -501,9 +595,21 @@ func registerStartedNodeCleanup(t startedNodeCleanupTB, node *StartedNode) {
 func registerStartedClusterCleanup(t startedNodeCleanupTB, cluster *StartedCluster) {
 	t.Helper()
 	t.Cleanup(func() {
+		type stopResult struct {
+			nodeID uint64
+			err    error
+		}
+		results := make(chan stopResult, len(cluster.Nodes))
 		for i := len(cluster.Nodes) - 1; i >= 0; i-- {
-			if err := cluster.Nodes[i].Stop(); err != nil {
-				t.Errorf("stop started cluster node %d: %v", cluster.Nodes[i].Spec.ID, err)
+			node := &cluster.Nodes[i]
+			go func() {
+				results <- stopResult{nodeID: node.Spec.ID, err: node.Stop()}
+			}()
+		}
+		for range cluster.Nodes {
+			result := <-results
+			if result.err != nil {
+				t.Errorf("stop started cluster node %d: %v", result.nodeID, result.err)
 			}
 		}
 	})
@@ -517,10 +623,7 @@ func (n *StartedNode) Restart(binaryPath string) error {
 	if strings.TrimSpace(binaryPath) == "" {
 		return fmt.Errorf("node %d restart binary path is empty", n.Spec.ID)
 	}
-	if n.Process == nil || n.Process.Cmd == nil || n.Process.Cmd.Process == nil {
-		return fmt.Errorf("node %d is not running", n.Spec.ID)
-	}
-	if n.Process.Cmd.ProcessState != nil && n.Process.Cmd.ProcessState.Exited() {
+	if n.Process == nil || !n.Process.Running() {
 		return fmt.Errorf("node %d is not running", n.Spec.ID)
 	}
 
@@ -572,6 +675,32 @@ func (w Workspace) ensureNodeDirs(nodeID uint64) error {
 		return err
 	}
 	return os.MkdirAll(w.NodeLogDir(nodeID), 0o755)
+}
+
+func (w Workspace) ensureSharedBackupRepository(nodeID uint64) error {
+	sharedPath := filepath.Join(w.RootDir, "shared-backup-repository")
+	if err := os.MkdirAll(sharedPath, 0o755); err != nil {
+		return err
+	}
+	linkPath := filepath.Join(w.NodeDataDir(nodeID), "backup-repository")
+	info, err := os.Lstat(linkPath)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink == 0 {
+			return fmt.Errorf("backup repository path exists and is not a symlink")
+		}
+		target, readErr := os.Readlink(linkPath)
+		if readErr != nil {
+			return readErr
+		}
+		if target != sharedPath {
+			return fmt.Errorf("backup repository symlink target changed")
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return err
+	}
+	return os.Symlink(sharedPath, linkPath)
 }
 
 // NodeRootDir returns the root directory for one node.

@@ -7,23 +7,22 @@ import (
 )
 
 type commitPorts struct {
-	subscribers                  SubscriberSource
-	activeAdmitter               ConversationActiveAdmitter
-	recipientAuthorityResolver   RecipientAuthorityResolver
-	deliveryEnqueuer             RecipientDeliveryEnqueuer
-	persistAfter                 PersistAfterEnqueuer
-	subscriberPageSize           int
-	recipientBatchSize           int
-	recipientDispatchConcurrency int
-	observer                     AppendObserver
+	subscribers                SubscriberSource
+	activeAdmitter             ConversationActiveAdmitter
+	recipientAuthorityResolver RecipientAuthorityResolver
+	deliveryEnqueuer           OnlineDeliveryEnqueuer
+	persistAfter               PersistAfterEnqueuer
+	subscriberPageSize         int
+	recipientBatchSize         int
+	observer                   AppendObserver
 }
 
 func (p commitPorts) hasPostCommitWork() bool {
-	return p.persistAfter != nil || p.activeAdmitter != nil || effectiveRecipientDeliveryEnqueuer(p) != nil
+	return p.persistAfter != nil || p.activeAdmitter != nil || p.deliveryEnqueuer != nil
 }
 
 func (p commitPorts) hasRecipientWork() bool {
-	return p.activeAdmitter != nil || effectiveRecipientDeliveryEnqueuer(p) != nil
+	return p.activeAdmitter != nil || p.deliveryEnqueuer != nil
 }
 
 type commitEffect struct {
@@ -123,17 +122,6 @@ func enqueuePersistAfterBestEffort(ctx context.Context, enqueuer PersistAfterEnq
 
 func commitPanicCompletion(effect commitEffect, recovered any) commitCompletedEvent {
 	return commitErrorCompletion(effect, effectPanicError(effectStagePostCommit, recovered), PostCommitFailureDetail{Phase: "panic"})
-}
-
-func commitScheduleErrorCompletion(effect commitEffect, scheduleErr error) commitCompletedEvent {
-	return commitErrorCompletion(effect, effectScheduleError(effectStagePostCommit, scheduleErr), PostCommitFailureDetail{Phase: "scheduler"})
-}
-
-// postCommitAdmissionFailure records an already-durable envelope that could
-// not enter the separately bounded best-effort backlog.
-func postCommitAdmissionFailure(event CommittedEnvelope) PostCommitFailureObservation {
-	err := fmt.Errorf("%w: post-commit backlog admission: %w", ErrCommitEffectFailed, ErrBackpressured)
-	return PostCommitFailureDetail{Phase: "admission"}.toObservation(event, 0, errorClass(err), err)
 }
 
 func commitErrorCompletion(effect commitEffect, err error, detail PostCommitFailureDetail) commitCompletedEvent {

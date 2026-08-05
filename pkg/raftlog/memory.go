@@ -102,6 +102,22 @@ func (m *memoryStore) LastIndex(ctx context.Context) (uint64, error) {
 	return m.snapshot.Metadata.Index, nil
 }
 
+// LogRangeBytes returns the exact encoded Raft entry size in [lo, hi).
+func (m *memoryStore) LogRangeBytes(ctx context.Context, lo, hi uint64) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var bytes uint64
+	for _, entry := range m.entries {
+		if entry.Index >= lo && entry.Index < hi {
+			bytes += uint64(entry.Size())
+		}
+	}
+	return bytes, nil
+}
+
 func (m *memoryStore) Snapshot(ctx context.Context) (raftpb.Snapshot, error) {
 	_ = ctx
 

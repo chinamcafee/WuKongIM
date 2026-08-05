@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/channel/reactor"
+	channelstore "github.com/WuKongIM/WuKongIM/pkg/channel/store"
+	"github.com/WuKongIM/WuKongIM/pkg/channel/worker"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/control"
 	controller "github.com/WuKongIM/WuKongIM/pkg/controller"
 	messagedb "github.com/WuKongIM/WuKongIM/pkg/db/message"
@@ -17,7 +19,11 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 )
 
-const minDefaultChannelReactorCount = 4
+const (
+	minDefaultChannelReactorCount      = 4
+	defaultChannelRPCWorkers           = worker.DefaultRPCWorkers
+	defaultCommitCoordinatorShardCount = channelstore.DefaultCommitShards
+)
 
 // Config contains cluster runtime configuration.
 type Config struct {
@@ -27,7 +33,6 @@ type Config struct {
 	ListenAddr string
 	// DataDir is the root directory for cluster data files.
 	DataDir string
-
 	// Control contains Controller adapter configuration.
 	Control ControlConfig
 	// Join contains dynamic data-node join bootstrap settings.
@@ -54,6 +59,17 @@ type Config struct {
 	Goroutines *gorutine.Registry
 	// Logger receives structured logs from cluster-owned runtimes and storage dependencies.
 	Logger wklog.Logger
+	// MaintenanceObserver receives Controller-owned restore maintenance edges.
+	// Enablement is delivered before the local cluster write fence so the app
+	// can close entries and drain accepted work; disablement is delivered after
+	// the fence is removed so node-local runtimes can restart.
+	MaintenanceObserver RestoreMaintenanceObserver
+}
+
+// RestoreMaintenanceObserver coordinates entry/runtime quiescence outside the
+// reusable cluster package.
+type RestoreMaintenanceObserver interface {
+	RestoreMaintenanceChanged(bool)
 }
 
 // ControlConfig contains Controller adapter configuration.
@@ -129,11 +145,11 @@ type ControlVoter struct {
 
 // SlotConfig contains Slot runtime sizing and placement defaults.
 type SlotConfig struct {
-	// InitialSlotCount is the number of physical Slots created by the initial control snapshot.
+	// InitialSlotCount is the number of logical Slot Raft Groups created by the initial control snapshot.
 	InitialSlotCount uint32
-	// HashSlotCount is the number of logical hash slots in the route table.
+	// HashSlotCount is the number of stable physical hash-slot fences in the route table.
 	HashSlotCount uint16
-	// ReplicaCount is the desired replica count for each physical Slot.
+	// ReplicaCount is the desired voter count for each logical Slot Raft Group.
 	ReplicaCount uint16
 	// TickInterval controls how often Slot Raft groups receive local ticks.
 	TickInterval time.Duration
@@ -163,8 +179,11 @@ type ChannelConfig struct {
 	StoreAppendBatchMaxWait time.Duration
 	// StoreApplyWorkers caps blocking follower apply store workers. Zero keeps the Channel runtime default.
 	StoreApplyWorkers int
-	// RPCWorkers caps blocking Channel replication RPC workers. Zero keeps the Channel runtime default.
+	// RPCWorkers caps blocking Channel replication RPC workers. Zero uses the QPS-validated default of 160.
 	RPCWorkers int
+	// RPCBatchMaxItems caps same-target Channel Pull or PullHint items in one
+	// blocking transport call. Zero uses the Channel worker default of 16.
+	RPCBatchMaxItems int
 	// MailboxSize bounds each Channel reactor mailbox.
 	MailboxSize int
 	// MaxChannels bounds loaded Channel runtimes on this node. Zero keeps unlimited behavior.
@@ -237,7 +256,7 @@ type StorageConfig struct {
 	CommitMaxRecords int
 	// CommitMaxBytes caps approximate payload bytes in one grouped physical commit.
 	CommitMaxBytes int
-	// CommitShards routes message DB commit requests across independent coordinators. Zero keeps one coordinator.
+	// CommitShards routes message DB commit requests across independent coordinators. Zero uses four partition-hashed coordinators.
 	CommitShards int
 	// CommitObserver receives message DB group-commit measurements.
 	CommitObserver messagedb.CommitCoordinatorObserver
@@ -361,6 +380,15 @@ func (c *Config) applyDefaults() {
 	if c.Channel.ReactorCount == 0 {
 		c.Channel.ReactorCount = defaultChannelReactorCount()
 	}
+	if c.Channel.RPCWorkers == 0 {
+		c.Channel.RPCWorkers = defaultChannelRPCWorkers
+	}
+	if c.Channel.RPCBatchMaxItems == 0 {
+		c.Channel.RPCBatchMaxItems = worker.DefaultRPCBatchMaxItems
+	}
+	if c.Storage.CommitShards == 0 {
+		c.Storage.CommitShards = defaultCommitCoordinatorShardCount
+	}
 	c.applyControlDefaults()
 	c.applySlotDefaults()
 	if c.Channel.ReplicaCount == 0 {
@@ -369,6 +397,12 @@ func (c *Config) applyDefaults() {
 	c.applyChannelMigrationDefaults()
 	c.applyChannelRetentionDefaults()
 	c.applyHealthReportDefaults()
+}
+
+// WithDefaults returns a copy normalized with the same defaults used by New.
+func (c Config) WithDefaults() Config {
+	c.applyDefaults()
+	return c
 }
 
 func namedLogger(logger wklog.Logger, name string) wklog.Logger {
@@ -415,7 +449,7 @@ func (c *Config) applySlotDefaults() {
 		c.Slots.InitialSlotCount = 1
 	}
 	if c.Slots.HashSlotCount == 0 {
-		c.Slots.HashSlotCount = 16
+		c.Slots.HashSlotCount = 256
 	}
 	if c.Slots.ReplicaCount == 0 {
 		c.Slots.ReplicaCount = uint16(len(c.Control.Voters))
@@ -497,6 +531,9 @@ func (c Config) validate() error {
 		return ErrInvalidConfig
 	}
 	if c.Channel.RPCWorkers < 0 {
+		return ErrInvalidConfig
+	}
+	if c.Channel.RPCBatchMaxItems < 0 {
 		return ErrInvalidConfig
 	}
 	if c.Channel.MailboxSize < 0 {

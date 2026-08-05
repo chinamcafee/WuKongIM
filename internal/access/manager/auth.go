@@ -16,7 +16,8 @@ var errMissingBearerToken = errors.New("missing bearer token")
 const managerUsernameContextKey = "manager_username"
 
 type managerClaims struct {
-	Username string `json:"username"`
+	Username     string `json:"username"`
+	SessionEpoch uint64 `json:"session_epoch"`
 	jwt.RegisteredClaims
 }
 
@@ -87,6 +88,17 @@ func (a authState) hasPermission(username, resource, action string) bool {
 		hasPermissionAction(principal.permissions["*"], action)
 }
 
+// hasExplicitPermission deliberately excludes wildcard grants. It is reserved
+// for recovery actions that require a separately reviewed operator grant.
+func (a authState) hasExplicitPermission(username, resource, action string) bool {
+	principal, ok := a.users[username]
+	if !ok {
+		return false
+	}
+	_, ok = principal.permissions[resource][action]
+	return ok
+}
+
 func hasPermissionAction(actions map[string]struct{}, action string) bool {
 	if len(actions) == 0 {
 		return false
@@ -120,8 +132,13 @@ func (s *Server) issueToken(username string, now time.Time) (string, error) {
 	if now.IsZero() {
 		now = time.Now()
 	}
+	sessionEpoch, err := s.currentManagerSessionEpoch()
+	if err != nil {
+		return "", err
+	}
 	claims := managerClaims{
-		Username: username,
+		Username:     username,
+		SessionEpoch: sessionEpoch,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    s.auth.jwtIssuer,
 			IssuedAt:  jwt.NewNumericDate(now),
@@ -140,6 +157,26 @@ func (s *Server) requirePermission(resource, action string) gin.HandlerFunc {
 			return
 		}
 		if !s.auth.hasPermission(username, resource, action) {
+			if resource == "cluster.backup" {
+				jsonError(c, http.StatusForbidden, "permission_denied", "backup permission denied")
+				return
+			}
+			jsonError(c, http.StatusForbidden, "forbidden", "forbidden")
+			return
+		}
+		c.Set(managerUsernameContextKey, username)
+		c.Next()
+	}
+}
+
+func (s *Server) requireExplicitPermission(resource, action string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		username, err := s.authenticateRequest(c.Request.Header.Get("Authorization"))
+		if err != nil {
+			jsonError(c, http.StatusUnauthorized, "unauthorized", "unauthorized")
+			return
+		}
+		if !s.auth.hasExplicitPermission(username, resource, action) {
 			jsonError(c, http.StatusForbidden, "forbidden", "forbidden")
 			return
 		}
@@ -162,6 +199,13 @@ func (s *Server) authenticateRequest(authorization string) (string, error) {
 	}
 	if _, ok := s.auth.users[claims.Username]; !ok {
 		return "", fmt.Errorf("unknown user")
+	}
+	sessionEpoch, err := s.currentManagerSessionEpoch()
+	if err != nil {
+		return "", err
+	}
+	if claims.SessionEpoch != sessionEpoch {
+		return "", fmt.Errorf("manager session has been invalidated")
 	}
 	return claims.Username, nil
 }

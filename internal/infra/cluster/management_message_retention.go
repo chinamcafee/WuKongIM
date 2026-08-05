@@ -97,7 +97,7 @@ func (o *ManagementMessageRetentionOperator) AdvanceMessageRetention(ctx context
 	if req.DryRun {
 		return retentionResponse(req, safeSeq, managementusecase.MessageRetentionStatusWouldAdvance, managementusecase.MessageRetentionBlockedReasonNone), nil
 	}
-
+	acceptedAt := o.currentTime().UTC()
 	advance := metadb.ChannelRetentionAdvance{
 		ChannelID:            req.ChannelID,
 		ChannelType:          req.ChannelType,
@@ -106,7 +106,7 @@ func (o *ManagementMessageRetentionOperator) AdvanceMessageRetention(ctx context
 		ExpectedLeader:       meta.Leader,
 		ExpectedLeaseUntilMS: meta.LeaseUntilMS,
 		RetentionThroughSeq:  safeSeq,
-		RetentionUpdatedAtMS: o.currentTime().UnixMilli(),
+		RetentionUpdatedAtMS: acceptedAt.UnixMilli(),
 	}
 	if err := o.node.AdvanceChannelRetentionThroughSeq(ctx, advance); err != nil {
 		return managementusecase.AdvanceMessageRetentionResponse{}, mapMessageRetentionError(err)

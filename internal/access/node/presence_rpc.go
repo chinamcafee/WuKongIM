@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	backupcontract "github.com/WuKongIM/WuKongIM/internal/contracts/backup"
 	"github.com/WuKongIM/WuKongIM/internal/observability/diagnostics"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/conversationactive"
 	runtimedelivery "github.com/WuKongIM/WuKongIM/internal/runtime/delivery"
@@ -62,6 +63,12 @@ type PresenceBatchAuthority interface {
 	EndpointsByUIDs(context.Context, presence.RouteTarget, []string) ([]presence.Route, error)
 }
 
+// PresenceTargetBatchAuthority optionally resolves multiple exact target groups in one call.
+// Implementations must preserve input cardinality and result order.
+type PresenceTargetBatchAuthority interface {
+	EndpointsByTargets(context.Context, []presence.EndpointLookupGroup) []presence.EndpointLookupResult
+}
+
 // PresenceOwner applies authority-requested actions to owner-local sessions.
 type PresenceOwner interface {
 	ApplyRouteAction(context.Context, presence.RouteAction) error
@@ -72,16 +79,13 @@ type DeliveryOwnerPush interface {
 	Push(context.Context, runtimedelivery.PushCommand) (runtimedelivery.PushResult, error)
 }
 
-// DeliveryFanoutRunner accepts authority-node fanout tasks over node RPC.
-type DeliveryFanoutRunner interface {
-	RunTask(context.Context, runtimedelivery.FanoutTask) error
-}
-
-// ConversationAuthority handles UID-owned conversation active cache requests.
+// ConversationAuthority handles UID-owned conversation active cache and durable hide requests.
 type ConversationAuthority interface {
 	AdmitPatches(context.Context, conversationusecase.RouteTarget, []conversationusecase.ActivePatch) error
 	// AdmitActiveBatch admits one already-routed channelappend active batch at the target authority.
 	AdmitActiveBatch(context.Context, conversationusecase.RouteTarget, conversationactive.ActiveBatch) error
+	// HideConversationsForTarget applies exact hide mutations at one fenced UID authority target.
+	HideConversationsForTarget(context.Context, conversationusecase.RouteTarget, []metadb.ConversationDelete) error
 	ListConversationActiveViewForTarget(context.Context, conversationusecase.RouteTarget, metadb.ConversationKind, string, metadb.ConversationActiveCursor, int) (conversationusecase.ActiveViewPage, error)
 	DrainAuthority(context.Context, conversationusecase.RouteTarget) (string, error)
 }
@@ -92,6 +96,11 @@ type ManagerConnectionReader interface {
 	GetConnection(context.Context, managementusecase.GetConnectionRequest) (managementusecase.ConnectionDetail, error)
 	NodeRuntimeSummary(context.Context, uint64) (managementusecase.NodeRuntimeSummary, error)
 	SetNodeDrainMode(context.Context, managementusecase.SetNodeDrainModeRequest) (managementusecase.SetNodeDrainModeResponse, error)
+}
+
+// ManagerGoroutineReader returns the node-local managed goroutine snapshot.
+type ManagerGoroutineReader interface {
+	Snapshot() managementusecase.GoroutineSnapshot
 }
 
 // ManagerLogReader handles node-local manager distributed log page requests.
@@ -199,6 +208,35 @@ type ManagerLatestMessageReader interface {
 	ListLocalLatestMessages(context.Context, uint64, int) (managementusecase.ListMessagesResponse, error)
 }
 
+// ScheduledFullBackupExporter writes Slot and message streams directly into
+// the configured archive repository.
+type ScheduledFullBackupExporter interface {
+	ExportSlot(
+		context.Context,
+		backupcontract.SlotExportCommand,
+	) (backupcontract.SlotExportReceipt, error)
+	ExportMessages(
+		context.Context,
+		backupcontract.MessageExportCommand,
+	) (backupcontract.MessageExportReceipt, error)
+}
+
+// ScheduledBackupRepositoryProbe verifies one cross-node repository marker.
+type ScheduledBackupRepositoryProbe interface {
+	ObserveRepositoryProbe(
+		context.Context,
+		backupcontract.RepositoryProbeCommand,
+	) error
+}
+
+// ScheduledBackupRestore performs replica-local staged restore steps.
+type ScheduledBackupRestore interface {
+	Run(
+		context.Context,
+		backupcontract.RestoreNodeCommand,
+	) (backupcontract.RestoreNodeReceipt, error)
+}
+
 // Options configures the internal node RPC adapter.
 type Options struct {
 	// Authority handles UID route authority requests after payload decoding.
@@ -207,8 +245,6 @@ type Options struct {
 	Owner PresenceOwner
 	// Delivery handles owner-local delivery push batches after payload decoding.
 	Delivery DeliveryOwnerPush
-	// DeliveryFanout handles authority-node delivery fanout tasks after payload decoding.
-	DeliveryFanout DeliveryFanoutRunner
 	// ConversationAuthority handles UID conversation authority cache requests after payload decoding.
 	ConversationAuthority ConversationAuthority
 	// ManagerConnections handles owner-local manager connection inventory requests.
@@ -235,6 +271,8 @@ type Options struct {
 	ManagerDiagnostics ManagerDiagnostics
 	// ManagerTaskAudit handles node-local Controller task audit reads.
 	ManagerTaskAudit ManagerTaskAuditReader
+	// ManagerGoroutines handles node-local managed goroutine snapshot reads.
+	ManagerGoroutines ManagerGoroutineReader
 	// ManagerPlugins handles node-local plugin inventory requests.
 	ManagerPlugins ManagerPluginReader
 	// NodeLifecycle handles validated seed-join lifecycle requests.
@@ -251,6 +289,12 @@ type Options struct {
 	NodeLifecycleJoinToken string
 	// PluginHTTPRoutes handles node-local plugin HTTP route requests.
 	PluginHTTPRoutes PluginHTTPRouter
+	// ScheduledBackup exports full-backup payloads on their current owners.
+	ScheduledBackup ScheduledFullBackupExporter
+	// ScheduledBackupProbe proves that every active node sees one repository.
+	ScheduledBackupProbe ScheduledBackupRepositoryProbe
+	// ScheduledRestore owns node-local staged restore files and storage changes.
+	ScheduledRestore ScheduledBackupRestore
 	// Logger records node RPC adapter failures that are converted into statuses.
 	Logger wklog.Logger
 }
@@ -263,8 +307,6 @@ type Adapter struct {
 	owner PresenceOwner
 	// delivery pushes messages into owner-local delivery sessions.
 	delivery DeliveryOwnerPush
-	// deliveryFanout runs subscriber fanout tasks for this authority node.
-	deliveryFanout DeliveryFanoutRunner
 	// conversation owns UID conversation active cache decisions.
 	conversation ConversationAuthority
 	// managerConnections reads owner-local connection inventory for manager pages.
@@ -291,6 +333,8 @@ type Adapter struct {
 	managerDiagnostics ManagerDiagnostics
 	// managerTaskAudit reads retained Controller task audit history.
 	managerTaskAudit ManagerTaskAuditReader
+	// managerGoroutines reads the node-local managed goroutine snapshot.
+	managerGoroutines ManagerGoroutineReader
 	// managerPlugins reads node-local plugin inventory for manager pages.
 	managerPlugins ManagerPluginReader
 	// nodeLifecycle submits validated seed joins through the management usecase.
@@ -307,6 +351,12 @@ type Adapter struct {
 	nodeLifecycleJoinToken string
 	// pluginHTTPRoutes invokes node-local plugin HTTP route hooks.
 	pluginHTTPRoutes PluginHTTPRouter
+	// scheduledBackup owns simplified full-backup node-local exports.
+	scheduledBackup ScheduledFullBackupExporter
+	// scheduledBackupProbe verifies shared repository visibility.
+	scheduledBackupProbe ScheduledBackupRepositoryProbe
+	// scheduledRestore owns node-local staged restore files and storage changes.
+	scheduledRestore ScheduledBackupRestore
 	// logger records adapter decode errors and rejected local operations.
 	logger wklog.Logger
 }
@@ -320,7 +370,6 @@ func New(opts Options) *Adapter {
 		authority:                opts.Authority,
 		owner:                    opts.Owner,
 		delivery:                 opts.Delivery,
-		deliveryFanout:           opts.DeliveryFanout,
 		conversation:             opts.ConversationAuthority,
 		managerConnections:       opts.ManagerConnections,
 		managerLogs:              opts.ManagerLogs,
@@ -334,6 +383,7 @@ func New(opts Options) *Adapter {
 		managerNodeConfig:        opts.ManagerNodeConfig,
 		managerDiagnostics:       opts.ManagerDiagnostics,
 		managerTaskAudit:         opts.ManagerTaskAudit,
+		managerGoroutines:        opts.ManagerGoroutines,
 		managerPlugins:           opts.ManagerPlugins,
 		nodeLifecycle:            opts.NodeLifecycle,
 		nodeReadiness:            opts.NodeReadiness,
@@ -342,6 +392,9 @@ func New(opts Options) *Adapter {
 		nodeLifecycleClusterID:   opts.NodeLifecycleClusterID,
 		nodeLifecycleJoinToken:   opts.NodeLifecycleJoinToken,
 		pluginHTTPRoutes:         opts.PluginHTTPRoutes,
+		scheduledBackup:          opts.ScheduledBackup,
+		scheduledBackupProbe:     opts.ScheduledBackupProbe,
+		scheduledRestore:         opts.ScheduledRestore,
 		logger:                   opts.Logger,
 	}
 }
@@ -420,6 +473,35 @@ func (a *Adapter) HandlePresenceAuthorityRPC(ctx context.Context, payload []byte
 
 func (a *Adapter) handlePresenceEndpointsByTargets(ctx context.Context, groups []presence.EndpointLookupGroup) ([]byte, error) {
 	results := make([]presenceRPCEndpointLookupResult, len(groups))
+	if targetBatchAuthority, ok := a.authority.(PresenceTargetBatchAuthority); ok {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			for i := range results {
+				results[i].Status = presenceRPCStatusForError(ctxErr)
+			}
+			return encodePresenceEndpointsByTargetsResponseBinary(results)
+		}
+		batchResults := targetBatchAuthority.EndpointsByTargets(ctx, groups)
+		if len(batchResults) != len(groups) {
+			err := fmt.Errorf("internal/access/node: presence target-batch result count %d does not match group count %d", len(batchResults), len(groups))
+			for i := range results {
+				results[i].Status = presenceRPCStatusForError(authoritypresence.ErrRouteNotReady)
+			}
+			a.rpcLogger().Warn("presence authority target batch result is not aligned",
+				wklog.Event("internal.access.node.presence_authority_target_batch_misaligned"),
+				wklog.Int("groupCount", len(groups)),
+				wklog.Int("resultCount", len(batchResults)),
+				wklog.Error(err),
+			)
+			return encodePresenceEndpointsByTargetsResponseBinary(results)
+		}
+		for i, result := range batchResults {
+			results[i].Status = presenceRPCStatusForError(result.Err)
+			if result.Err == nil {
+				results[i].Routes = result.Routes
+			}
+		}
+		return encodePresenceEndpointsByTargetsResponseBinary(results)
+	}
 	batchAuthority, hasBatchAuthority := a.authority.(PresenceBatchAuthority)
 	for i, group := range groups {
 		var routes []presence.Route

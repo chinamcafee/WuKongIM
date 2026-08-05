@@ -106,6 +106,51 @@ bounded `NodeHealthReport` per node. It updates durable health evidence and
 heartbeat churn. Consumers that need health freshness compare report age against
 the configured TTL instead of interpreting membership `JoinState` as liveness.
 
+### Operations MCP Desired State
+
+`OpsMCPState` is an optional, low-frequency section of
+`cluster-state.json`. It stores only the enabled flag, one active execution
+owner, and at most two credential records containing an identifier, SHA-256
+digest, and creation time. A low-frequency profile fence timestamp is written
+only on an administrative stop so a newly selected owner cannot overlap a
+maximum-duration capture from the prior owner generation. Raw `wko_*` tokens,
+per-request limits, audits, caches, and profiles never enter Controller Raft.
+
+`ReplaceOpsMCPState` replaces the complete section through the normal global
+`Revision` fence. Validation requires the owner to be an active cluster node
+before enabling and requires at least one credential. The owner cannot change
+while MCP is enabled, so ingress routing and owner-side token revalidation use
+one unambiguous durable revision.
+
+### Scheduled Backup State
+
+`ScheduledBackupState` is one optional bounded section of
+`cluster-state.json`. It contains:
+
+- one revisioned Manager-owned plan;
+- at most one active full-backup job or one active restore job;
+- at most one repository-operation lease, including the owning Controller node
+  and term for leader-run retention;
+- exactly 256 bounded per-Hash-Slot progress rows in an active job;
+- a newest-first backup, restore, verification, and retention history capped
+  at 100 records;
+- a monotonic Manager session epoch.
+
+Repository manifests, chunks, object keys, plaintext credentials, Channel
+identities, and staging paths never enter Controller state. S3 credentials are
+stored only as authenticated ciphertext.
+
+All mutations use the normal global Controller revision fence. Slot backup
+completion additionally matches job ID, attempt, owner node, and leader term.
+Restore progress records the exact sorted physical replica set for each
+attempt. Validation forbids simultaneous backup and restore, incomplete Slot
+coverage, invalid plan limits, terminal jobs in the active fields, and
+unbounded history.
+
+Controller snapshot encode/decode and clone paths include this section, so a
+process restart, Controller snapshot restore, or Leader change resumes the
+same durable task instead of admitting a duplicate.
+
 ## Server Facade Flow
 
 ```text

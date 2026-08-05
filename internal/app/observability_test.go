@@ -1298,7 +1298,7 @@ func TestObservabilityConversationAuthorityMetricsObserverMapsCounters(t *testin
 		},
 	})
 	observer.ObserveConversationActiveMutation(conversationactive.MutationObservation{
-		Result: "ok", BecameDirty: 3, DirtyUpdated: 2, Unchanged: 1,
+		Result: "ok", BecameDirty: 3, DirtyUpdated: 2, CooldownSuppressed: 4, Unchanged: 1,
 		LockWaitDuration: time.Millisecond, LockHoldDuration: 2 * time.Millisecond,
 		CacheObservationDuration: 3 * time.Millisecond,
 	})
@@ -1307,9 +1307,10 @@ func TestObservabilityConversationAuthorityMetricsObserverMapsCounters(t *testin
 	})
 	observer.ObserveConversationActiveFlush(conversationactive.FlushObservation{
 		Result:                "ok",
-		Selected:              5,
+		Selected:              7,
 		Persisted:             4,
 		Skipped:               1,
+		DeleteFenced:          2,
 		Cleared:               4,
 		VersionConflicts:      1,
 		Requeued:              1,
@@ -1374,9 +1375,18 @@ func TestObservabilityConversationAuthorityMetricsObserverMapsCounters(t *testin
 	if got := findAppMetricByLabels(t, flushRowsTotal, map[string]string{"result": "ok", "stage": "requeued", "reason": "version_conflict"}).GetCounter().GetValue(); got != 1 {
 		t.Fatalf("active flush version-conflict rows metric = %v, want 1", got)
 	}
+	if got := findAppMetricByLabels(t, flushRowsTotal, map[string]string{"result": "ok", "stage": "skipped", "reason": "active_cooldown"}).GetCounter().GetValue(); got != 1 {
+		t.Fatalf("active flush cooldown rows metric = %v, want 1", got)
+	}
+	if got := findAppMetricByLabels(t, flushRowsTotal, map[string]string{"result": "ok", "stage": "skipped", "reason": "delete_barrier"}).GetCounter().GetValue(); got != 2 {
+		t.Fatalf("active flush delete-barrier rows metric = %v, want 2", got)
+	}
 	dirtyMutations := requireAppMetricFamily(t, families, "wukongim_conversation_active_dirty_mutations_total")
 	if got := findAppMetricByLabels(t, dirtyMutations, map[string]string{"event": "became_dirty"}).GetCounter().GetValue(); got != 3 {
 		t.Fatalf("active dirty became metric = %v, want 3", got)
+	}
+	if got := findAppMetricByLabels(t, dirtyMutations, map[string]string{"event": "cooldown_suppressed"}).GetCounter().GetValue(); got != 4 {
+		t.Fatalf("active cooldown suppressed metric = %v, want 4", got)
 	}
 	cacheLock := requireAppMetricFamily(t, families, "wukongim_conversation_active_cache_lock_duration_seconds")
 	if got := findAppMetricByLabels(t, cacheLock, map[string]string{"result": "ok", "phase": "wait"}).GetHistogram().GetSampleCount(); got != 1 {
@@ -2536,45 +2546,24 @@ func TestNewRejectsNegativeDeepDiagnosticsConfig(t *testing.T) {
 	}
 }
 
-func TestDeliveryObserverLogsAsyncErrorsWithoutMetrics(t *testing.T) {
-	logger := &recordingAppLogger{}
-	observer := deliveryMetricsObserver{logger: logger}
-
-	observer.ObserveRetry(runtimedelivery.RetryEvent{
-		Event:      runtimedelivery.DeliveryRetryEventDrop,
-		Result:     runtimedelivery.DeliveryResultMaxAttempts,
-		ErrorClass: runtimedelivery.DeliveryErrorClassRetryable,
-		Attempt:    3,
-		QueueDepth: 7,
-	})
-	observer.ObserveManagerTerminal(runtimedelivery.ManagerTerminalEvent{
-		Result:     runtimedelivery.DeliveryResultError,
-		ErrorClass: runtimedelivery.DeliveryErrorClassError,
-		QueueDepth: 1,
-	})
-
-	requireAppLogEvent(t, logger, "WARN", "internal.app.delivery.retry_failed")
-	requireAppLogEvent(t, logger, "WARN", "internal.app.delivery.manager_terminal_failed")
-}
-
-func TestDeliveryMessageObserverMapsRecipientDeliveryWorkerMetrics(t *testing.T) {
+func TestOnlineDeliveryObserverMapsRuntimeMetrics(t *testing.T) {
 	reg := obsmetrics.New(1, "n1")
-	observer := deliveryMessageObserver{app: &App{metrics: reg}}
+	observer := onlineDeliveryObserver{app: &App{metrics: reg}}
 
-	observer.SetChannelAppendRecipientDeliveryQueue(channelappend.RecipientDeliveryQueueObservation{
+	observer.ObservePlanAdmission(runtimedelivery.PlanAdmissionEvent{
+		Result:        runtimedelivery.ObservationResultTimeout,
 		QueueDepth:    3,
 		QueueCapacity: 8,
+		Duration:      2 * time.Millisecond,
 	})
-	observer.SetChannelAppendRecipientDeliveryWorkerPressure(channelappend.RecipientDeliveryWorkerPressureObservation{
-		Inflight: 2,
-		Capacity: 4,
+	observer.SetRuntimePressure(runtimedelivery.RuntimePressureEvent{
+		QueueDepth:    3,
+		QueueCapacity: 8,
+		Inflight:      2,
+		Workers:       4,
 	})
-	observer.ObserveChannelAppendRecipientDeliveryAdmission(channelappend.RecipientDeliveryAdmissionObservation{
-		Result:   "timeout",
-		Duration: 2 * time.Millisecond,
-	})
-	observer.ObserveChannelAppendRecipientDeliveryProcess(channelappend.RecipientDeliveryProcessObservation{
-		Result:     "ok",
+	observer.ObservePlanTerminal(runtimedelivery.PlanTerminalEvent{
+		Result:     runtimedelivery.ObservationResultOK,
 		Recipients: 4,
 		Duration:   5 * time.Millisecond,
 	})
@@ -2603,6 +2592,34 @@ func TestDeliveryMessageObserverMapsRecipientDeliveryWorkerMetrics(t *testing.T)
 	if got := findAppMetricByLabels(t, process, map[string]string{"result": "ok"}).GetHistogram().GetSampleSum(); got != 4 {
 		t.Fatalf("recipient worker process recipients = %v, want 4", got)
 	}
+}
+
+func TestDeliveryMessageObserverMapsChannelAppendPostCommitPressure(t *testing.T) {
+	reg := obsmetrics.New(1, "n1")
+	observer := deliveryMessageObserver{app: &App{metrics: reg}}
+
+	observer.SetChannelAppendWriterPressure(channelappend.WriterPressureObservation{
+		PostCommitHandoffDepth:    11,
+		PostCommitHandoffCapacity: 17,
+		PostCommitRetryQueueDepth: 3,
+		PostCommitRetryContended:  true,
+	})
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather() error = %v", err)
+	}
+	assertGauge := func(name string, want float64) {
+		t.Helper()
+		family := requireAppMetricFamily(t, families, name)
+		if got := findAppMetricByLabels(t, family, nil).GetGauge().GetValue(); got != want {
+			t.Fatalf("%s = %v, want %v", name, got, want)
+		}
+	}
+	assertGauge("wukongim_channelappend_post_commit_handoff_depth", 11)
+	assertGauge("wukongim_channelappend_post_commit_handoff_capacity", 17)
+	assertGauge("wukongim_channelappend_post_commit_retry_queue_depth", 3)
+	assertGauge("wukongim_channelappend_post_commit_retry_contended", 1)
 }
 
 func TestDeliveryMessageObserverLogsChannelAppendPostCommitFailure(t *testing.T) {
@@ -2668,66 +2685,10 @@ func TestDeliveryMessageObserverWarnsExpectedRoutePostCommitFailure(t *testing.T
 	entry := requireAppLogEvent(t, logger, "WARN", "internal.app.channelappend.post_commit_failed")
 	requireAppLogField(t, entry, "phase", "conversation_active")
 	requireAppLogField(t, entry, "result", "stale_route")
-	for _, logged := range logger.entries {
+	for _, logged := range logger.entriesSnapshot() {
 		if logged.level == "ERROR" {
 			t.Fatalf("unexpected ERROR log for retryable post-commit route failure: %#v", logged)
 		}
-	}
-}
-
-func TestDeliveryMetricsObserverMapsAckEventToGauge(t *testing.T) {
-	reg := obsmetrics.New(1, "n1")
-	observer := deliveryMetricsObserver{metrics: reg}
-
-	observer.ObserveAck(runtimedelivery.AckEvent{PendingCount: 6})
-
-	families, err := reg.Gather()
-	if err != nil {
-		t.Fatalf("Gather() error = %v", err)
-	}
-	ackBindings := requireAppMetricFamily(t, families, "wukongim_delivery_ack_bindings")
-	if got := findAppMetricByLabels(t, ackBindings, nil).GetGauge().GetValue(); got != 6 {
-		t.Fatalf("delivery ack bindings = %v, want 6", got)
-	}
-}
-
-func TestCombinedDeliveryObserverFansOutAckEvents(t *testing.T) {
-	reg := obsmetrics.New(1, "n1")
-	collector := newTopCollector(topCollectorOptions{
-		ClusterSnapshot: func() cluster.Snapshot {
-			return cluster.Snapshot{RoutesReady: true, SlotsReady: true, ChannelsReady: true}
-		},
-	})
-	observer := combineDeliveryObservers(
-		deliveryMetricsObserver{metrics: reg},
-		topDeliveryObserver{top: collector},
-	)
-	ackObserver, ok := observer.(runtimedelivery.AckObserver)
-	if !ok {
-		t.Fatalf("combined observer does not implement AckObserver")
-	}
-
-	collector.recordSampleAt(time.Unix(100, 0))
-	ackObserver.ObserveAck(runtimedelivery.AckEvent{PendingCount: 9})
-	collector.recordSampleAt(time.Unix(110, 0))
-
-	families, err := reg.Gather()
-	if err != nil {
-		t.Fatalf("Gather() error = %v", err)
-	}
-	ackBindings := requireAppMetricFamily(t, families, "wukongim_delivery_ack_bindings")
-	if got := findAppMetricByLabels(t, ackBindings, nil).GetGauge().GetValue(); got != 9 {
-		t.Fatalf("metrics ack bindings = %v, want 9", got)
-	}
-	snapshot, err := collector.SnapshotTop(context.Background(), accessapi.TopSnapshotQuery{
-		Window: 10 * time.Second,
-		View:   accessapi.TopViewDelivery,
-	})
-	if err != nil {
-		t.Fatalf("SnapshotTop() error = %v", err)
-	}
-	if snapshot.Delivery == nil || snapshot.Delivery.AckBindings != 9 {
-		t.Fatalf("top ack bindings = %#v, want 9", snapshot.Delivery)
 	}
 }
 
@@ -2745,7 +2706,8 @@ func (s *recordingInternalSendTraceSink) snapshot() []sendtrace.Event {
 
 func requireAppLogEvent(t *testing.T, logger *recordingAppLogger, level, event string) recordedAppLogEntry {
 	t.Helper()
-	for _, entry := range logger.entries {
+	entries := logger.entriesSnapshot()
+	for _, entry := range entries {
 		if entry.level != level {
 			continue
 		}
@@ -2755,7 +2717,7 @@ func requireAppLogEvent(t *testing.T, logger *recordingAppLogger, level, event s
 			}
 		}
 	}
-	t.Fatalf("missing app log event level=%s event=%s entries=%#v", level, event, logger.entries)
+	t.Fatalf("missing app log event level=%s event=%s entries=%#v", level, event, entries)
 	return recordedAppLogEntry{}
 }
 

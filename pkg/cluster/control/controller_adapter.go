@@ -74,6 +74,11 @@ func normalizeNodeHealthReportTTL(ttl time.Duration) time.Duration {
 
 func snapshotFromControllerState(st controller.ClusterState, leaderID uint64, now time.Time, healthTTL time.Duration) Snapshot {
 	snap := Snapshot{ClusterID: st.ClusterID, Revision: st.Revision, ControllerID: leaderID, Nodes: make([]Node, 0, len(st.Nodes)), Slots: make([]SlotAssignment, 0, len(st.Slots)), Tasks: make([]ReconcileTask, 0, len(st.Tasks))}
+	if st.ScheduledBackup != nil &&
+		st.ScheduledBackup.ActiveRestore != nil &&
+		st.ScheduledBackup.ActiveRestore.MaintenanceEntered {
+		snap.Maintenance = true
+	}
 	healthByNode := make(map[uint64]controller.NodeHealthReport, len(st.NodeHealthReports))
 	for _, report := range st.NodeHealthReports {
 		healthByNode[report.NodeID] = report
@@ -117,6 +122,21 @@ func snapshotFromControllerState(st controller.ClusterState, leaderID uint64, no
 			ObservedVoters:      append([]uint64(nil), task.ObservedVoters...),
 			ObservedLearners:    append([]uint64(nil), task.ObservedLearners...),
 		})
+	}
+	if st.OpsMCP != nil {
+		snap.OpsMCP = &OpsMCPState{
+			Enabled:                     st.OpsMCP.Enabled,
+			OwnerNodeID:                 st.OpsMCP.OwnerNodeID,
+			ProfileFenceUntilUnixMillis: st.OpsMCP.ProfileFenceUntilUnixMillis,
+			Credentials:                 make([]OpsMCPCredential, 0, len(st.OpsMCP.Credentials)),
+		}
+		for _, credential := range st.OpsMCP.Credentials {
+			snap.OpsMCP.Credentials = append(snap.OpsMCP.Credentials, OpsMCPCredential{
+				ID:                  credential.ID,
+				DigestSHA256:        credential.DigestSHA256,
+				CreatedAtUnixMillis: credential.CreatedAtUnixMillis,
+			})
+		}
 	}
 	return snap
 }

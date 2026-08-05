@@ -4,8 +4,9 @@ import (
 	"context"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 )
 
 // Group owns a set of hash-sharded local authority channel writers.
@@ -14,19 +15,27 @@ type Group struct {
 	shards []*shard
 	// advancePool runs non-blocking writer state-machine activation.
 	advancePool *workerPool
+	// advanceScheduler is the only blocking submitter to advancePool. It keeps
+	// callers and effect completions out of cross-pool dependency cycles.
+	advanceScheduler *writerAdvanceScheduler
 	// appendPool runs foreground blocking durable append effects.
 	appendPool *workerPool
 	// postCommitPool runs best-effort post-commit and realtime recipient effects.
 	postCommitPool *workerPool
+	// handoff bounds append-bound messages across append and post-commit work.
+	handoff *postCommitHandoff
+	// postCommitRetries fairly retries writers rejected by the non-blocking effect pool.
+	postCommitRetries *postCommitRetryScheduler
 
 	runtimeCtx    context.Context
 	runtimeCancel context.CancelFunc
-	// runtimeStopped is the hot-path stop signal checked by channel writers.
-	runtimeStopped atomic.Bool
-	metrics        groupMetrics
+	metrics       groupMetrics
+	stopOnce      sync.Once
+	stopDone      chan struct{}
 
 	mu       sync.RWMutex
 	started  bool
+	paused   bool
 	stopping bool
 	stopped  bool
 }
@@ -36,17 +45,27 @@ func New(opts Options) *Group {
 	opts = applyDefaults(opts)
 	limits := stateLimitsFromOptions(opts)
 	advancePool := newWorkerPool(opts.AdvancePoolSize)
+	advanceScheduler := newWriterAdvanceScheduler(advancePool)
 	appendPool := newWorkerPool(opts.EffectPoolSize)
 	postCommitPool := newNonblockingWorkerPool(opts.EffectPoolSize)
+	handoff := newPostCommitHandoff(opts.PostCommitHandoffCapacity)
+	postCommitRetries := newPostCommitRetryScheduler()
+	postCommitRetries.capacityAvailable = func() bool {
+		return postCommitPool.running() < postCommitPool.capacity()
+	}
 	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
 	group := &Group{
-		opts:           opts,
-		advancePool:    advancePool,
-		appendPool:     appendPool,
-		postCommitPool: postCommitPool,
-		shards:         make([]*shard, opts.AuthorityShardCount),
-		runtimeCtx:     runtimeCtx,
-		runtimeCancel:  runtimeCancel,
+		opts:              opts,
+		advancePool:       advancePool,
+		advanceScheduler:  advanceScheduler,
+		appendPool:        appendPool,
+		postCommitPool:    postCommitPool,
+		handoff:           handoff,
+		postCommitRetries: postCommitRetries,
+		shards:            make([]*shard, opts.AuthorityShardCount),
+		runtimeCtx:        runtimeCtx,
+		runtimeCancel:     runtimeCancel,
+		stopDone:          make(chan struct{}),
 	}
 	for i := range group.shards {
 		group.shards[i] = newShard(limits, int64(opts.AdmissionCapacityPerShard), opts.WriterIdleRetention)
@@ -60,18 +79,23 @@ func New(opts Options) *Group {
 			appendPool:        appendPool,
 			postCommitPool:    postCommitPool,
 			advancePool:       advancePool,
+			advanceScheduler:  advanceScheduler,
+			handoff:           handoff,
+			postCommitRetries: postCommitRetries,
 		}
 		metrics = &group.metrics
 	}
+	advanceScheduler.onStateChange = group.metrics.observePressure
 	ports := writerPorts{
 		prepare:        preparePortsFromOptions(opts),
 		append:         appendPortsFromOptions(opts),
 		commit:         commitPortsFromOptions(opts),
 		appendPool:     appendPool,
 		postCommitPool: postCommitPool,
+		handoff:        handoff,
+		commitRetries:  postCommitRetries,
 		schedule:       group.schedule,
 		runtimeCtx:     runtimeCtx,
-		stopped:        &group.runtimeStopped,
 		metrics:        metrics,
 
 		inboxCoalesceWindow:   opts.InboxCoalesceWindow,
@@ -84,7 +108,7 @@ func New(opts Options) *Group {
 }
 
 func (g *Group) schedule(w *channelWriter) {
-	_ = g.advancePool.submit(func() { w.advance() })
+	g.advanceScheduler.schedule(w)
 }
 
 func (g *Group) shardForTarget(target AuthorityTarget) *shard {
@@ -98,49 +122,114 @@ func (g *Group) Start(ctx context.Context) error {
 		return err
 	}
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	if g.stopping || g.stopped {
+		g.mu.Unlock()
 		return ErrBackpressured
 	}
 	if g.started {
+		g.mu.Unlock()
 		return nil
 	}
+	g.advanceScheduler.start()
+	g.metrics.startPressurePublisher()
+	g.postCommitRetries.start()
 	g.started = true
+	g.mu.Unlock()
+	g.metrics.observePressure()
 	return nil
 }
 
-// Stop closes admission, drains accepted writer work, and releases the pool.
+// WaitIdle waits for every admitted append and post-commit effect to finish
+// without closing the reusable runtime.
+func (g *Group) WaitIdle(ctx context.Context) error {
+	if g == nil {
+		return nil
+	}
+	return g.drainWriters(ctx)
+}
+
+// PauseForRestore closes local admission before the maintenance drain. The
+// same lock is read by SubmitLocal, so every accepted request is either owned
+// by the subsequent drain or rejected.
+func (g *Group) PauseForRestore() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	g.paused = true
+	g.mu.Unlock()
+}
+
+// ResumeAfterRestore reopens local admission after the restored runtimes and
+// caches have converged.
+func (g *Group) ResumeAfterRestore() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	g.paused = false
+	g.mu.Unlock()
+}
+
+// ResetAfterRestore drops idle writer state whose authority epochs and
+// subscriber snapshots may be newer than the restored durable cut.
+func (g *Group) ResetAfterRestore() error {
+	if g == nil {
+		return nil
+	}
+	if !g.writersIdle() {
+		return ErrBackpressured
+	}
+	for _, shard := range g.shards {
+		shard.mu.Lock()
+		shard.writers = make(map[string]*channelWriter)
+		shard.mu.Unlock()
+	}
+	return nil
+}
+
+// Stop closes admission, drains accepted work, and only then cancels the
+// runtime and releases its pools. A deadline preserves all unfinished state so
+// a later Stop call can continue the same drain.
 func (g *Group) Stop(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	g.mu.Lock()
-	if !g.started || g.stopped {
+	if g.stopped {
 		g.mu.Unlock()
 		return nil
 	}
 	g.stopping = true
-	g.runtimeStopped.Store(true)
-	g.runtimeCancel()
 	g.mu.Unlock()
+	g.stopOnce.Do(func() {
+		goruntimeregistry.SafeGo(nil, goruntimeregistry.TaskChannelAppendStopDrain, g.finishStop)
+	})
+	select {
+	case <-g.stopDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
-	if err := g.drainWriters(ctx); err != nil {
-		return err
-	}
-	if err := g.advancePool.stop(ctx); err != nil {
-		return err
-	}
-	if err := g.appendPool.stop(ctx); err != nil {
-		return err
-	}
-	if err := g.postCommitPool.stop(ctx); err != nil {
-		return err
-	}
+// finishStop owns the one-way background drain. Caller deadlines only stop
+// waiting; they never cancel accepted work or discard retry ownership.
+func (g *Group) finishStop() {
+	background := context.Background()
+	_ = g.drainWriters(background)
+	_ = g.postCommitRetries.stopAndWait(background)
+	g.advanceScheduler.stop()
+	_ = g.metrics.stopPressurePublisher(background)
+	_ = g.advancePool.stop(background)
+	_ = g.appendPool.stop(background)
+	_ = g.postCommitPool.stop(background)
 
+	g.runtimeCancel()
 	g.mu.Lock()
 	g.stopped = true
 	g.mu.Unlock()
-	return nil
+	close(g.stopDone)
 }
 
 // drainWriters waits until every writer has no pending work and is not scheduled.
@@ -160,7 +249,13 @@ func (g *Group) drainWriters(ctx context.Context) error {
 }
 
 func (g *Group) writersIdle() bool {
+	if g.postCommitRetries.pending() > 0 || g.handoff.depth() > 0 {
+		return false
+	}
 	for _, s := range g.shards {
+		if s.admissionUsed.Load() > 0 {
+			return false
+		}
 		s.mu.RLock()
 		for _, w := range s.writers {
 			if w.scheduled.Load() {
@@ -225,7 +320,7 @@ func (g *Group) SubmitLocal(ctx context.Context, target AuthorityTarget, items [
 		return nil, err
 	}
 	g.mu.RLock()
-	if !g.started || g.stopping || g.stopped {
+	if !g.started || g.paused || g.stopping || g.stopped {
 		g.mu.RUnlock()
 		return nil, ErrRouteNotReady
 	}

@@ -50,6 +50,8 @@ const (
 	ReasonControllerVoterProofMissing = "controller_voter_proof_missing"
 	// ReasonControllerVoterSetMismatch marks a promotion fenced to a stale Controller voter set.
 	ReasonControllerVoterSetMismatch = "controller_voter_set_mismatch"
+	// ReasonOpsMCPOwnerChangeWhileEnabled rejects changing the executor without stopping MCP first.
+	ReasonOpsMCPOwnerChangeWhileEnabled = "ops_mcp_owner_change_while_enabled"
 	// ReasonInitConflict marks an init command that does not match existing state.
 	ReasonInitConflict = "init_conflict"
 	// MaxTaskLastErrorBytes bounds the durable LastError field for failed tasks.
@@ -118,6 +120,10 @@ func (sm *StateMachine) applyMutation(next *state.ClusterState, raftIndex uint64
 		result = sm.applyPromoteControllerVoter(next, cmd)
 	case command.KindReplaceHashSlotTable:
 		result = sm.applyReplaceHashSlotTable(next, cmd)
+	case command.KindReplaceScheduledBackupState:
+		result = sm.applyReplaceScheduledBackupState(next, cmd)
+	case command.KindReplaceOpsMCPState:
+		result = sm.applyReplaceOpsMCPState(next, cmd)
 	case command.KindUpsertSlotAssignmentAndTask:
 		result = sm.applyUpsertSlotAssignmentAndTask(next, cmd)
 	case command.KindUpsertSlotReplicaMoveTask:

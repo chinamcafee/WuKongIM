@@ -35,6 +35,7 @@ type Registry struct {
 	AntsPool        *AntsPoolMetrics
 	NodeResource    *NodeResourceMetrics
 	NodeLifecycle   *NodeLifecycleMetrics
+	OpsMCP          *OpsMCPMetrics
 }
 
 func New(nodeID uint64, nodeName string) *Registry {
@@ -68,6 +69,7 @@ func New(nodeID uint64, nodeName string) *Registry {
 		AntsPool:        newAntsPoolMetrics(registry, labels),
 		NodeResource:    newNodeResourceMetrics(registry, labels),
 		NodeLifecycle:   newNodeLifecycleMetrics(registry, labels),
+		OpsMCP:          newOpsMCPMetrics(registry, labels),
 	}
 }
 

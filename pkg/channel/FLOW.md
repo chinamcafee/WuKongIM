@@ -94,6 +94,10 @@ coalesce flushed tasks across channels before entering the store adapter;
 `StoreAppendBatchMaxWait` can shorten that worker-side wait for low-latency
 profiles while zero keeps the default batching window.
 
+Runtime snapshots include a per-reactor count of channels with accepted append
+work still outstanding. This count is a bounded local quiescence proof used by
+the cluster source-fence barrier; it does not expose Channel identities.
+
 Leader reactors keep a configurable recent-record suffix cache for durable
 append records, defaulting to 128 records. Follower `Pull` requests that are
 covered by this suffix can complete from memory; older requests still use
@@ -154,6 +158,10 @@ leader rejects new append admission with `ErrWriteFenced`; already accepted
 in-flight append bookkeeping is not cleared by the fence-only metadata update
 so migration executors can drain it explicitly before changing leadership or
 membership.
+`Meta.RouteGeneration` projects the durable complete-metadata version for
+append-authority cache ordering and conditional invalidation. It is not a
+Channel state-machine fence: reactor and machine decisions continue to use the
+channel epoch, leader epoch, leader, retention boundary, and write fence fields.
 The hosted runtime may also provide an `AppendAdmissionGuard`. Channel runtime calls
 it only after local leader, write-fence, and epoch checks and before enqueueing
 new leader appends. The guard is an external readiness fence: it must not mutate

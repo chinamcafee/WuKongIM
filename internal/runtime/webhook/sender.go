@@ -37,7 +37,7 @@ func NewHTTPSender(opts HTTPSenderOptions) *HTTPSender {
 	return &HTTPSender{addr: opts.Addr, timeout: opts.Timeout, client: client}
 }
 
-// Send posts the encoded webhook body as JSON. Only HTTP 200 is classified as success.
+// Send posts the encoded webhook body as JSON. Any HTTP 2xx is classified as success.
 func (s *HTTPSender) Send(ctx context.Context, req SendRequest) error {
 	if s == nil || s.addr == "" {
 		return fmt.Errorf("webhook: http addr is required")

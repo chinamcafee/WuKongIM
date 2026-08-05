@@ -4,9 +4,70 @@
 
 - `internal` is the promoted send-to-sendack kernel: gateway SEND maps to `usecase/message.SendBatch`, appends through `infra/cluster.ChannelAppender`, and returns SENDACK after `pkg/cluster` / `pkg/channel` append.
 - `internal` single-node deployments must use single-node cluster config. Do not add send or storage paths that bypass cluster semantics.
+- Review Agent invalidation is generation-bound. Fresh PR facts and signed
+  scheduler state supersede stale workers; only the dedicated App-owned
+  `Review Agent Verdict` may represent the current automated decision.
+- Review Agent model work starts only from an exact `@review-agent review`
+  comment whose author has fresh repository `admin` permission. Lifecycle,
+  Review, and manual Controller signals may cancel or repair existing work but
+  must never create a generation. Administrator manual merge authority remains
+  independent of Review Agent state.
+- Review Agent `workflow_run` identity must be authenticated by its stable
+  workflow path; dynamic run names are not an authority boundary.
+- Review Agent role identity must be verified with the App JWT before minting
+  a repository-scoped installation token. Installation tokens must not call
+  App-JWT-only identity endpoints such as `GET /installation`.
+- Review Agent scheduler canonical JSON normalizes zero-length queue and active
+  collections to `null`; empty slice representation is never a state change.
+  The loader may recover one semantically identical legacy duplicate and its
+  strict successor without rewinding the append-only scheduler ref.
+- Review Agent evidence collection treats missing Context, reviewer, or
+  baseline artifacts as bounded infrastructure failure; it must still produce
+  signed retry or terminal `inconclusive` state and release the queue.
+- Review Agent hosted runners keep Ubuntu's global unprivileged-user-namespace
+  restriction enabled. Only a root-owned Review Agent `unshare` path receives
+  a narrow temporary AppArmor `userns` profile. The profile, copied binary, and
+  directory are removed after the isolated namespace is ready and before any
+  candidate command executes.
+- Review Agent Codex runs with full runner-user access through
+  `--dangerously-bypass-approvals-and-sandbox`. It receives no GitHub/App
+  credential or inherited host environment; Docker and `sudo` are disabled,
+  and tracked candidate-tree mutation is rejected. The protected Check MCP is
+  required at Codex startup and keeps candidate checks inside the rootless
+  network namespace and per-command Bubblewrap sandbox.
+- Review Agent model transport has one root-owned loopback Responses proxy. It
+  injects the OpenRouter credential and clamps `max_output_tokens` to 32,768;
+  its root-only credential handoff file is deleted before the listener is
+  published. Runner-user Codex must have no second, unclamped credential path.
+- Review Agent baseline candidate-network rules live only in that rootless
+  namespace, whose host loopback is disabled. The trusted host disables Docker
+  and `sudo` but retains runner transport for pinned post-job Artifact actions.
+- A Review Agent generation has one signed 90-minute deadline and at most one
+  automatic infrastructure retry. Merge conflicts deterministically publish
+  `changes_required`; late results are always `inconclusive`.
+- Review Agent interaction budgets are per head, not per control revision. An
+  authorized reconsideration for the current head binds fresh eligible
+  control, intent, base, and test-merge facts and consumes the existing signed
+  reconsideration allowance; it must not fall through to a second automatic
+  review when those generation facts changed.
+- Review Agent protected binaries are built once per Worker from the exact
+  control SHA and distributed only through a run-scoped, SHA-256-verified
+  Artifact. Consumers install a role-specific allowlist and never share a
+  cross-run build cache. Root `README.md` and `README_CN.md` join `docs/` and
+  `docs-site/` on the exclusive `docs-contracts` path.
+- Review Agent Controller runs also compile their protected binary once. A
+  true no-op never enters the credentialed State Writer or Publisher and never
+  dispatches; mutation and projection paths reuse the exact run-scoped,
+  control-SHA-bound binary Artifact.
+- Backup has one Manager-owned plan in Controller state; it is configured only through Manager, supports Cron or `@every`, and has no TOML/environment compatibility path.
+- Saving backup repository configuration is a durable Controller operation and never proves connectivity. Only the exact saved plan revision that completes the repository and all-active-data-node probe is verified and eligible for backup admission. A nil verification record is legacy verified state until the effective repository changes.
+- Every run publishes one independent full 256-hash-slot archive to the shared file repository under `<data_dir>/backup-repository`, Alibaba OSS, Tencent COS, or a generic S3-compatible repository. `COMPLETE` makes an archive visible, `HOLD` exempts it from retention, and object-storage credentials are encrypted in Controller state while archive payloads are not encrypted.
+- Restore is a same-identity, current-cluster maintenance operation: business traffic stops, every current replica stages and verifies the full archive, verified logical streams activate only after all peers acknowledge, and an all-replica rollback image restores the original state if activation fails. `v1` does not adopt a repository identity into a separately bootstrapped cluster.
+- Manager backup operations are Controller-Leader-fenced and available from every Manager node. The single Web page configures backup, manages archives, and starts restore; restore requires exact `cluster.restore:w`, current credentials, and exact archive confirmation. Manager is read-only when authentication is disabled.
 - `internal/app` seeds message IDs from the effective cluster node ID: `Config.Cluster.NodeID` when set, otherwise top-level `Config.NodeID`.
 - Browser-facing manager APIs encode 64-bit `message_id` values as decimal JSON strings; web filters, keys, and display code must keep them as strings end to end.
 - The Manager Web production bundle is generated into `internal/access/manager/webui/dist`, committed in full, and embedded in `cmd/wukongim`; production must not require a separate web process or a frontend build during ordinary Go compilation.
+- The embedded Operations MCP is administered through Manager but authenticated independently with one opaque `wko_*` token. Every Manager listener serves `/mcp`; Controller state selects one execution owner, ingress nodes never forward the raw token, targets consume one-time owner-held leases before pprof, audit fanout is deadline-bounded, and a stop-time 30-second fence prevents profile overlap across owner generations.
 - Manager message payloads are raw bytes encoded as Base64 in JSON; web views decode valid printable UTF-8 (including non-ASCII text) and keep binary payloads in Base64 form.
 - `cmd/wukongim` is the promoted product entrypoint. Controller, the new
   cluster runtime, the multi-reactor channel runtime, and the new business
@@ -21,8 +82,17 @@
 - `internal` presence stores owner-local `OwnerRoute` projections for authority/touch; concrete gateway session handles must stay out of authority routes and live only in owner-local session records used for conflict close actions.
 - `internal/runtime/delivery` is the no-gateway/no-cluster benchmark boundary for online fanout, owner push batching, and recipient-owner recvack tracking.
 - `internal` persists critical `msg.notify`/`msg.offline` webhooks in a node-local sync-WAL outbox with stable delivery IDs, bounded disk, durable retry, and dead-letter replay; only `user.onlinestatus` remains best-effort. Large offline fanout must use batch observer/chunking, and webhook failure must not affect SENDACK, durable append, conversation active admission, or owner delivery.
-- Channelappend post-commit pool admission and per-channel backlog must stay bounded and independent from foreground append admission; saturation is observed and dropped so best-effort conversation/delivery work cannot pin writer-advance workers, delay durable SEND/SENDACK, or return `ErrChannelBusy` for an otherwise admissible send.
+- Channelappend post-commit handoff and per-channel backlog must stay bounded.
+  When post-commit ports are configured, append-bound items reserve global
+  handoff capacity before durable append; unavailable capacity returns
+  `ErrChannelBusy` before the message is appended. After a successful durable
+  append, SENDACK completes independently, and isolated post-commit workers
+  retain scheduler-saturated envelopes in bounded writer state rather than
+  losing an already-committed handoff. Terminal conversation/delivery failures
+   remain best-effort and do not roll back the Channel commit.
+- Channelappend writer activation must pass through the dedicated dispatcher; callers or append/effect workers must never block while submitting back into the bounded advance pool, or saturated advance/append pools can form a cross-pool deadlock.
 - Conversation-active cache churn may evict clean rows during memory-only admission; dirty persistence stays exclusively on periodic, pressure-woken, or handoff flush workers.
+- Local Cloud Analysis should use the run's Cloud View `RemoteAddr` as a best-effort same-destination egress hint; transparent routing can give public echo services another IPv4. Keep pinned-TLS MCP health authoritative and preserve the echo fallback for runs without Cloud View.
 
 ## Gateway Runtime
 
@@ -30,6 +100,7 @@
 
 ## Channel Runtime
 
+- Node-local Channel reactor routing must avalanche stable hashes before a power-of-two modulus; raw FNV-64a low bits collapse sequential canonical person-channel IDs onto a subset of reactors. Reactor partitions are not cluster hash slots or persisted ownership.
 - Channel runtime data replicas are selected by Channel placement, not by Slot metadata peers; Slot route peers describe metadata ownership only.
 
 ### Conversation working set
@@ -47,10 +118,13 @@
 - Conversation active pressure uses one coalesced async worker wakeup, bounded flush attempts, and 80%/70% high/dirty-low watermarks; clean rows below the dirty watermark are the reusable eviction reserve.
 - Conversation active projection failure is observed independently and must not block recipient delivery, later large-channel pages, or subscriber snapshot caching.
 - Recipient delivery plans preserve complete UID-authority fences and batch presence RPC by actual leader; only stale/not-ready groups may batch-resolve fresh targets and retry once, without replaying successful siblings.
+- Cloud Medium recipient pages are bounded at 512 rows: authority normalization uses an inline UID index and exact 256-physical-hash-slot grouping while preserving all 10 logical Slot and leader/config fences; do not replace it with per-message UID/target maps.
 - Deleting a conversation clears current active visibility through `DeletedToSeq`; a later message with a larger sequence must be allowed to reactivate it.
 - Delete without an explicit message sequence must first resolve the latest Channel Log sequence; if no sequence is available, do not install a zero delete barrier.
 - Duplicate/stale delete barriers must not clear an `ActiveAt` written by a newer message.
 - Legacy channel allowlist, denylist, and temporary-subscriber APIs are backed by namespaced slot subscriber lists until dedicated metadata tables exist.
+- Manager business-channel detail and subscriber/allowlist/denylist reads are Slot-Leader authoritative and fail closed when no leader is confirmed; exact UID lookup is a point read, never a full member scan.
+- Manager channel create and flag patch are distinct conditional Slot-FSM commands: create is create-only, while patch changes only `Ban`, `Disband`, and `SendBan`. First allowlist/denylist add creates its derived list only after validating the parent channel and uses the same create-only primitive.
 - Legacy system UID APIs are backed by the namespaced slot subscriber list `__wk_internal_system_uids__`.
 - Persisted system UID add/remove APIs must refresh node-local caches on peer nodes through node RPC.
 - Message send permission checks live in `internal/usecase/message` before durable append; `pkg/channel` remains business-rule free.
@@ -135,6 +209,8 @@
 - In wukongim three-node Channel runtime activation, `routing.Route.Leader` is the observed Slot Raft leader for metadata proposals; `routing.Route.PreferredLeader` is the control-plane data-plane placement target for initial Channel runtime leader selection.
 - wukongim single hot-channel SEND stress is sensitive to gateway async SEND shard count: too many default shards shrink per-channel queue headroom and can close sessions with `async_dispatch_queue_full` before Channel runtime saturates.
 - wukongim 1000-channel three-node real-QPS stress with 4096 online users needs about 2048 gateway async SEND dispatch workers; 1024 workers creates per-shard SEND head-of-line blocking before Channel runtime is fully saturated.
+- The local three-node 5000-offered-QPS gate uses Channel replication RPC workers 160, same-target Pull/PullHint batch size 16, and four partition-hashed synchronous commit coordinators. These defaults passed the 30-second durable gate with p99 below 600ms; an oversized 500-worker pool and larger transport batches increased scheduler or tail-latency pressure.
+- Cluster transport may wait at most 100 microseconds to coalesce an isolated RPC or Bulk frame. Raft and Control frames remain immediate; keep the generic transport default at zero so the latency tradeoff stays cluster-specific.
 - SENDACK must only follow a crash-safe durable message commit; message append `NoSync` is unsafe for this guarantee and must not be exposed as runtime/user configuration. Durable QPS work should optimize message DB grouped commits, not acknowledge before fsync.
 
 ## Cluster Membership
@@ -171,6 +247,7 @@
 - Controller Raft shares the cluster transport server, so its wire message type must stay distinct from slot Raft and observation-hint message types.
 - Inbound Controller Raft frames must be addressed to the local node and originate from a different node; drop looped or misrouted frames before calling `RawNode.Step`.
 - Controller read RPCs can see `not leader` while Raft elects or fails over; keep those retryable read failures out of ERROR logs.
+- Controller-backed writes crossing the `pkg/cluster.Node` facade must expose cluster lifecycle errors while preserving Controller causes; manager routes map transient leadership/lifecycle failures to stable HTTP 503, and bounded idempotent e2e callers may retry only that status.
 
 ### Controller Raft compaction
 - Controller Raft snapshot restore starts from the snapshot index and replays post-snapshot entries; never skip replay by using a later persisted applied index after importing snapshot data.
@@ -180,6 +257,8 @@
 - Slot Raft snapshot restore follows the same boundary as Controller Raft: restore snapshot data first, then replay committed entries after the snapshot index.
 - After Slot Raft log compaction exists, membership changes must refresh the snapshot ConfState so newly added learners can install a snapshot and catch up.
 - Large Slot Raft snapshots are chunked only in `pkg/cluster` raft transport; receivers reassemble chunks into the original `MsgSnap` before calling `multiraft.Runtime.Step`.
+- Slot Raft batched fanout must attempt every peer before returning a send error; one offline peer must not block quorum messages to healthy peers in the same batch.
+- A Multi-Raft Slot apply queue must stay pinned while an accepted apply crosses from the Slot lock to the apply-pipeline lock; idle retirement cannot invalidate that in-flight enqueue.
 
 ### Local storage
 - `pkg/db` is the single local storage library: `message` owns channel logs and `meta` owns hash-slot metadata.
@@ -189,47 +268,144 @@
 - PullHint is only a wakeup/refresh trigger. Unloaded followers must resolve authoritative metadata before opening storage through a dedicated bounded cold-activation pool; loaded newer-fence recovery uses its separate authoritative refresh pool.
 
 ### Node scale-in
-- Manager-driven node scale-in drains a node to `ready_to_remove`; it must not call physical Slot removal or Kubernetes scale-down directly.
-- Scale-in manager reads require `cluster.node:r` and `cluster.slot:r`; start/advance/cancel require `cluster.node:w` and `cluster.slot:w`.
-- Node scale-in readiness must account for channel leaders, channel replicas, and active channel migration tasks before reporting `ready_to_remove`.
+- Manager-driven node scale-in drains until authoritative status reports
+  `safe_to_remove=true`; dynamic diagnostics then derives the
+  `ready_to_remove` recommendation. This recommendation is not a lifecycle
+  state. Manager must not call physical Slot removal or Kubernetes scale-down.
+- Scale-in status/diagnostics routes require `cluster.node:r`; plan, start,
+  drain, advance, and remove require `cluster.node:w`. Separate Slot inventory
+  and mutation routes retain their own `cluster.slot:r/w` permissions. Scale-in
+  has no cancel route.
+- Node scale-in safety must account for channel leaders, channel replicas, and
+  active channel migration tasks before reporting `safe_to_remove=true`.
 
 ## Plugin Subsystem
 
 - Plugin runtime is node-local and disabled by default; plugin-user bindings are Slot Raft metadata keyed by UID.
 - Phase 1 supports `.wkp`/go-pdk core methods and host RPCs, but stream RPCs return explicit unimplemented errors.
 - Plugin sends must go through `message.App.Send`; PersistAfter runs only on the channel owner node.
+- Offline Receive observation enters the plugin worker as one message-scoped UID batch with one owned payload copy; candidate discovery runs once per batch and skips UID binding reads when no running Receive plugin exists.
 - Plugin migration changes should rerun the microbenchmark baseline in `docs/development/PLUGIN_BENCHMARK_BASELINE.md`, especially Send hook selection, host RPC mapping, PersistAfter, HTTP forward, and NoPersist realtime delivery.
 - Plugin wire contracts live in `pkg/plugin/pluginproto`; keep protobuf field numbers compatible with `github.com/WuKongIM/go-pdk` and do not add new imports of old `internal/usecase/plugin/pluginproto`.
 - The node-local plugin process host lives in `pkg/plugin/pluginhost`; internal app wiring adapts it to `internal/usecase/plugin` without depending on old plugin runtime code.
 
 ## Development Workflow
 
+### Public documentation
+- The public WuKongIM v3 documentation application lives in `docs-site/`; the repository-level `docs/` tree remains the engineering knowledge base.
+- Public documentation uses the canonical bilingual routes `/{zh|en}/{guide|server|sdk|api}`. Both languages share one navigation registry in `docs-site/lib/navigation.ts`.
+- A documentation route is published only when both language variants are ready. Planned routes remain visible with a badge but are `noindex` and excluded from search, sitemap, and LLM outputs.
+- `docs-site` is a Bun-managed Fumadocs/Next.js static export. Phase 1 does not deploy it, cut over DNS, migrate legacy page bodies, or publish the known-stale v2 OpenAPI document as v3 reference.
+- Phase 5 configuration reference pages are checked against every public field returned by `internal/config.SchemaFields()` in both locales. `wukongim.toml.example` is a loadable development baseline, not a promise that its explicit values are runtime defaults for omitted fields.
+- Phase 6 public operations guidance treats Manager as a privileged boundary,
+  distinguishes `/healthz` liveness from `/readyz` admission, keeps dynamic
+  node onboarding explicit and scale-in fail-closed, and keeps all 256 physical
+  hash slots. Backup configuration lives only in Manager; a saved plan is not a
+  verified repository, restore accepts only the current cluster identity, and
+  mixed-version or v2-to-v3 migration is never promised without exact
+  release-specific evidence.
+- Phase 7 public troubleshooting starts with low-cost, read-only evidence and
+  keeps unknown state fail-closed. `wkcli` uses public APIs and Manager safety
+  gates; `wkdb` is node-local/offline and only `import` writes storage;
+  `wkbench` targets controlled benchmark clusters; Operations MCP exposes a
+  closed 12-tool observation registry with no write tool, while its bounded
+  `pprof_analyze` capture is the only active observation.
+- Phase 8 public server-architecture guidance distinguishes 256 stable physical
+  hash-slot fences from logical Slot Raft Groups, Controller intent from
+  observed Raft leadership, Slot metadata from Channel message logs, and
+  durable Channel commit from post-commit delivery and plugin effects. Client
+  Gateway transport and node transport are separate, while exact UID presence
+  authority is in-memory and target-fenced and concrete sessions remain
+  owner-local.
+- Phase 9 public guide foundations keep product capability claims
+  workload-qualified and define stable user-facing vocabulary for clusters,
+  physical hash slots, logical Slot Raft Groups, Channels, messages, users,
+  devices, and UID-owned conversations. Plain non-command `NoPersist` is a
+  compatibility success without realtime delivery; command-style `NoPersist`
+  alone enters transient delivery. Plugins are node-local `.wkp` processes:
+  Send hooks are synchronous and fail closed by default, while Receive and
+  PersistAfter are post-commit effects; Slot-owned UID bindings do not prove a
+  compatible plugin is running on every node.
+- Phase 10 public scenario tutorials treat direct and group chat as product
+  workflows over the same cluster semantics. Direct chat supplies the peer UID
+  with `channel_type=1` and leaves canonical person-Channel derivation to the
+  server. Group chat uses a product-owned group ID with `channel_type=2`; the
+  product service owns the membership source of truth and reconciles
+  subscribers through bounded requests. Current product HTTP routes remain a
+  trusted service-side boundary. Durable SEND success proves Channel quorum
+  commit, not complete fanout, RECVACK, conversation projection, or a business
+  result. `ClearUnread` advances through the newest server-visible Channel
+  message; its optional request sequence is only a fallback, not exact
+  client-side read progress. A 100,000-member workflow uses checkpointed
+  application batches and post-commit paged fanout rather than one full-member
+  request.
+- Public deployment guidance treats the root Compose stack as development-only
+  and builds artifacts from reviewed source without promising an official image
+  registry or tag. Traffic admission uses `/readyz`, not process-level
+  `/healthz`; Kubernetes remains a planned route.
+
 ### E2E profiling
 - API `/debug...` routes are exposed only when `WK_DEBUG_API_ENABLE=true`; e2e profile scenarios should enable it with node config overrides and fetch `/debug/pprof/*` through the real API listener.
+- Prebuilt binaries passed through `WK_E2E_BINARY` must be built with `go build -tags=e2e`; tagged product substitutes remain dormant unless each scenario also supplies its explicit harness environment.
+- Default local E2E binaries use one repository/GOOS/GOARCH-scoped user-cache path and are atomically replaced; do not create process-specific binary cache roots.
+- E2E loopback allocation leases one non-overlapping port block per `go test` process with a process-lifetime sentinel listener; per-address probes still skip unrelated host listeners.
 
 ### Worktree testing
 - The chat Demo is embedded under the product API listener at `/demo/`; it defaults to the page origin for HTTP APIs and discovers WebSocket addresses through `/route`.
 - When using project-local `.worktrees/*`, run Go tests with `GOWORK=off`; the parent `go.work` points at the main checkout and otherwise makes packages resolve under `.worktrees` incorrectly.
 - Repository-wide Go gates must use `GOWORK=off` plus explicit roots (`cmd`, `internal`, `pkg`, `scripts`, `docker`, or `test/e2e`); root `./...` ignores `.gitignore` and can include local `tmp` or `web/node_modules` packages.
+- The default `scripts/...` unit tier is limited to static contracts, parsers,
+  AWK/JQ transforms, help output, and no-background dry runs. Binary builds,
+  process lifecycle/signals, real sleeps/deadlines, TCP, retry/readiness, and
+  fault-injection scenarios live in `*_integration_test.go` and run with
+  `-tags=integration -parallel=2`; wall-clock-sensitive cases use the shared
+  exclusive timing lock. Production `scripts/**/*.sh` and scripts integration
+  test changes receive both the protected Go unit/Vet checks and the scripts
+  integration check from Review Agent policy.
+- Every ready, open pull request targeting `main` is adjudicated by the
+  review-only Review Agent. Its signed generation binds the exact head, base,
+  test-merge commit, intent digest, trusted checks, and model result. Only the
+  dedicated Review Agent App may project the required `Review Agent Verdict`
+  Check. The model never edits code or merges; the protected Publisher may
+  merge only the exact approved head of a repository administrator or
+  organization member, while every other author requires a human merge. There
+  is no periodic PR scan.
+- The GitHub Issue Agent is a GitHub-Actions-only stateless system. Canonical App-authored, GitHub-signed commits on `agent-state/issue-<number>` are its sole durable authority; event payloads are wake-up hints. A full-SHA-pinned official Codex Action performs one complete ephemeral engineering task with public internet but no GitHub/App/cloud/deploy credentials or Docker socket. Filesystem capture ignores Codex Git metadata, a clean credential-free Verifier owns test evidence and risk, and only the protected Publisher may create an expected-head signed commit on `agent/issue-<number>`, one complete Draft PR, and the status/state projections. Humans remain the only merge authority; setup and boundaries live in `docs/agents/issue-agent.md`.
+- A stale Ready Issue Agent PR is synchronized without another model run only
+  by the protected Publisher: it replays the exact bounded linear App-signed
+  history on current `main` when every final touched path is unchanged, swaps
+  the Agent ref under CAS, advances signed state within a three-sync budget,
+  and requires a fresh Review Agent generation. Overlap or an external head
+  fails closed.
+- Official `cmd/wukongim` goroutines must launch through a fixed `pkg/goroutine` task or an audited registered pool; `scripts/managed_goroutines_test.go` rejects raw `go`, `.Go`, and unregistered ants pools in production roots.
 - `internal/gateway` now ships only the `gnet` transport; connection callbacks are serialized by actor shards and there is no `stdnet` fallback or per-connection writer goroutine.
 - wk-sim performance investigations must follow the `docs/development/PERF_TRIAGE.md` runbook: collect evidence, classify, hypothesize, then run one-variable experiments.
 - Node log output is split by `internal/log`: `app.log` contains info and above, `warn.log` contains warnings, `error.log` contains errors, and `debug.log` exists when debug logging is enabled.
 - Bench APIs are benchmark-only `/bench/v1/*` routes gated by `WK_BENCH_API_ENABLE`; remotely reachable deployments must set the sensitive `WK_BENCH_API_TOKEN` bearer capability, and mutations go through benchdata plus user/channel usecase boundaries.
 - Cloud Simulation billable creation and unattended cleanup use separate GitHub Environments; AccessKey mode requires a complete Repository Secret pair, while OIDC mode uses exact workflow-conditioned subjects. Cleanup must never require a reviewer because it is the lease backstop.
 - Cloud Simulation Actions are repository opt-in: provision, analysis, monitor, and cleanup jobs require `ALIBABA_CLOUD_SIM_ENABLED=true`; an unconfigured fork must skip before Alibaba credential resolution.
+- Cloud Simulation Provision is a billable final validation gate, not a per-change feedback loop. Before starting Alibaba Cloud resources, finish one cohesive local candidate with representative before/after benchmarks, focused and race tests, the explicit-root repository Go gate, review, green PR CI, and a written go/no-go showing the candidate can plausibly meet the target throughput and latency with margin.
+- A retained Cloud Simulation Run Locator is an audit/identity candidate, not proof of live resources; scheduled Monitor first narrows candidates with one authority-validated provider Inventory Snapshot per bounded account/region binding, then requires exact Preflight and patrols only `live + running` runs. Inventory absence alone never proves `released`.
 - Cloud Simulation may classify a run as released only after the locator matches the authenticated cloud account and region and the provider returns an empty exact-tag inventory; analysis then stops before Codex runs.
 - Cloud Simulation destroy and sweep must prove the active credential matches the retained provider account before interpreting cleanup inventory or mutating resources.
+- Cloud Simulation compute inventory readiness does not prove guest SSH readiness; Provision must probe the simulator jump and every private target, retry only bounded SSH transport failures, and log the exact bootstrap stage before transferring or installing the bundle.
 - Cloud Simulation simple onboarding stores a complete Alibaba AccessKey pair as Repository Secrets and discovers non-secret provider config before billable creation; `scripts/cloud-sim/setup.sh` remains the optional hardened OIDC onboarding path.
 - Cloud Simulation CloudShell tool downloads are checksum-pinned, IPv4/HTTP 1.1, bounded, resumable under the user cache, and missing Go prefers the Alibaba Golang mirror; do not add an unverified GitHub Release proxy.
 - Cloud Simulation live Codex analysis uses `scripts/cloud-sim/analyze.sh` with local ChatGPT authentication; GitHub receives no OpenAI or Codex credential and hands off only a request-correlated RSA-OAEP-encrypted, run-scoped token.
+- `wkbench-diagnostic-summary/v1` is a strict producer/consumer contract: any field change must update the report producer, cloudanalysis parser, MCP DTO, and producer-shaped fixtures together because unknown fields are rejected.
 - Cloud Simulation workers must set an explicit bounded WKProto client capacity profile; omitting it activates the generic 8192-entry per-client queues and can exhaust simulator memory at stability scale.
 - wkbench warmup records typed session-operation failures and continues, while timed measurements continue individual message failures; send, sendack, recv, and recvack errors, including SENDACK rejection and receive payload mismatch, must retain their session and operation code so configured error-rate limits decide the verdict instead of failing the phase, phase cancellation is excluded from error counters, and structural harness failures remain fail-fast.
 - wkbench warmup may extend early cold-channel operations to the warmup duration, but all in-flight waits must share a final deadline at warmup end plus the original traffic operation timeout; coordinator polling must include the same tail and report child-deadline exhaustion as `phase_timeout`.
 - Cloud Simulation Codex tool subprocesses inherit no caller environment and run under strict filesystem/network permission profiles; Codex auth and the live Analysis Token stay in the parent Codex/MCP process, tools cannot read them, and model-authored diagnosis text never enters Draft PR metadata.
 - Cloud Simulation local analysis ignores project exec rules and rejects deployed `.codex/config.toml` or `.codex/hooks.json` before Codex starts so repository configuration cannot widen its permission profiles.
 - Cloud Simulation cleanup reconstructs temporary ingress deadlines from provider security rules; sweeps preserve unexpired local Analysis Windows and close expired, malformed, or duplicate windows.
-- Cloud Simulation normal completion uses a non-diagnostic Finalization Schedule plus local `finalize.sh`: retry an explicit in-progress workload while the lease permits, run exact cleanup even after diagnosis/remediation failure, then require structured provider-confirmed empty inventory.
+- Cloud Simulation normal completion uses a non-diagnostic Finalization Schedule plus local `finalize.sh`: arm cleanup before bounded GitHub preflight, retry an explicit in-progress workload while the lease permits, survive terminal signals through exact cleanup, then require structured provider-confirmed empty inventory.
 - Cloud Simulation stability topology uses 256 physical hash slots mapped to 10 logical Slot Raft Groups; bootstrap gates both values separately.
+- E2E `readyz` and WKProto probes prove process liveness only; scenarios that register distributed authority must also require a bounded stable window of voter-agreed actual Slot Raft leaders before creating clients.
+- Cloud Simulation bundles carry a versioned effective-node runtime contract; Bootstrap Gate must match every node's normalized TOML-sourced critical values before starting a paid workload.
+- Bootstrap Gate must parse the rendered YAML shape rather than source-file indentation, retry only convergence failures, and destroy the exact Run on terminal contract failure or workflow cancellation.
+- Omitted Channel store/RPC worker settings stay zero in the loader so the owning Channel runtime derives them; deployment profiles that require a fixed shape must set them explicitly.
+- Local Cloud Medium RC evidence must disable parent `go.work`, resolve the exact `go.mod` toolchain, and use portable temporary/hash commands so macOS and Linux exercise the same committed harness.
 - Cloud Simulation Bootstrap Gate accepts a non-zero actual Slot Raft leader that belongs to the current voter set when quorum and peer sync are healthy; `PreferredLeader` mismatch is placement evidence, not a health failure.
 - Conversation-active flush evidence must distinguish selected, acknowledged-persisted, cooldown-skipped, actually cleared, version-conflicted retry rows, and superseded stale snapshots; a successful store call does not prove that version-fenced dirty markers were cleared, while a failed cross-Slot store call leaves durable progress unknown.
 - Conversation-active cooldown must classify the current dirty version's ReadSeq advance, not a historical cached ReadSeq; after a persisted snapshot conflicts with a newer cache version, only a ReadSeq beyond that snapshot remains sender-dirty. Bounded flush selection must cover each live dirty address before repeating, and dirty-age indexes must be bounded by live dirty rows rather than cumulative updates.
@@ -240,6 +416,10 @@
 - Workflow input `public_observation` optionally enables a Run-Lease-bounded `0.0.0.0/0:19443` Cloud View on sim; real Demo/WS use and Manager writes annotate benchmark purity, while authenticated gate probes are excluded and must prove Manager, Demo, WS, and all seven Prometheus targets.
 - wkbench requires server bench mode (`WK_BENCH_API_ENABLE=true`) and must prepare target data only through `/bench/v1/*`; it must not use Manager APIs for benchmark setup.
 - wkbench traffic with `recv_ack=true` must drain delivered recv frames and send protocol recvack even when receive verification is `none`; otherwise delivery retry will keep re-pushing accepted routes until they expire.
+- `wkcli sim --rate` is a per-group rate, so the aggregate offered SEND rate is `groups * rate`; high aggregate pacing must schedule from cumulative elapsed time because sub-millisecond ticker delivery can drop ticks under load.
+- `wkcli sim` group plans must distribute deterministic membership windows across the full user pool; repeating a small set of group cohorts synchronizes initial senders and turns per-client SENDACK waits into an artificial workload-generator bottleneck.
+- `wkcli sim` client SEND/RECV buffers must use fixed per-client bounds rather than the simulator-wide concurrency. The send-load simulator auto-acks but does not consume RECV payloads, so it retains only the newest delivered frame; otherwise sustained fanout retains millions of frames and distorts generator QPS.
+- The three-node `wkcli sim` stress harness uses 4096 Gateway async SEND workers and 800 delivery recipient workers for its validated 2000-user, 2000-group, 4000-SEND/s profile; these are stress-harness defaults, not general production sizing recommendations.
 - `wkcli sim` online users must start client PING heartbeats as soon as each CONNECT succeeds; slow full-pool connection phases must not leave early sessions idle until all users connect.
 - `pkg/client` WKProto client batch-send changes should run `scripts/bench-pkg-client-baseline.sh`; hard allocation guards and recorded baseline numbers live in `docs/development/PKG_CLIENT_BENCHMARK_BASELINE.md`.
 - Committed delivery routing treats transient channel status errors such as `channel: not ready` as retry signals; warn only after retries are exhausted.
@@ -253,9 +433,13 @@
 - Mixed `wkbench` traffic must retain drained RECV frames only for channel types with receive verification; buffering unverified group fanout because person traffic verifies will create an unconsumed simulator backlog and invalidate the run.
 - `wkbench` connection rate limits attempt start times; do not sleep a full interval after each handshake, because per-connection handshake latency accumulates into false connect-phase timeouts at large online counts.
 - In three-node real-QPS SEND benchmarks, the promoted transport runtime's channel append RPCs need a larger service pool than generic RPCs; Channel runtime store append/apply defaults should stay capped near the shared message DB commit coordinator instead of scaling unbounded with CPU count.
+- Channel replication capacity is bounded by both RPC workers and same-target batch size; accept a bounded batch with the real 256/10/3 process-level gate before increasing worker or remote-call concurrency, use observed blocking time only as corroboration, and rotate mixed-target subgroup priority under actual Slot-leader skew.
+- Cloud scale-specific blocking RPC worker counts must come from completed queue-saturation evidence with explicit headroom; keep them bounded and sealed in the effective runtime contract, and separate high-frequency metric observer effects from performance measurements in single-host gates.
 - Stage 2 package promotion uses promoted names in default evidence and human-readable output (`channel`, `transport`) while keeping raw Prometheus inputs and legacy aliases such as `wukongim_channelv2_*`, `component="channelv2"`, and `channelv2_metrics_summary.tsv` compatible.
 - Stage 2 package promotion has physically moved the canonical runtimes to `pkg/channel`, `pkg/cluster`, `pkg/controller`, and `pkg/transport`; the old implementations have been removed, and new imports must not target `pkg/*v2`.
 - Promoted production roots must not import old runtime paths; `pkg/slot/proxy` has no legacy imports.
 - `pkg/cluster.Node` satisfies `pkg/slot/proxy.Cluster` plus the optional hash-slot proposer port; Slot proxy RPC handler registration goes through `pkg/cluster.Node.RegisterRPC`.
-- In local three-node real-QPS runs, message DB commit shards are an experimental default-off knob: 3000, 4000, and 16k evidence all show that multiple coordinators on one physical store fragment group commits and increase sync tail; prefer one coordinator with bounded store append/apply workers unless nodes use independently proven storage parallelism.
+- Commit-coordinator shard count is workload-sensitive: older 3000, 4000, and 16k local evidence found that multiple coordinators fragmented group commits, while the current 5000-QPS three-node SEND workload benefits from four partition-hashed synchronous coordinators. Keep four as the shipped default validated by the current acceptance gate, preserve per-channel partition affinity, and remeasure before changing it for another workload or storage topology.
+- Typed Raft receive services must preserve message order from each stable peer connection; concurrent handling can apply a later Heartbeat before its earlier Append and advance commit beyond the follower log.
+- Shell scripts that must stop and wait for a background sampler must start it in the owning shell; command substitution creates a subshell-owned child that the parent cannot reliably wait or clean up.
 - Stage 2 package promotion extracted protocol-facing channel ID helpers to `pkg/protocol/channelid`; v1 and v2 server packages must not add new imports of old `internal/runtime/channelid`.

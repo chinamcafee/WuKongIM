@@ -85,6 +85,10 @@ func Render(root string, spec BundleSpec) error {
 	if err := validateSpec(spec); err != nil {
 		return err
 	}
+	runtimeProfile, err := nodeRuntimeProfileForScenario(spec.ScenarioPath)
+	if err != nil {
+		return err
+	}
 	requiredBinaries := []string{"wukongim", "wkbench", "wkanalysis", "prometheus", "node_exporter"}
 	if spec.PublicViewEnabled {
 		requiredBinaries = append(requiredBinaries, "wkcloudview")
@@ -101,10 +105,18 @@ func Render(root string, spec BundleSpec) error {
 		}
 	}
 	for index, role := range []string{"node-1", "node-2", "node-3"} {
-		content := nodeConfig(index+1, spec.PrivateIPv4)
+		content := nodeConfig(index+1, spec.PrivateIPv4, runtimeProfile)
 		if err := writeBundleFile(root, filepath.Join("config", role+".toml"), []byte(content), 0o640); err != nil {
 			return err
 		}
+	}
+	contractData, err := json.MarshalIndent(runtimeProfile, "", "  ")
+	if err != nil {
+		return err
+	}
+	contractData = append(contractData, '\n')
+	if err := writeBundleFile(root, filepath.Join("config", effectiveNodeRuntimeContractName), contractData, 0o640); err != nil {
+		return err
 	}
 	if err := renderScenario(root, spec); err != nil {
 		return err
@@ -131,6 +143,24 @@ func Render(root string, spec BundleSpec) error {
 		}
 	}
 	return nil
+}
+
+// nodeRuntimeProfileForScenario returns the reviewed exact runtime contract
+// declared by the effective scenario rather than inferred from a filename.
+func nodeRuntimeProfileForScenario(path string) (EffectiveNodeRuntimeContract, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return EffectiveNodeRuntimeContract{}, err
+	}
+	var document struct {
+		Objectives struct {
+			Scale string `yaml:"scale"`
+		} `yaml:"objectives"`
+	}
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return EffectiveNodeRuntimeContract{}, fmt.Errorf("%w: scenario YAML: %v", ErrInvalidBundle, err)
+	}
+	return effectiveNodeRuntimeContractForScale(document.Objectives.Scale)
 }
 
 // Seal inventories all bundle files and writes a self-contained manifest.

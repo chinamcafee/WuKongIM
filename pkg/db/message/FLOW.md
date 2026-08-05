@@ -109,6 +109,20 @@ Current flow:
     separate durable header column from the legacy `Timestamp` field; old rows
     without the new column decode `ServerTimestampMS` as zero, and new leader
     appends default it at the DB boundary when callers omit it.
-18. Schema and key helpers define the durable message table layout.
+18. Full-backup readers pin one engine view and stream a portable, checksummed
+    hash-slot payload containing every committed message through the selected
+    HW, plus checkpoint, epoch history, retention state, and idempotency fields.
+    The count pass derives the exact message-row count and maximum message ID
+    from the same pinned view; restore parsing independently recomputes both.
+19. Restore imports one complete snapshot into a fresh isolated database in
+    bounded batches. An exact retry is idempotent, any different pre-existing
+    Channel checkpoint is a conflict, and final verification checks live
+    checkpoint/LEO state plus deterministic snapshot content before a replica
+    acknowledges staging.
+20. Restore failure cleanup removes every Channel row, global/local secondary
+    index, checkpoint/history/retention record, and catalog entry before retry.
+    Message and index deletion is paged in batches of at most 1024 rows and
+    approximately 8 MiB of payload.
+21. Schema and key helpers define the durable message table layout.
 
 Storage code in this package must not import Pebble directly.

@@ -14,7 +14,10 @@ CHANNEL_REACTOR_COUNT="${WK_WKCLI_SIM_THREE_SMOKE_CHANNEL_REACTOR_COUNT:-32}"
 CHANNEL_STORE_APPEND_WORKERS="${WK_WKCLI_SIM_THREE_SMOKE_CHANNEL_STORE_APPEND_WORKERS:-500}"
 CHANNEL_STORE_APPLY_WORKERS="${WK_WKCLI_SIM_THREE_SMOKE_CHANNEL_STORE_APPLY_WORKERS:-500}"
 CHANNEL_RPC_WORKERS="${WK_WKCLI_SIM_THREE_SMOKE_CHANNEL_RPC_WORKERS:-500}"
+GATEWAY_ASYNC_SEND_WORKERS="${WK_WKCLI_SIM_THREE_SMOKE_GATEWAY_ASYNC_SEND_WORKERS:-${WK_GATEWAY_RUNTIME_ASYNC_SEND_WORKERS:-4096}}"
+DELIVERY_RECIPIENT_WORKERS="${WK_WKCLI_SIM_THREE_SMOKE_DELIVERY_RECIPIENT_WORKERS:-${WK_DELIVERY_RECIPIENT_WORKER_CONCURRENCY:-800}}"
 GATEWAY_SEND_TIMEOUT="${WK_WKCLI_SIM_THREE_SMOKE_GATEWAY_SEND_TIMEOUT:-14s}"
+SIM_CONNECT_RATE="${WK_WKCLI_SIM_THREE_SMOKE_CONNECT_RATE:-20}"
 SIM_CONCURRENCY="${WK_WKCLI_SIM_THREE_SMOKE_CONCURRENCY:-64}"
 SIM_ACK_TIMEOUT="${WK_WKCLI_SIM_THREE_SMOKE_ACK_TIMEOUT:-15s}"
 MAX_FLUSH_ERROR_SELECTED_ROWS="${WK_WKCLI_SIM_THREE_SMOKE_MAX_FLUSH_ERROR_SELECTED_ROWS:-0}"
@@ -80,6 +83,8 @@ AUTO_JOIN_STARTED=0
 API_VALUES=()
 GATEWAY_VALUES=()
 AUTO_JOIN_SEED_VALUES=()
+CLUSTER_START_ENV=()
+CLUSTER_START_ARGS=()
 
 usage() {
   cat <<'USAGE'
@@ -91,9 +96,10 @@ from every node, then stops the cluster.
 
 The started cluster enables WK_DEBUG_API_ENABLE by default so pprof/debug
 evidence is available during failures. Set WK_DEBUG_API_ENABLE=false to opt out.
-It also uses the validated three-node Channel capacity profile (32 reactors,
-500 append/apply/RPC workers), a 14s gateway SEND deadline, and a 15s client
-SENDACK deadline. Override these with WK_WKCLI_SIM_THREE_SMOKE_* variables.
+It also uses the validated three-node capacity profile (32 Channel reactors,
+500 append/apply/RPC workers, 4096 gateway async SEND workers, 800 delivery
+recipient workers), a 14s gateway SEND deadline, and a 15s client SENDACK
+deadline. Override these with WK_WKCLI_SIM_THREE_SMOKE_* variables.
 
 Options:
   --out-dir DIR             Evidence directory. Default: data/wkcli-sim-three-node-smoke.
@@ -108,6 +114,8 @@ Options:
   --groups N                Simulated group channels. Default: 6.
   --members N               Members per group. Default: 10.
   --rate RATE               Per-group send rate. Default: 10/s.
+  --connect-rate N          Maximum simulated client connects per second. Default: 20.
+  --concurrency N           Maximum concurrent SEND operations. Default: 64.
   --duration DURATION       Sim max runtime. Default: 10s.
   --payload-size SIZE       Sim payload size. Default: 128B.
   --ready-timeout SECS      Cluster ready wait timeout. Default: 90.
@@ -275,6 +283,7 @@ metrics_dir() {
   printf '%s/metrics' "$OUT_DIR"
 }
 
+
 summary_output() {
   printf '%s/summary.md' "$OUT_DIR"
 }
@@ -365,6 +374,7 @@ prepare_auto_join_state() {
   rm -f "$AUTO_JOIN_CONFIG_PATH" "$(auto_join_log)"
 }
 
+
 auto_join_api_listen_addr() {
   local raw="$AUTO_JOIN_API_ADDR"
   raw="${raw#http://}"
@@ -401,25 +411,42 @@ cluster_profile_env() {
     "WK_CLUSTER_CHANNEL_STORE_APPEND_WORKERS=$CHANNEL_STORE_APPEND_WORKERS" \
     "WK_CLUSTER_CHANNEL_STORE_APPLY_WORKERS=$CHANNEL_STORE_APPLY_WORKERS" \
     "WK_CLUSTER_CHANNEL_RPC_WORKERS=$CHANNEL_RPC_WORKERS" \
+    "WK_GATEWAY_RUNTIME_ASYNC_SEND_WORKERS=$GATEWAY_ASYNC_SEND_WORKERS" \
+    "WK_DELIVERY_RECIPIENT_WORKER_CONCURRENCY=$DELIVERY_RECIPIENT_WORKERS" \
     "WK_GATEWAY_SEND_TIMEOUT=$(effective_gateway_send_timeout)"
 }
 
-cluster_start_env_preview() {
+prepare_cluster_start_command() {
   local assignment
-  local envs=()
+  CLUSTER_START_ENV=()
+  CLUSTER_START_ARGS=()
+  if [[ "$START_CLUSTER" -eq 0 ]]; then
+    return
+  fi
   while IFS= read -r assignment; do
-    envs+=("$assignment")
+    CLUSTER_START_ENV+=("$assignment")
   done < <(cluster_profile_env)
   if [[ "$FAULT_KILL_NODE" == "true" ]]; then
-    [[ -n "$FAULT_HEALTH_REPORT_INTERVAL" ]] && envs+=("WK_CLUSTER_NODE_HEALTH_REPORT_INTERVAL=$FAULT_HEALTH_REPORT_INTERVAL")
-    [[ -n "$FAULT_HEALTH_REPORT_TTL" ]] && envs+=("WK_CLUSTER_NODE_HEALTH_REPORT_TTL=$FAULT_HEALTH_REPORT_TTL")
-    [[ -n "$FAULT_CHANNEL_MIGRATION_SCAN_INTERVAL" ]] && envs+=("WK_CHANNEL_MIGRATION_SCAN_INTERVAL=$FAULT_CHANNEL_MIGRATION_SCAN_INTERVAL")
-    [[ -n "$FAULT_CHANNEL_MIGRATION_SCAN_LIMIT" ]] && envs+=("WK_CHANNEL_MIGRATION_SCAN_LIMIT=$FAULT_CHANNEL_MIGRATION_SCAN_LIMIT")
-    [[ -n "$FAULT_CHANNEL_MIGRATION_MAX_PAGES_PER_TICK" ]] && envs+=("WK_CHANNEL_MIGRATION_MAX_PAGES_PER_TICK=$FAULT_CHANNEL_MIGRATION_MAX_PAGES_PER_TICK")
-    [[ -n "$FAULT_CHANNEL_MIGRATION_MAX_TASKS_PER_TICK" ]] && envs+=("WK_CHANNEL_MIGRATION_MAX_TASKS_PER_TICK=$FAULT_CHANNEL_MIGRATION_MAX_TASKS_PER_TICK")
-    [[ -n "$FAULT_CHANNEL_MIGRATION_TASK_LIMIT" ]] && envs+=("WK_CHANNEL_MIGRATION_TASK_LIMIT=$FAULT_CHANNEL_MIGRATION_TASK_LIMIT")
+    [[ -n "$FAULT_HEALTH_REPORT_INTERVAL" ]] && CLUSTER_START_ENV+=("WK_CLUSTER_NODE_HEALTH_REPORT_INTERVAL=$FAULT_HEALTH_REPORT_INTERVAL")
+    [[ -n "$FAULT_HEALTH_REPORT_TTL" ]] && CLUSTER_START_ENV+=("WK_CLUSTER_NODE_HEALTH_REPORT_TTL=$FAULT_HEALTH_REPORT_TTL")
+    [[ -n "$FAULT_CHANNEL_MIGRATION_SCAN_INTERVAL" ]] && CLUSTER_START_ENV+=("WK_CHANNEL_MIGRATION_SCAN_INTERVAL=$FAULT_CHANNEL_MIGRATION_SCAN_INTERVAL")
+    [[ -n "$FAULT_CHANNEL_MIGRATION_SCAN_LIMIT" ]] && CLUSTER_START_ENV+=("WK_CHANNEL_MIGRATION_SCAN_LIMIT=$FAULT_CHANNEL_MIGRATION_SCAN_LIMIT")
+    [[ -n "$FAULT_CHANNEL_MIGRATION_MAX_PAGES_PER_TICK" ]] && CLUSTER_START_ENV+=("WK_CHANNEL_MIGRATION_MAX_PAGES_PER_TICK=$FAULT_CHANNEL_MIGRATION_MAX_PAGES_PER_TICK")
+    [[ -n "$FAULT_CHANNEL_MIGRATION_MAX_TASKS_PER_TICK" ]] && CLUSTER_START_ENV+=("WK_CHANNEL_MIGRATION_MAX_TASKS_PER_TICK=$FAULT_CHANNEL_MIGRATION_MAX_TASKS_PER_TICK")
+    [[ -n "$FAULT_CHANNEL_MIGRATION_TASK_LIMIT" ]] && CLUSTER_START_ENV+=("WK_CHANNEL_MIGRATION_TASK_LIMIT=$FAULT_CHANNEL_MIGRATION_TASK_LIMIT")
   fi
-  printf '%s' "${envs[*]}"
+
+  CLUSTER_START_ARGS=("$START_SCRIPT")
+  if [[ "$CLEAN_CLUSTER" -eq 1 ]]; then
+    CLUSTER_START_ARGS+=(--clean)
+  fi
+  CLUSTER_START_ARGS+=(--ready-timeout "$READY_TIMEOUT" --bin "$(cluster_bin)" --log-dir "$(node_log_dir)")
+  if [[ "$BUILD_CLUSTER" -eq 0 ]]; then
+    CLUSTER_START_ARGS+=(--no-build)
+  fi
+  if [[ "$FAULT_KILL_NODE" == "true" ]]; then
+    CLUSTER_START_ARGS+=(--pid-dir "$FAULT_PID_DIR" --allow-node-exit "$FAULT_NODE_ID")
+  fi
 }
 
 print_start_cmd() {
@@ -427,17 +454,9 @@ print_start_cmd() {
     printf 'start_cmd=<disabled>\n'
     return
   fi
-  printf 'start_cmd=env %s %s' "$(cluster_start_env_preview)" "$START_SCRIPT"
-  if [[ "$CLEAN_CLUSTER" -eq 1 ]]; then
-    printf ' --clean'
-  fi
-  printf ' --ready-timeout %s --bin %s --log-dir %s' "$READY_TIMEOUT" "$(cluster_bin)" "$(node_log_dir)"
-  if [[ "$BUILD_CLUSTER" -eq 0 ]]; then
-    printf ' --no-build'
-  fi
-  if [[ "$FAULT_KILL_NODE" == "true" ]]; then
-    printf ' --pid-dir %s --allow-node-exit %s' "$FAULT_PID_DIR" "$FAULT_NODE_ID"
-  fi
+  printf 'start_cmd=env'
+  printf ' %s' "${CLUSTER_START_ENV[@]}"
+  printf ' %s' "${CLUSTER_START_ARGS[@]}"
   printf '\n'
 }
 
@@ -453,7 +472,7 @@ print_sim_cmd() {
   done
   printf ' --users %s --groups %s --group-members %s --rate %s --max-runtime %s --payload-size %s --status-listen %s --status-interval %s' \
     "$USERS" "$GROUP_COUNT" "$GROUP_MEMBERS" "$RATE" "$DURATION" "$PAYLOAD_SIZE" "$STATUS_LISTEN" "$STATUS_INTERVAL"
-  printf ' --concurrency %s --ack-timeout %s' "$SIM_CONCURRENCY" "$(effective_sim_ack_timeout)"
+  printf ' --connect-rate %s --concurrency %s --ack-timeout %s' "$SIM_CONNECT_RATE" "$SIM_CONCURRENCY" "$(effective_sim_ack_timeout)"
   printf ' --json\n'
 }
 
@@ -492,6 +511,7 @@ print_fault_cmd() {
   printf 'fault_cmd=kill -s %s $(cat %s)\n' "$FAULT_SIGNAL" "$(fault_pid_file)"
 }
 
+
 print_plan() {
   printf 'repo_root=%s\n' "$ROOT_DIR"
   printf 'out_dir=%s\n' "$OUT_DIR"
@@ -503,7 +523,10 @@ print_plan() {
   printf 'channel_store_append_workers=%s\n' "$CHANNEL_STORE_APPEND_WORKERS"
   printf 'channel_store_apply_workers=%s\n' "$CHANNEL_STORE_APPLY_WORKERS"
   printf 'channel_rpc_workers=%s\n' "$CHANNEL_RPC_WORKERS"
+  printf 'gateway_async_send_workers=%s\n' "$GATEWAY_ASYNC_SEND_WORKERS"
+  printf 'delivery_recipient_workers=%s\n' "$DELIVERY_RECIPIENT_WORKERS"
   printf 'gateway_send_timeout=%s\n' "$(effective_gateway_send_timeout)"
+  printf 'sim_connect_rate=%s\n' "$SIM_CONNECT_RATE"
   printf 'sim_concurrency=%s\n' "$SIM_CONCURRENCY"
   printf 'sim_ack_timeout=%s\n' "$(effective_sim_ack_timeout)"
   printf 'cluster_log=%s\n' "$(cluster_log)"
@@ -694,6 +717,16 @@ while [[ $# -gt 0 ]]; do
     --rate)
       [[ $# -ge 2 ]] || die '--rate requires a value'
       RATE="$2"
+      shift 2
+      ;;
+    --connect-rate)
+      [[ $# -ge 2 ]] || die '--connect-rate requires a value'
+      SIM_CONNECT_RATE="$2"
+      shift 2
+      ;;
+    --concurrency)
+      [[ $# -ge 2 ]] || die '--concurrency requires a value'
+      SIM_CONCURRENCY="$2"
       shift 2
       ;;
     --duration)
@@ -905,6 +938,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+case "$OUT_DIR" in
+  /*) ;;
+  *) OUT_DIR="$ROOT_DIR/${OUT_DIR#./}" ;;
+esac
 if [[ "$AUTO_JOIN_CONFIG_PATH_SET" -eq 0 ]]; then
   AUTO_JOIN_CONFIG_PATH="$OUT_DIR/wukongim-node${AUTO_JOIN_NODE_ID}.toml"
 fi
@@ -927,7 +964,10 @@ require_positive_uint 'WK_WKCLI_SIM_THREE_SMOKE_CHANNEL_REACTOR_COUNT' "$CHANNEL
 require_positive_uint 'WK_WKCLI_SIM_THREE_SMOKE_CHANNEL_STORE_APPEND_WORKERS' "$CHANNEL_STORE_APPEND_WORKERS"
 require_positive_uint 'WK_WKCLI_SIM_THREE_SMOKE_CHANNEL_STORE_APPLY_WORKERS' "$CHANNEL_STORE_APPLY_WORKERS"
 require_positive_uint 'WK_WKCLI_SIM_THREE_SMOKE_CHANNEL_RPC_WORKERS' "$CHANNEL_RPC_WORKERS"
-require_positive_uint 'WK_WKCLI_SIM_THREE_SMOKE_CONCURRENCY' "$SIM_CONCURRENCY"
+require_positive_uint 'WK_WKCLI_SIM_THREE_SMOKE_GATEWAY_ASYNC_SEND_WORKERS' "$GATEWAY_ASYNC_SEND_WORKERS"
+require_positive_uint 'WK_WKCLI_SIM_THREE_SMOKE_DELIVERY_RECIPIENT_WORKERS' "$DELIVERY_RECIPIENT_WORKERS"
+require_positive_uint '--connect-rate' "$SIM_CONNECT_RATE"
+require_positive_uint '--concurrency' "$SIM_CONCURRENCY"
 require_nonempty 'WK_WKCLI_SIM_THREE_SMOKE_GATEWAY_SEND_TIMEOUT' "$GATEWAY_SEND_TIMEOUT"
 require_nonempty 'WK_WKCLI_SIM_THREE_SMOKE_ACK_TIMEOUT' "$SIM_ACK_TIMEOUT"
 require_bool 'WK_WKCLI_SIM_THREE_SMOKE_AUTO_JOIN_NODE' "$AUTO_JOIN_NODE"
@@ -988,12 +1028,12 @@ if [[ "$FAULT_KILL_NODE" == "true" ]]; then
   esac
   require_nonempty '--fault-pid-dir' "$FAULT_PID_DIR"
 fi
+prepare_cluster_start_command
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   print_plan
   exit 0
 fi
-
 mkdir -p "$OUT_DIR" "$(node_log_dir)" "$(capabilities_dir)" "$(capacity_dir)" "$(snapshot_dir)" "$(metrics_dir)"
 : >"$(cluster_log)"
 : >"$(sim_output)"
@@ -1033,8 +1073,7 @@ start_cluster() {
     log 'using already-running cluster'
     return
   fi
-  local args=("$START_SCRIPT")
-  local assignment
+  local args=("${CLUSTER_START_ARGS[@]}")
   local exported_name
   local env_args=()
   while IFS= read -r exported_name; do
@@ -1042,26 +1081,7 @@ start_cluster() {
       WK_WKCLI_SIM_THREE_SMOKE_*) env_args+=("-u" "$exported_name") ;;
     esac
   done < <(compgen -e)
-  while IFS= read -r assignment; do
-    env_args+=("$assignment")
-  done < <(cluster_profile_env)
-  if [[ "$CLEAN_CLUSTER" -eq 1 ]]; then
-    args+=(--clean)
-  fi
-  args+=(--ready-timeout "$READY_TIMEOUT" --bin "$(cluster_bin)" --log-dir "$(node_log_dir)")
-  if [[ "$BUILD_CLUSTER" -eq 0 ]]; then
-    args+=(--no-build)
-  fi
-  if [[ "$FAULT_KILL_NODE" == "true" ]]; then
-    args+=(--pid-dir "$FAULT_PID_DIR" --allow-node-exit "$FAULT_NODE_ID")
-    [[ -n "$FAULT_HEALTH_REPORT_INTERVAL" ]] && env_args+=("WK_CLUSTER_NODE_HEALTH_REPORT_INTERVAL=$FAULT_HEALTH_REPORT_INTERVAL")
-    [[ -n "$FAULT_HEALTH_REPORT_TTL" ]] && env_args+=("WK_CLUSTER_NODE_HEALTH_REPORT_TTL=$FAULT_HEALTH_REPORT_TTL")
-    [[ -n "$FAULT_CHANNEL_MIGRATION_SCAN_INTERVAL" ]] && env_args+=("WK_CHANNEL_MIGRATION_SCAN_INTERVAL=$FAULT_CHANNEL_MIGRATION_SCAN_INTERVAL")
-    [[ -n "$FAULT_CHANNEL_MIGRATION_SCAN_LIMIT" ]] && env_args+=("WK_CHANNEL_MIGRATION_SCAN_LIMIT=$FAULT_CHANNEL_MIGRATION_SCAN_LIMIT")
-    [[ -n "$FAULT_CHANNEL_MIGRATION_MAX_PAGES_PER_TICK" ]] && env_args+=("WK_CHANNEL_MIGRATION_MAX_PAGES_PER_TICK=$FAULT_CHANNEL_MIGRATION_MAX_PAGES_PER_TICK")
-    [[ -n "$FAULT_CHANNEL_MIGRATION_MAX_TASKS_PER_TICK" ]] && env_args+=("WK_CHANNEL_MIGRATION_MAX_TASKS_PER_TICK=$FAULT_CHANNEL_MIGRATION_MAX_TASKS_PER_TICK")
-    [[ -n "$FAULT_CHANNEL_MIGRATION_TASK_LIMIT" ]] && env_args+=("WK_CHANNEL_MIGRATION_TASK_LIMIT=$FAULT_CHANNEL_MIGRATION_TASK_LIMIT")
-  fi
+  env_args+=("${CLUSTER_START_ENV[@]}")
   log "starting three-node cluster: $START_SCRIPT"
   (
     cd "$ROOT_DIR"
@@ -1520,6 +1540,7 @@ wait_ready() {
   die "cluster did not become ready within ${READY_TIMEOUT}s"
 }
 
+
 capture_one_target_evidence() {
   local node="$1"
   local api="$2"
@@ -1570,10 +1591,11 @@ run_sim() {
   cmd+=(--max-runtime "$DURATION")
   cmd+=(--status-listen "$STATUS_LISTEN")
   cmd+=(--status-interval "$STATUS_INTERVAL")
+  cmd+=(--connect-rate "$SIM_CONNECT_RATE")
   cmd+=(--concurrency "$SIM_CONCURRENCY")
   cmd+=(--ack-timeout "$(effective_sim_ack_timeout)")
   cmd+=(--json)
-  log "running wkcli sim: users=${USERS} groups=${GROUP_COUNT} members=${GROUP_MEMBERS} gateways=${#GATEWAY_VALUES[@]}"
+  log "running wkcli sim: users=${USERS} groups=${GROUP_COUNT} members=${GROUP_MEMBERS} connect_rate=${SIM_CONNECT_RATE}/s concurrency=${SIM_CONCURRENCY} gateways=${#GATEWAY_VALUES[@]}"
   local status=0
   rm -f "$(sim_done_file)"
   (
@@ -1832,7 +1854,10 @@ write_summary() {
     printf '%s\n' "- channel_store_append_workers: ${CHANNEL_STORE_APPEND_WORKERS}"
     printf '%s\n' "- channel_store_apply_workers: ${CHANNEL_STORE_APPLY_WORKERS}"
     printf '%s\n' "- channel_rpc_workers: ${CHANNEL_RPC_WORKERS}"
+    printf '%s\n' "- gateway_async_send_workers: ${GATEWAY_ASYNC_SEND_WORKERS}"
+    printf '%s\n' "- delivery_recipient_workers: ${DELIVERY_RECIPIENT_WORKERS}"
     printf '%s\n' "- gateway_send_timeout: $(effective_gateway_send_timeout)"
+    printf '%s\n' "- sim_connect_rate: ${SIM_CONNECT_RATE}"
     printf '%s\n' "- sim_concurrency: ${SIM_CONCURRENCY}"
     printf '%s\n' "- sim_ack_timeout: $(effective_sim_ack_timeout)"
     printf '%s\n' '- sim_output: sim.jsonl'

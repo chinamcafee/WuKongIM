@@ -13,6 +13,7 @@ import (
 	accessapi "github.com/WuKongIM/WuKongIM/internal/access/api"
 	"github.com/WuKongIM/WuKongIM/internal/access/manager/webui"
 	managementusecase "github.com/WuKongIM/WuKongIM/internal/usecase/management"
+	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/gin-gonic/gin"
 )
@@ -128,6 +129,16 @@ type Management interface {
 	DeleteDiagnosticsTrackingRule(ctx context.Context, ruleID string) (managementusecase.DiagnosticsTrackingDeleteResponse, error)
 	// ListBusinessChannels returns manager-facing channel metadata rows.
 	ListBusinessChannels(ctx context.Context, req managementusecase.ListBusinessChannelsRequest) (managementusecase.ListBusinessChannelsResponse, error)
+	// GetBusinessChannel returns one authoritative business channel detail.
+	GetBusinessChannel(ctx context.Context, channelID string, channelType int64) (managementusecase.BusinessChannelDetail, error)
+	// CreateBusinessChannel creates one new business channel.
+	CreateBusinessChannel(ctx context.Context, req managementusecase.CreateBusinessChannelRequest) (managementusecase.BusinessChannelDetail, error)
+	// UpdateBusinessChannel patches one existing business channel.
+	UpdateBusinessChannel(ctx context.Context, req managementusecase.UpdateBusinessChannelRequest) (managementusecase.BusinessChannelDetail, error)
+	// ListBusinessChannelMembers returns one member page or exact UID hit.
+	ListBusinessChannelMembers(ctx context.Context, req managementusecase.ListBusinessChannelMembersRequest) (managementusecase.ListBusinessChannelMembersResponse, error)
+	// MutateBusinessChannelMembers applies one bounded member-set mutation.
+	MutateBusinessChannelMembers(ctx context.Context, req managementusecase.MutateBusinessChannelMembersRequest) (managementusecase.MutateBusinessChannelMembersResponse, error)
 	// ListChannelRuntimeMeta returns manager-facing channel runtime metadata rows.
 	ListChannelRuntimeMeta(ctx context.Context, req managementusecase.ListChannelRuntimeMetaRequest) (managementusecase.ListChannelRuntimeMetaResponse, error)
 	// RequestChannelLeaderTransfer submits a manual Channel leader transfer.
@@ -202,6 +213,20 @@ type Options struct {
 	Auth AuthConfig
 	// Management provides manager read usecases.
 	Management Management
+	// OpsMCP provides embedded operations MCP administration.
+	OpsMCP OpsMCPManagement
+	// OpsMCPHandler serves the embedded agent-facing MCP endpoint at /mcp.
+	OpsMCPHandler http.Handler
+	// Backup provides optional cluster backup control operations.
+	Backup BackupManagement
+	// Restore provides explicit disaster-recovery control operations.
+	Restore RestoreManagement
+	// SessionEpoch returns the durable Manager JWT invalidation generation.
+	SessionEpoch func() (uint64, error)
+	// Maintenance reports restore maintenance. Manager control-plane backup
+	// routes remain available while business data and mutation routes fail
+	// closed.
+	Maintenance func() bool
 	// RealtimeMonitor provides unified realtime monitor snapshots.
 	RealtimeMonitor RealtimeMonitorProvider
 	// Top provides local runtime pressure snapshots for read-only runtime views.
@@ -223,6 +248,12 @@ type Server struct {
 	listenAddr      string
 	addr            string
 	management      Management
+	opsMCP          OpsMCPManagement
+	opsMCPHandler   http.Handler
+	backup          BackupManagement
+	restore         RestoreManagement
+	sessionEpoch    func() (uint64, error)
+	maintenance     func() bool
 	realtimeMonitor RealtimeMonitorProvider
 	top             accessapi.TopSnapshotProvider
 	webhookConfig   WebhookConfigProvider
@@ -246,6 +277,12 @@ func New(opts Options) *Server {
 		engine:          engine,
 		listenAddr:      strings.TrimSpace(opts.ListenAddr),
 		management:      opts.Management,
+		opsMCP:          opts.OpsMCP,
+		opsMCPHandler:   opts.OpsMCPHandler,
+		backup:          opts.Backup,
+		restore:         opts.Restore,
+		sessionEpoch:    opts.SessionEpoch,
+		maintenance:     opts.Maintenance,
 		realtimeMonitor: opts.RealtimeMonitor,
 		top:             opts.Top,
 		webhookConfig:   opts.WebhookConfig,
@@ -253,6 +290,7 @@ func New(opts Options) *Server {
 		auth:            newAuthState(opts.Auth),
 		logger:          opts.Logger,
 	}
+	engine.Use(srv.restoreMaintenanceGate())
 	srv.registerRoutes()
 	engine.NoRoute(func(c *gin.Context) {
 		// Gin presets NoRoute responses to 404 before running the handler. Reset
@@ -261,6 +299,50 @@ func New(opts Options) *Server {
 		webui.Handler().ServeHTTP(c.Writer, c.Request)
 	})
 	return srv
+}
+
+func (s *Server) restoreMaintenanceGate() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if s == nil || s.maintenance == nil || !s.maintenance() ||
+			managerMaintenanceAllowed(c.Request.Method, c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+		jsonError(
+			c, http.StatusServiceUnavailable,
+			"restore_maintenance", "restore maintenance is active",
+		)
+		c.Abort()
+	}
+}
+
+func managerMaintenanceAllowed(method, path string) bool {
+	if method == http.MethodOptions || path == "/manager/login" ||
+		path == "/mcp" || strings.HasPrefix(path, "/manager/backups") ||
+		path == "/manager/permissions" {
+		return true
+	}
+	if !strings.HasPrefix(path, "/manager/") {
+		return true
+	}
+	for _, businessPrefix := range []string{
+		"/manager/channels", "/manager/conversations",
+		"/manager/messages", "/manager/connections",
+		"/manager/users", "/manager/system-users", "/manager/db/inspect",
+		"/manager/channel-runtime-meta", "/manager/channel-migrations",
+	} {
+		if strings.HasPrefix(path, businessPrefix) {
+			return false
+		}
+	}
+	return method == http.MethodGet || method == http.MethodHead
+}
+
+func (s *Server) currentManagerSessionEpoch() (uint64, error) {
+	if s == nil || s.sessionEpoch == nil {
+		return 0, nil
+	}
+	return s.sessionEpoch()
 }
 
 // Engine returns the underlying gin engine.
@@ -308,7 +390,7 @@ func (s *Server) Start() error {
 	s.addr = ln.Addr().String()
 	s.started = true
 	s.mu.Unlock()
-	go func() {
+	goruntimeregistry.SafeGo(nil, goruntimeregistry.TaskManagerHTTPServe, func() {
 		if serveErr := httpServer.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			s.httpLogger().Error("manager http serve failed",
 				wklog.Event("internal.access.manager.serve_failed"),
@@ -316,7 +398,7 @@ func (s *Server) Start() error {
 				wklog.Error(serveErr),
 			)
 		}
-	}()
+	})
 	return nil
 }
 
@@ -341,6 +423,9 @@ func (s *Server) registerRoutes() {
 	if s == nil || s.engine == nil {
 		return
 	}
+	if s.opsMCPHandler != nil {
+		s.engine.Any("/mcp", gin.WrapH(s.opsMCPHandler))
+	}
 	if s.auth.enabled() {
 		s.engine.POST("/manager/login", s.handleLogin)
 	}
@@ -349,6 +434,27 @@ func (s *Server) registerRoutes() {
 		permissions.Use(s.requirePermission("cluster.permission", "r"))
 	}
 	permissions.GET("/permissions", s.handlePermissions)
+	s.registerBackupRoutes()
+	s.registerRestoreRoutes()
+
+	mcpReads := s.engine.Group("/manager")
+	mcpReads.Use(s.requireMCPAdministrationReady())
+	if s.auth.enabled() {
+		mcpReads.Use(s.requirePermission("cluster.mcp", "r"))
+	}
+	mcpReads.GET("/mcp", s.handleOpsMCPStatus)
+	mcpReads.GET("/mcp/audits", s.handleOpsMCPAudits)
+
+	mcpWrites := s.engine.Group("/manager")
+	mcpWrites.Use(s.requireMCPAdministrationReady())
+	if s.auth.enabled() {
+		mcpWrites.Use(s.requirePermission("cluster.mcp", "w"))
+	}
+	mcpWrites.POST("/mcp/tokens", s.handleOpsMCPTokenCreate)
+	mcpWrites.DELETE("/mcp/tokens/:credential_id", s.handleOpsMCPTokenRevoke)
+	mcpWrites.PUT("/mcp/owner", s.handleOpsMCPOwnerUpdate)
+	mcpWrites.POST("/mcp/start", s.handleOpsMCPStart)
+	mcpWrites.POST("/mcp/stop", s.handleOpsMCPStop)
 
 	nodes := s.engine.Group("/manager")
 	if s.auth.enabled() {
@@ -452,6 +558,10 @@ func (s *Server) registerRoutes() {
 	}
 	channels.GET("/channel-runtime-meta", s.handleChannelRuntimeMeta)
 	channels.GET("/channels", s.handleBusinessChannels)
+	channels.GET("/channels/:channel_type/:channel_id", s.handleBusinessChannel)
+	channels.GET("/channels/:channel_type/:channel_id/subscribers", s.handleBusinessChannelSubscribers)
+	channels.GET("/channels/:channel_type/:channel_id/allowlist", s.handleBusinessChannelAllowlist)
+	channels.GET("/channels/:channel_type/:channel_id/denylist", s.handleBusinessChannelDenylist)
 	channels.GET("/conversations", s.handleConversations)
 	channels.GET("/messages", s.handleMessages)
 
@@ -498,6 +608,14 @@ func (s *Server) registerRoutes() {
 		channelWrites.Use(s.requirePermission("cluster.channel", "w"))
 	}
 	channelWrites.POST("/messages/retention", s.handleAdvanceMessageRetention)
+	channelWrites.POST("/channels", s.handleBusinessChannelCreate)
+	channelWrites.PATCH("/channels/:channel_type/:channel_id", s.handleBusinessChannelUpdate)
+	channelWrites.POST("/channels/:channel_type/:channel_id/subscribers/add", s.handleBusinessChannelSubscribersAdd)
+	channelWrites.POST("/channels/:channel_type/:channel_id/subscribers/remove", s.handleBusinessChannelSubscribersRemove)
+	channelWrites.POST("/channels/:channel_type/:channel_id/allowlist/add", s.handleBusinessChannelAllowlistAdd)
+	channelWrites.POST("/channels/:channel_type/:channel_id/allowlist/remove", s.handleBusinessChannelAllowlistRemove)
+	channelWrites.POST("/channels/:channel_type/:channel_id/denylist/add", s.handleBusinessChannelDenylistAdd)
+	channelWrites.POST("/channels/:channel_type/:channel_id/denylist/remove", s.handleBusinessChannelDenylistRemove)
 	channelWrites.POST("/channel-migrations/leader-transfer", s.handleChannelMigrationLeaderTransfer)
 	channelWrites.POST("/channel-migrations/replica-replace", s.handleChannelMigrationReplicaReplace)
 	channelWrites.POST("/channel-migrations/:task_id/abort", s.handleChannelMigrationAbort)

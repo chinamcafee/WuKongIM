@@ -7,6 +7,7 @@ import (
 
 	conversationusecase "github.com/WuKongIM/WuKongIM/internal/usecase/conversation"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster"
+	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 )
 
 type conversationAuthorityRouteLifecycleOptions struct {
@@ -79,11 +80,15 @@ func (l *conversationAuthorityRouteLifecycle) Start(ctx context.Context) error {
 	}
 	if events != nil {
 		l.wg.Add(1)
-		go l.watchRouteAuthorities(runCtx, events)
+		goruntimeregistry.SafeGo(nil, goruntimeregistry.TaskAppConversationRoute, func() {
+			l.watchRouteAuthorities(runCtx, events)
+		})
 	}
 	if l.initial != nil {
 		l.wg.Add(1)
-		go l.reconcileRouteAuthorities(runCtx)
+		goruntimeregistry.SafeGo(nil, goruntimeregistry.TaskAppConversationRoute, func() {
+			l.reconcileRouteAuthorities(runCtx)
+		})
 	}
 	l.mu.Unlock()
 	l.applyRouteAuthorities(runCtx, l.initialAuthorities())
@@ -198,22 +203,33 @@ func (l *conversationAuthorityRouteLifecycle) startAuthorityDrain(ctx context.Co
 	if l == nil || l.localAuthority == nil {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	drainCtx := ctx
+	cancel := func() {}
+	if l.handoffTimeout > 0 {
+		drainCtx, cancel = context.WithTimeout(ctx, l.handoffTimeout)
+	}
 	result, err := l.localAuthority.beginDrainAuthority(target)
 	if err != nil {
+		cancel()
 		l.localAuthority.observeHandoff(result, err)
 		return
 	}
 	l.mu.Lock()
 	if l.cancel == nil {
 		l.mu.Unlock()
+		cancel()
 		return
 	}
 	l.wg.Add(1)
 	l.mu.Unlock()
-	go func() {
+	goruntimeregistry.SafeGo(nil, goruntimeregistry.TaskAppConversationDrain, func() {
 		defer l.wg.Done()
-		l.drainAuthorityTarget(ctx, target)
-	}()
+		defer cancel()
+		l.drainAuthorityTarget(drainCtx, target)
+	})
 }
 
 func (l *conversationAuthorityRouteLifecycle) drainAuthorityTarget(ctx context.Context, target conversationusecase.RouteTarget) {
@@ -223,13 +239,7 @@ func (l *conversationAuthorityRouteLifecycle) drainAuthorityTarget(ctx context.C
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	drainCtx := ctx
-	var cancel context.CancelFunc
-	if l.handoffTimeout > 0 {
-		drainCtx, cancel = context.WithTimeout(ctx, l.handoffTimeout)
-		defer cancel()
-	}
-	_, _ = l.localAuthority.finishDrainingAuthority(drainCtx, target)
+	_, _ = l.localAuthority.finishDrainingAuthority(ctx, target)
 }
 
 func conversationAuthorityRouteTargetNewer(next, current conversationusecase.RouteTarget) bool {

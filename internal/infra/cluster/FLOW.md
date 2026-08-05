@@ -29,8 +29,11 @@ selected node's internal diagnostics store or peer RPC, routes manager plugin
 inventory reads and lifecycle mutations to the selected node's plugin lifecycle
 usecase over peer RPC, routes
 manager Controller task audit reads to the current Controller leader's
-node-local audit store over peer RPC when needed, and adapts presence/delivery
-ports to cluster routing and node RPC.
+node-local audit store over peer RPC when needed, and adapts presence
+ports plus channelappend recipient-authority resolution to cluster routing and
+node RPC. `ChannelMetadataStore` also exposes one restore-only subscriber page
+adapter that delegates to the node-local maintenance read; it is used only to
+rebuild the system-UID privilege cache before foreground admission resumes.
 
 ## Management Snapshot Flow
 
@@ -470,6 +473,47 @@ application log sources and entry pages; file discovery, parsing, filtering,
 cursor handling, and path hiding remain owned by `internal/app` and
 `internal/log`.
 
+## Operations MCP Observation Flow
+
+```text
+opsobserve.Source
+  -> management inventory/task/log/diagnostics/config ports
+  -> server-owned Prometheus query IDs
+  -> backup read facade
+  -> owner-side bounded pprof analyzer
+  -> explicit snake_case safe projection
+```
+
+`OpsObservationSource` maps existing read models into stable, redacted MCP
+DTOs instead of serializing Manager or runtime structs directly. Cluster
+health combines Controller/Slot evidence with optional target-up and runtime
+queue-pressure metrics; absent optional metrics make the result partial rather
+than healthy. Missing required node-health evidence yields an `unknown`,
+partial observation rather than a definite degraded verdict. Node inspection includes bounded node diagnostics and
+node-filtered runtime queue evidence.
+
+Channel runtime inspection uses the exact `(channel_id, channel_type)` point
+lookup and never scans or guesses channel rows. Metric requests map only fixed
+IDs to server-owned PromQL. Application log routing preserves opaque cursors
+and exact before/after context. Configuration projection remains allowlisted
+and redacted; backup projection excludes credentials, object keys, Channel
+identities, and restore staging paths. Backup inspection exposes the single
+redacted plan, active backup or restore task, bounded task history, and bounded
+published-archive summaries from the scheduled-backup dashboard. Diagnostic
+time bounds are passed into each node-local query before
+its limit is applied, so returned events and aggregate summaries describe the
+same window. `ManagementOpsMCPAuditReader` fans out with bounded concurrency to
+alive/suspect nodes, merges available summaries newest-first, and tolerates an
+unavailable peer without hiding healthy-node evidence. The aggregate fanout
+uses a fixed eight-worker pool, retains only the requested newest top-K entries,
+and has a fixed two-second deadline, so cluster size or a connected but
+non-responsive suspect node cannot create unbounded per-request work or block
+the Manager page indefinitely. Its producer and workers run as the managed
+`manager/ops_mcp_audit_fanout` burst task. The two bounded cluster-health
+metric queries run as the managed
+`observability/ops_mcp_metrics_fanout` burst task, so both fanouts contribute
+to module ownership and shutdown evidence without introducing dynamic labels.
+
 ## Management DB Inspect Flow
 
 ```text
@@ -534,10 +578,18 @@ subscriber mutation version into the required cluster facade argument. The
 membership facade is separate from the channel metadata facade so tests and
 future adapters can expose read/write channel metadata without implicitly
 claiming support for the reverse membership index.
+The Manager path requires the conditional metadata facade. Create-only channel
+writes and existing-only business-flag patches are proposed to the Slot leader;
+the flag patch invalidates append metadata cache state because the FSM preserves
+unrelated channel fields and returns only an applied/not-applied result.
 For message permission checks, the adapter exposes channel metadata reads,
-subscriber point lookups, and subscriber-set non-emptiness. It uses direct
-cluster lookup facades when available and falls back to bounded subscriber
-page scans only for test or alternate nodes that do not expose point lookups.
+subscriber point lookups, subscriber-set non-emptiness, and exact durable
+subscriber mutation counts. Production node reads use authoritative Slot-leader
+facades; alternate nodes must expose point lookups explicitly because the
+adapter never substitutes an unbounded page scan. Permission reads translate
+unavailable cluster routes, node lifecycle, and transport dial failures into
+the message contract's retryable route-not-ready error instead of exposing
+infrastructure errors at entry boundaries.
 When configured with `ChannelAppendMetadataCache`, successful channel metadata
 upserts refresh append fanout metadata and deletes remove cached entries; final
 subscriber mutation versions are still refreshed by the channel usecase
@@ -576,13 +628,17 @@ conversation sync usecase
        -> filter SyncOnce/CMD rows from ordinary legacy recents
        -> channel-owned committed rows used for legacy recents
 
-conversation mutation usecase
+conversation read-state mutation usecase
   -> UpsertConversationStates(uid-owned normal-kind read row)
        -> UpsertConversationStatesBatch
        -> UID-owned Slot metadata propose
+
+conversation delete usecase
   -> HideConversations(uid-owned normal-kind delete barrier)
-       -> HideConversationsBatch
-       -> UID-owned Slot metadata propose that clears active_at
+       -> ConversationAuthorityClient resolves the UID's exact RouteTarget
+       -> local or RPC authority HideConversationsForTarget
+       -> authority-owned HideConversationsBatch propose clears durable active_at
+       -> authority reconciles the exact active-cache row before returning
 ```
 
 The adapter clones row slices and message payloads across the boundary. It does
@@ -608,21 +664,59 @@ identity. Legacy patch admission is best-effort and does not retry
 route-not-ready, stale-route, or not-leader errors; callers are expected to log
 and drop failed active admission.
 Active-batch admission resolves the affected UID set as `SenderUID` plus each
-unique recipient UID, caches each UID's `RouteTarget` for the current attempt,
+unique recipient UID through one lightweight `RouteAuthoritiesPartial`
+snapshot per attempt when supported, with `RouteKeysPartial` retained as the
+compatibility fallback,
 coalesces duplicate recipient entries with `IsSender` OR semantics, and sends
-one target-scoped batch per group. Only the sender-owned target receives
+one target-scoped batch per group. Aligned key-specific route failures do not
+discard successfully routed siblings. Only the sender-owned target receives
 `SenderUID`; other target batches carry an empty `SenderUID` and only their
 recipient subset, so a receiver authority cannot cache the sender row by
 mistake. Each target-scoped batch preserves the source
 `metadb.ConversationKind`; invalid or zero kinds are left for downstream
 validation instead of being normalized. If the sender is not in the recipient
-set, the sender target still receives a sender-only batch. Active-batch
-admission retries route-not-ready, stale-route, not-leader, and background Slot
-proposal backpressure within a small bounded fresh-route window, regrouping
-only target groups that failed on the prior attempt; continued failure is
-returned to the caller so the post-commit path remains bounded.
-The remote RPC client chunks large patch groups and active-batch recipient
-groups at the codec collection limit before sending them. List resolves the
+set, the sender target still receives a sender-only batch. Exact target groups
+are packed by `LeaderNodeID` for transport, but the leader envelope never
+replaces each group's physical hash-slot, logical Slot Raft Group, leader-term,
+and config-epoch fence. Active-batch admission retries route-not-ready,
+stale-route, not-leader, and background Slot proposal backpressure within a
+small bounded fresh-route window. Only aligned failed groups or failed UID
+route items are resolved again; successful siblings are never issued twice.
+Continued failure is returned to the caller so the post-commit path remains
+bounded. Retry delay grows exponentially from 5ms to a 100ms cap, and the
+50-attempt admission window remains inside the recipient plan's outer context.
+The routed active-batch surface is the normal channelappend fast path. Its first
+attempt consumes caller-supplied exact target groups without another route
+snapshot. If stale-route, not-leader, route-not-ready, proposal backpressure, or
+a retryable transport failure affects a group, only that group's sender and
+recipient rows are resolved again inside the same bounded handoff window.
+Successfully admitted sibling groups are never replayed. A terminal sibling
+failure is retained as the overall result but does not suppress bounded retries
+for independent retryable siblings. If backoff, fresh routing, or the final
+retry attempt also fails, the adapter joins that error with the retained
+terminal failure so callers can classify both causes with `errors.Is`. The
+legacy `AdmitActiveBatch` surface uses the same bounded handoff window for
+callers that do not already own an aligned route snapshot.
+The normal one-batch path coalesces UIDs and recipient roles once, counts each
+exact target group before allocation, and fills disjoint capacity-limited
+slices from one shared recipient backing store. This avoids per-target growth
+and intermediate retry copies for high-fanout admissions. A failed target is
+cloned before retry so retaining one failed subset cannot retain the whole
+happy-path backing allocation.
+Delete-barrier writes group rows by UID and use the same fresh-target retry
+loop as authority reads. The actual Slot write runs on the resolved authority
+leader, which reconciles its cache and revalidates the exact target before it
+returns. A stale target therefore causes an idempotent retry against the new
+leader instead of leaving a clean cache baseline detached from durable state.
+The remote RPC client chunks large patch groups at the codec collection limit.
+Active-batch groups for the same remote leader are packed into one or more
+`WKVC2` envelopes of at most 4,096 aggregate active rows and receive `WKVc2`
+group-aligned statuses. A target group larger than one envelope is split while
+preserving the sender only in its first fragment. The local path uses the same
+bounded packing and optional bulk authority contract. A retryable transport
+failure re-routes only the groups from the failed envelope; completed sibling
+leaders and envelopes are not replayed. Context cancellation/deadline, codec,
+and business errors are not classified as transport retries. List resolves the
 requested UID once per retry attempt and reads the active view from that
 authority target; the active-view response is not satisfied by a local DB-only
 fallback when the UID authority is remote. Drain uses the caller-supplied exact
@@ -636,16 +730,30 @@ ConversationAuthorityClient
        -> local conversation authority for local groups
        -> access/node Conversation Authority Admit RPC for remote groups
   -> AdmitActiveBatch(ActiveBatch)
-       -> RouteKey(SenderUID) plus RouteKey(recipient.UID) once per unique UID
+       -> one RouteAuthoritiesPartial snapshot for all pending unique UIDs
+          (RouteKeysPartial compatibility fallback)
        -> coalesce duplicate recipient entries with IsSender OR
        -> group by exact RouteTarget
        -> set SenderUID only on the sender target's batch
-       -> local conversation authority for local groups
-       -> access/node Conversation Authority ActiveBatch RPC for remote groups
+       -> pack exact groups by LeaderNodeID without weakening target fences
+       -> bounded local bulk authority calls of at most 4,096 active rows
+       -> bounded access/node WKVC2 bulk RPC envelopes per remote leader
+       -> preserve group-aligned statuses and re-route only failed groups
+  -> AdmitRoutedActiveBatches([]ConversationActiveTargetBatch)
+       -> admit caller-supplied exact targets without an initial route lookup
+       -> preserve every physical hash-slot and logical Slot fence
+       -> fresh-route only failed groups during a bounded handoff window
+       -> never replay successful siblings
   -> ListConversationActiveView(kind, uid)
        -> RouteKey(uid)
        -> local conversation authority active view for kind when local
        -> access/node Conversation Authority List RPC carrying kind when remote
+  -> HideConversations([]ConversationDelete)
+     -> group by UID and reject any group above the bounded 4096-row RPC contract before leader selection
+       -> group rows by UID
+       -> resolve a fresh exact RouteTarget for each UID group
+       -> local authority hide when local
+       -> access/node Conversation Authority Hide RPC when remote
   -> DrainAuthority(target)
        -> local drain when target leader is this node
        -> access/node Conversation Authority Drain RPC when remote
@@ -654,8 +762,10 @@ ConversationAuthorityClient
 List route-not-ready, stale-route, and not-leader results are retried with a
 short bounded backoff so authority movement can settle without changing
 conversation list semantics. Legacy patch admission returns those errors
-directly, while active-batch admission makes a small bounded fresh-route retry
-window. Raw
+directly, while active-batch admission makes an election-sized bounded
+fresh-route retry window. A route snapshot outer failure retries the pending
+set, while an aligned UID failure retries only that UID subset after
+already-routed siblings have completed. Raw
 cluster route errors returned by remote RPC calls are mapped to the same
 conversation route sentinels before retry decisions.
 
@@ -672,7 +782,11 @@ same cache, so hot channels avoid a foreground Slot metadata lookup on every
 SEND while still seeing low-churn fanout metadata changes. The adapter maps
 `channel.Meta` and recipient fanout metadata to `channelappend.AuthorityTarget`
 with the canonical `ChannelID`, `ChannelKey`, `LeaderNodeID`, `Epoch`,
-`LeaderEpoch`, `Large`, and `SubscriberMutationVersion`.
+`LeaderEpoch`, `RouteGeneration`, `Large`, and `SubscriberMutationVersion`.
+It also exposes conditional authority invalidation to the router. Invalidation
+delegates the generation through `cluster.Node` and removes only the exact
+failed authority version; zero generation retains static/legacy tuple
+compatibility. Subscriber/fanout metadata caching remains independent.
 
 ```text
 channelappend.Router
@@ -694,6 +808,35 @@ Route errors are translated at this adapter boundary:
 `channelappend.ErrRouteNotReady`. Remote forwarding is supplied by the
 `internal/access/node` Channel Append RPC client; remote item results are
 returned item-aligned without interpreting successful payloads.
+
+## Recipient Authority Flow
+
+`RecipientAuthorityResolver` is the cluster adapter for channelappend's
+post-commit recipient grouping seam. `NewRecipientAuthorityResolver` accepts the
+concrete app-wired cluster runtime, verifies only the required single-key route
+capability, and returns nil when that capability is unavailable. All optional
+batch capability probing stays private to the adapter, so the app composition
+root does not import or reinterpret `pkg/cluster` route DTOs.
+
+```text
+channelappend recipient UID page
+  -> RecipientAuthorityResolver.ResolveRecipientAuthorities
+  -> prefer RouteAuthoritiesPartial for one aligned lightweight snapshot
+  -> otherwise RouteAuthorities, RouteKeysPartial, RouteKeys, or RouteKey
+  -> map cluster route errors to channelappend route errors
+  -> convert each successful route to RecipientAuthorityTarget
+  -> preserve key-specific errors and input alignment
+```
+
+The adapter preserves physical hash slot, logical Slot, actual leader, leader
+term, config epoch, route revision, and diagnostic authority epoch. A zero
+actual leader fails closed as `channelappend.ErrRouteNotReady`; preferred leader
+metadata is not substituted for the actual elected leader. Batch result
+cardinality mismatches also fail closed. When an observer is installed, exactly
+one aggregate event records a bounded outcome, requested item count, distinct
+successful physical hash-slot target count, and duration. The common 256-slot
+target count uses a fixed bitmap and does not allocate; UID, route, Slot, and
+node identities never enter observation labels.
 
 ## User Metadata Flow
 
@@ -729,6 +872,9 @@ other errors                                         -> channelappend.ErrAppendF
 and owner-action port to `pkg/cluster` UID routing and
 `internal/access/node` RPC. The adapter does not own gateway activation
 policy, authority conflict rules, or local session mutation rules.
+`PresenceDirectoryAuthority` is the local-side adapter from the node-local
+runtime presence directory to the fenced authority RPC contract; app only
+constructs it and injects it into the client and access adapter.
 
 ```text
 presence.Route / uid
@@ -767,7 +913,7 @@ Batch target resolution preserves input order and cardinality without falling
 back to per-UID `RouteKey` calls or retrying individual failed entries inside
 the batch. A batch-level routing or context error is copied to every aligned
 item, while a key-specific error is mapped only onto its corresponding item;
-successful items retain the hash Slot, physical Slot, leader term, config
+successful items retain the physical hash slot, logical Slot, leader term, config
 epoch, route revision, and authority epoch fences from the single cluster
 routing snapshot. The app worker owns exact route requeue for failed items so a
 later flush can resolve them against a newer routing snapshot.
@@ -775,16 +921,35 @@ later flush can resolve them against a newer routing snapshot.
 Target-aware endpoint lookup consumes those already-resolved target fences. It
 never calls `RouteKey` or `RouteKeysPartial` on the happy path. Multiple exact
 hash-slot targets for the same remote leader share one RPC envelope, so network
-work scales with leader count instead of recipient or hash-slot count. The
-local path uses the optional batch authority surface and keeps each exact target
-fence intact. Remote transport or response-cardinality failures are copied only
-to groups assigned to that leader; per-group stale/not-leader errors remain
-aligned and do not discard successful results from other groups.
+work scales with leader count instead of recipient or hash-slot count.
+When every non-empty exact target belongs to one leader, the client borrows the
+caller-owned immutable group slice directly and preserves identity result
+alignment without constructing another leader map, index slice, or group copy.
+Independent leader envelopes execute concurrently under a fixed bound while
+aligned results remain in original input order. Each leader execution boundary
+also converts a local-authority or remote-client panic into a terminal error for
+only that leader's aligned groups, so a child worker cannot terminate the
+process or discard successful sibling leaders. The local path uses the optional
+target-group batch authority surface once for all groups assigned to the local
+leader and keeps each exact target fence intact. The production local authority
+then groups those targets by directory shard, so physical hash-slot groups touch
+at most the configured shard count of read locks rather than being collapsed
+into the smaller logical Slot set. Remote
+transport or response-cardinality failures are copied only to groups assigned
+to that leader; per-group stale/not-leader errors remain aligned and do not
+discard successful results from other groups.
 If one group returns not-leader, stale-route, or route-not-ready after waiting
 in the asynchronous delivery queue, the adapter batch-resolves current targets
-for only that group's UIDs and retries it once. Successful sibling groups are
-not issued again. The retry remains aligned to the original group and rejects
-an inconsistent refresh whose UIDs no longer share one exact target.
+for only that group's UIDs inside a bounded exponential-backoff handoff window.
+Successful sibling groups are not issued again. Every retry remains aligned to
+the original group and rejects an inconsistent refresh whose UIDs no longer
+share one exact target.
+An optional observer emits exactly once for each leader execution stage, after
+the aligned results are final. It uses only the fixed paths `local_bulk`,
+`remote_bulk`, and `legacy_fallback`, bounded outcomes, and a boolean stale
+retry label; item count, exact-target group count, and duration are numeric.
+The observer is outside UID and target loops, and never labels UIDs, node IDs,
+hash slots, route revisions, or authority epochs.
 
 For the individual register, unregister, endpoint, commit, and abort paths, if
 route resolution reports route-not-ready, stale routing, or not-leader, the
@@ -795,45 +960,3 @@ bounded presence error so pending token cleanup semantics stay explicit.
 
 Best-effort unregister calls are bounded by a short context timeout so gateway
 close and rollback paths do not block indefinitely on route lookup or node RPC.
-
-## Delivery Push Flow
-
-`DeliveryPusher` adapts the internal delivery runtime pusher port to local
-owner delivery or `internal/access/node` delivery RPC.
-
-```text
-delivery.PushCommand
-  -> OwnerNodeID == localNodeID
-       -> local runtime delivery Pusher
-  -> OwnerNodeID != localNodeID
-       -> access/node Delivery Push RPC client
-       -> remote owner DeliveryOwnerPush
-```
-
-When the command targets this node but no local delivery pusher is installed,
-the adapter marks all routes dropped because no owner-local session runtime can
-accept them. When a remote client is missing or the remote RPC fails, it marks
-all routes retryable and returns nil error so the delivery runtime can apply its
-normal retry policy.
-
-## Delivery Fanout Partition Flow
-
-`DeliveryPartitioner` adapts the cluster UID hash-slot route table to
-`runtime/delivery.Partitioner`. It caches the last valid partition layout by
-route revision and hash-slot count, reuses the cached layout for repeated reads,
-and falls back to the last valid layout when the route table is momentarily not
-ready. On a cache miss, it reads the current snapshot hash-slot count, routes
-each hash slot through `RouteHashSlot`, and merges contiguous hash-slot ranges
-with the same leader into delivery partitions.
-
-```text
-cluster Snapshot.HashSlotCount
-  -> RouteHashSlot(hashSlot)
-  -> contiguous ranges grouped by Route.Leader
-  -> runtime/delivery.Partition{LeaderNodeID, HashSlotStart, HashSlotEnd}
-```
-
-Route-table-not-ready, no-leader, and route lookup failures map to
-`runtime/delivery.ErrRouteNotReady` only when no last valid partition layout is
-available, so the async delivery sink can record the failure without adding
-cluster-specific errors to the runtime package.

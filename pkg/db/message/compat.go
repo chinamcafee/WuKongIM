@@ -332,6 +332,80 @@ func (e *Engine) ListChannelsPage(ctx context.Context, after ChannelKey, limit i
 	return entries, cursor, more, toChannelError(err)
 }
 
+// OpenBackupSnapshot pins and streams exact committed channel cuts for cluster backup.
+func (e *Engine) OpenBackupSnapshot(ctx context.Context, request BackupSnapshotRequest) (io.ReadCloser, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	if e == nil {
+		return nil, channel.ErrClosed
+	}
+	e.mu.Lock()
+	db := e.db
+	e.mu.Unlock()
+	if db == nil {
+		return nil, channel.ErrClosed
+	}
+	reader, err := db.OpenBackupSnapshot(ctx, request)
+	return reader, toChannelError(err)
+}
+
+// OpenBackupSnapshotWithStats pins and streams exact committed cuts with
+// record-count and allocator-fence evidence from the same database view.
+func (e *Engine) OpenBackupSnapshotWithStats(ctx context.Context, request BackupSnapshotRequest) (io.ReadCloser, BackupSnapshotStats, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, BackupSnapshotStats{}, err
+	}
+	if e == nil {
+		return nil, BackupSnapshotStats{}, channel.ErrClosed
+	}
+	e.mu.Lock()
+	db := e.db
+	e.mu.Unlock()
+	if db == nil {
+		return nil, BackupSnapshotStats{}, channel.ErrClosed
+	}
+	reader, stats, err := db.OpenBackupSnapshotWithStats(ctx, request)
+	return reader, stats, toChannelError(err)
+}
+
+// ImportBackupSnapshot verifies and installs a portable message backup snapshot.
+func (e *Engine) ImportBackupSnapshot(ctx context.Context, data []byte) (BackupSnapshotStats, error) {
+	if err := ctxErr(ctx); err != nil {
+		return BackupSnapshotStats{}, err
+	}
+	if e == nil {
+		return BackupSnapshotStats{}, channel.ErrClosed
+	}
+	e.mu.Lock()
+	db := e.db
+	e.mu.Unlock()
+	if db == nil {
+		return BackupSnapshotStats{}, channel.ErrClosed
+	}
+	stats, err := db.ImportBackupSnapshot(ctx, data)
+	return stats, toChannelError(err)
+}
+
+// ImportBackupSnapshotReader validates and installs a seekable portable stream
+// with bounded memory.
+func (e *Engine) ImportBackupSnapshotReader(ctx context.Context, reader io.ReadSeeker, size int64) (BackupSnapshotStats, error) {
+	if err := ctxErr(ctx); err != nil {
+		return BackupSnapshotStats{}, err
+	}
+	if e == nil {
+		return BackupSnapshotStats{}, channel.ErrClosed
+	}
+	e.mu.Lock()
+	db := e.db
+	e.mu.Unlock()
+	if db == nil {
+		return BackupSnapshotStats{}, channel.ErrClosed
+	}
+	stats, err := db.ImportBackupSnapshotReader(ctx, reader, size)
+	return stats, toChannelError(err)
+}
+
 // ListLatestMessages returns one node-local newest-first message page.
 func (e *Engine) ListLatestMessages(ctx context.Context, beforeMessageID uint64, limit int) (LatestMessagePage, error) {
 	if err := ctx.Err(); err != nil {
@@ -1823,6 +1897,77 @@ func (s *ChannelStore) TruncateLogAndHistory(ctx context.Context, to uint64) err
 	}
 	defer s.endUse()
 	return s.truncateLocked(ctx, to, true)
+}
+
+// DiscardForRestore removes every row, secondary index, and durable system
+// record for this Channel. It is intentionally limited to explicit restore
+// failure cleanup before the cluster is activated.
+func (s *ChannelStore) DiscardForRestore(ctx context.Context) error {
+	const (
+		restoreDiscardBatchMessages = 1024
+		restoreDiscardBatchBytes    = 8 << 20
+	)
+	if err := s.beginUse(); err != nil {
+		return err
+	}
+	defer s.endUse()
+	if err := ctxErr(ctx); err != nil {
+		return err
+	}
+	s.log.appendMu.Lock()
+	defer s.log.appendMu.Unlock()
+	nextSeq := uint64(1)
+	for {
+		rows, err := s.log.readRows(ctx, nextSeq, 0, ReadOptions{
+			Limit: restoreDiscardBatchMessages, MaxBytes: restoreDiscardBatchBytes,
+		})
+		if err != nil {
+			return toChannelError(err)
+		}
+		if len(rows) == 0 {
+			break
+		}
+		batch := s.log.db.engine.NewBatch()
+		for _, row := range rows {
+			if err := s.log.stageDeleteMessage(
+				batch, messageFromRow(row),
+			); err != nil {
+				_ = batch.Close()
+				return toChannelError(err)
+			}
+		}
+		commitErr := batch.Commit(true)
+		closeErr := batch.Close()
+		if commitErr != nil || closeErr != nil {
+			return toChannelError(errors.Join(commitErr, closeErr))
+		}
+		lastSeq := rows[len(rows)-1].MessageSeq
+		if lastSeq < nextSeq {
+			return toChannelError(dberrors.ErrCorruptState)
+		}
+		if lastSeq == ^uint64(0) {
+			break
+		}
+		nextSeq = lastSeq + 1
+	}
+	batch := s.log.db.engine.NewBatch()
+	defer batch.Close()
+	prefix := encodeMessageChannelPartitionPrefix(s.log.key)
+	span := keycodec.NewPrefixSpan(prefix)
+	if err := batch.DeleteRange(engine.Span{
+		Start: span.Start, End: span.End,
+	}); err != nil {
+		return toChannelError(err)
+	}
+	if err := batch.Delete(encodeCatalogKey(s.log.key)); err != nil {
+		return toChannelError(err)
+	}
+	if err := batch.Commit(true); err != nil {
+		return toChannelError(err)
+	}
+	s.log.leo.Store(0)
+	s.log.loaded.Store(false)
+	return nil
 }
 
 func (s *ChannelStore) truncateLocked(ctx context.Context, to uint64, truncateHistory bool) error {

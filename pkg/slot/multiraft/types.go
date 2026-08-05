@@ -2,6 +2,7 @@ package multiraft
 
 import (
 	"context"
+	"io"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/goroutine"
@@ -212,6 +213,20 @@ type Storage interface {
 	MarkApplied(ctx context.Context, index uint64) error
 }
 
+// ExternalSnapshotStorage supports controlled replacement of a recovery
+// snapshot at the exact already-applied index. Maintenance restore uses this
+// after replacing FSM state outside the proposal path. Ordinary Save must keep
+// rejecting a different same-index snapshot.
+type ExternalSnapshotStorage interface {
+	ReplaceSnapshot(context.Context, raftpb.Snapshot) error
+}
+
+// LogRangeSizer estimates retained bytes for a half-open Raft entry interval.
+// Implementations may conservatively include overlapping storage blocks.
+type LogRangeSizer interface {
+	LogRangeBytes(context.Context, uint64, uint64) (uint64, error)
+}
+
 // ConfigAppliedIndexStorage persists the latest applied Raft membership entry index.
 // Storage implementations that compact applied log entries should implement this
 // so Status.ConfigAppliedIndex can be restored after the original entry is gone.
@@ -238,6 +253,32 @@ type StateMachine interface {
 	Apply(ctx context.Context, cmd Command) ([]byte, error)
 	Restore(ctx context.Context, snap Snapshot) error
 	Snapshot(ctx context.Context) (Snapshot, error)
+}
+
+// HashSlotSnapshotter opens one pinned logical hash-slot snapshot without blocking later applies.
+type HashSlotSnapshotter interface {
+	// OpenHashSlotSnapshot must pin the state visible at the call before returning.
+	OpenHashSlotSnapshot(ctx context.Context, hashSlot uint16) (io.ReadCloser, error)
+}
+
+// CapturedHashSlotSnapshot is a portable stream paired with its exact local applied boundary.
+type CapturedHashSlotSnapshot struct {
+	// SlotID is the physical Raft group that produced the snapshot.
+	SlotID SlotID
+	// HashSlot is the logical partition carried by Reader.
+	HashSlot uint16
+	// AppliedIndex is the durable Slot Raft boundary visible in Reader.
+	AppliedIndex uint64
+	// CommitIndex is the Raft commit boundary observed atomically before Reader was opened.
+	CommitIndex uint64
+	// AppliedTerm is the Raft log term at AppliedIndex.
+	AppliedTerm uint64
+	// LeaderTerm is the current Raft leader term that authorized the capture.
+	LeaderTerm uint64
+	// CapturedAtUnixMillis is the UTC watermark observed only after commit and apply matched.
+	CapturedAtUnixMillis int64
+	// Reader streams the pinned snapshot and must be closed by the caller.
+	Reader io.ReadCloser
 }
 
 // BatchStateMachine extends StateMachine with batched apply support.

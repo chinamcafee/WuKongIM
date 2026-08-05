@@ -293,6 +293,44 @@ func TestControlWriteClientPreservesWrappedSemanticErrorIdentity(t *testing.T) {
 	}
 }
 
+func TestControlWriteClientReplacesScheduledBackupAndPreservesRevisionMismatch(t *testing.T) {
+	network := clusternet.NewLocalNetwork()
+	applier := &recordingControlWriteApplier{}
+	network.Register(1, clusternet.RPCControlWrite, NewControlWriteHandler(applier))
+	client := NewControlWriteClient(network)
+	replacement := controller.ScheduledBackupState{
+		Plan: &controller.BackupPlan{Enabled: true, Cron: "0 1 * * *"},
+	}
+
+	_, err := client.Submit(context.Background(), 1, ControlWriteRequest{
+		Action: ControlWriteActionReplaceScheduledBackup,
+		ReplaceScheduledBackup: ReplaceScheduledBackupRequest{
+			ExpectedRevision: 11,
+			Replacement:      replacement,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Submit(replace backup coordination) error = %v", err)
+	}
+	if len(applier.scheduledBackupReplacements) != 1 ||
+		applier.scheduledBackupReplacements[0].expectedRevision != 11 ||
+		!reflect.DeepEqual(applier.scheduledBackupReplacements[0].replacement, replacement) {
+		t.Fatalf("backup replacements = %#v, want revision-fenced replacement", applier.scheduledBackupReplacements)
+	}
+
+	applier.scheduledBackupReplacementErr = controller.ErrExpectedRevisionMismatch
+	_, err = client.Submit(context.Background(), 1, ControlWriteRequest{
+		Action: ControlWriteActionReplaceScheduledBackup,
+		ReplaceScheduledBackup: ReplaceScheduledBackupRequest{
+			ExpectedRevision: 12,
+			Replacement:      replacement,
+		},
+	})
+	if !errors.Is(err, controller.ErrExpectedRevisionMismatch) {
+		t.Fatalf("Submit(stale backup coordination) error = %v, want ErrExpectedRevisionMismatch", err)
+	}
+}
+
 func TestNewControlWriteHandlerCallsMarkNodeLeaving(t *testing.T) {
 	network := clusternet.NewLocalNetwork()
 	applier := &recordingControlWriteApplier{
@@ -451,27 +489,34 @@ func (a *recordingTaskApplier) CommitSlotReplicaMove(ctx context.Context, commit
 }
 
 type recordingControlWriteApplier struct {
-	nodeReports                  []NodeReport
-	nodeReportErr                error
-	joinNodes                    []JoinNodeRequest
-	joinResult                   JoinNodeResult
-	joinErr                      error
-	activateNodes                []ActivateNodeRequest
-	activateCalls                int
-	activateResult               ActivateNodeResult
-	activateErr                  error
-	markNodeLeaving              []MarkNodeLeavingRequest
-	markNodeLeavingResult        MarkNodeLeavingResult
-	markNodeLeavingErr           error
-	markNodeRemoved              []MarkNodeRemovedRequest
-	markNodeRemovedResult        MarkNodeRemovedResult
-	markNodeRemovedErr           error
-	slotReplicaMoves             []SlotReplicaMoveRequest
-	slotReplicaMoveResult        SlotReplicaMoveResult
-	slotReplicaMoveErr           error
-	promoteControllerVoters      []PromoteControllerVoterRequest
-	promoteControllerVoterResult PromoteControllerVoterResult
-	promoteControllerVoterErr    error
+	nodeReports                   []NodeReport
+	nodeReportErr                 error
+	joinNodes                     []JoinNodeRequest
+	joinResult                    JoinNodeResult
+	joinErr                       error
+	activateNodes                 []ActivateNodeRequest
+	activateCalls                 int
+	activateResult                ActivateNodeResult
+	activateErr                   error
+	markNodeLeaving               []MarkNodeLeavingRequest
+	markNodeLeavingResult         MarkNodeLeavingResult
+	markNodeLeavingErr            error
+	markNodeRemoved               []MarkNodeRemovedRequest
+	markNodeRemovedResult         MarkNodeRemovedResult
+	markNodeRemovedErr            error
+	slotReplicaMoves              []SlotReplicaMoveRequest
+	slotReplicaMoveResult         SlotReplicaMoveResult
+	slotReplicaMoveErr            error
+	promoteControllerVoters       []PromoteControllerVoterRequest
+	promoteControllerVoterResult  PromoteControllerVoterResult
+	promoteControllerVoterErr     error
+	scheduledBackupReplacements   []recordedScheduledBackupReplacement
+	scheduledBackupReplacementErr error
+}
+
+type recordedScheduledBackupReplacement struct {
+	expectedRevision uint64
+	replacement      controller.ScheduledBackupState
 }
 
 func (a *recordingControlWriteApplier) ReportNode(ctx context.Context, req NodeReport) error {
@@ -526,6 +571,18 @@ func (a *recordingControlWriteApplier) PromoteControllerVoter(ctx context.Contex
 		return PromoteControllerVoterResult{}, a.promoteControllerVoterErr
 	}
 	return a.promoteControllerVoterResult, nil
+}
+
+func (a *recordingControlWriteApplier) ReplaceScheduledBackupState(
+	ctx context.Context,
+	expectedRevision uint64,
+	replacement controller.ScheduledBackupState,
+) error {
+	a.scheduledBackupReplacements = append(a.scheduledBackupReplacements, recordedScheduledBackupReplacement{
+		expectedRevision: expectedRevision,
+		replacement:      replacement,
+	})
+	return a.scheduledBackupReplacementErr
 }
 
 type recordingRaftStepper struct {

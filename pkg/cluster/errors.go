@@ -9,6 +9,8 @@ var (
 	ErrNotStarted = errors.New("cluster: not started")
 	// ErrStopping indicates that the node is shutting down and rejects new foreground work.
 	ErrStopping = errors.New("cluster: stopping")
+	// ErrMaintenance indicates that restore maintenance rejects business traffic.
+	ErrMaintenance = errors.New("cluster: restore maintenance")
 	// ErrRouteNotReady indicates that no valid route snapshot is available.
 	ErrRouteNotReady = errors.New("cluster: route not ready")
 	// ErrNoSlotLeader indicates that a route exists but the Slot leader is unknown.

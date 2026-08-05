@@ -339,6 +339,7 @@ type recordingRetentionNode struct {
 	advance             metadb.ChannelRetentionAdvance
 	advanceCalled       bool
 	advanceErr          error
+	events              *[]string
 }
 
 func (n *recordingRetentionNode) NodeID() uint64 {
@@ -366,6 +367,9 @@ func (n *recordingRetentionNode) ReadChannelCommitted(_ context.Context, _ chann
 }
 
 func (n *recordingRetentionNode) AdvanceChannelRetentionThroughSeq(_ context.Context, req metadb.ChannelRetentionAdvance) error {
+	if n.events != nil {
+		*n.events = append(*n.events, "advance")
+	}
 	n.advance = req
 	n.advanceCalled = true
 	return n.advanceErr

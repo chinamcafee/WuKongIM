@@ -93,6 +93,116 @@ func TestValidateAllowsLeavingDataSlotPeer(t *testing.T) {
 	require.NoError(t, st.Validate())
 }
 
+func TestValidateScheduledBackupAcceptsCloudProviders(t *testing.T) {
+	testCases := []struct {
+		name  string
+		store BackupStoreConfig
+	}{
+		{
+			name: "Alibaba OSS",
+			store: BackupStoreConfig{
+				Kind:                 BackupStoreKindOSS,
+				Region:               "cn-hangzhou",
+				Bucket:               "wukongim-backups",
+				Prefix:               "cluster-a",
+				CredentialCiphertext: []byte("ciphertext"),
+				CredentialRevision:   1,
+			},
+		},
+		{
+			name: "Tencent COS",
+			store: BackupStoreConfig{
+				Kind:                 BackupStoreKindCOS,
+				Region:               "ap-shanghai",
+				Bucket:               "wukongim-backups-1250000000",
+				Prefix:               "cluster-a",
+				CredentialCiphertext: []byte("ciphertext"),
+				CredentialRevision:   1,
+			},
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			st := testState()
+			st.ScheduledBackup = &ScheduledBackupState{
+				Revision: 1,
+				Plan: validScheduledBackupPlanForTest(
+					testCase.store,
+					&BackupRepositoryVerification{
+						Status: BackupRepositoryVerificationUnverified,
+					},
+				),
+			}
+
+			require.NoError(t, st.Validate())
+		})
+	}
+}
+
+func TestValidateScheduledBackupRepositoryVerification(t *testing.T) {
+	testCases := []struct {
+		name         string
+		verification *BackupRepositoryVerification
+		wantError    bool
+	}{
+		{name: "legacy"},
+		{
+			name: "unverified",
+			verification: &BackupRepositoryVerification{
+				Status: BackupRepositoryVerificationUnverified,
+			},
+		},
+		{
+			name: "verified",
+			verification: &BackupRepositoryVerification{
+				Status:               BackupRepositoryVerificationVerified,
+				VerifiedAtUnixMillis: 1_800_000_000_500,
+			},
+		},
+		{
+			name: "unverified with timestamp",
+			verification: &BackupRepositoryVerification{
+				Status:               BackupRepositoryVerificationUnverified,
+				VerifiedAtUnixMillis: 1_800_000_000_500,
+			},
+			wantError: true,
+		},
+		{
+			name: "verified without timestamp",
+			verification: &BackupRepositoryVerification{
+				Status: BackupRepositoryVerificationVerified,
+			},
+			wantError: true,
+		},
+		{
+			name: "unknown",
+			verification: &BackupRepositoryVerification{
+				Status: BackupRepositoryVerificationStatus("unknown"),
+			},
+			wantError: true,
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			st := testState()
+			st.ScheduledBackup = &ScheduledBackupState{
+				Revision: 1,
+				Plan: validScheduledBackupPlanForTest(
+					BackupStoreConfig{Kind: BackupStoreKindFile},
+					testCase.verification,
+				),
+			}
+
+			err := st.Validate()
+			if testCase.wantError {
+				require.ErrorIs(t, err, ErrInvalidState)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestValidateRejectsHashSlotGap(t *testing.T) {
 	st := testState()
 	st.HashSlots.Ranges[0].To = 7
@@ -242,6 +352,26 @@ func TestNormalizeBootstrapTaskDefaultsParticipantProgress(t *testing.T) {
 		{NodeID: 2, Status: TaskParticipantStatusPending},
 		{NodeID: 3, Status: TaskParticipantStatusPending},
 	}, st.Tasks[0].ParticipantProgress)
+}
+
+func validScheduledBackupPlanForTest(
+	store BackupStoreConfig,
+	verification *BackupRepositoryVerification,
+) *BackupPlan {
+	return &BackupPlan{
+		Revision:                 1,
+		Store:                    store,
+		Cron:                     "0 1 * * *",
+		TimeZone:                 "Asia/Shanghai",
+		RetentionCount:           7,
+		RateBytesPerSec:          50 << 20,
+		WorkersPerNode:           1,
+		MaxDurationMillis:        12 * 60 * 60 * 1000,
+		ScheduleCursorUnixMillis: 1_800_000_000_000,
+		CreatedUnixMillis:        1_800_000_000_000,
+		UpdatedUnixMillis:        1_800_000_000_000,
+		RepositoryVerification:   verification,
+	}
 }
 
 func TestClusterStateCloneCopiesParticipantProgress(t *testing.T) {
@@ -438,6 +568,68 @@ func TestDecodeRejectsUnknownNestedField(t *testing.T) {
 	_, err = Decode([]byte(withUnknown))
 	require.Error(t, err)
 	require.NotErrorIs(t, err, ErrChecksumMismatch)
+}
+
+func TestOpsMCPStateRoundTripsAndClonesCredentials(t *testing.T) {
+	st := testState()
+	st.OpsMCP = &OpsMCPState{
+		Enabled:                     true,
+		OwnerNodeID:                 2,
+		ProfileFenceUntilUnixMillis: 1710000030000,
+		Credentials: []OpsMCPCredential{
+			{ID: "token-b", DigestSHA256: strings.Repeat("b", 64), CreatedAtUnixMillis: 1710000002000},
+			{ID: "token-a", DigestSHA256: strings.Repeat("a", 64), CreatedAtUnixMillis: 1710000001000},
+		},
+	}
+
+	data, err := Encode(st)
+	require.NoError(t, err)
+	decoded, err := Decode(data)
+	require.NoError(t, err)
+	require.Equal(t, []string{"token-a", "token-b"}, []string{
+		decoded.OpsMCP.Credentials[0].ID,
+		decoded.OpsMCP.Credentials[1].ID,
+	})
+	require.Equal(t, int64(1710000030000), decoded.OpsMCP.ProfileFenceUntilUnixMillis)
+
+	clone := decoded.Clone()
+	clone.OpsMCP.Credentials[0].ID = "changed"
+	require.Equal(t, "token-a", decoded.OpsMCP.Credentials[0].ID)
+}
+
+func TestValidateOpsMCPStateRejectsUnsafeConfiguration(t *testing.T) {
+	validCredential := OpsMCPCredential{
+		ID:                  "token-a",
+		DigestSHA256:        strings.Repeat("a", 64),
+		CreatedAtUnixMillis: 1710000001000,
+	}
+	tests := []struct {
+		name string
+		mcp  *OpsMCPState
+	}{
+		{name: "enabled without owner", mcp: &OpsMCPState{Enabled: true, Credentials: []OpsMCPCredential{validCredential}}},
+		{name: "negative profile fence", mcp: &OpsMCPState{ProfileFenceUntilUnixMillis: -1}},
+		{name: "enabled without credential", mcp: &OpsMCPState{Enabled: true, OwnerNodeID: 1}},
+		{name: "unknown owner", mcp: &OpsMCPState{OwnerNodeID: 99}},
+		{name: "removed owner", mcp: &OpsMCPState{OwnerNodeID: 3}},
+		{name: "malformed digest", mcp: &OpsMCPState{Credentials: []OpsMCPCredential{{ID: "token-a", DigestSHA256: "bad", CreatedAtUnixMillis: 1}}}},
+		{name: "duplicate credential", mcp: &OpsMCPState{Credentials: []OpsMCPCredential{validCredential, validCredential}}},
+		{name: "too many credentials", mcp: &OpsMCPState{Credentials: []OpsMCPCredential{
+			validCredential,
+			{ID: "token-b", DigestSHA256: strings.Repeat("b", 64), CreatedAtUnixMillis: 1710000002000},
+			{ID: "token-c", DigestSHA256: strings.Repeat("c", 64), CreatedAtUnixMillis: 1710000003000},
+		}}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			st := testState()
+			st.Nodes[2].JoinState = NodeJoinStateRemoved
+			st.Nodes[2].Status = NodeStatusDown
+			st.OpsMCP = test.mcp
+			require.ErrorIs(t, st.Validate(), ErrInvalidState)
+		})
+	}
 }
 
 func TestEncodeEmptyRepeatedFieldsAsArrays(t *testing.T) {

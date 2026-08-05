@@ -18,6 +18,12 @@ routing; missing file-like paths and unmatched `/manager/*` routes remain 404.
 Content-hashed `/assets/*` responses are immutable-cacheable while `index.html`
 and public root assets require revalidation.
 
+When Manager authentication is disabled, a fresh Web client probes the
+read-only permissions snapshot and may enter only `/cluster/backups` with
+`cluster.backup:r`. The client does not persist this synthetic session and
+does not expose backup writes or the login/logout flow. Server-reported
+`auth_enabled=false` remains a second fail-closed write guard on the page.
+
 ```text
 POST /manager/login   (only when Auth.On=true)
 GET  /manager/permissions (read-only manager auth/user/catalog snapshot; requires cluster.permission:r when Auth.On=true)
@@ -58,6 +64,17 @@ GET  /manager/slots/:slot_id/logs (Slot distributed log page; requires cluster.s
 GET  /manager/app-logs/sources (ordinary app log fixed source list; requires cluster.log:r when Auth.On=true)
 GET  /manager/app-logs (ordinary app log page; requires cluster.log:r when Auth.On=true)
 GET  /manager/app-logs/stream (ordinary app log NDJSON stream; requires cluster.log:r when Auth.On=true)
+GET    /manager/backups (scheduled plan, current tasks, bounded history, and archives; requires cluster.backup:r when Auth.On=true)
+PUT    /manager/backups/plan (replace the single backup plan; requires cluster.backup:w when Auth.On=true)
+POST   /manager/backups/repository/test (probe the configured repository; requires cluster.backup:w when Auth.On=true)
+POST   /manager/backups/jobs (start one full backup now; requires cluster.backup:w when Auth.On=true)
+POST   /manager/backups/jobs/:job_id/cancel (cancel the active backup; requires cluster.backup:w when Auth.On=true)
+GET    /manager/backups/archives/:archive_id (read one archive; requires cluster.backup:r when Auth.On=true)
+POST   /manager/backups/archives/:archive_id/verify (verify one archive; requires cluster.backup:w when Auth.On=true)
+PUT    /manager/backups/archives/:archive_id/hold (hold or release one archive; requires cluster.backup:w when Auth.On=true)
+DELETE /manager/backups/archives/:archive_id (delete one archive; requires cluster.backup:w when Auth.On=true)
+POST   /manager/backups/archives/:archive_id/restore (restore one archive; requires exact cluster.restore:w plus reauthentication and confirmation)
+POST   /manager/backups/restores/:job_id/cancel (cancel the active restore before switching; requires exact cluster.restore:w)
 GET  /manager/diagnostics/trace/:trace_id (diagnostics trace aggregation; requires cluster.diagnostics:r when Auth.On=true)
 GET  /manager/diagnostics/message (diagnostics message lookup; requires cluster.diagnostics:r when Auth.On=true)
 GET  /manager/diagnostics/events (diagnostics event query, including optional exact physical slot_id; requires cluster.diagnostics:r when Auth.On=true)
@@ -70,7 +87,11 @@ POST /manager/channel-migrations/replica-replace (manual Channel replica-replace
 GET  /manager/channel-migrations/active (active Channel migration task list scoped by channel_id/channel_type; requires cluster.channel:r when Auth.On=true)
 GET  /manager/channel-migrations/:task_id (Channel migration task detail scoped by channel_id/channel_type; requires cluster.channel:r when Auth.On=true)
 POST /manager/channel-migrations/:task_id/abort (abort Channel migration task scoped by channel_id/channel_type; requires cluster.channel:w when Auth.On=true)
-GET  /manager/channels (read-only business channel list; requires cluster.channel:r when Auth.On=true)
+GET  /manager/channels (business channel list; requires cluster.channel:r when Auth.On=true)
+GET  /manager/channels/:channel_type/:channel_id (authoritative detail; cluster.channel:r)
+GET  /manager/channels/:channel_type/:channel_id/{subscribers,allowlist,denylist} (page or exact UID; cluster.channel:r)
+POST /manager/channels and PATCH /manager/channels/:channel_type/:channel_id (create/flag patch; cluster.channel:w)
+POST /manager/channels/:channel_type/:channel_id/{subscribers,allowlist,denylist}/{add,remove} (bounded set mutation; cluster.channel:w)
 GET  /manager/conversations (recent conversation list; requires cluster.channel:r when Auth.On=true)
 GET  /manager/messages (channel message list; requires cluster.channel:r when Auth.On=true)
 POST /manager/messages/retention (message retention request; requires cluster.channel:w when Auth.On=true)
@@ -98,6 +119,28 @@ GET  /manager/system-users (system UID list; requires cluster.user:r when Auth.O
 POST /manager/system-users/add (add system UIDs; requires cluster.user:w when Auth.On=true)
 POST /manager/system-users/remove (remove system UIDs; requires cluster.user:w when Auth.On=true)
 ```
+
+Backup responses expose only the redacted scheduled-full-backup plan, bounded
+task progress/history, archive health/hold state, aggregate byte/record counts,
+and the fixed `healthy`, `warning`, or `critical` schedule-health projection.
+History covers full backup, restore, archive verification, and retention
+cleanup. They never expose repository object paths, encrypted credential bytes,
+plaintext secrets, Channel identities, or restore staging paths.
+
+Backup plan requests select `file`, `oss`, `cos`, or generic `s3` storage.
+Alibaba OSS and Tencent COS require Region, Bucket, Prefix, and provider
+credentials, reject path-style addressing, and allow Endpoint to remain blank
+for the provider's standard public address. COS requires the full Bucket name
+including its numeric APPID suffix.
+
+Saving and testing are distinct mutations. `PUT /manager/backups/plan`
+durably saves and returns the redacted plan without repository I/O.
+`POST /manager/backups/repository/test` accepts only
+`expected_plan_revision`, probes that exact saved repository from every active
+data node, and marks only that revision verified. Repository or credential
+changes become unverified; schedule-only saves retain verification. Blank
+credential fields reuse the saved same-provider credential and all reads keep
+those inputs blank.
 
 `/manager/login` preserves the legacy manager response shape migrated from
 `internal/access/manager`: successful responses include `username`,
@@ -149,7 +192,10 @@ one selected node's effective startup configuration. The handler validates a
 positive path node ID, requires the same `cluster.node:r` permission as node
 inventory, delegates node-existence checks and local/remote targeting to
 `internal/usecase/management`, and serializes only the allowlisted,
-pre-redacted groups returned by that usecase. It never reads environment
+pre-redacted groups returned by that usecase. Every item carries its normalized
+effective value plus a bounded `toml`, `env`, `default`, or `derived` source so
+operators do not mistake a zero-valued auto input for its non-zero runtime
+shape. It never reads environment
 variables directly, never exposes raw manager credentials or join tokens, and
 does not mutate runtime configuration. Missing nodes return `404 not_found`;
 unwired or unreachable config readers return `503 service_unavailable`.
@@ -199,6 +245,10 @@ The downstream flow is `SlotReplicaMoveWriter -> Controller slot_replica_move
 task -> cluster task executor -> Slot Raft learner/config-change flow -> final
 Controller assignment commit`; HTTP never treats target learners as
 `DesiredPeers` before that final commit.
+Transient cluster lifecycle and Controller leadership failures use the stable
+`503 service_unavailable` envelope rather than leaking Controller internals as
+`500 internal_error`; callers may retry these idempotent fenced writes within
+their own bounded operation deadline.
 
 `/manager/nodes/:node_id/slot-move-out/*` exposes bounded Slot replica
 migration away from an active Data-role node without entering the scale-in
@@ -281,7 +331,8 @@ and scale-in status because it only reads cluster-node lifecycle evidence.
 `/manager/realtime-monitor` backs the unified web realtime monitor under
 cluster operations. It parses chart `window`, optional `step`, optional
 positive `node_id`, and `category` (`common`, `gateway`, `internal`, `message`,
-`conversation`, `channel`, `database`, `control`, `slot`, or `node`), requires
+`conversation`, `channel`, `database`, `control`, `slot`, `node`, or
+`goroutines`), requires
 `cluster.node:r` when manager auth is enabled, and delegates Prometheus plus
 bounded `control_snapshot` reads to the app-wired realtime monitor provider.
 When Prometheus is disabled or unavailable the route still returns HTTP 200
@@ -315,6 +366,17 @@ queue/inflight/task-latency pressure.
 Node cards cover runtime workqueue pressure, process CPU, RSS memory,
 goroutine count, and Go GC pause/rate/CPU/heap-goal pressure while preserving
 per-node series for the global cluster view.
+Goroutine cards combine Prometheus history with a direct, current node RPC
+snapshot. The direct view remains available when Prometheus is disabled,
+preserves node identity, and returns fixed module/task ownership plus pool
+busy/capacity/queue-depth/queue-capacity/rejection values through the
+entry-independent management read model. Peer failures are partial node results,
+not zeroes, and never expose stack traces or dynamic function names. Fan-out is
+limited to eight concurrent reads, 256 nodes, 1.5 seconds per node, and two
+seconds overall; successful peer snapshots are coalesced and cached for two
+seconds, while stale, unsupported, timed-out, and unavailable nodes remain
+explicit. Module/task health derives from fixed-count drift, panic evidence,
+and pool pressure.
 
 `/manager/runtime/workqueues` is backed by the `internal/app` top collector.
 It is a forced runtime view of the local node only: it does not fan out to peer
@@ -397,6 +459,26 @@ local-vs-remote node selection to `internal/usecase/management`. The stream
 route emits lightweight NDJSON events for lines, rotations, heartbeats, and
 reader errors without owning a long-running log runtime.
 
+## Embedded Operations MCP
+
+Every configured normal-mode Manager listener mounts the agent-facing `POST /mcp`
+Streamable HTTP endpoint and the SPA settings page at `/system/mcp`. The
+agent-facing route uses only its opaque MCP bearer token; it does not accept a
+Manager JWT. Non-empty browser `Origin` values are rejected and the route has
+no CORS grant.
+
+Administration is deliberately separate under `/manager/mcp*` and is disabled
+unless Manager authentication is enabled. Status, token metadata, and local
+audits require `cluster.mcp:r`; token create/revoke, owner change, start, and
+stop require `cluster.mcp:w`. The UI displays the raw token exactly once,
+generates a token-only client snippet, warns on plain HTTP, and reloads
+authoritative Controller state after each mutation.
+
+The Manager listener is the only endpoint operators configure. There is no
+separate MCP process, port, capability file, TLS requirement, or MCP-specific
+TOML switch. Any Manager node may receive a request and forwards it to the
+single Controller-selected execution owner.
+
 `/manager/diagnostics*` exposes internal diagnostics tracing. The HTTP layer
 parses trace/message/event query parameters, enforces the dedicated
 `cluster.diagnostics` permissions, and delegates local-vs-remote fan-out plus
@@ -407,12 +489,18 @@ The event route accepts an optional positive physical `slot_id` and returns
 explicit PreferredLeader decision, actual/preferred leader, Raft term, and
 config epoch fields without repurposing generic peer, retry, or error fields.
 
-`/manager/channels` preserves the legacy business channel list response shape
-for the web channel list view, including `node_id`, `type`, `keyword`, `limit`,
-and `cursor` query parameters. It only exposes the list display route; channel
-detail, member, and mutation operation routes remain unmigrated. Non-local
-`node_id` reads are delegated below the HTTP layer through the management
-usecase.
+`/manager/channels` preserves the business channel list response shape for the
+web channel list view, including `node_id`, `type`, `keyword`, `limit`, and
+`cursor` query parameters. Typed detail and member-list routes read through the
+authoritative Slot leader. Member pages default to 100 rows and cap at 500;
+`uid` performs one exact lookup and is mutually exclusive with `cursor`.
+Create is create-only (`409` for an existing row), PATCH changes only
+`ban`/`disband`/`send_ban`, and member writes accept at most 500 distinct UIDs.
+Subscriber writes on person channels are rejected. Member writes emit one
+bounded audit record with the operator, channel, list, operation,
+requested/changed counts, result, timestamp, and at most one redacted UID
+sample; the complete UID list is never logged. Non-local list `node_id` reads
+remain delegated below the HTTP layer through the management usecase.
 
 `/manager/channel-runtime-meta` preserves the legacy channel cluster list
 response shape for the web cluster channel page, including `node_id`,
@@ -513,3 +601,58 @@ The manager server uses its own listen address from the composition root and is
 separate from `internal/access/api`. In `cmd/wukongim`, that listener is
 configured by `WK_MANAGER_LISTEN_ADDR`; JWT settings and static users are
 configured by the `WK_MANAGER_*` auth keys.
+
+## Backup And Restore
+
+Manager exposes one scheduled full-backup surface:
+
+```text
+GET    /manager/backups
+PUT    /manager/backups/plan
+POST   /manager/backups/repository/test
+POST   /manager/backups/jobs
+POST   /manager/backups/jobs/:job_id/cancel
+GET    /manager/backups/archives/:archive_id
+POST   /manager/backups/archives/:archive_id/verify
+PUT    /manager/backups/archives/:archive_id/hold
+DELETE /manager/backups/archives/:archive_id
+POST   /manager/backups/archives/:archive_id/restore
+POST   /manager/backups/restores/:job_id/cancel
+```
+
+Reads require `cluster.backup:r` when Manager auth is enabled. Every backup
+write requires authenticated Manager mode plus `cluster.backup:w`; writes are
+rejected when authentication is disabled.
+
+Restore requires an exact resource grant for `cluster.restore:w`; a global
+wildcard resource does not satisfy it. The administrator must also submit the
+current username/password and exact `RESTORE <archive-id>` confirmation.
+Restore routes remain available while cluster business traffic is in
+maintenance.
+
+The dashboard projection contains only the redacted plan, active task, bounded
+history, credential-present boolean, published archive summaries, and schedule
+health. A latest failed backup is `warning`; two expected schedule occurrences
+without a successful archive is `critical`. It never returns credential
+ciphertext, plaintext secrets, object keys, Channel identities, or staging
+paths. Backup route failures use stable `backup_*` error codes so the Web UI
+does not infer behavior from messages.
+
+The embedded Web UI uses one `/cluster/backups` page for configuration,
+current progress, archive verify/hold/delete, and in-place restore. It offers
+daily 01:00, every 12 hours, or custom Cron/`@every` schedules. The previous
+checkpoint tabs and recovery-command page do not exist. Auth-disabled Manager
+may view this page read-only and cannot perform writes or restore.
+
+Repository test failures use specific stable codes for authentication,
+permission, bucket, region, endpoint, TLS, timeout, repository identity, node,
+and operation failures. The optional error detail contains only provider,
+stage, reason, bounded provider code, bounded request ID, and node ID. The Web
+page renders test success or failure in a live region immediately below the
+Save/Test action row, so feedback stays visible without scrolling to the page
+header. The same response never contains credentials or an unbounded raw
+provider message.
+
+A successful restore increments Controller's Manager session epoch. JWT
+validation compares that epoch, so all pre-restore Manager sessions are forced
+to sign in again.

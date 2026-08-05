@@ -57,8 +57,11 @@ func TestServiceObservesQueueAdmissionInflightAndTask(t *testing.T) {
 		t.Fatalf("reply payload = %q, want ok", resp.Payload)
 	}
 
-	events := waitForEvent(t, observer, func(event core.Event) bool {
+	waitForEvent(t, observer, func(event core.Event) bool {
 		return event.Name == "service_task" && event.ServiceID == 42 && event.Result == "ok"
+	})
+	events := waitForEvent(t, observer, func(event core.Event) bool {
+		return event.Name == "service_inflight" && event.ServiceID == 42 && event.Inflight == 0
 	})
 	okAdmission := findEvent(events, "service_admission", "ok")
 	if okAdmission == nil {
@@ -143,10 +146,15 @@ func TestServiceQueueFullReturnsBusy(t *testing.T) {
 
 func TestServiceAdmissionUsesChannelCapacityDuringDequeueWindow(t *testing.T) {
 	observer := &recordingObserver{}
-	svc := NewService(1, func(context.Context, []byte) ([]byte, error) {
-		return nil, nil
-	}, core.ServiceOptions{Concurrency: 1, QueueSize: 1, MaxQueueBytes: 1024}, observer)
-	defer svc.Stop()
+	opts := normalizeServiceOptions(core.ServiceOptions{
+		Concurrency: 1, QueueSize: 1, MaxQueueBytes: 1024,
+	})
+	svc := &Service{
+		ID:       1,
+		opts:     opts,
+		observer: observer,
+		queue:    make(chan Request, opts.QueueSize),
+	}
 
 	req := Request{Payload: core.CopyOwnedBuffer([]byte("queued"))}
 	svc.queue <- req
@@ -170,6 +178,8 @@ func TestServiceAdmissionUsesChannelCapacityDuringDequeueWindow(t *testing.T) {
 	if queueEvent.Items > queueEvent.Capacity {
 		t.Fatalf("service_queue items = %d, capacity = %d; want depth capped to capacity", queueEvent.Items, queueEvent.Capacity)
 	}
+	next := <-svc.queue
+	next.Payload.Release()
 }
 
 func TestServiceTimeout(t *testing.T) {

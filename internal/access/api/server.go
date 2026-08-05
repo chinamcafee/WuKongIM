@@ -21,6 +21,7 @@ import (
 	messageusecase "github.com/WuKongIM/WuKongIM/internal/usecase/message"
 	userusecase "github.com/WuKongIM/WuKongIM/internal/usecase/user"
 	"github.com/WuKongIM/WuKongIM/pkg/bench/model"
+	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/gin-gonic/gin"
 )
@@ -222,6 +223,9 @@ type Options struct {
 	ListenAddr string
 	// Readyz reports whether the node is ready for benchmark traffic.
 	Readyz func(context.Context) (bool, any)
+	// Maintenance reports whether Controller restore maintenance currently
+	// fences every product and benchmark route on this node.
+	Maintenance func() bool
 	// BenchEnabled exposes /bench/v1/* routes for controlled benchmark runs.
 	BenchEnabled bool
 	// BenchToken optionally requires an exact bearer capability on every /bench/v1/* route.
@@ -285,6 +289,7 @@ type Server struct {
 	listenAddr               string
 	addr                     string
 	readyz                   func(context.Context) (bool, any)
+	maintenance              func() bool
 	benchEnabled             bool
 	benchToken               string
 	benchMaxBatchSize        int
@@ -327,6 +332,7 @@ func New(opts Options) *Server {
 		engine:                   engine,
 		listenAddr:               strings.TrimSpace(opts.ListenAddr),
 		readyz:                   opts.Readyz,
+		maintenance:              opts.Maintenance,
 		benchEnabled:             opts.BenchEnabled,
 		benchToken:               strings.TrimSpace(opts.BenchToken),
 		benchMaxBatchSize:        opts.BenchMaxBatchSize,
@@ -358,8 +364,34 @@ func New(opts Options) *Server {
 	if s.logger == nil {
 		s.logger = wklog.NewNop()
 	}
+	s.engine.Use(s.restoreMaintenanceMiddleware())
 	s.registerRoutes()
 	return s
+}
+
+func (s *Server) restoreMaintenanceMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if s == nil || s.maintenance == nil || !s.maintenance() ||
+			restoreMaintenanceAllowedPath(c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+			"error":   "maintenance",
+			"message": "restore maintenance is active",
+		})
+	}
+}
+
+func restoreMaintenanceAllowedPath(path string) bool {
+	switch path {
+	case "/healthz", "/readyz", "/metrics", "/top/v1/snapshot":
+		return true
+	}
+	return strings.HasPrefix(path, "/debug/") ||
+		path == "/debug" ||
+		strings.HasPrefix(path, DemoPath) ||
+		path == strings.TrimSuffix(DemoPath, "/")
 }
 
 func cloneLegacyRouteNodes(nodes map[uint64]LegacyRouteNodeAddresses) map[uint64]LegacyRouteNodeAddresses {
@@ -426,7 +458,7 @@ func (s *Server) Start() error {
 	s.addr = ln.Addr().String()
 	s.started = true
 	s.mu.Unlock()
-	go func() {
+	goruntimeregistry.SafeGo(nil, goruntimeregistry.TaskAPIHTTPServe, func() {
 		if serveErr := httpServer.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			s.httpLogger().Error("api http serve failed",
 				wklog.Event("internal.access.api.serve_failed"),
@@ -434,7 +466,7 @@ func (s *Server) Start() error {
 				wklog.Error(serveErr),
 			)
 		}
-	}()
+	})
 	return nil
 }
 

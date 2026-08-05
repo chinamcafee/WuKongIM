@@ -16,6 +16,8 @@ type pebbleStore struct {
 	scope Scope
 }
 
+var _ multiraft.ExternalSnapshotStorage = (*pebbleStore)(nil)
+
 // snapshotSavePlan describes the metadata and external IO needed for a snapshot save.
 type snapshotSavePlan struct {
 	// Metadata is the incoming snapshot metadata without payload bytes.
@@ -137,6 +139,18 @@ func (s *pebbleStore) LastIndex(ctx context.Context) (uint64, error) {
 	return meta.LastIndex, nil
 }
 
+// LogRangeBytes returns Pebble's conservative disk estimate for Raft entries
+// in the half-open [lo, hi) interval.
+func (s *pebbleStore) LogRangeBytes(ctx context.Context, lo, hi uint64) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if hi <= lo {
+		return 0, nil
+	}
+	return s.db.db.EstimateDiskUsage(encodeEntryKey(s.scope, lo), encodeEntryKey(s.scope, hi))
+}
+
 func (s *pebbleStore) Snapshot(ctx context.Context) (raftpb.Snapshot, error) {
 	_ = ctx
 	return s.loadSnapshot(ctx)
@@ -173,6 +187,61 @@ func (s *pebbleStore) Save(ctx context.Context, st multiraft.PersistentState) er
 	}
 
 	err := s.db.publishSnapshotAndCommit(staged, &writeRequest{scope: s.scope, op: saveOp{state: writeState}, done: make(chan error, 1)})
+	if err == nil {
+		s.db.startSnapshotGC()
+	}
+	return err
+}
+
+// ReplaceSnapshot atomically publishes a different recovery snapshot at the
+// exact durable applied boundary. It is intentionally separate from Save so
+// ordinary Raft persistence cannot silently rewrite same-index history.
+func (s *pebbleStore) ReplaceSnapshot(
+	ctx context.Context,
+	snapshot raftpb.Snapshot,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	unlock := s.db.lockScopeMutation(s.scope)
+	defer unlock()
+
+	view, err := s.loadSnapshotMetaView(ctx)
+	if err != nil {
+		return err
+	}
+	if snapshot.Metadata.Index == 0 ||
+		snapshot.Metadata.Index != view.meta.AppliedIndex {
+		return errors.New(
+			"raftstorage: external snapshot must match durable applied index",
+		)
+	}
+	staged, err := s.db.prepareAndWriteSnapshot(ctx, s.scope, snapshot)
+	if err != nil {
+		return err
+	}
+	writeState := withoutSnapshotData(multiraft.PersistentState{
+		Snapshot: &snapshot,
+	})
+	writeState.Snapshot = &raftpb.SnapshotMetadata{
+		Index: staged.manifest.Index,
+		Term:  staged.manifest.Term,
+		ConfState: cloneConfState(
+			staged.manifest.ConfState,
+		),
+	}
+	writeState.SnapshotManifest = cloneSnapshotManifestPtr(&staged.manifest)
+	err = s.db.publishSnapshotAndCommit(staged, &writeRequest{
+		scope: s.scope,
+		op: saveOp{
+			state:                writeState,
+			allowSnapshotReplace: true,
+		},
+		done: make(chan error, 1),
+	})
 	if err == nil {
 		s.db.startSnapshotGC()
 	}

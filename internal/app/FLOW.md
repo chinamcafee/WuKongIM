@@ -18,7 +18,19 @@ conversation authority active cache/list reads, and opt-in local online
 delivery.
 
 This package owns lifecycle ordering. Business rules stay in usecase packages,
-and protocol details stay in access packages.
+entry-protocol details stay in access packages, and concrete runtime adapters
+stay in infra packages.
+
+`NewIssueAgentOperations` and `NewReviewAgentOperations` are standalone
+GitHub-Actions composition roots. They do not call `New`, join a WuKongIM
+cluster, or start product runtimes. Review Agent composition keeps fresh
+GitHub reads, deterministic lifecycle, credential-free verification, signed
+state writes, Review/Check publication, and the authorized exact-head
+administrator/member merge behind separate role boundaries.
+Terminal `collect_only` verification reads and validates the frozen ledger
+without constructing the command executor used by the earlier baseline job.
+It also owns strict loading and cross-layer validation of the protected Review
+Agent policy before projecting narrow lifecycle and verifier configurations.
 
 ## Construction Flow
 
@@ -34,10 +46,10 @@ New(Config)
      Prometheus metrics and the optional Top collector
   -> create metrics registry when Observability.MetricsEnabled=true and attach
      runtime observers for metrics/logging
-     (gateway runtime pressure, Slot scheduler/proposal/apply-gap/leader-election pressure and low-cardinality preferred-leader reconcile decisions/strict-wait latency, Controller Raft step queue/bounded outbound send queue/apply gap, Transport service RPC totals/latency and observed write-batch shape, Channel runtime append/replication/PullHint/PullBatch/leader-Pull/runtime pressure stages, message DB grouped commit pressure, and delivery fanout)
+     (gateway runtime pressure, Slot scheduler/proposal/apply-gap/leader-election pressure and low-cardinality preferred-leader reconcile decisions/strict-wait latency, Controller Raft step queue/bounded outbound send queue/apply gap, Transport service RPC totals/latency and observed write-batch shape, Channel runtime append/replication/PullHint/PullBatch/leader-Pull/runtime pressure stages, message DB grouped commit pressure, and online delivery)
      plus direct ants/v2 pool occupancy gauges for instrumented runtime pools
-     plus direct channelappend owner-push attempts on the same bounded delivery
-     push metric families used by runtime fanout, conversation list request latency/page-shape metrics, conversation
+     plus canonical Online Delivery local and remote owner-push attempts on the
+     bounded delivery push metric families, conversation list request latency/page-shape metrics, conversation
      authority admit/list/cache-pressure/handoff counters, conversation active
      cache gauges, dirty-mutation counters, persisted/cleared/requeued/superseded
      flush conservation counters, fair dirty-queue and bounded dirty-age-index
@@ -45,9 +57,12 @@ New(Config)
      flush-stage histograms, and pressure-wakeup
      lifecycle metrics, channel append and post-commit
      counters, presence authority expiry cost/index gauges and bounded owner
-     touch-flush route/chunk/target-group counters, recipient delivery worker
+     touch-flush route/chunk/target-group counters plus aggregate exact-target
+     endpoint lookup path/outcome/retry metrics, recipient authority batch
+     calls/items/physical-targets/duration, online delivery runtime
      queue/admission/process metrics plus configured worker capacity and current
-     in-flight command gauges,
+     in-flight command gauges, and owner-local ACK batch bind/finish shape,
+     rejection, rollback, and duration metrics,
      plugin PersistAfter and Receive hook enqueue/invoke counters and
      histograms, and synchronous plugin Send hook invoke counters and histograms
      plus node lifecycle gauges/counters from control snapshots and scale-in
@@ -129,11 +144,11 @@ New(Config)
        runtime/conversationactive.Manager plus one routed
        ConversationAuthorityClient, register the conversation authority RPC
        adapter, create the route-authority lifecycle, and use that client as
-       the conversation list Store while keeping the read adapter as Messages,
-       durable state reads, read-cursor writes, and delete-barrier writes
+       the conversation list and delete Store while keeping the read adapter as
+       Messages, durable state reads, and read-cursor writes
   -> when the cluster exposes cluster Slot metadata subscriber APIs, create
      a delivery metadata adapter backed by real storage for bench setup,
-     channelappend subscriber scans, and optional delivery fanout
+     and channelappend subscriber scans
   -> when the cluster exposes presence routing:
        create owner boot ID, online.Registry, runtime/presence.Directory,
        infra/cluster.PresenceAuthorityClient, usecase/presence.App,
@@ -206,14 +221,16 @@ New(Config)
        adapter, owner-local online registry, optional presence lookup, and the
        channel metadata adapter as the system UID store
   -> when Delivery.Enabled=true:
-       create a cluster-backed delivery partitioner
-       when route snapshots are available, an app subscriber planner, presence
-       resolver, local/cluster delivery pusher, and partition-leader fanout router
-       wrap the fanout runner with a bounded in-memory retry scheduler
-       create runtime/delivery Manager in bounded async mode around the runner
-       attach delivery observer for metrics and async error logging
-       create usecase/delivery.App backed by the manager
-       register delivery push and fanout RPC handlers when node RPC is available
+       create the canonical runtime/delivery Runtime with bounded plan
+       admission, exact-target presence resolution, owner grouping, narrow
+       retry, pending-RECVACK tracking, and plugin/webhook offline observers
+       supply infra/delivery.LocalSessionWriter for final exact owner-local
+       packet writes and the node RPC client for remote owner pushes
+       attach delivery observers for metrics, pressure, ACK state, and bounded
+       terminal error logging
+       expose gateway RECVACK/session-close feedback through the temporary
+       usecase/delivery facade; channelappend remains the sole plan producer
+       register only the owner-push RPC handler when node RPC is available
   -> when Plugin.Enable=true (default unless WK_PLUGIN_ENABLE=false is set):
        wire a node-local PDK-compatible plugin runtime with a Unix host RPC
        socket, the lifecycle plus /message/send, /channel/messages,
@@ -234,10 +251,10 @@ New(Config)
        positive toNodeId /plugin/httpForward calls through the cluster manager
        plugin RPC forwarder; wire Receive hook binding selection to
        cluster-authoritative UID plugin bindings when available; attach the
-       plugin hook metrics observer
-       when metrics are enabled, expose durable commit PersistAfter events to
-       channelappend, expose durable offline recipient candidates to
-       channelappend's recipient delivery worker for Receive hooks, and
+       plugin hook metrics observer when metrics are enabled; expose durable
+       commit PersistAfter events to
+       channelappend, expose each durable offline recipient batch from the
+       Online Delivery runtime to Receive hooks, and
        register the manager plugin RPC handler when node RPC is available so
        peer managers can inspect or mutate this node's plugin lifecycle state
        and invoke this node's local /plugin/route hook for forwarded plugin
@@ -247,7 +264,8 @@ New(Config)
        msg.notify/msg.offline, bounded dispatch, durable exponential retry,
        dead-letter state, and an HTTP sender; wire webhook adapters into
        channelappend's durable post-commit PersistAfter sink, the batch offline
-       recipient observer, and the presence online-status observer
+       recipient observer exposed by the Online Delivery runtime, and the
+       presence online-status observer
        Plugin hooks and webhook sinks coexist on the same side-effect surfaces.
        user.onlinestatus remains best-effort; critical webhook failures remain
        durable post-commit side effects and must not affect
@@ -257,10 +275,9 @@ New(Config)
        create channelappend.Group with hash-sharded per-channel authority writers,
        cluster ChannelAppender, node-scoped message IDs, subscriber source,
        cluster-backed idempotency lookup when the cluster exposes it,
-       recipient authority resolver, conversation active-batch admitter,
-       optional recipient delivery worker enqueuer, optional plugin/webhook
-       PersistAfter enqueuers, optional plugin/webhook offline-recipient
-       observers, append metrics observer, and shared append/post-commit worker
+       infra/cluster recipient authority resolver adapter, conversation active-batch admitter,
+       optional canonical Online Delivery plan enqueuer, optional plugin/webhook
+       PersistAfter enqueuers, append metrics observer, and shared append/post-commit worker
        pools
        create channelappend.Router for local authority admission and remote
        channel-authority forwarding
@@ -293,6 +310,9 @@ New(Config)
      `/manager/nodes/:node_id/plugins*`, `/manager/plugin-bindings`,
      `/manager/users*`, and
      `/manager/system-users*`;
+     business channel detail/member operations cross the composition root
+     through `managerChannelBusinessOperator`, which adapts management-owned
+     DTOs to the sibling channel usecase without coupling those usecases;
      channel, conversation, message, and user lists are attached only when the
      cluster also exposes the corresponding metadata/message page scans, while
      local connection list/detail reads use the owner-local online registry,
@@ -344,8 +364,19 @@ New(Config)
      cluster-operations card series, including Slot proposal admission,
      leader-change, replica-lag, and scheduler pressure cards, category counts, explicit
      disabled/unavailable source states, and bounded `ListNodes`/`ListSlots`
-     control snapshots through the management usecase; the realtime monitor
+     control snapshots through the management usecase; the `goroutines`
+     category combines Prometheus node/module history with process-wide local
+     snapshots and an eight-worker, per-node-timeout Manager Goroutine RPC
+     fan-out, coalescing concurrent reads and caching successful peer reads for
+     two seconds. Global refreshes evict removed-node entries and the cache is
+     hard-capped at the same 256-node response bound; the realtime monitor
      does not read from `topCollector`
+  -> when normal-mode Manager is configured, compose one Operations MCP endpoint on the
+     same listener: Controller desired-state reader/writer, token verifier,
+     fixed observation service, per-node call control/audit, owner forwarding,
+     aggregate audit reader, and target pprof RPC share one registered typed
+     node RPC; every Manager mounts `/mcp`, while only the Controller-selected
+     owner executes tools
   -> create pkg/gateway.Gateway with WKProto CONNECT authentication only when listeners are configured
 	   Token authentication is enabled by default by the product config. The app
 	   resolves `uid + device_flag` through the routed Slot metadata device store,
@@ -354,340 +385,12 @@ New(Config)
 	   when metadata is missing, unavailable, timed out, or inconsistent.
 ```
 
-The DB Inspect reader is app-owned because only the composition root derives
-the node-local storage locations for `pkg/db/inspect`. It is exposed to manager
-usecases as a read-only diagnostics port and never accepts filesystem paths
-from HTTP, web, or node RPC callers. The manager page can inspect the local
-manager node by omitting `node_id`; selecting another node uses the manager DB
-inspect RPC path to that node and does not combine rows from multiple nodes.
+## Product Runtime Details
 
-The ordinary application log reader is also app-owned because only the
-composition root owns `Log.Dir` and the concrete node-local logger layout. It is
-separate from the distributed Controller/Slot Raft log reader: ordinary app log
-requests list fixed local log sources and parse application log entries, while
-Raft log requests read cluster log storage metadata and decoded Raft payloads.
-Remote ordinary app log requests use the manager app-log RPC path for the
-selected node and still return only reader-owned source names and file labels,
-never absolute paths.
-
-The node-config snapshot provider is app-owned because only startup config
-loading has the fully merged TOML/env effective values. `internal/config`
-builds the bounded allowlist once during startup, redacts manager credentials,
-cluster join tokens, static manager users, local filesystem paths, and
-similarly sensitive values, then attaches that snapshot to `app.Config`.
-`internal/app` only serves the supplied snapshot for the local node and returns
-`ErrNodeConfigUnavailable` when the startup loader did not provide one. It is
-read-only and does not watch or mutate live runtime config.
-
-The diagnostics store is app-owned because only the composition root knows
-whether `Observability.Diagnostics.Enabled` installed the bounded event store,
-tracking sampler, and process-wide sendtrace sink. Manager diagnostics routes
-use that same store for local reads and tracking-rule mutations; non-local
-node-scoped reads and mutations route through the manager diagnostics RPC path
-without falling back to legacy `internal` diagnostics state.
-PreferredLeader details remain node-local diagnostics rather than Prometheus
-labels: one bounded signature per observed physical Slot preserves state changes
-immediately and resamples an unchanged non-match decision at most once every 30
-seconds. A non-match to `match` recovery is retained once, while initial or
-repeated steady `match` decisions remain available only through aggregate
-metrics and later cluster snapshots so they cannot churn the diagnostics ring.
-Diagnostic event counts are transition evidence, not reconcile-rate evidence;
-aggregate Prometheus counters remain the frequency source.
-
-Controller Raft status and manual compaction use a cluster-routed management
-operator created in the app composition root. Local reads and compaction call
-the local cluster node facade directly; non-local node-scoped operations use
-the manager Controller Raft node RPC path. The cluster-wide manager compact
-action fans out above the RPC layer by targeting every Controller voter in the
-current control snapshot.
-
-`Delivery.Enabled` remains false for app-level zero-value configs, while the
-`wukongim` executable config enables `WK_DELIVERY_ENABLE` by default. With
-delivery disabled, committed message effects still run inside the channel
-authority writer so recent conversation state is updated, but no online
-delivery is submitted. With delivery enabled, gateway RECVACK and session close
-feedback flows to the delivery usecase, while channelappend post-commit effects
-enqueue bounded multi-target recipient delivery plans into the recipient
-delivery worker. Each plan retains every exact Slot authority fence. The app
-presence adapter converts all plan groups in one call; the cluster adapter then
-batches local groups in the presence directory and sends at most one batch RPC
-to each remote Slot leader. Results remain aligned per exact target so a failed
-leader group does not discard successful groups from the same plan.
-`Config.ChannelAppend.AuthorityShardCount` defaults to a CPU-aware lookup-shard
-count with a minimum of four. `ChannelAppend.AdvancePoolSize` is the direct ants
-pool capacity used to activate channelappend writer state machines.
-`ChannelAppend.EffectPoolSize` is the direct ants pool capacity used separately
-by foreground channelappend append effects and post-append recipient effects.
-The post-append pool uses non-blocking saturated admission and drops the
-already-best-effort effect through the scheduler-failure observation instead of
-blocking a channel writer advance worker; the foreground append pool keeps its
-blocking worker admission semantics. Each channel also keeps the post-commit
-backlog separately bounded from foreground append admission; a full side-effect
-backlog records and drops the newest already-durable envelope without returning
-`ErrChannelBusy` to a later SEND.
-Prepare runs inline on the writer advance path; append remains the foreground
-durable path that determines SEND/SENDACK throughput.
-`ChannelAppend.RecipientAuthorityDispatchConcurrency` defaults to a bounded
-recipient-authority target fanout for legacy batch-only enqueuers. The
-production plan-capable worker admits exact-target groups together instead of
-using this target fanout.
-`Delivery.RecipientWorkerConcurrency` independently defaults to 100 and controls
-only the goroutines draining the bounded recipient delivery queue. The legacy
-target fanout and production plan execution capacities therefore remain
-independent. The lookup-shard count controls writer map sharding; effect workers run only blocking effects and never write channel
-state concurrently with another advance for the same channel. The delivery
-observer maps aggregate writer pressure and effect pool observations into
-Prometheus, and also records direct ants/v2 occupancy for the channelappend
-advance/append_effect/post_commit pools in the generic ants pool metrics. The three-node bench
-script summarizes these in `channelappend_metrics_summary.tsv` and
-`ants_pool_usage_summary.tsv`. Per-channel append ordering remains capped
-by the single-writer invariant even when different channels run through
-different shards or workers.
-The foreground SEND path waits only for channel-authority durable append;
-subscriber scan, recipient authority grouping, delivery enqueue, and the
-independent conversation active projection all run after SENDACK from the
-authority writer's best-effort post-commit pipeline. The recipient delivery worker later
-drains accepted plans, resolves all exact-target groups through the batched
-presence seam, coalesces successful routes by owner across each whole plan,
-splits each owner group by `Delivery.PushBatchSize`, and pushes those bounded
-commands in first-seen order. The owner-push adapter records every actual local
-or remote attempt in the delivery push count, route-count, and duration metrics.
-Post-commit persistence
-and restart replay are not part of
-channelappend. Post-commit enqueue failures are logged with the failing phase and
-route/dispatch context, counted through effect metrics, and dropped after the
-routed helper's bounded retry window; they do not change channel durability or
-the already-successful SENDACK decision. Conversation active-batch admission
-performs only a short bounded fresh-route retry in the routed client. Delivery
-is enqueued first; active projection failures surface independently as the
-`conversation_active` post-commit phase and do not stop online delivery or later
-large-channel pages.
-Runtime fanout failures are counted with normalized delivery error classes.
-Retryable fanout failures enter
-a bounded in-memory retry scheduler with a small fixed attempt cap; retry queue
-overflow is surfaced as `queue_full`. Owner-local pushes write `RecvPacket` values through
-`online.SessionHandle.WriteDelivery`. Each owner push snapshots the immutable
-envelope payload once and reuses that snapshot across recipient packets;
-closed-session and outbound-overflow write errors are terminal drops, while
-unknown write errors remain retryable. The same append observer records
-per-message append success/error latency and classifies append failures with
-low-cardinality labels for benchmark triage, including typed Channel runtime/cluster
-errors and short append results.
-
-The channel append commit pipeline scopes unscoped person-channel events to the
-two channel participants. For non-person unscoped channels it pages durable
-subscribers through the app delivery metadata source, an explicitly supplied
-subscriber source, or the cluster Slot metadata source. When cluster exposes
-batch key routing, the app recipient resolver resolves each subscriber page's
-unique UIDs through one batch route lookup. After each recipient set is formed,
-channelappend groups recipients by exact UID hash-slot authority
-target including Slot leader term and Slot config epoch, then packs the groups
-into a bounded delivery plan. The worker preserves those fences while the
-presence usecase groups target lookups by actual leader and returns partial
-per-target results.
-It next admits an independent kind-aware `conversationactive.ActiveBatch`
-through the shared `ConversationAuthorityClient`; channelappend chooses normal
-versus CMD kind from the committed envelope, and active admission still runs
-when online delivery is disabled. When delivery is enabled, the app wires a bounded
-recipient delivery worker that drains those plans and runs the delivery-only
-channelappend recipient processor outside the authority writer. `/bench/v1/channels`,
-`/bench/v1/channels/subscribers`, and `/bench/v1/channels/subscribers/remove`
-write real channel metadata or add/remove subscriber rows through Slot proposals.
-The benchmark data writer uses bounded concurrency for independent
-channel/subscriber mutations while preserving subscriber mutation order within
-the same channel. Scoped UID delivery bypasses subscriber scan and
-flows through recipient authority grouping, presence resolution, and the local
-or RPC owner pusher after the recipient delivery worker accepts the plan.
-The app maps the worker's serialized execution-pressure observation into
-Prometheus worker capacity and in-flight gauges. These metrics do not include
-UID, channel, slot, or per-target labels.
-
-When the cluster runtime exposes route snapshots, delivery planning uses the
-cluster UID hash-slot table to create authority partitions. A fanout task
-router runs local partitions through the in-process fanout worker and forwards
-remote partitions through access/node Delivery Fanout RPC. The remote node then
-uses its own subscriber source and still pushes resolved online routes by
-owner node. Runtime fanout task, resolve, and push observations are translated
-by app-level metrics/logging adapters; retry enqueue, attempt, drop, and
-queue-depth observations use the same adapter. The delivery runtime itself stays
-independent from Prometheus and concrete logging backends.
-
-The Channel runtime metrics observer also logs rare admitted-append cancellation
-snapshots emitted by the append runtime. These lines include the channel key,
-op id, commit mode, LEO/HW/target offset, queue and in-flight counts, and
-quorum progress flags plus a compact leader-visible follower summary so
-benchmark timeout triage can identify the stuck append phase without adding
-high-cardinality Prometheus labels.
-Leader-side Pull stage metrics sample one in every sixteen operation IDs. When
-multiple optional observers request different sample intervals, the composite
-observer admits the greatest-common-divisor envelope and filters callbacks by
-operation ID for each child, preserving every child's requested rate without
-forcing the metrics child to inherit a more expensive observer's rate.
-
-Message append observations record low-cardinality metrics for every durable
-append attempt and log rare append failures, including gateway deadline
-timeouts, with path, error class, duration, and raw error. These diagnostics do
-not change append admission, durable write, or quorum ACK rules.
-When metrics are enabled, app observability also adapts cluster message event
-observations into Prometheus counters, histograms, and stream-cache gauges.
-The adapter preserves the cluster-provided bounded labels only; it does not add
-UID, channel, slot, or per-message labels.
-
-If a test or harness supplies `WithCluster` and that runtime implements the
-cluster append surface, `New` still wires a `ChannelAppender` to keep the real
-send path available.
-If that runtime also implements the committed channel message read surface,
-`New` wires a `ChannelMessageReader` so `/channel/messagesync` can use the same
-message usecase as the gateway send path.
-If that runtime also implements the message event projection surface, `New`
-wires `MessageEventStore` so `/message/event` appends and `/channel/messagesync`
-event summaries share the same Slot/meta reducer as other cluster-owned message
-metadata. `/message/eventsync` remains outside the app surface in this phase.
-
-If the runtime also exposes unified conversation projection writes and committed
-Channel runtime reads, `New` wires `internal/usecase/cmdsync` through
-`CMDSyncStore`. `/message/sync` scans only `ConversationKindCMD` rows from the
-UID-owned projection, reads the corresponding command/source SyncOnce channel
-logs, and returns legacy message arrays through the API adapter.
-`/message/syncack` advances CMD-kind read cursors in the same kind-aware
-conversation table, so CMD sync does not introduce a second metadata branch or
-pending-state updater. Ordinary conversation hydration stays on
-`ConversationKindNormal` rows and skips `SyncOnce`/command-channel log entries
-instead of relying on suffix filtering in conversation storage or list logic.
-
-Bench runtime controls flow from internal HTTP through `internal/infra/cluster`, `pkg/cluster.Node`, `pkg/cluster/channels.Service`, and finally the hosted Channel runtime runtime. These routes are benchmark-only observation/cleanup controls and do not replace the gateway SEND activation path.
-
-Legacy channel management requests flow from internal HTTP through
-`internal/usecase/channel` and the `internal/infra/cluster`
-`ChannelMetadataStore` adapter to `pkg/cluster.Node` Slot metadata facades.
-Mutations are proposed through Slot ownership; reads use the current routed Slot
-metadata store. Ordinary subscriber mutations also project `(uid, channel)` rows
-through the UID-owned membership facade for compatible metadata reads; the
-conversation list itself pages UID-owned active conversation rows instead. When
-the channelappend group is available, the app-level subscriber mutation observer
-forwards the final large-group flag and subscriber mutation version to
-`channelappend.Group.ApplySubscriberMutation` so non-large channel subscriber
-snapshots cached in `channelState` stay aligned with API mutations.
-
-Conversation list reads flow from entry adapters through
-`internal/usecase/conversation`. When the cluster exposes the conversation
-authority surface, the list Store is the routed
-`internal/infra/cluster.ConversationAuthorityClient`, which resolves the UID
-hash-slot authority and reads the target-owned active view from the local or
-remote authority cache. The Messages port remains the `ConversationStore`
-adapter so last-message hydration reads committed Channel runtime tails with
-`Config.Conversation.MaxLastMessageConcurrency` as a bounded tail-read limit;
-the same adapter remains the StateStore, StateMutationStore, and DeleteStore so
-legacy conversation read/delete mutations still write through UID-owned Slot
-metadata instead of the authority list client.
-If a test or limited harness exposes conversation reads but not the authority
-surface, the usecase uses `ConversationStore` for both Store and Messages as a
-DB-only compatibility path. Conversation rows do not store the last message.
-When metrics are enabled, the app maps API conversation-list observations to
-Prometheus metrics for latency, returned items, sparse items, last-message
-loads, last-message errors, active-index stale skips, and whether another active
-page exists using only low-cardinality labels. It also maps conversation active
-cache observations to Prometheus gauges for cached rows, dirty rows, fair
-dirty-queue rows, bounded dirty-age buckets, oldest dirty age, fixed normal/CMD
-row and dirty-row counts, accepted/rejected admission cache-lock latency, and
-flush result/row/stage-duration metrics.
-
-Conversation list with authority enabled:
-
-```text
-/conversation/list
-  -> access/api parses the UID page request
-  -> internal/usecase/conversation asks Store for the UID active view
-  -> ConversationAuthorityClient resolves the UID hash-slot authority
-  -> local authority:
-       validate the exact RouteTarget
-       delegate cache and UID-owned DB active-view merge to runtime/conversationactive.Manager
-  -> remote authority:
-       call access/node Conversation Authority List RPC for the target-owned view
-  -> usecase hydrates only the returned page with channel-owned last-visible messages
-  -> access/api shapes the legacy-compatible response
-```
-
-Conversation active-batch admission with authority enabled:
-
-```text
-channelappend active producer
-  -> emits conversationactive.ActiveBatch with explicit normal or CMD kind
-  -> ConversationAuthorityClient.AdmitActiveBatch
-       -> cluster groups SenderUID and recipient UIDs by exact UID authority
-  -> local authority:
-       validate the exact RouteTarget
-       delegate ActiveBatch to runtime/conversationactive.Manager.AdmitActiveBatch
-  -> remote authority:
-       access/node Conversation Authority ActiveBatch RPC
-       remote local authority applies the same target validation and runtime admission
-```
-
-The app authority does not regroup or reinterpret active batches and does not
-normalize zero conversation kinds. It trusts the cluster-routed client to send
-`SenderUID` only to the sender-owned authority target; non-sender recipient
-targets arrive with an empty sender field.
-
-Legacy user management requests flow from internal HTTP through
-`internal/usecase/user` and the `internal/infra/cluster`
-`UserMetadataStore` adapter to `pkg/cluster.Node` Slot metadata facades.
-Token and device mutations are proposed through UID Slot ownership. Online
-status reads use the v2 presence usecase when available, while device close
-side effects are limited to owner-local sessions from `online.Registry`.
-System UID persistence reuses the compatible channel metadata store's internal
-subscriber-list model.
-
-Legacy message send and channel message sync requests flow from internal HTTP
-through the app message facade. Sends delegate to `channelappend.Router`, which
-resolves the canonical channel's append authority. Local authority sends are
-admitted to the local `channelappend.Group`; remote authority sends are forwarded
-through access/node Channel Append RPC to the target node, where they enter only
-that node's authority writer group. Channel message sync uses the
-`internal/infra/cluster` ChannelMessageReader, which reads committed Channel runtime
-messages through the cluster Node facade and keeps legacy person-channel
-response IDs in the HTTP adapter.
-
-Conversation active rows remain working-set hints: delayed or dropped
-post-commit work does not change message durability or SENDACK success. The
-runtime/conversationactive.Manager coalesces active rows, serves list reads by
-merging cached rows with UID-owned DB active rows, and flushes durable active
-touch patches through the conversation active flush worker or handoff drain.
-Cache pressure only sends a nonblocking wakeup to that worker; admission never
-performs durable I/O. The app conversation authority keeps route target fencing,
-lifecycle handoff, observer mapping, and usecase/RPC type adaptation.
-Aggregate admission cache snapshots are coalesced to a 100ms interval in the
-production authority wiring; pressure transitions and flush completion still
-publish immediate snapshots, while mutation counters remain unsampled.
-
-SEND with channel authority routing enabled:
-
-```text
-gateway/API send
-  -> message.App delegates to channelappend.Router
-  -> Router resolves channel append authority
-  -> local channel authority:
-       channelappend.Group admits the batch to the channel writer
-  -> remote channel authority:
-       access/node Channel Append RPC forwards the batch
-       remote node admits it to its local channel writer
-  -> authority writer prepares commands, allocates IDs, and calls cluster ChannelAppender
-  -> Channel runtime persists messages and returns append result
-  -> SENDACK returns to sender
-  -> authority writer post-commit effect:
-       scope person recipients or page subscribers
-       group recipients by UID authority target, including Slot leader term and config epoch, for delivery
-       enqueue recipient delivery batch when delivery is enabled
-       ConversationAuthorityClient.AdmitActiveBatch as an independent projection
-       drop the in-memory post-commit envelope after one enqueue attempt
-```
-
-The bench presence snapshot controller aggregates `online.Registry.Snapshot`
-and `runtime/presence.Directory.Snapshot`. It is read-only and exists so
-wkbench can validate owner-route and authority-route counts after connection
-runs.
-
-The effective cluster node ID is also the message ID seed. `Config.Cluster.NodeID`
-wins when set; top-level `Config.NodeID` is only the fallback.
+Detailed product-runtime composition, Online Delivery, channelappend,
+conversation, and SEND flows live in
+[`FLOW_PRODUCT_RUNTIME.md`](FLOW_PRODUCT_RUNTIME.md). This file remains the
+canonical index for package-wide construction and lifecycle ordering.
 
 ## Lifecycle Flow
 
@@ -708,7 +411,7 @@ Start(ctx)
   -> plugin runtime Start(ctx): open the host RPC socket, scan local plugins, and start enabled processes
   -> plugin PersistAfter worker Start(ctx): accept durable commit side effects before channel append opens
   -> webhook runtime Start(ctx): accept post-commit webhook side effects before producers open
-  -> delivery worker group Start(ctx): retry scheduler, async manager, then recipient delivery worker
+  -> Online Delivery runtime Start(ctx): open bounded plan admission and workers
   -> channel append group Start(ctx): open local channel-authority writer admission
   -> api.Start()
   -> manager.Start()
@@ -722,14 +425,29 @@ Any component start failure
   -> retain the full structured internal.app.lifecycle_start_failed event in error.log
   -> rollback already-started components in reverse order
 
+Any App construction failure
+  -> stop and unregister constructor-owned ChannelAppend pools
+  -> restore the diagnostics sink and close construction-time audit resources
+
 Stop(ctx)
   -> restore diagnostics sendtrace sink
+  -> when Start never completed, stop constructor-owned ChannelAppend pools
+     and wait only for post-baseline managed activity before returning
   -> gateway.Stop()
   -> prometheus.Stop(ctx)
   -> manager.Stop(ctx)
   -> api.Stop(ctx)
-  -> channel append group Stop(ctx): close admission and drain accepted appends plus post-commit effects
-  -> delivery worker group Stop(ctx): recipient delivery worker drains before async manager and retry scheduler
+  -> top.Stop(ctx)
+  -> channel append group Stop(ctx): close admission and wait for its single
+     background graceful drain of accepted appends, handoff reservations,
+     post-commit effects, and retry ownership
+     if this caller's context expires before that drain completes:
+       return the stop error immediately
+       keep delivery, webhook, plugin, conversation, presence, seed-join, cluster,
+       and controller-task-audit dependencies running
+       retain their started flags so a later Stop(newCtx) waits for the same
+       channel append drain and then resumes this dependency shutdown sequence
+  -> Online Delivery runtime Stop(ctx): close admission and drain accepted plans
   -> webhook runtime Stop(ctx): stop accepting new webhook side effects after producers drain
   -> plugin PersistAfter worker Stop(ctx): stop accepting new side effects after channel append drains
   -> plugin runtime Stop(ctx): stop plugin processes and close the host RPC socket
@@ -742,9 +460,25 @@ Stop(ctx)
      JSONL file after the Controller runtime can no longer emit observer calls
 ```
 
+The app always installs the process-wide `pkg/goroutine` registry, passes it to
+Cluster and Gateway configuration, projects it into the management goroutine
+read model for Manager node RPC readers, exposes the concrete snapshot only
+through the local API debug hook, and registers its Prometheus collector with constant node
+identity labels. Metrics and Prometheus history remain configurable, but
+goroutine lifecycle accounting has no disable switch.
+After component shutdown completes, `App.Stop` waits each fixed goroutine
+module with the caller context. A deadline returns bounded live task evidence
+instead of silently reporting a clean stop. The wait is relative to the
+process-registry launch/registration baseline captured before App-owned runtimes are constructed,
+so pre-existing process tasks are not reassigned to this App.
+
 `Start` and `Stop` are serialized by a lifecycle mutex. If API, manager, Prometheus, or gateway
 startup fails after the cluster starts, `Start` attempts rollback in reverse
 order; if rollback fails, state remains retryable so a later `Stop` can clean up.
+Rollback uses the same channel-append drain boundary as ordinary Stop: a rollback
+deadline at that boundary returns without closing post-commit dependencies, and
+a later Stop with a fresh context continues the existing drain before closing
+them. Entry runtimes already stopped before the boundary remain stopped.
 The startup console is presentation-only: it is disabled with `Log.Console=false`,
 does not add a configuration surface, and does not replace structured lifecycle
 events in rolling files. API, Demo (`/demo/` on the API listener), manager, metrics,
@@ -757,7 +491,13 @@ When `Plugin.Enable=true` (the default unless `WK_PLUGIN_ENABLE=false` is set),
 the app wires the PDK-compatible node-local plugin
 runtime, desired-state store adapter, minimal lifecycle host RPC adapter, v2
 plugin usecase, and bounded PersistAfter worker before channelappend. The
-channelappend group receives only the PersistAfter enqueue port. Plugin runtime
+channelappend group receives the PersistAfter enqueue port and a batch-capable
+offline-recipient observer. One offline recipient batch becomes one plugin
+worker admission and one owned copy of its payload and UID slice. The plugin
+usecase snapshots eligible running Receive plugins once per batch, returns
+before binding reads when none exist, and then preserves ordered per-UID binding,
+dedupe, and invocation semantics only for bound recipients. The legacy scalar
+observer and worker interfaces remain as compatibility fallbacks. Plugin runtime
 and hook workers start before channelappend and stop after channelappend drains,
 so accepted durable commits can enqueue plugin side effects until the append
 runtime is stopped. Desired plugin config remains node-local in this phase and
@@ -772,9 +512,14 @@ bounded dispatch, survive restart, retry with the same stable delivery ID, and
 move to dead-letter after the configured maximum attempts. Online-status
 delivery remains best-effort. Neither path changes SENDACK, durable append,
 plugin hooks, conversation active admission, or owner delivery.
-The manager drains accepted fanout before the retry scheduler stops, so queued
-retries remain available while accepted manager work completes. Stale pending
-recvacks expire during owner-local push activity.
+The Online Delivery runtime drains accepted plans before it stops. Retryable
+owner routes are narrowed and retried inside the plan's bounded execution
+window. Stale pending recvacks expire during owner-local push activity. The runtime admits at
+most one full pending-ack scan per second and never overlaps scans; ordinary
+pushes, binds, and Recvacks therefore do not pay an O(pending acks) sweep on
+every owner batch. The tracker uses second-resolution delivery timestamps, so
+under an advancing clock and continuing push activity the gate adds at most one
+scheduling interval before the next stale-entry scan.
 
 ## Presence Touch Worker
 
@@ -836,11 +581,19 @@ periodic tick or coalesced cache-pressure wakeup
   -> batch-read durable conversation rows for receiver-only cooldown filtering
   -> skip receiver-only ActiveAt updates inside AuthorityActiveCooldown
   -> store.TouchConversationActiveAtBatch persists remaining ActiveAt/ReadSeq/UpdatedAt
-  -> after a successful pressure-cycle attempt, requeue one wakeup while dirty
-     rows remain above the 70% low watermark and at least one dirty marker was
-     cleared; a zero-progress attempt waits for the next periodic tick
+  -> after a successful pressure-cycle attempt with cleared rows, the Manager
+     requeues one coalesced wakeup while dirty rows remain above the 70% low
+     watermark
+  -> when a selected pressure batch clears no dirty marker while retryable rows
+     remain, the app worker schedules one cancellation-safe delayed retry with
+     bounded exponential backoff from 25ms to 250ms; progress, no work, or an error
+     cancels that retry and returns continuation ownership to the normal
+     Manager pressure signal or periodic tick
 
 cache admission
+  -> keep the latest receiver activity visible in cache while suppressing only
+     its durable dirty work against a separately tracked clean ActiveAt baseline
+     strictly inside AuthorityActiveCooldown
   -> at 80% total occupancy with dirty rows above the 70% low watermark, start
      one pressure cycle
   -> if clean-row eviction cannot satisfy the hard cache bound, reject
@@ -852,6 +605,9 @@ Stop(ctx)
   -> cancel the periodic loop
   -> drain remaining dirty active rows in bounded batches with the caller's stop context
      and the same per-attempt timeout
+  -> after a successful drain, repeated Stop calls return without flushing
+     again under the restore maintenance fence; a timed-out or failed drain
+     remains retryable
 ```
 
 The flush worker does not construct conversation rows and does not read message
@@ -859,15 +615,25 @@ payloads. It only persists dirty active rows already admitted into the
 conversationactive cache, keeping cache visibility immediate while bounding
 eventual durable lag. The capacity-1 pressure channel and single worker goroutine
 coalesce concurrent wakeups; every attempt remains bounded by
-`AuthorityFlushBatchRows` and `AuthorityFlushTimeout`.
+`AuthorityFlushBatchRows` and `AuthorityFlushTimeout`. The worker owns and reuses
+the delayed pressure-retry timer, stops it on cancellation, and never immediately
+re-signals a zero-progress batch, so repeated version conflicts cannot create a
+busy loop.
 
 ## Conversation Authority Handoff
 
 ```text
 cluster.RouteAuthorityEvent
   -> ignore stale events by hash-slot route revision, Slot config epoch, Slot leader term, and diagnostic authority epoch tie-break
+  -> when handing off a previous local target, mark that exact target draining
+     under the authority mutex so no new admission reservation can start
+  -> hand the reservation wait and flush/purge to a bounded background drain;
+     the route watcher remains free to publish a newer local tenure
+  -> in that background drain, wait within the handoff timeout for only that
+     exact target's accepted admission reservations to reach zero
   -> if local node becomes authority:
        mark the exact conversation authority target active
+       purge clean rows for that hash slot before reusing its cache baseline
   -> if leader becomes unknown:
        drain the previous local or warming target with AuthorityHandoffTimeout
        mark the no-leader target warming
@@ -879,9 +645,17 @@ cluster.RouteAuthorityEvent
 Foreground committed-message admission still resolves the current UID authority
 through the routed `ConversationAuthorityClient`. The watcher only maintains
 local cache/list readiness for targets that this node can serve. Handoff drains
-only dirty runtime rows indexed under the previous target's UID hash slot, using
+only after the previous exact target's accepted cache mutations have returned;
+it then drains dirty runtime rows indexed under the previous target's UID hash slot, using
 `AuthorityFlushBatchRows` per iteration until the target is clean or
-`AuthorityHandoffTimeout` expires. Dirty rows for other hash slots stay owned by
+`AuthorityHandoffTimeout` expires. The same timeout bounds reservation wait and
+durable drain together. A successful drain then purges clean rows for
+that hash slot; activation also purges any clean rows retained from an older
+leader tenure, so a stale durable baseline is never reused after leadership
+returns. Every drain iteration and its final purge revalidate the exact draining
+target. If a newer local tenure has replaced it, the obsolete drain returns
+`transferred` without purging or continuing through the new tenure. Dirty rows
+for other hash slots stay owned by
 their current authorities and are left for their own scoped drains or the normal
 conversation active flush worker. The lifecycle also periodically pulls current
 authorities from the same initial route source so missed watch events and startup
@@ -889,6 +663,16 @@ races repair local authority state. The hard local authority identity is
 `(HashSlot, SlotID, LeaderNodeID, Slot leader term, Slot config epoch)`; route
 revision orders observations, and the authority epoch is retained only as a
 local diagnostic tie-breaker for the same distributed identity.
+Reservations are keyed by that complete hard identity rather than hash slot, so
+an old target waiting to drain does not serialize admission to a newly published
+local target for the same logical hash slot. Chained unknown or remote route
+events retain every older exact target that is already draining until its
+accepted reservations and scoped flush complete; a newly active local tenure
+may supersede those drains because it owns any late cache mutation for the hash
+slot. A successful final purge retires that exact draining target atomically,
+so completed remote/unknown handoffs do not accumulate route state. A failed or
+timed-out drain remains fenced for an explicit bounded retry or later local
+tenure replacement.
 
 ## Cloud Analysis Gateway Composition
 
@@ -913,3 +697,102 @@ public browser gateway. It injects the fixed private node API, Manager,
 WebSocket, and Prometheus origins into `internal/access/cloudview`. The process
 never joins the cluster, decodes WKProto frames, or receives cloud credentials;
 the Cloud Simulation lifecycle separately owns public TCP/19443 ingress.
+
+## Scheduled Backup Composition
+
+Backup composition is always present as a cluster capability but has no startup
+TOML or environment policy. Manager stores the only plan in Controller state.
+
+The composition root creates:
+
+- a cluster-bound credential cipher and shared-file/OSS/COS/S3-compatible
+  repository provider;
+- a Controller-backed scheduled state store;
+- Manager save-only plan, exact-revision repository test, archive, and restore
+  services;
+- repository visibility probes for every active data node;
+- current-authority Slot/message export RPC adapters;
+- one Controller-leader scheduled runtime;
+- node-local staged restore plus distributed all-replica coordination.
+
+Plan saving never opens the repository. The separately invoked test uses the
+saved credential and repository provider, runs the coordinator and node-local
+probe adapters against every active data node, and publishes verified state
+only for the same saved plan revision. Backup admission and runner wiring share
+that durable verification gate.
+
+The scheduled runtime starts after cluster control and stops before cluster
+storage. Only the current Controller Leader evaluates schedules, advances
+backup batches, or advances restore. Active work is read from Controller state,
+so Leader failover resumes it.
+
+Online backup captures stable Slot metadata and Channel-leader message
+snapshots while ordinary traffic continues. Each producing node writes
+compressed chunks directly to the shared repository. Publication occurs only
+after all 256 Slot artifacts verify.
+
+Restore is a normal Manager operation, not a startup mode. Controller
+maintenance keeps Manager reachable while Gateway/business traffic is fenced.
+Every current physical Slot replica captures rollback data, stages and verifies
+the selected archive, and is rechecked before switch. Failure enters the same
+durable rollback phase. Successful restore increments the Manager session epoch
+and preserves restored client tokens. Restore-sensitive delivery, metadata,
+permission, and message-event caches are activation-fenced when maintenance
+starts and reset again immediately before business runtimes resume; a slow
+pre-restore cache fill therefore cannot republish stale state.
+
+The node-local resume acknowledgement runs while Controller maintenance is
+still active. It reloads the restored system-UID cache through the dedicated
+maintenance-only local read, rebuilds side-effect runtimes, retargets the
+stable Channel RPC gateway, and restarts paused Channel background loops.
+Controller clears maintenance only after every current data node acknowledges
+that resume path.
+
+## Standalone Issue Agent Composition
+
+`issue_agent.go` composes the JSON command operations used only by
+`cmd/wkissueagent`. It is not called by `app.New`, does not join a WuKongIM
+cluster, and owns no server lifecycle.
+
+The composition root connects deterministic reconciliation, signed state-ref
+storage, bounded Context Builder reads, filesystem candidate capture, the
+clean Verifier, short-lived App token minting, and the sole Candidate
+Publisher. Codex runs in the official Action and is not embedded here. Local
+capture and verification require no GitHub configuration. GitHub reads use an
+explicit read token; writes require the protected repository-scoped App token.
+Publisher credentials therefore never enter the product server or Codex
+Engineer process.
+
+PR lifecycle and Review events first complete a separate credential-free
+Signal Workflow. A `workflow_run` event then wakes the default-branch
+Controller. This composition validates the fixed Signal Workflow name, exact
+Agent PR branch, actor permission, current Review threads, and signed state
+before making a decision; the Signal payload never grants authority.
+
+Pure Bug-form admission, permission, risk, and lifecycle tracking rules live
+in `internal/usecase/issueagent`; this package only gathers facts and composes
+their adapters. Context construction freezes every repository `AGENTS.md` and
+`FLOW.md` Git blob identity from the task's exact candidate source commit.
+
+Controller admission requires the binary's exact checkout SHA to match the
+fresh protected `main` head. The reusable task freezes that SHA for every
+trusted control role while the candidate workspace uses the task's separate
+exact base SHA.
+
+For a Ready Agent PR behind that protected head, this composition invokes the
+Publisher-owned mechanical base synchronizer. It accepts only a bounded linear
+history of exact App-signed candidate commits from signed source, proves
+current `main` retained every final candidate path, atomically fences `main`
+and swaps the Agent ref through a staging ref, advances the signed state under
+CAS, and requires a fresh Review generation.
+It never runs Codex or candidate code, resolves conflicts, adopts an external
+head, or merges the PR. A bounded recovery path recognizes only the exact
+App-signed head from an interrupted ref-swap-before-state-write transaction,
+records its exact base first, and lets later reconciliation chase newer `main`.
+
+After the Controller commits a signed transition, that transition and its
+dispatch result remain authoritative if a GitHub status projection fails.
+Status repair runs before terminal tracking-label removal; a status failure
+therefore retains `ready-for-agent` so the bounded sweep retries the projection.
+Projection failures are emitted as typed Workflow warnings without discarding
+the committed result.

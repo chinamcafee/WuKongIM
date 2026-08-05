@@ -6,17 +6,28 @@
 reactor goroutine is the writer for each loaded channel runtime. Blocking store
 and RPC work leaves the reactor through bounded worker pools and returns as
 fenced worker completions.
+Channel keys use stable FNV-64a followed by an avalanche mix before the
+node-local reactor modulus. The mix prevents structured person-channel IDs from
+collapsing onto the weak low bits of power-of-two reactor counts. This reactor
+partition is in-memory execution ownership; it is not a cluster hash slot or a
+persisted routing decision, so a restart may remap keys after the reactor count
+or implementation changes.
 Started reactors also open/load channel stores and close detached store handles
 through worker tasks, so metadata activation and runtime eviction do not wait on
 store I/O inside the reactor loop.
 Store append and follower apply pools default to twice the reactor count, capped
 at 128 workers, because quorum traffic produces both leader appends and follower
-apply work while the hosted message DB still has one shared commit coordinator.
-Read and RPC pools default to the reactor count unless explicitly configured.
+apply work while the hosted message DB still has one shared partition-hashed
+commit-coordinator set.
+The Read pool defaults to the reactor count. The RPC pool defaults to the
+QPS-validated 160-worker bound unless explicitly configured.
 Production composition roots may still cap store append/apply worker counts to
 reduce pressure on the shared message DB commit coordinator; this only limits
 blocking task concurrency and does not relax store sync, quorum progress, or
 waiter fencing.
+Reactor loops, detached store close work, cancellation helpers, and worker-pool
+goroutines use fixed `pkg/goroutine` ownership IDs so idle workers remain
+visible independently from task inflight counts.
 
 Group construction reports the fixed reactor count and emits both Leader and
 Follower runtime counts for every reactor before reactor goroutines start. An
@@ -76,8 +87,12 @@ Maintenance
   dueColdActivation
 ```
 
-The loop drains mailbox events in priority order and runs ready due work after
-each drained batch as well as while idle. This keeps append flushes, follower
+The loop prefers high-priority mailbox events but, after at most 32 consecutive
+high dequeues, admits one waiting normal event before returning to high traffic;
+low priority remains idle-only. The fairness counter carries across small drain
+batches and `WaitOne`, so sustained Pull/worker-result traffic cannot starve
+foreground Append/Ack events. The loop runs ready due work after each drained
+batch as well as while idle. This keeps append flushes, follower
 replication retries, lifecycle checks, pending-meta deadlines, and fixed cold
 activation deadlines from waiting for the mailbox to become completely empty
 during sustained load.
@@ -432,3 +447,8 @@ The owning reactor reads or evicts its local `channels` map, preserving the
 single-writer rule. Evict only removes loaded runtime state when
 `safeToEvictRuntime()` is true; it never deletes durable channel metadata or
 messages.
+Each reactor snapshot also counts runtimes with accepted ordinary append work
+still queued, executing, retrying, or awaiting completion. Because the snapshot
+event shares normal mailbox order with append events, a source-fence health
+barrier can prove every append accepted before the fence has drained; append
+events processed afterward encounter the one-way admission fence.

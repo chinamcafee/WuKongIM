@@ -152,24 +152,57 @@ func TestComposePersistAfterEnqueuersCallsBoth(t *testing.T) {
 func TestComposeOfflineRecipientObserversKeepsPluginSingleAndWebhookBatch(t *testing.T) {
 	plugin := &recordingOfflineRecipientObserverForWebhookTest{}
 	webhook := &recordingOfflineRecipientsObserverForWebhookTest{}
-	single, batch := composeOfflineRecipientObservers(plugin, webhook)
+	batch := composeOfflineRecipientObservers(plugin, webhook)
 
-	processor := channelappend.NewRecipientProcessor(channelappend.RecipientProcessorOptions{
-		PresenceResolver:            staticChannelAppendPresenceResolver{},
-		OfflineRecipientObserver:    single,
-		OfflineRecipientsObserver:   batch,
-		DeliveryRetryMaxAttempts:    1,
-		DeliveryRetryInitialBackoff: 1,
-		DeliveryRetryMaxBackoff:     1,
-	})
-	err := processor.ProcessRecipientBatch(context.Background(), channelappend.RecipientBatch{
-		Event:      channelappend.CommittedEnvelope{MessageID: 101, MessageSeq: 1, ChannelID: "g1", ChannelType: 2},
-		Recipients: []channelappend.Recipient{{UID: "u1"}, {UID: "u2"}},
+	batch.ObserveOfflineRecipients(context.Background(), channelappend.OfflineRecipientsEvent{
+		Event: channelappend.CommittedEnvelope{MessageID: 101, MessageSeq: 1, ChannelID: "g1", ChannelType: 2},
+		UIDs:  []string{"u1", "u2"},
 	})
 
-	require.NoError(t, err)
 	require.Equal(t, []string{"u1", "u2"}, plugin.uids)
 	require.Equal(t, [][]string{{"u1", "u2"}}, webhook.uidBatches)
+}
+
+func TestComposeOfflineRecipientObserversUsesPluginBatchWhenAvailable(t *testing.T) {
+	plugin := &recordingBatchOfflineRecipientObserverForWebhookTest{}
+	webhook := &recordingOfflineRecipientsObserverForWebhookTest{}
+	batch := composeOfflineRecipientObservers(plugin, webhook)
+
+	batch.ObserveOfflineRecipients(context.Background(), channelappend.OfflineRecipientsEvent{
+		Event: channelappend.CommittedEnvelope{MessageID: 101, MessageSeq: 1, ChannelID: "g1", ChannelType: 2},
+		UIDs:  []string{"u1", "u2"},
+	})
+
+	require.Empty(t, plugin.singleUIDs)
+	require.Equal(t, [][]string{{"u1", "u2"}}, plugin.uidBatches)
+	require.Equal(t, [][]string{{"u1", "u2"}}, webhook.uidBatches)
+}
+
+func TestComposeOfflineRecipientObserversKeepsPluginWithoutWebhook(t *testing.T) {
+	plugin := &recordingOfflineRecipientObserverForWebhookTest{}
+	batch := composeOfflineRecipientObservers(plugin, nil)
+
+	require.NotNil(t, batch)
+	batch.ObserveOfflineRecipients(context.Background(), channelappend.OfflineRecipientsEvent{
+		Event: channelappend.CommittedEnvelope{MessageID: 101},
+		UIDs:  []string{"u1", "u2"},
+	})
+
+	require.Equal(t, []string{"u1", "u2"}, plugin.uids)
+}
+
+func TestComposeOfflineRecipientObserversKeepsPluginBatchWithoutWebhook(t *testing.T) {
+	plugin := &recordingBatchOfflineRecipientObserverForWebhookTest{}
+	batch := composeOfflineRecipientObservers(plugin, nil)
+
+	require.NotNil(t, batch)
+	batch.ObserveOfflineRecipients(context.Background(), channelappend.OfflineRecipientsEvent{
+		Event: channelappend.CommittedEnvelope{MessageID: 101},
+		UIDs:  []string{"u1", "u2"},
+	})
+
+	require.Empty(t, plugin.singleUIDs)
+	require.Equal(t, [][]string{{"u1", "u2"}}, plugin.uidBatches)
 }
 
 func TestWebhookNotifyEnqueuerMapsCommittedEnvelopeAndCopiesSlices(t *testing.T) {
@@ -369,12 +402,19 @@ type recordingOfflineRecipientsObserverForWebhookTest struct {
 	uidBatches [][]string
 }
 
-func (r *recordingOfflineRecipientsObserverForWebhookTest) ObserveOfflineRecipients(_ context.Context, event channelappend.OfflineRecipientsEvent) {
+type recordingBatchOfflineRecipientObserverForWebhookTest struct {
+	singleUIDs []string
+	uidBatches [][]string
+}
+
+func (r *recordingBatchOfflineRecipientObserverForWebhookTest) ObserveOfflineRecipient(_ context.Context, event channelappend.OfflineRecipientEvent) {
+	r.singleUIDs = append(r.singleUIDs, event.UID)
+}
+
+func (r *recordingBatchOfflineRecipientObserverForWebhookTest) ObserveOfflineRecipients(_ context.Context, event channelappend.OfflineRecipientsEvent) {
 	r.uidBatches = append(r.uidBatches, append([]string(nil), event.UIDs...))
 }
 
-type staticChannelAppendPresenceResolver struct{}
-
-func (staticChannelAppendPresenceResolver) EndpointsByUIDs(context.Context, []string) ([]channelappend.Route, error) {
-	return nil, nil
+func (r *recordingOfflineRecipientsObserverForWebhookTest) ObserveOfflineRecipients(_ context.Context, event channelappend.OfflineRecipientsEvent) {
+	r.uidBatches = append(r.uidBatches, append([]string(nil), event.UIDs...))
 }

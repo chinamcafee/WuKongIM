@@ -17,6 +17,34 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 )
 
+// DefaultCommitShards is the QPS-validated partition-hashed commit coordinator count.
+const DefaultCommitShards = 4
+
+// BackupChannelCut identifies one exact committed channel boundary selected by cluster coordination.
+type BackupChannelCut struct {
+	// Key is the stable channel storage partition key.
+	Key ch.ChannelKey
+	// ID is the durable channel identity.
+	ID ch.ChannelID
+	// Epoch is the durable channel epoch represented by the cut.
+	Epoch uint64
+	// LogStartOffset is the first retained logical offset.
+	LogStartOffset uint64
+	// HW is the authoritative committed high watermark.
+	HW uint64
+}
+
+// BackupSnapshotRequest selects one logical hash-slot message snapshot.
+type BackupSnapshotRequest struct {
+	// HashSlot identifies the logical partition represented by the stream.
+	HashSlot uint16
+	// Channels contains exact cluster-selected committed cuts.
+	Channels []BackupChannelCut
+}
+
+// BackupSnapshotStats summarizes an imported message backup snapshot.
+type BackupSnapshotStats = messagedb.BackupSnapshotStats
+
 // MessageDBFactory adapts the shared message DB engine to the channel runtime.
 type MessageDBFactory struct {
 	// engine owns the compatibility message database runtime.
@@ -35,12 +63,23 @@ type MessageDBFactoryOptions struct {
 	CommitMaxRecords int
 	// CommitMaxBytes caps approximate payload bytes in one grouped physical commit.
 	CommitMaxBytes int
-	// CommitShards routes grouped commit requests across independent message DB coordinators. Zero keeps one coordinator.
+	// CommitShards routes grouped commit requests across independent message DB coordinators. Zero uses DefaultCommitShards.
 	CommitShards int
 	// CommitObserver receives message DB group-commit measurements.
 	CommitObserver messagedb.CommitCoordinatorObserver
 	// Logger receives structured diagnostics from the shared message DB engine.
 	Logger wklog.Logger
+}
+
+// RestoreChannelBoundary is one authenticated full cursor installed before a
+// restored Channel becomes visible to the runtime.
+type RestoreChannelBoundary struct {
+	// ID is the durable Channel identity.
+	ID ch.ChannelID
+	// Epoch, LogStartOffset, and HW are the exact committed cursor.
+	Epoch          uint64
+	LogStartOffset uint64
+	HW             uint64
 }
 
 // NewMessageDBFactory opens a message DB engine behind the v2 adapter.
@@ -50,6 +89,9 @@ func NewMessageDBFactory(path string) *MessageDBFactory {
 
 // NewMessageDBFactoryWithOptions opens a message DB engine behind the v2 adapter.
 func NewMessageDBFactoryWithOptions(path string, opts MessageDBFactoryOptions) *MessageDBFactory {
+	if opts.CommitShards == 0 {
+		opts.CommitShards = DefaultCommitShards
+	}
 	engine, err := messagedb.OpenWithLogger(path, opts.Logger)
 	if err != nil {
 		return &MessageDBFactory{}
@@ -85,6 +127,48 @@ func (f *MessageDBFactory) ChannelStore(key ch.ChannelKey, id ch.ChannelID) (Cha
 	return &messageDBChannelStoreAdapter{store: dbStore, id: id, owner: f}, nil
 }
 
+// DiscardRestoreChannels removes partial live Channel state after a failed
+// restore attempt. Callers must provide bounded, unique restore boundaries.
+func (f *MessageDBFactory) DiscardRestoreChannels(
+	ctx context.Context,
+	boundaries []RestoreChannelBoundary,
+) error {
+	if err := f.availabilityError(); err != nil {
+		return err
+	}
+	if len(boundaries) > 4096 {
+		return ch.ErrInvalidConfig
+	}
+	seen := make(map[ch.ChannelID]struct{}, len(boundaries))
+	for _, boundary := range boundaries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if boundary.ID.ID == "" || boundary.ID.Type == 0 {
+			return ch.ErrInvalidConfig
+		}
+		if _, exists := seen[boundary.ID]; exists {
+			return ch.ErrInvalidConfig
+		}
+		seen[boundary.ID] = struct{}{}
+		store, err := f.engine.ForChannel(
+			channel.ChannelKey(ch.ChannelKeyForID(boundary.ID)),
+			channel.ChannelID{
+				ID: boundary.ID.ID, Type: boundary.ID.Type,
+			},
+		)
+		if err != nil {
+			return f.mapError(err)
+		}
+		discardErr := store.DiscardForRestore(ctx)
+		closeErr := store.Close()
+		if discardErr != nil || closeErr != nil {
+			return f.mapError(errors.Join(discardErr, closeErr))
+		}
+	}
+	return nil
+}
+
 // ListChannelsPage returns one ordered page from the local message channel catalog.
 func (f *MessageDBFactory) ListChannelsPage(ctx context.Context, after ch.ChannelKey, limit int) ([]ChannelCatalogEntry, ch.ChannelKey, bool, error) {
 	if err := f.availabilityError(); err != nil {
@@ -102,6 +186,66 @@ func (f *MessageDBFactory) ListChannelsPage(ctx context.Context, after ch.Channe
 		})
 	}
 	return out, ch.ChannelKey(cursor), more, nil
+}
+
+// OpenBackupSnapshot pins and streams exact committed channel cuts.
+func (f *MessageDBFactory) OpenBackupSnapshot(ctx context.Context, request BackupSnapshotRequest) (io.ReadCloser, error) {
+	if err := f.availabilityError(); err != nil {
+		return nil, err
+	}
+	channels := make([]messagedb.BackupChannelCut, len(request.Channels))
+	for index, channelCut := range request.Channels {
+		channels[index] = messagedb.BackupChannelCut{
+			Key: messagedb.ChannelKey(channelCut.Key),
+			ID:  messagedb.ChannelID{ID: channelCut.ID.ID, Type: channelCut.ID.Type},
+			Checkpoint: messagedb.Checkpoint{
+				Epoch:          channelCut.Epoch,
+				LogStartOffset: channelCut.LogStartOffset,
+				HW:             channelCut.HW,
+			},
+		}
+	}
+	reader, err := f.engine.OpenBackupSnapshot(ctx, messagedb.BackupSnapshotRequest{HashSlot: request.HashSlot, Channels: channels})
+	return reader, f.mapError(err)
+}
+
+// OpenBackupSnapshotWithStats pins and streams exact committed cuts while
+// returning record-count and message-ID evidence from the same read view.
+func (f *MessageDBFactory) OpenBackupSnapshotWithStats(ctx context.Context, request BackupSnapshotRequest) (io.ReadCloser, BackupSnapshotStats, error) {
+	if err := f.availabilityError(); err != nil {
+		return nil, BackupSnapshotStats{}, err
+	}
+	channels := make([]messagedb.BackupChannelCut, len(request.Channels))
+	for index, channelCut := range request.Channels {
+		channels[index] = messagedb.BackupChannelCut{
+			Key: messagedb.ChannelKey(channelCut.Key),
+			ID:  messagedb.ChannelID{ID: channelCut.ID.ID, Type: channelCut.ID.Type},
+			Checkpoint: messagedb.Checkpoint{
+				Epoch: channelCut.Epoch, LogStartOffset: channelCut.LogStartOffset, HW: channelCut.HW,
+			},
+		}
+	}
+	reader, stats, err := f.engine.OpenBackupSnapshotWithStats(ctx, messagedb.BackupSnapshotRequest{HashSlot: request.HashSlot, Channels: channels})
+	return reader, stats, f.mapError(err)
+}
+
+// ImportBackupSnapshot verifies and installs a portable message snapshot.
+func (f *MessageDBFactory) ImportBackupSnapshot(ctx context.Context, data []byte) (BackupSnapshotStats, error) {
+	if err := f.availabilityError(); err != nil {
+		return BackupSnapshotStats{}, err
+	}
+	stats, err := f.engine.ImportBackupSnapshot(ctx, data)
+	return stats, f.mapError(err)
+}
+
+// ImportBackupSnapshotReader validates and installs a seekable message stream
+// without loading the complete shard into memory.
+func (f *MessageDBFactory) ImportBackupSnapshotReader(ctx context.Context, reader io.ReadSeeker, size int64) (BackupSnapshotStats, error) {
+	if err := f.availabilityError(); err != nil {
+		return BackupSnapshotStats{}, err
+	}
+	stats, err := f.engine.ImportBackupSnapshotReader(ctx, reader, size)
+	return stats, f.mapError(err)
 }
 
 // ListLatestMessages returns one newest-first page from the node-local shared message database.

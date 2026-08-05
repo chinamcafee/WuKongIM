@@ -194,6 +194,65 @@ func TestRuntimeManualLogCompactionForcesSnapshotBelowAutomaticThreshold(t *test
 	}
 }
 
+func TestRuntimeInstallExternalStateSnapshotReplacesSameIndexWhenCompactionDisabled(t *testing.T) {
+	rt := newCompactionRuntime(t, LogCompactionConfig{
+		Enabled:    false,
+		EnabledSet: true,
+	})
+	store := &internalFakeStorage{}
+	fsm := &snapshottingStateMachine{}
+	slotID := SlotID(196)
+	if err := rt.BootstrapSlot(context.Background(), BootstrapSlotRequest{
+		Slot:   SlotOptions{ID: slotID, Storage: store, StateMachine: fsm},
+		Voters: []NodeID{1},
+	}); err != nil {
+		t.Fatalf("BootstrapSlot() error = %v", err)
+	}
+	waitForSingleNodeLeader(t, rt, slotID)
+
+	future, err := rt.Propose(
+		context.Background(), slotID, proposalString("before-restore"),
+	)
+	if err != nil {
+		t.Fatalf("Propose() error = %v", err)
+	}
+	applied := waitForFutureResult(t, future).Index
+	if err := rt.InstallExternalStateSnapshot(context.Background(), slotID); err != nil {
+		t.Fatalf("first InstallExternalStateSnapshot() error = %v", err)
+	}
+
+	fsm.mu.Lock()
+	fsm.externalSnapshot = []byte("restored-state")
+	fsm.mu.Unlock()
+	if err := rt.InstallExternalStateSnapshot(context.Background(), slotID); err != nil {
+		t.Fatalf("second InstallExternalStateSnapshot() error = %v", err)
+	}
+
+	snapshot, err := store.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	if snapshot.Metadata.Index != applied {
+		t.Fatalf("Snapshot().Index = %d, want %d", snapshot.Metadata.Index, applied)
+	}
+	data, _, err := decodeSlotSnapshotData(snapshot.Data)
+	if err != nil {
+		t.Fatalf("decodeSlotSnapshotData() error = %v", err)
+	}
+	if string(data) != "restored-state" {
+		t.Fatalf("Snapshot().Data = %q, want restored-state", data)
+	}
+	if err := rt.ReloadSlot(context.Background(), slotID); err != nil {
+		t.Fatalf("ReloadSlot() error = %v", err)
+	}
+	fsm.mu.Lock()
+	defer fsm.mu.Unlock()
+	if fsm.restoreCount == 0 ||
+		string(fsm.restores[len(fsm.restores)-1].Data) != "restored-state" {
+		t.Fatalf("Restore() calls/data = %d/%q", fsm.restoreCount, fsm.restores)
+	}
+}
+
 func TestRuntimeManualLogCompactionWaitsForAsyncApply(t *testing.T) {
 	rt := newCompactionRuntime(t, LogCompactionConfig{
 		Enabled:        true,
@@ -331,7 +390,7 @@ func TestRuntimeManualCompactionReadsSnapshotMetadataWithoutPayload(t *testing.T
 			EnabledSet:     true,
 			TriggerEntries: 1000,
 			CheckInterval:  time.Hour,
-		}, 0),
+		}, 10),
 	}
 
 	result, err := g.compactLogManually(context.Background(), 10)
@@ -350,8 +409,8 @@ func TestRuntimeManualCompactionReadsSnapshotMetadataWithoutPayload(t *testing.T
 	if store.snapshotCalls != 0 {
 		t.Fatalf("Snapshot() calls = %d, want 0", store.snapshotCalls)
 	}
-	if store.firstIndexCalls == 0 || store.termCalls == 0 {
-		t.Fatalf("metadata calls = FirstIndex:%d Term:%d, want both used", store.firstIndexCalls, store.termCalls)
+	if store.firstIndexCalls == 0 || store.termCalls != 0 {
+		t.Fatalf("metadata calls = FirstIndex:%d Term:%d, want boundary without payload or term reads", store.firstIndexCalls, store.termCalls)
 	}
 }
 
@@ -660,11 +719,12 @@ func waitForSlotWorkerWaitingOnApply(t *testing.T, rt *Runtime, slotID SlotID) {
 }
 
 type snapshottingStateMachine struct {
-	mu           sync.Mutex
-	commands     []Command
-	restoreCount int
-	restores     []Snapshot
-	snapshotErr  error
+	mu               sync.Mutex
+	commands         []Command
+	restoreCount     int
+	restores         []Snapshot
+	snapshotErr      error
+	externalSnapshot []byte
 }
 
 func (s *snapshottingStateMachine) Apply(_ context.Context, cmd Command) ([]byte, error) {
@@ -699,6 +759,9 @@ func (s *snapshottingStateMachine) Snapshot(context.Context) (Snapshot, error) {
 		err := s.snapshotErr
 		s.snapshotErr = nil
 		return Snapshot{}, err
+	}
+	if s.externalSnapshot != nil {
+		return Snapshot{Data: append([]byte(nil), s.externalSnapshot...)}, nil
 	}
 	if len(s.commands) == 0 {
 		return Snapshot{Data: []byte("empty")}, nil

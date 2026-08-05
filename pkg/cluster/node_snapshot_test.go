@@ -103,6 +103,50 @@ func TestNodeControlWatchUpdatesRouteRevision(t *testing.T) {
 	})
 }
 
+func TestNodeMaintenanceClosesAndReopensForeground(t *testing.T) {
+	controllerRuntime := control.NewStaticController(nodeControlSnapshot())
+	node, err := New(
+		validNodeConfig(t), withController(controllerRuntime),
+		withSlotReconciler(&recordingReconciler{}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := node.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = node.Stop(context.Background()) })
+
+	next := nodeControlSnapshot()
+	next.Revision = 2
+	next.HashSlots.Revision = 2
+	next.Maintenance = true
+	if err := controllerRuntime.Publish(next); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return node.maintenance.Load() })
+	if _, err := node.RouteHashSlot(0); !errors.Is(err, ErrMaintenance) {
+		t.Fatalf("RouteHashSlot() error = %v, want ErrMaintenance", err)
+	}
+	if node.runtimeReadyForHealthReport() {
+		t.Fatal("runtimeReadyForHealthReport() = true during maintenance")
+	}
+
+	normal := next.Clone()
+	normal.Revision = 3
+	normal.HashSlots.Revision = 3
+	normal.Maintenance = false
+	if err := controllerRuntime.Publish(normal); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool {
+		return node.Snapshot().StateRevision == 3
+	})
+	if err := node.ensureForeground(); err != nil {
+		t.Fatalf("ensureForeground(after maintenance) error = %v", err)
+	}
+}
+
 func seedJoinMirrorRouteNodeForTest(nodeID uint64, caller clusternet.Caller) *Node {
 	return &Node{
 		cfg: Config{

@@ -66,6 +66,7 @@ func RenderClusterConfig(local NodeSpec, nodes []NodeSpec) string {
 		// Most scenarios do not provision /user/token metadata. Token-auth tests
 		// must opt in explicitly through WithNodeConfigOverrides.
 		{key: "WK_GATEWAY_TOKEN_AUTH_ENABLED", value: "false"},
+		{key: "WK_PLUGIN_ENABLE", value: "false"},
 	}
 	if local.ManagerAddr != "" {
 		lines = append(lines, configLine{key: "WK_MANAGER_LISTEN_ADDR", value: local.ManagerAddr})
@@ -113,6 +114,7 @@ func RenderSeedJoinNodeConfig(local NodeSpec, cfg SeedJoinNodeConfig) string {
 		// Most scenarios do not provision /user/token metadata. Token-auth tests
 		// must opt in explicitly through WithNodeConfigOverrides.
 		{key: "WK_GATEWAY_TOKEN_AUTH_ENABLED", value: "false"},
+		{key: "WK_PLUGIN_ENABLE", value: "false"},
 	}
 	if local.ManagerAddr != "" {
 		lines = append(lines, configLine{key: "WK_MANAGER_LISTEN_ADDR", value: local.ManagerAddr})

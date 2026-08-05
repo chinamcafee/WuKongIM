@@ -36,6 +36,10 @@ const (
 	KindReportNodeHealth Kind = "report_node_health"
 	// KindReplaceHashSlotTable replaces the hash-slot routing table.
 	KindReplaceHashSlotTable Kind = "replace_hash_slot_table"
+	// KindReplaceScheduledBackupState replaces the simplified full-backup subsystem state.
+	KindReplaceScheduledBackupState Kind = "replace_scheduled_backup_state"
+	// KindReplaceOpsMCPState replaces bounded embedded operations MCP desired state.
+	KindReplaceOpsMCPState Kind = "replace_ops_mcp_state"
 )
 
 // Command is the versioned payload replicated through Controller Raft.
@@ -70,6 +74,10 @@ type Command struct {
 	NodeHealth *state.NodeHealthReport `json:"node_health,omitempty"`
 	// HashSlots contains a replacement hash-slot table.
 	HashSlots *state.HashSlotTable `json:"hash_slots,omitempty"`
+	// ScheduledBackup contains replacement scheduled full-backup state.
+	ScheduledBackup *state.ScheduledBackupState `json:"scheduled_backup,omitempty"`
+	// OpsMCP contains replacement embedded operations MCP desired state.
+	OpsMCP *state.OpsMCPState `json:"ops_mcp,omitempty"`
 }
 
 // ControllerVoterPromotion records a proven promotion of one node into Controller Raft voting membership.

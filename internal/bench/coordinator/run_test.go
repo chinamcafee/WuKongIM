@@ -884,15 +884,42 @@ func TestCoordinatorPollTimeoutReturnsWorkerFailed(t *testing.T) {
 	require.Equal(t, "phase_completion", result.Report.WorkerFailures[0].Operation)
 }
 
-func TestCoordinatorWorkerStatusDeadlineIsReportedAsPhaseTimeout(t *testing.T) {
+func TestCoordinatorWorkerStatusTimeoutIsIndependentFromPhasePollTimeout(t *testing.T) {
+	coord := New(CoordinatorConfig{PollTimeout: 5 * time.Millisecond})
+
+	require.Equal(t, defaultWorkerStatusTimeout, coord.workerStatusTimeout())
+}
+
+func TestCoordinatorPhaseBudgetSurvivesStatusRequestPastPollGrace(t *testing.T) {
 	workers := newFakeWorkers(t, 1)
-	workers[0].BlockStatus(PhaseConnect)
+	workers[0].DelayStatus(PhaseRun, 20*time.Millisecond)
+	workers[0].CompletePhaseAfter(PhaseRun, 35*time.Millisecond)
 	coord := New(CoordinatorConfig{
 		Workers:      workers.ClientConfigs(),
 		Target:       fakeTargetOK(),
 		Preflight:    preflightFunc(func(context.Context, model.Target, model.WorkerSet) error { return nil }),
 		PollInterval: time.Millisecond,
 		PollTimeout:  5 * time.Millisecond,
+	})
+	scenario := fakeScenario()
+	scenario.Run.Duration = 20 * time.Millisecond
+
+	result, err := coord.Run(context.Background(), scenario)
+
+	require.NoError(t, err)
+	require.Equal(t, StatusCompleted, result.Status)
+}
+
+func TestCoordinatorWorkerStatusDeadlineIsReportedAsPhaseTimeout(t *testing.T) {
+	workers := newFakeWorkers(t, 1)
+	workers[0].BlockStatus(PhaseConnect)
+	coord := New(CoordinatorConfig{
+		Workers:             workers.ClientConfigs(),
+		Target:              fakeTargetOK(),
+		Preflight:           preflightFunc(func(context.Context, model.Target, model.WorkerSet) error { return nil }),
+		PollInterval:        time.Millisecond,
+		PollTimeout:         5 * time.Millisecond,
+		WorkerStatusTimeout: 5 * time.Millisecond,
 	})
 
 	result, err := coord.Run(context.Background(), fakeScenario())
@@ -909,11 +936,12 @@ func TestCoordinatorLaterWorkerStatusDeadlineStillReportsWorkerStatus(t *testing
 	workers[0].KeepPhaseInProgress(PhasePrepare)
 	workers[0].BlockStatusAfter(PhasePrepare, 1)
 	coord := New(CoordinatorConfig{
-		Workers:      workers.ClientConfigs(),
-		Target:       fakeTargetOK(),
-		Preflight:    preflightFunc(func(context.Context, model.Target, model.WorkerSet) error { return nil }),
-		PollInterval: time.Millisecond,
-		PollTimeout:  10 * time.Millisecond,
+		Workers:             workers.ClientConfigs(),
+		Target:              fakeTargetOK(),
+		Preflight:           preflightFunc(func(context.Context, model.Target, model.WorkerSet) error { return nil }),
+		PollInterval:        time.Millisecond,
+		PollTimeout:         10 * time.Millisecond,
+		WorkerStatusTimeout: 10 * time.Millisecond,
 	})
 
 	result, err := coord.Run(context.Background(), fakeScenario())
@@ -930,11 +958,12 @@ func TestCoordinatorDeadlineStraddleFinalActiveStatusReportsPhaseCompletion(t *t
 	workers[0].KeepPhaseInProgress(PhasePrepare)
 	workers[0].BlockOneStatusAfter(PhasePrepare, 1)
 	coord := New(CoordinatorConfig{
-		Workers:      workers.ClientConfigs(),
-		Target:       fakeTargetOK(),
-		Preflight:    preflightFunc(func(context.Context, model.Target, model.WorkerSet) error { return nil }),
-		PollInterval: time.Millisecond,
-		PollTimeout:  10 * time.Millisecond,
+		Workers:             workers.ClientConfigs(),
+		Target:              fakeTargetOK(),
+		Preflight:           preflightFunc(func(context.Context, model.Target, model.WorkerSet) error { return nil }),
+		PollInterval:        time.Millisecond,
+		PollTimeout:         10 * time.Millisecond,
+		WorkerStatusTimeout: 10 * time.Millisecond,
 	})
 
 	result, err := coord.Run(context.Background(), fakeScenario())
@@ -1106,6 +1135,97 @@ func TestCoordinatorRunPollTimeoutIncludesOperationTail(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, StatusCompleted, result.Status)
 	require.True(t, workers[0].SawPhaseAttempt(PhaseCooldown))
+}
+
+func TestMaximumTrafficOperationTimeoutSumsSequentialSendackAndRecvWaits(t *testing.T) {
+	scenario := fakeScenario()
+	scenario.Messages.Traffic[0].AckTimeout = 7 * time.Second
+	scenario.Messages.Traffic[0].RecvTimeout = 11 * time.Second
+	scenario.Messages.Traffic[0].Verify.Recv.Mode = "full"
+
+	// The five-member group has one sender and four recipients. Group receive
+	// verification waits for those recipients serially after the SENDACK.
+	require.Equal(t, 51*time.Second, maximumTrafficOperationTimeout(scenario, model.Plan{}))
+}
+
+func TestMaximumTrafficOperationTimeoutBoundsSampledGroupRecipientWaits(t *testing.T) {
+	scenario := fakeScenario()
+	scenario.Messages.Traffic[0].AckTimeout = 7 * time.Second
+	scenario.Messages.Traffic[0].RecvTimeout = 11 * time.Second
+	scenario.Messages.Traffic[0].Verify.Recv.Mode = "sampled"
+	scenario.Messages.Traffic[0].Verify.Recv.SampleSizePerMessage = 2
+
+	require.Equal(t, 29*time.Second, maximumTrafficOperationTimeout(scenario, model.Plan{}))
+}
+
+func TestMaximumTrafficOperationTimeoutUsesLargestSplitWorkerLocalRecipientSet(t *testing.T) {
+	scenario := fakeScenario()
+	scenario.Channels.Profiles[0].Members.Count = 100_000
+	scenario.Channels.Profiles[0].Shard.Mode = model.ShardModeSplitMembersAndTraffic
+	scenario.Messages.Traffic[0].AckTimeout = 2 * time.Second
+	scenario.Messages.Traffic[0].RecvTimeout = 3 * time.Second
+	scenario.Messages.Traffic[0].Verify.Recv.Mode = "full"
+	plan := model.Plan{Workers: map[string]model.WorkerPlan{
+		"worker-1": {Profiles: map[string]model.ProfileShard{
+			"group-hot": {
+				Name:         "group-hot",
+				ChannelType:  model.ChannelTypeGroup,
+				ChannelRange: model.Range{Start: 0, End: 1},
+				MemberRange:  model.Range{Start: 0, End: 3},
+			},
+		}},
+		"worker-2": {Profiles: map[string]model.ProfileShard{
+			"group-hot": {
+				Name:         "group-hot",
+				ChannelType:  model.ChannelTypeGroup,
+				ChannelRange: model.Range{Start: 0, End: 1},
+				MemberRange:  model.Range{Start: 3, End: 5},
+			},
+		}},
+	}}
+
+	// The busiest worker verifies two recipients after its local sender. The
+	// global 100k-member shape must not inflate the exact worker phase tail.
+	require.Equal(t, 8*time.Second, maximumTrafficOperationTimeout(scenario, plan))
+}
+
+func TestMaximumTrafficOperationTimeoutIgnoresRecvWhenVerificationDisabled(t *testing.T) {
+	scenario := fakeScenario()
+	scenario.Messages.Traffic[0].AckTimeout = 7 * time.Second
+	scenario.Messages.Traffic[0].RecvTimeout = 11 * time.Second
+	scenario.Messages.Traffic[0].Verify.Recv.Mode = "none"
+
+	require.Equal(t, 7*time.Second, maximumTrafficOperationTimeout(scenario, model.Plan{}))
+}
+
+func TestMaximumWarmupOperationTimeoutUsesSharedDeadlineTail(t *testing.T) {
+	scenario := fakeScenario()
+	scenario.Messages.Traffic[0].AckTimeout = 7 * time.Second
+	scenario.Messages.Traffic[0].RecvTimeout = 11 * time.Second
+	scenario.Messages.Traffic[0].Verify.Recv.Mode = "full"
+
+	require.Equal(t, 11*time.Second, maximumWarmupOperationTimeout(scenario))
+}
+
+func TestCoordinatorRunPollTimeoutIncludesEveryChurnWindowOperationTail(t *testing.T) {
+	coord := New(CoordinatorConfig{PollTimeout: 10 * time.Second})
+	scenario := fakeScenario()
+	scenario.Run.Duration = 30 * time.Minute
+	scenario.Online.ConnectRate = model.Rate{PerSecond: 10}
+	scenario.Online.Churn = model.ChurnConfig{
+		Enabled:  true,
+		Interval: 5 * time.Minute,
+		Ratio:    0.1,
+	}
+	scenario.Messages.Traffic[0].AckTimeout = 15 * time.Second
+	scenario.Messages.Traffic[0].RecvTimeout = 15 * time.Second
+	scenario.Messages.Traffic[0].Verify.Recv.Mode = "full"
+	plan := model.Plan{Workers: map[string]model.WorkerPlan{
+		"worker-1": {IdentityRange: model.Range{Start: 0, End: 100}},
+	}}
+
+	require.Equal(t, 6, measuredTrafficWindowCount(scenario))
+	require.Equal(t, 30*time.Minute+5*time.Second+6*75*time.Second+10*time.Second, coord.phasePollTimeout(scenario, PhaseRun, plan))
 }
 
 func TestCoordinatorPollTimeoutIncludesChurnReconnectSchedule(t *testing.T) {
@@ -1803,6 +1923,7 @@ func newFakeWorkers(t *testing.T, count int) fakeWorkers {
 			activePhase:      make(map[Phase]bool),
 			completeAfter:    make(map[Phase]time.Duration),
 			phaseAcceptedAt:  make(map[Phase]time.Time),
+			statusDelay:      make(map[Phase]time.Duration),
 			failAfterAccept:  make(map[Phase]string),
 		}
 		fw.server = httptest.NewServer(http.HandlerFunc(fw.handle))
@@ -1853,6 +1974,7 @@ type fakeWorker struct {
 	activePhase         map[Phase]bool
 	completeAfter       map[Phase]time.Duration
 	phaseAcceptedAt     map[Phase]time.Time
+	statusDelay         map[Phase]time.Duration
 	failAfterAccept     map[Phase]string
 	cancelOnAssign      context.CancelFunc
 	cancelOnStatusPoll  context.CancelFunc
@@ -2001,6 +2123,12 @@ func (fw *fakeWorker) CompletePhaseAfter(phase Phase, d time.Duration) {
 		fw.completeAfter = make(map[Phase]time.Duration)
 	}
 	fw.completeAfter[phase] = d
+}
+
+func (fw *fakeWorker) DelayStatus(phase Phase, d time.Duration) {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	fw.statusDelay[phase] = d
 }
 
 func (fw *fakeWorker) FailPhaseAfterAccept(phase Phase, message string) {
@@ -2274,10 +2402,14 @@ func (fw *fakeWorker) handleStatus(w http.ResponseWriter, r *http.Request) {
 	} else {
 		status.CompletedPhase = fw.phase
 	}
+	delay := fw.statusDelay[phase]
 	fw.mu.Unlock()
 	if blocked {
 		<-r.Context().Done()
 		return
+	}
+	if delay > 0 {
+		time.Sleep(delay)
 	}
 	writeRunTestJSON(w, status)
 }

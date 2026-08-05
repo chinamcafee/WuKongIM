@@ -18,6 +18,8 @@ const (
 	CurrentSchemaVersion = state.CurrentSchemaVersion
 	// CurrentHashSlotTableVersion is the supported hash-slot table schema version.
 	CurrentHashSlotTableVersion = state.CurrentHashSlotTableVersion
+	// MaxOpsMCPCredentials bounds active tokens during rotation.
+	MaxOpsMCPCredentials = state.MaxOpsMCPCredentials
 )
 
 type (
@@ -47,6 +49,40 @@ type (
 	HashSlotRange = state.HashSlotRange
 	// ReconcileTask is an active durable task needed to converge data-plane state.
 	ReconcileTask = state.ReconcileTask
+	// ScheduledBackupState stores the simplified scheduled full-backup subsystem state.
+	ScheduledBackupState = state.ScheduledBackupState
+	// BackupStoreKind identifies the configured archive repository implementation.
+	BackupStoreKind = state.BackupStoreKind
+	// BackupStoreConfig stores archive repository settings.
+	BackupStoreConfig = state.BackupStoreConfig
+	// BackupRepositoryVerificationStatus describes durable repository verification.
+	BackupRepositoryVerificationStatus = state.BackupRepositoryVerificationStatus
+	// BackupRepositoryVerification records verification for one exact repository.
+	BackupRepositoryVerification = state.BackupRepositoryVerification
+	// BackupPlan is the single cluster-scoped scheduled full-backup policy.
+	BackupPlan = state.BackupPlan
+	// BackupTrigger identifies why a full-backup job was admitted.
+	BackupTrigger = state.BackupTrigger
+	// BackupJobStatus is a bounded full-backup lifecycle phase.
+	BackupJobStatus = state.BackupJobStatus
+	// BackupSlotStatus is one Hash Slot export phase.
+	BackupSlotStatus = state.BackupSlotStatus
+	// BackupSlotProgress stores one Hash Slot's bounded export progress.
+	BackupSlotProgress = state.BackupSlotProgress
+	// ScheduledBackupJob is the only active full-backup job.
+	ScheduledBackupJob = state.ScheduledBackupJob
+	// ScheduledRestoreJob is the only active maintenance-mode restore job.
+	ScheduledRestoreJob = state.ScheduledRestoreJob
+	// RestoreSlotProgress stores one restored Hash Slot's replica evidence.
+	RestoreSlotProgress = state.RestoreSlotProgress
+	// BackupTaskRecord is one bounded terminal backup or restore observation.
+	BackupTaskRecord = state.BackupTaskRecord
+	// BackupArchiveOperation is one durable repository-operation lease.
+	BackupArchiveOperation = state.BackupArchiveOperation
+	// OpsMCPState stores bounded desired state for the embedded operations MCP.
+	OpsMCPState = state.OpsMCPState
+	// OpsMCPCredential stores one opaque bearer token verifier.
+	OpsMCPCredential = state.OpsMCPCredential
 	// TaskKind describes one reconcile workflow kind.
 	TaskKind = state.TaskKind
 	// TaskStep describes the current step inside a reconcile workflow.

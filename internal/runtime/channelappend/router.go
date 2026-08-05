@@ -4,29 +4,42 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 	runtimechannelid "github.com/WuKongIM/WuKongIM/pkg/protocol/channelid"
 )
 
 const (
-	defaultRouterRetryBackoff     = time.Millisecond
-	defaultRouterMaxRouteAttempts = 3
+	defaultRouterRetryBackoff                  = time.Millisecond
+	defaultRouterMaxRouteAttempts              = 3
+	defaultRouterMaxConcurrentResolvesPerBatch = 16
+	defaultRouterMaxConcurrentGroupsPerBatch   = 16
 )
 
 // AuthorityResolver resolves the append authority for a canonical channel.
+// Implementations must be safe for concurrent calls from one or more Router instances.
 type AuthorityResolver interface {
 	// ResolveAppendAuthority returns the current fenced channel authority target.
 	ResolveAppendAuthority(context.Context, ChannelID) (AuthorityTarget, error)
 }
 
+// AuthorityInvalidator optionally invalidates the exact failed fenced route
+// before a bounded retry resolves authority metadata again.
+type AuthorityInvalidator interface {
+	InvalidateAppendAuthority(ChannelID, AuthorityTarget)
+}
+
 // LocalSubmitter submits sends to the local channel authority runtime.
+// Implementations must be safe for concurrent calls from SendBatch.
 type LocalSubmitter interface {
 	// SubmitLocal admits a batch to the local channel authority.
 	SubmitLocal(context.Context, AuthorityTarget, []SendBatchItem) (*Future, error)
 }
 
 // RemoteForwarder forwards sends to a remote channel authority.
+// Implementations must be safe for concurrent calls from SendBatch.
 type RemoteForwarder interface {
 	// ForwardSendBatch forwards items to the resolved remote channel authority.
 	ForwardSendBatch(context.Context, AuthorityTarget, []SendBatchItem) []SendBatchItemResult
@@ -48,6 +61,10 @@ type RouterOptions struct {
 	MaxRouteAttempts int
 	// MaxOutboundPerNode bounds concurrent remote forwards per leader node. Values <= 0 disable this limit.
 	MaxOutboundPerNode int
+	// MaxConcurrentResolvesPerBatch bounds concurrent authority lookups for independent canonical channels. Values <= 0 use the default.
+	MaxConcurrentResolvesPerBatch int
+	// MaxConcurrentGroupsPerBatch bounds concurrently submitted independent canonical-channel groups within one SendBatch. Values <= 0 use the default.
+	MaxConcurrentGroupsPerBatch int
 	// Observer receives foreground routing observations.
 	Observer RouterObserver
 }
@@ -59,12 +76,14 @@ type Router struct {
 	local       LocalSubmitter
 	remote      RemoteForwarder
 
-	retryBackoff     time.Duration
-	maxRouteAttempts int
-	maxOutbound      int
-	outbound         map[uint64]int
-	outboundMu       sync.Mutex
-	observer         RouterObserver
+	retryBackoff                  time.Duration
+	maxRouteAttempts              int
+	maxConcurrentResolvesPerBatch int
+	maxConcurrentGroupsPerBatch   int
+	maxOutbound                   int
+	outbound                      map[uint64]int
+	outboundMu                    sync.Mutex
+	observer                      RouterObserver
 }
 
 // NewRouter creates a channel authority router.
@@ -77,16 +96,26 @@ func NewRouter(opts RouterOptions) *Router {
 	if maxRouteAttempts <= 0 {
 		maxRouteAttempts = defaultRouterMaxRouteAttempts
 	}
+	maxConcurrentGroupsPerBatch := opts.MaxConcurrentGroupsPerBatch
+	if maxConcurrentGroupsPerBatch <= 0 {
+		maxConcurrentGroupsPerBatch = defaultRouterMaxConcurrentGroupsPerBatch
+	}
+	maxConcurrentResolvesPerBatch := opts.MaxConcurrentResolvesPerBatch
+	if maxConcurrentResolvesPerBatch <= 0 {
+		maxConcurrentResolvesPerBatch = defaultRouterMaxConcurrentResolvesPerBatch
+	}
 	return &Router{
-		localNodeID:      opts.LocalNodeID,
-		resolver:         opts.Resolver,
-		local:            opts.Local,
-		remote:           opts.Remote,
-		retryBackoff:     retryBackoff,
-		maxRouteAttempts: maxRouteAttempts,
-		maxOutbound:      opts.MaxOutboundPerNode,
-		outbound:         make(map[uint64]int),
-		observer:         opts.Observer,
+		localNodeID:                   opts.LocalNodeID,
+		resolver:                      opts.Resolver,
+		local:                         opts.Local,
+		remote:                        opts.Remote,
+		retryBackoff:                  retryBackoff,
+		maxRouteAttempts:              maxRouteAttempts,
+		maxConcurrentResolvesPerBatch: maxConcurrentResolvesPerBatch,
+		maxConcurrentGroupsPerBatch:   maxConcurrentGroupsPerBatch,
+		maxOutbound:                   opts.MaxOutboundPerNode,
+		outbound:                      make(map[uint64]int),
+		observer:                      opts.Observer,
 	}
 }
 
@@ -121,15 +150,21 @@ func (r *Router) SendBatch(items []SendBatchItem) []SendBatchItemResult {
 
 	for len(pending) > 0 {
 		groups, nextPending := r.resolvePending(items, routeChannels, results, pending, attempts)
-		for _, group := range groups {
-			groupResults := r.submitGroup(group)
+		submitted := r.submitResolvedGroups(groups)
+		for groupIndex, group := range groups {
+			groupResults := submitted[groupIndex]
+			invalidate := false
 			for i, result := range normalizeRouterGroupResults(len(group.indexes), groupResults) {
 				index := group.indexes[i]
+				invalidate = invalidate || shouldInvalidateRouterAuthority(result.Err)
 				if shouldRetryRouterError(result.Err) && canRetryRouterItem(items[index], attempts[index], r.maxRouteAttempts, time.Now()) {
 					nextPending = append(nextPending, index)
 					continue
 				}
 				results[index] = result
+			}
+			if invalidate {
+				r.invalidateAppendAuthority(group.target.ChannelID, group.target)
 			}
 		}
 		if len(nextPending) == 0 {
@@ -168,6 +203,9 @@ func (r *Router) sendSingle(item SendBatchItem) SendBatchItemResult {
 			return SendBatchItemResult{Err: err}
 		}
 		result = r.submitSingleTarget(target, prepared)
+		if shouldInvalidateRouterAuthority(result.Err) {
+			r.invalidateAppendAuthority(routeChannel, target)
+		}
 		if shouldRetryRouterError(result.Err) && canRetryRouterItem(prepared, attempts, r.maxRouteAttempts, time.Now()) {
 			r.waitBeforeRetry([]SendBatchItem{prepared}, []int{0})
 			continue
@@ -180,6 +218,16 @@ type routerBatchGroup struct {
 	target  AuthorityTarget
 	indexes []int
 	items   []SendBatchItem
+}
+
+// routerBatchLane serializes resolved groups that share one batch-local outbound lane.
+type routerBatchLane struct {
+	groupIndexes []int
+}
+
+type routerResolvedChannel struct {
+	target AuthorityTarget
+	err    error
 }
 
 func (r *Router) resolvePending(items []SendBatchItem, routeChannels []ChannelID, results []SendBatchItemResult, pending []int, attempts []int) ([]routerBatchGroup, []int) {
@@ -204,13 +252,25 @@ func (r *Router) resolvePending(items []SendBatchItem, routeChannels []ChannelID
 		}
 		indexesByChannel[channelID] = append(indexesByChannel[channelID], index)
 	}
-	for _, channelID := range channelOrder {
+	resolved := make([]routerResolvedChannel, len(channelOrder))
+	runRouterBatchWorkers(len(channelOrder), r.maxConcurrentResolvesPerBatch, func(channelIndex int) {
+		channelID := channelOrder[channelIndex]
+		indexes := indexesByChannel[channelID]
+		if len(indexes) == 0 {
+			return
+		}
+		target, err := r.resolver.ResolveAppendAuthority(routerItemContext(items[indexes[0]]), channelID)
+		if err == nil {
+			target, err = normalizeRouterTarget(channelID, target)
+		}
+		resolved[channelIndex] = routerResolvedChannel{target: target, err: err}
+	})
+	for channelIndex, channelID := range channelOrder {
 		indexes := indexesByChannel[channelID]
 		if len(indexes) == 0 {
 			continue
 		}
-		firstIndex := indexes[0]
-		target, err := r.resolver.ResolveAppendAuthority(routerItemContext(items[firstIndex]), channelID)
+		target, err := resolved[channelIndex].target, resolved[channelIndex].err
 		if err != nil {
 			for _, index := range indexes {
 				item := items[index]
@@ -218,13 +278,6 @@ func (r *Router) resolvePending(items []SendBatchItem, routeChannels []ChannelID
 					nextPending = append(nextPending, index)
 					continue
 				}
-				results[index] = SendBatchItemResult{Err: err}
-			}
-			continue
-		}
-		target, err = normalizeRouterTarget(channelID, target)
-		if err != nil {
-			for _, index := range indexes {
 				results[index] = SendBatchItemResult{Err: err}
 			}
 			continue
@@ -237,6 +290,120 @@ func (r *Router) resolvePending(items []SendBatchItem, routeChannels []ChannelID
 		groups = append(groups, group)
 	}
 	return groups, nextPending
+}
+
+// submitResolvedGroups submits independent channel groups while retaining group-index result alignment.
+func (r *Router) submitResolvedGroups(groups []routerBatchGroup) [][]SendBatchItemResult {
+	results := make([][]SendBatchItemResult, len(groups))
+	if len(groups) == 0 {
+		return results
+	}
+	if !r.requiresResolvedGroupLanes(groups) {
+		runRouterBatchWorkers(len(groups), r.maxConcurrentGroupsPerBatch, func(groupIndex int) {
+			results[groupIndex] = r.submitGroup(groups[groupIndex])
+		})
+		return results
+	}
+
+	lanes := r.resolvedGroupLanes(groups)
+	runRouterBatchWorkers(len(lanes), r.maxConcurrentGroupsPerBatch, func(laneIndex int) {
+		for _, groupIndex := range lanes[laneIndex].groupIndexes {
+			results[groupIndex] = r.submitGroup(groups[groupIndex])
+		}
+	})
+	return results
+}
+
+// runRouterBatchWorkers executes indexed work with the caller participating in the fixed worker bound.
+func runRouterBatchWorkers(workItems int, maxWorkers int, submit func(int)) {
+	workers := maxWorkers
+	if workers > workItems {
+		workers = workItems
+	}
+	if workers <= 1 {
+		for index := 0; index < workItems; index++ {
+			submit(index)
+		}
+		return
+	}
+
+	var next atomic.Uint64
+	run := func() {
+		for {
+			index := int(next.Add(1) - 1)
+			if index >= workItems {
+				return
+			}
+			submit(index)
+		}
+	}
+	var wg sync.WaitGroup
+	wg.Add(workers - 1)
+	for worker := 1; worker < workers; worker++ {
+		goruntimeregistry.SafeGo(nil, goruntimeregistry.TaskChannelAppendRouter, func() {
+			defer wg.Done()
+			run()
+		})
+	}
+	run()
+	wg.Wait()
+}
+
+// requiresResolvedGroupLanes reports whether one remote leader exceeds its batch-local outbound concurrency limit.
+func (r *Router) requiresResolvedGroupLanes(groups []routerBatchGroup) bool {
+	if r.maxOutbound <= 0 || r.maxOutbound >= len(groups) {
+		return false
+	}
+	for groupIndex, group := range groups {
+		leaderNodeID := group.target.LeaderNodeID
+		if leaderNodeID == r.localNodeID {
+			continue
+		}
+		leaderGroups := 1
+		for candidateIndex := groupIndex + 1; candidateIndex < len(groups); candidateIndex++ {
+			if groups[candidateIndex].target.LeaderNodeID != leaderNodeID {
+				continue
+			}
+			leaderGroups++
+			if leaderGroups > r.maxOutbound {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// resolvedGroupLanes keeps one batch from consuming more concurrent remote slots per leader than the configured outbound limit.
+func (r *Router) resolvedGroupLanes(groups []routerBatchGroup) []routerBatchLane {
+	lanes := make([]routerBatchLane, 0, len(groups))
+	if r.maxOutbound <= 0 {
+		for groupIndex := range groups {
+			lanes = append(lanes, routerBatchLane{groupIndexes: []int{groupIndex}})
+		}
+		return lanes
+	}
+
+	remoteLanes := make(map[uint64][]int)
+	remoteLaneCursor := make(map[uint64]int)
+	for groupIndex, group := range groups {
+		leaderNodeID := group.target.LeaderNodeID
+		if leaderNodeID == r.localNodeID {
+			lanes = append(lanes, routerBatchLane{groupIndexes: []int{groupIndex}})
+			continue
+		}
+		leaderLanes := remoteLanes[leaderNodeID]
+		if len(leaderLanes) < r.maxOutbound {
+			laneIndex := len(lanes)
+			lanes = append(lanes, routerBatchLane{groupIndexes: []int{groupIndex}})
+			remoteLanes[leaderNodeID] = append(leaderLanes, laneIndex)
+			continue
+		}
+		cursor := remoteLaneCursor[leaderNodeID]
+		laneIndex := leaderLanes[cursor%len(leaderLanes)]
+		remoteLaneCursor[leaderNodeID] = cursor + 1
+		lanes[laneIndex].groupIndexes = append(lanes[laneIndex].groupIndexes, groupIndex)
+	}
+	return lanes
 }
 
 func (r *Router) submitGroup(group routerBatchGroup) []SendBatchItemResult {
@@ -450,6 +617,24 @@ func shouldRetryRouterError(err error) bool {
 		errors.Is(err, ErrNotLeader) ||
 		errors.Is(err, ErrRouteNotReady) ||
 		errors.Is(err, context.Canceled)
+}
+
+func shouldInvalidateRouterAuthority(err error) bool {
+	return errors.Is(err, ErrStaleRoute) ||
+		errors.Is(err, ErrNotChannelAuthority) ||
+		errors.Is(err, ErrNotLeader) ||
+		errors.Is(err, ErrRouteNotReady)
+}
+
+func (r *Router) invalidateAppendAuthority(id ChannelID, target AuthorityTarget) {
+	if r == nil || r.resolver == nil {
+		return
+	}
+	invalidator, ok := r.resolver.(AuthorityInvalidator)
+	if !ok {
+		return
+	}
+	invalidator.InvalidateAppendAuthority(id, target)
 }
 
 func canRetryRouterItem(item SendBatchItem, attempts int, maxAttempts int, now time.Time) bool {

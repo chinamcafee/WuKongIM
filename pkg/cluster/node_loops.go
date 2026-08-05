@@ -9,6 +9,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/control"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/observe"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/tasks"
+	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 	"github.com/WuKongIM/WuKongIM/pkg/slot/multiraft"
 )
 
@@ -28,7 +29,7 @@ func (n *Node) startWatchLoop() {
 	n.watchCancel = cancel
 	watch := n.control.Watch()
 	n.watchWG.Add(1)
-	go func() {
+	goruntimeregistry.SafeGo(n.cfg.Goroutines, goruntimeregistry.TaskClusterNodeControlWatch, func() {
 		defer n.watchWG.Done()
 		for {
 			select {
@@ -41,7 +42,7 @@ func (n *Node) startWatchLoop() {
 				_ = n.applySnapshot(ctx, ev.Snapshot)
 			}
 		}
-	}()
+	})
 }
 
 func (n *Node) stopWatchLoop() {
@@ -70,7 +71,7 @@ func (n *Node) startHealthReportLoop() {
 	ctx, cancel := context.WithCancel(context.Background())
 	n.healthReportCancel = cancel
 	n.healthReportWG.Add(1)
-	go func() {
+	goruntimeregistry.SafeGo(n.cfg.Goroutines, goruntimeregistry.TaskClusterHealthReport, func() {
 		defer n.healthReportWG.Done()
 		_ = n.reportNodeHealth(ctx, reporter)
 		loop := observe.NewLoop(n.cfg.HealthReport.Interval, func(ctx context.Context) error {
@@ -79,7 +80,7 @@ func (n *Node) startHealthReportLoop() {
 		loop.Start(ctx)
 		<-ctx.Done()
 		loop.Stop()
-	}()
+	})
 }
 
 func (n *Node) stopHealthReportLoop(ctx context.Context) {
@@ -133,7 +134,8 @@ func healthReportTimeout(interval, ttl time.Duration) time.Duration {
 }
 
 func (n *Node) runtimeReadyForHealthReport() bool {
-	if n == nil || !n.started.Load() || n.stopping.Load() {
+	if n == nil || !n.started.Load() || n.stopping.Load() ||
+		n.maintenance.Load() {
 		return false
 	}
 	n.mu.RLock()
@@ -146,8 +148,9 @@ func (n *Node) observedControlRevision() uint64 {
 		return 0
 	}
 	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return n.controlSnapshot.Revision
+	revision := n.controlSnapshot.Revision
+	n.mu.RUnlock()
+	return revision
 }
 
 func (n *Node) observedSlotRevision() uint64 {
@@ -190,7 +193,7 @@ func (n *Node) startTaskReconcileLoop() {
 	ctx, cancel := context.WithCancel(context.Background())
 	n.taskReconcileCancel = cancel
 	n.taskReconcileWG.Add(1)
-	go func() {
+	goruntimeregistry.SafeGo(n.cfg.Goroutines, goruntimeregistry.TaskClusterTaskReconcile, func() {
 		defer n.taskReconcileWG.Done()
 		timer := time.NewTimer(n.nextTaskReconcileInterval(fastInterval, idleInterval))
 		defer timer.Stop()
@@ -224,7 +227,7 @@ func (n *Node) startTaskReconcileLoop() {
 				timer.Reset(nextInterval)
 			}
 		}
-	}()
+	})
 }
 
 func (n *Node) taskReconcileFastInterval() time.Duration {
@@ -282,7 +285,7 @@ func (n *Node) startPreferredLeaderReconcileLoop() {
 	ctx, cancel := context.WithCancel(context.Background())
 	n.preferredLeaderCancel = cancel
 	n.preferredLeaderWG.Add(1)
-	go func() {
+	goruntimeregistry.SafeGo(n.cfg.Goroutines, goruntimeregistry.TaskClusterPreferredLeader, func() {
 		defer n.preferredLeaderWG.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -298,7 +301,7 @@ func (n *Node) startPreferredLeaderReconcileLoop() {
 				_ = n.preferredLeaderReconciler.Reconcile(ctx, snapshot)
 			}
 		}
-	}()
+	})
 }
 
 func (n *Node) stopPreferredLeaderReconcileLoop() {
@@ -433,13 +436,18 @@ func (g *preferredLeaderIntentGeneration) invalidate() {
 }
 
 func (n *Node) startChannelTickLoop() {
-	if n == nil || n.channels == nil || n.channelTickCancel != nil {
+	if n == nil {
+		return
+	}
+	n.channelTickMu.Lock()
+	defer n.channelTickMu.Unlock()
+	if n.channels == nil || n.channelTickCancel != nil {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	n.channelTickCancel = cancel
 	n.channelTickWG.Add(1)
-	go func() {
+	goruntimeregistry.SafeGo(n.cfg.Goroutines, goruntimeregistry.TaskClusterChannelTick, func() {
 		defer n.channelTickWG.Done()
 		ticker := time.NewTicker(n.cfg.Channel.TickInterval)
 		defer ticker.Stop()
@@ -451,11 +459,16 @@ func (n *Node) startChannelTickLoop() {
 				_ = n.channels.Tick(ctx)
 			}
 		}
-	}()
+	})
 }
 
 func (n *Node) stopChannelTickLoop() {
-	if n == nil || n.channelTickCancel == nil {
+	if n == nil {
+		return
+	}
+	n.channelTickMu.Lock()
+	defer n.channelTickMu.Unlock()
+	if n.channelTickCancel == nil {
 		return
 	}
 	n.channelTickCancel()
@@ -464,7 +477,12 @@ func (n *Node) stopChannelTickLoop() {
 }
 
 func (n *Node) startChannelRetentionGCLoop() {
-	if n == nil || n.channelRetentionCancel != nil || !n.cfg.ChannelRetention.PhysicalGCEnabled {
+	if n == nil {
+		return
+	}
+	n.channelRetentionMu.Lock()
+	defer n.channelRetentionMu.Unlock()
+	if n.channelRetentionCancel != nil || !n.cfg.ChannelRetention.PhysicalGCEnabled {
 		return
 	}
 	if n.channels == nil || n.defaultChannelStore == nil || n.defaultSlotMetaDB == nil {
@@ -473,7 +491,7 @@ func (n *Node) startChannelRetentionGCLoop() {
 	ctx, cancel := context.WithCancel(context.Background())
 	n.channelRetentionCancel = cancel
 	n.channelRetentionWG.Add(1)
-	go func() {
+	goruntimeregistry.SafeGo(n.cfg.Goroutines, goruntimeregistry.TaskClusterChannelRetention, func() {
 		defer n.channelRetentionWG.Done()
 		ticker := time.NewTicker(n.cfg.ChannelRetention.ScanInterval)
 		defer ticker.Stop()
@@ -485,11 +503,16 @@ func (n *Node) startChannelRetentionGCLoop() {
 				_, _ = n.RunChannelRetentionGCOnce(ctx)
 			}
 		}
-	}()
+	})
 }
 
 func (n *Node) stopChannelRetentionGCLoop() {
-	if n == nil || n.channelRetentionCancel == nil {
+	if n == nil {
+		return
+	}
+	n.channelRetentionMu.Lock()
+	defer n.channelRetentionMu.Unlock()
+	if n.channelRetentionCancel == nil {
 		return
 	}
 	n.channelRetentionCancel()
@@ -498,7 +521,12 @@ func (n *Node) stopChannelRetentionGCLoop() {
 }
 
 func (n *Node) startChannelMigrationLoop() {
-	if n == nil || n.channelMigrationCancel != nil || !n.cfg.ChannelMigration.Enabled {
+	if n == nil {
+		return
+	}
+	n.channelMigrationMu.Lock()
+	defer n.channelMigrationMu.Unlock()
+	if n.channelMigrationCancel != nil || !n.cfg.ChannelMigration.Enabled {
 		return
 	}
 	store := n.ChannelMigrationStore()
@@ -539,7 +567,7 @@ func (n *Node) startChannelMigrationLoop() {
 	ctx, cancel := context.WithCancel(context.Background())
 	n.channelMigrationCancel = cancel
 	n.channelMigrationWG.Add(1)
-	go func() {
+	goruntimeregistry.SafeGo(n.cfg.Goroutines, goruntimeregistry.TaskClusterChannelMigration, func() {
 		defer n.channelMigrationWG.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -552,11 +580,16 @@ func (n *Node) startChannelMigrationLoop() {
 				_, _ = scanner.RunOnce(ctx)
 			}
 		}
-	}()
+	})
 }
 
 func (n *Node) stopChannelMigrationLoop() {
-	if n == nil || n.channelMigrationCancel == nil {
+	if n == nil {
+		return
+	}
+	n.channelMigrationMu.Lock()
+	defer n.channelMigrationMu.Unlock()
+	if n.channelMigrationCancel == nil {
 		return
 	}
 	n.channelMigrationCancel()

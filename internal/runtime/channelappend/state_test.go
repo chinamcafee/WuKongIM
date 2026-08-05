@@ -12,9 +12,8 @@ func TestNewChannelStateCapturesAuthorityIdentityAndLimits(t *testing.T) {
 	}
 
 	state := newChannelState(target, channelStateLimits{
-		pendingItemHighWatermark:       8,
-		postCommitBacklogHighWatermark: 8,
-		appendInflightLimit:            2,
+		pendingItemHighWatermark: 8,
+		appendInflightLimit:      2,
 	})
 
 	if state.target != target {
@@ -22,9 +21,6 @@ func TestNewChannelStateCapturesAuthorityIdentityAndLimits(t *testing.T) {
 	}
 	if state.pendingItemHighWatermark != 8 {
 		t.Fatalf("pendingItemHighWatermark = %d, want 8", state.pendingItemHighWatermark)
-	}
-	if state.postCommitBacklogHighWatermark != 8 {
-		t.Fatalf("postCommitBacklogHighWatermark = %d, want 8", state.postCommitBacklogHighWatermark)
 	}
 	if state.appendInflightLimit != 2 {
 		t.Fatalf("appendInflightLimit = %d, want 2", state.appendInflightLimit)
@@ -122,7 +118,7 @@ func TestChannelStateDropCurrentCommitAdvancesCursorWithoutMovingBacklog(t *test
 	state.enqueueCommitted(CommittedEnvelope{MessageID: 2})
 	state.enqueueCommitted(CommittedEnvelope{MessageID: 3})
 
-	state.dropCurrentCommit()
+	state.dropCommitted(1)
 
 	if state.commitCursor != 1 {
 		t.Fatalf("commitCursor = %d, want 1 without compacting every committed item", state.commitCursor)

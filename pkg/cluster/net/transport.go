@@ -12,8 +12,10 @@ import (
 
 const defaultTransportQueueSize = 4096
 const defaultTransportPoolSize = 16
+const defaultTransportWriteBatchMaxWait = 100 * time.Microsecond
 const defaultTransportServiceConcurrency = 128
 const defaultTransportForegroundWriteServiceConcurrency = 512
+const orderedRaftServiceConcurrency = 1
 const defaultTransportServiceQueueSize = 4096
 const defaultTransportServiceMaxQueueBytes = 64 << 20
 
@@ -35,6 +37,7 @@ type TransportServerConfig struct {
 // TransportServiceConfig configures per-service transport worker pools.
 type TransportServiceConfig struct {
 	// Concurrency is the worker count for each registered typed RPC service. Non-positive values use the cluster default.
+	// Raft protocol services always use one worker because peer message order is part of the protocol contract.
 	Concurrency int
 	// QueueSize is the queued request count for each typed RPC service. Non-positive values use the cluster default.
 	QueueSize int
@@ -162,14 +165,16 @@ func (c *TransportClient) CallOwned(ctx context.Context, nodeID uint64, serviceI
 func (c *TransportClient) CallShard(ctx context.Context, nodeID uint64, serviceID uint8, shardKey uint64, payload []byte) ([]byte, error) {
 	// gofail: var wkClusterNetCallShardFault string
 	// if err := gofailClusterNetServiceFault(wkClusterNetCallShardFault, serviceID); err != nil { return nil, err }
-	return c.client.Call(ctx, transport.NodeID(nodeID), shardKey, servicePriority(serviceID), uint16(serviceID), payload)
+	response, err := c.client.Call(ctx, transport.NodeID(nodeID), shardKey, servicePriority(serviceID), uint16(serviceID), payload)
+	return response, translateTransportCallError(nodeID, serviceID, err)
 }
 
 // CallShardOwned invokes serviceID on nodeID using shardKey and transfers payload ownership.
 func (c *TransportClient) CallShardOwned(ctx context.Context, nodeID uint64, serviceID uint8, shardKey uint64, payload transport.OwnedBuffer) ([]byte, error) {
 	// gofail: var wkClusterNetCallShardOwnedFault string
 	// if err := gofailClusterNetServiceFault(wkClusterNetCallShardOwnedFault, serviceID); err != nil { return nil, err }
-	return c.client.CallOwned(ctx, transport.NodeID(nodeID), shardKey, servicePriority(serviceID), uint16(serviceID), payload)
+	response, err := c.client.CallOwned(ctx, transport.NodeID(nodeID), shardKey, servicePriority(serviceID), uint16(serviceID), payload)
+	return response, translateTransportCallError(nodeID, serviceID, err)
 }
 
 // Send sends serviceID to nodeID without waiting for a response.
@@ -215,6 +220,22 @@ func (c *TransportClient) Stop() {
 	if c != nil && c.client != nil {
 		c.client.Stop()
 	}
+}
+
+func translateTransportCallError(nodeID uint64, serviceID uint8, err error) error {
+	if err == nil {
+		return nil
+	}
+	var remoteErr transport.RemoteError
+	if !errors.As(err, &remoteErr) {
+		return err
+	}
+	if remoteErr.Code == transport.RemoteErrorCodeServiceNotFound ||
+		(remoteErr.Code == transport.RemoteErrorCodeGeneric &&
+			remoteErr.Message == fmt.Sprintf("transport: service %d not found", serviceID)) {
+		return fmt.Errorf("%w: node %d service %d", ErrServiceNotFound, nodeID, serviceID)
+	}
+	return err
 }
 
 func serviceShardKey(serviceID uint8) uint64 {
@@ -282,12 +303,26 @@ func transportServiceFailpointAlias(serviceID uint8) string {
 
 func (s *TransportServer) serviceOptions(serviceID uint8) transport.ServiceOptions {
 	cfg := s.cfg.Service
-	if isForegroundChannelMutationService(serviceID) && cfg.Concurrency <= 0 {
+	if isOrderedRaftService(serviceID) {
+		// Each Raft sender uses one stable peer connection. Serial execution on
+		// the receiver preserves that connection's Append-before-Heartbeat order;
+		// concurrent handlers could otherwise commit beyond the follower log.
+		cfg.Concurrency = orderedRaftServiceConcurrency
+	} else if isForegroundChannelMutationService(serviceID) && cfg.Concurrency <= 0 {
 		cfg.Concurrency = defaultTransportForegroundWriteServiceConcurrency
 	}
 	opts := normalizeTransportServiceOptions(cfg, s.cfg.MaxPayload)
 	opts.Alias = transportServiceAlias(serviceID)
 	return opts
+}
+
+func isOrderedRaftService(serviceID uint8) bool {
+	switch serviceID {
+	case MsgSlotRaft, MsgSlotRaftBatch, RPCControlRaft:
+		return true
+	default:
+		return false
+	}
 }
 
 func isForegroundChannelMutationService(serviceID uint8) bool {
@@ -321,8 +356,11 @@ func normalizeTransportLimits(limits transport.Limits, queueSize int) transport.
 	if limits.MaxBatchFrames <= 0 {
 		limits.MaxBatchFrames = transport.DefaultLimits().MaxBatchFrames
 	}
-	if limits.DialFailureCooldown < 0 || limits.WriteTimeout < 0 || limits.ReadIdleTimeout < 0 {
+	if limits.WriteBatchMaxWait < 0 || limits.DialFailureCooldown < 0 || limits.WriteTimeout < 0 || limits.ReadIdleTimeout < 0 {
 		panic("cluster/net: negative transport timeout")
+	}
+	if limits.WriteBatchMaxWait == 0 {
+		limits.WriteBatchMaxWait = defaultTransportWriteBatchMaxWait
 	}
 	if limits.DialFailureCooldown == 0 {
 		limits.DialFailureCooldown = transport.DefaultLimits().DialFailureCooldown

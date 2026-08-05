@@ -1,9 +1,11 @@
 package multiraft
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"reflect"
 	"sync"
 	"testing"
@@ -33,6 +35,57 @@ func TestStepUnknownSlotReturnsErrSlotNotFound(t *testing.T) {
 	err := rt.Step(context.Background(), Envelope{SlotID: 404})
 	if !errors.Is(err, ErrSlotNotFound) {
 		t.Fatalf("expected ErrSlotNotFound, got %v", err)
+	}
+}
+
+func TestClassifyRawProposalError(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		status raft.BasicStatus
+		want   error
+	}{
+		{
+			name: "leadership transfer",
+			err:  raft.ErrProposalDropped,
+			status: raft.BasicStatus{
+				SoftState:      raft.SoftState{RaftState: raft.StateLeader},
+				LeadTransferee: 2,
+			},
+			want: ErrNotLeader,
+		},
+		{
+			name: "candidate",
+			err:  raft.ErrProposalDropped,
+			status: raft.BasicStatus{
+				SoftState: raft.SoftState{RaftState: raft.StateCandidate},
+			},
+			want: ErrNotLeader,
+		},
+		{
+			name: "leader uncommitted budget",
+			err:  raft.ErrProposalDropped,
+			status: raft.BasicStatus{
+				SoftState: raft.SoftState{RaftState: raft.StateLeader},
+			},
+			want: ErrProposalBackpressure,
+		},
+		{
+			name: "other error",
+			err:  ErrSlotClosed,
+			status: raft.BasicStatus{
+				SoftState: raft.SoftState{RaftState: raft.StateLeader},
+			},
+			want: ErrSlotClosed,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyRawProposalError(tt.err, tt.status)
+			if !errors.Is(got, tt.want) {
+				t.Fatalf("classifyRawProposalError() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -1854,4 +1907,16 @@ func (f *internalFakeStateMachine) Restore(ctx context.Context, snap Snapshot) e
 
 func (f *internalFakeStateMachine) Snapshot(ctx context.Context) (Snapshot, error) {
 	return Snapshot{}, nil
+}
+
+func (f *internalFakeStateMachine) OpenHashSlotSnapshot(_ context.Context, hashSlot uint16) (io.ReadCloser, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var data []byte
+	for _, command := range f.commands {
+		if command.HashSlot == hashSlot {
+			data = append([]byte(nil), command.Data...)
+		}
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
 }

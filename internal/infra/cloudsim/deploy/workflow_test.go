@@ -1,10 +1,13 @@
 package deploy
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -44,7 +47,26 @@ func TestCloudSimulationMonitorPatrolsRunningRunsWithoutStartingThem(t *testing.
 		"if: vars.ALIBABA_CLOUD_SIM_ENABLED == 'true'",
 		"run_id:",
 		"environment: cloud-sim-analysis",
-		`status "$run_id"`,
+		`MAX_PROVIDER_CONFIG_ARTIFACTS: "512"`,
+		`MAX_PROVIDER_BINDINGS: "4"`,
+		`MAX_RUNNING_CANDIDATES: "4"`,
+		`PROVIDER_COMMAND_TIMEOUT_SECONDS: "60"`,
+		`inventory >"$snapshot"`,
+		`discovery-errors.jsonl`,
+		`record_discovery_error provider_config_artifact_budget_exceeded`,
+		`record_discovery_error provider_binding_budget_exceeded`,
+		`record_discovery_error running_candidate_budget_exceeded`,
+		`artifact_name="cloud-sim-locator-${run_id}"`,
+		`gh api --paginate --slurp`,
+		`[.[] | .artifacts[]? | select(.expired == false)] | length`,
+		`error:"locator_unavailable"`,
+		`error:"locator_invalid"`,
+		`error:"provider_config_unavailable"`,
+		`preflight --locator "$locator_path"`,
+		`error:"preflight_unavailable"`,
+		`error:"preflight_invalid"`,
+		`if [[ "$preflight_state" == "released" ]]; then`,
+		`run_json="$(jq -cer '.run' "$preflight_path")"`,
 		`/cloud-view/status`,
 		`/prometheus/api/v1/targets?state=active`,
 		`min_over_time(up[30m])`,
@@ -55,8 +77,64 @@ func TestCloudSimulationMonitorPatrolsRunningRunsWithoutStartingThem(t *testing.
 			t.Fatalf("monitor workflow missing patrol contract %q", required)
 		}
 	}
-	if strings.Contains(monitor, " create ") || strings.Contains(monitor, "wkbench run") {
-		t.Fatal("monitor workflow can start a simulation")
+	for _, forbidden := range []string{`status "$run_id"`, `error:"status_unavailable"`, "tail -n 25", " create ", "wkbench run"} {
+		if strings.Contains(monitor, forbidden) {
+			t.Fatalf("monitor workflow contains forbidden lifecycle contract %q", forbidden)
+		}
+	}
+	inventoryIndex := strings.Index(monitor, `inventory >"$snapshot"`)
+	locatorIndex := strings.Index(monitor, `artifact_name="cloud-sim-locator-${run_id}"`)
+	preflightIndex := strings.Index(monitor, `preflight --locator "$locator_path"`)
+	releasedIndex := strings.Index(monitor, `if [[ "$preflight_state" == "released" ]]; then`)
+	runIndex := strings.Index(monitor, `run_json="$(jq -cer '.run' "$preflight_path")"`)
+	nonRunningIndex := strings.Index(monitor, `if [[ "$state" != "running" ]]; then`)
+	patrolIndex := strings.Index(monitor, `/cloud-view/status`)
+	if inventoryIndex < 0 || locatorIndex <= inventoryIndex || preflightIndex <= locatorIndex || releasedIndex <= preflightIndex || runIndex <= releasedIndex ||
+		nonRunningIndex <= runIndex || patrolIndex <= nonRunningIndex {
+		t.Fatal("monitor workflow does not narrow provider inventory and bind locator preflight before public patrol")
+	}
+	releasedBlock := workflowShellIfBlock(t, monitor, `if [[ "$preflight_state" == "released" ]]; then`)
+	if !strings.Contains(releasedBlock, "\n              continue") || strings.Contains(releasedBlock, "patrol_failed=1") {
+		t.Fatal("monitor workflow does not treat provider-confirmed released as a normal skip")
+	}
+	nonRunningBlock := workflowShellIfBlock(t, monitor, `if [[ "$state" != "running" ]]; then`)
+	if !strings.Contains(nonRunningBlock, "\n              continue") || strings.Contains(nonRunningBlock, "/cloud-view/") {
+		t.Fatal("monitor workflow does not skip non-running live runs before public patrol")
+	}
+	for _, errorMarker := range []string{
+		`error:"locator_unavailable"`, `error:"locator_invalid"`, `error:"provider_config_unavailable"`,
+		`error:"preflight_unavailable"`, `error:"preflight_invalid"`,
+	} {
+		assertWorkflowFailureIsFailClosed(t, monitor, errorMarker)
+	}
+}
+
+func TestCloudSimulationMonitorCommandBudgetsFitJobTimeout(t *testing.T) {
+	monitor := readWorkflowText(t, repositoryRoot(t), "cloud-sim-monitor.yml")
+	jobMinutes := workflowIntValue(t, monitor, `timeout-minutes:\s*([0-9]+)`)
+	providerSeconds := workflowIntValue(t, monitor, `PROVIDER_COMMAND_TIMEOUT_SECONDS:\s*"([0-9]+)"`)
+	maxBindings := workflowIntValue(t, monitor, `MAX_PROVIDER_BINDINGS:\s*"([0-9]+)"`)
+	maxCandidates := workflowIntValue(t, monitor, `MAX_RUNNING_CANDIDATES:\s*"([0-9]+)"`)
+	curlMatches := regexp.MustCompile(`--max-time\s+([0-9]+)`).FindAllStringSubmatch(monitor, -1)
+	if len(curlMatches) == 0 {
+		t.Fatal("monitor workflow has no bounded public HTTP timeout")
+	}
+	curlSeconds, err := strconv.Atoi(curlMatches[0][1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, match := range curlMatches[1:] {
+		if match[1] != curlMatches[0][1] {
+			t.Fatalf("monitor public HTTP timeouts are inconsistent: %v", curlMatches)
+		}
+	}
+	const startupAndLocalReserveSeconds = 10 * 60
+	const publicCallsPerCandidate = 7
+	const boundedCommandsPerCandidate = 3
+	boundedSeconds := providerSeconds*(1+2*maxBindings+boundedCommandsPerCandidate*maxCandidates) +
+		curlSeconds*publicCallsPerCandidate*maxCandidates + startupAndLocalReserveSeconds
+	if boundedSeconds > jobMinutes*60 {
+		t.Fatalf("monitor command budget %ds plus reserve exceeds job timeout %ds", boundedSeconds, jobMinutes*60)
 	}
 }
 
@@ -93,8 +171,10 @@ func TestCloudSimulationWorkflowPrivilegeSeparation(t *testing.T) {
 		t.Fatal("analysis session preparation privilege boundary is invalid")
 	}
 	for _, required := range []string{
-		"run-name: Cloud Simulation Analysis", "operation:", "request_id:", "client_ipv4:", "client_public_key:",
+		"run-name: Cloud Simulation Analysis", "operation:", "- inspect", "request_id:", "client_ipv4:", "client_public_key:",
 		`select(test("^[0-9a-f]{40}$"))`, `select(test("^sha256:[0-9a-f]{64}$"))`,
+		"wukongim/cloud-simulation-analysis-preflight/v1", `.resources == [] and (has("run") | not)`,
+		`provider="$(jq -cer '{state:.state,resources:.resources}' preflight.json)"`,
 		`open-analysis "$RUN_ID"`, `--source "${CLIENT_IPV4}/32"`, "openssl pkeyutl -encrypt",
 		"rsa_padding_mode:oaep", "rsa_oaep_md:sha256", "encrypted-token.bin",
 		"cloud-sim-analysis-session-${{ inputs.request_id }}", "retention-days: 1",
@@ -102,6 +182,13 @@ func TestCloudSimulationWorkflowPrivilegeSeparation(t *testing.T) {
 		if !strings.Contains(analysis, required) {
 			t.Fatalf("analysis session workflow missing %q", required)
 		}
+	}
+	clientValidation := strings.Index(prepareSection, "- name: Validate live client material")
+	preflight := strings.Index(prepareSection, "- name: Bind locator to current provider inventory")
+	if preflight < 0 || clientValidation <= preflight ||
+		!strings.Contains(prepareSection, "if: inputs.operation == 'prepare' && steps.preflight.outputs.state == 'live'") ||
+		!strings.Contains(prepareSection, "continue-on-error: true") {
+		t.Fatal("analysis broker does not defer nullable client-material validation until provider-confirmed live state")
 	}
 	runnerClose := strings.Index(prepareSection, `close-analysis "$RUN_ID"`)
 	clientOpen := strings.Index(prepareSection, `--source "${CLIENT_IPV4}/32"`)
@@ -114,6 +201,13 @@ func TestCloudSimulationWorkflowPrivilegeSeparation(t *testing.T) {
 	}
 	if !strings.Contains(prepareSection, "id: handoff\n        if: steps.ingress.outputs.opened == 'true'\n        continue-on-error: true") {
 		t.Fatal("analysis broker cannot materialize an insufficient-evidence handoff after exchange failure")
+	}
+	if !strings.Contains(prepareSection, "id: ingress\n        if: inputs.operation == 'prepare' && steps.client.outputs.valid == 'true'\n        continue-on-error: true") {
+		t.Fatal("analysis broker cannot materialize an insufficient-evidence session after bounded ingress failure")
+	}
+	if !strings.Contains(prepareSection, `echo "attempted=true" >>"$GITHUB_OUTPUT"`) ||
+		!strings.Contains(prepareSection, "steps.ingress.outputs.attempted == 'true' && steps.handoff.outputs.client_window != 'true'") {
+		t.Fatal("analysis broker cannot revoke a possibly-created exchange rule after a timed-out ingress command")
 	}
 	for _, forbidden := range []string{"OPENAI_API_KEY", "openai/codex-action", "environment: cloud-sim-remediation", "contents: write", "WK_ANALYSIS_MCP_TOKEN="} {
 		if strings.Contains(analysis, forbidden) {
@@ -147,6 +241,26 @@ func TestCloudSimulationWorkflowPrivilegeSeparation(t *testing.T) {
 		if !strings.Contains(oidcSubject, required) {
 			t.Fatalf("OIDC subject workflow missing %q", required)
 		}
+	}
+}
+
+func TestCloudSimulationAnalysisLiveClientValidationRejectsMissingMaterial(t *testing.T) {
+	root := repositoryRoot(t)
+	script := workflowStepRun(t, root, "cloud-sim-analyze.yml", "Validate live client material")
+	outputPath := filepath.Join(t.TempDir(), "github-output")
+	command := exec.Command("/bin/bash", "-c", script)
+	command.Env = append(os.Environ(),
+		"CLIENT_IPV4=",
+		"CLIENT_PUBLIC_KEY=",
+		"GITHUB_OUTPUT="+outputPath,
+	)
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("live client validation accepted missing material:\n%s", output)
+	}
+	if output, err := os.ReadFile(outputPath); err == nil && strings.Contains(string(output), "valid=true") {
+		t.Fatalf("live client validation published success for missing material: %s", output)
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
 	}
 }
 
@@ -218,11 +332,33 @@ func TestCloudSimulationWorkflowMapsReviewedScaleAliasesAndConfirmsWeekCost(t *t
 	}
 }
 
+func TestCloudSimulationWorkflowFailsFastOnTerminalBootstrapGateAndCleansCancellation(t *testing.T) {
+	provision := readWorkflowText(t, repositoryRoot(t), "cloud-sim-provision.yml")
+	for _, required := range []string{
+		`bundle/bin/wkcloudgate --snapshot bootstrap-gate.json --bundle-digest "$BUNDLE_DIGEST" | tee bootstrap-gate-result.json`,
+		`'.passed == false and (.retryable | type == "boolean")'`,
+		`'.retryable == true'`,
+		`Bootstrap Gate reported a non-retryable invariant`,
+		`if: (failure() || cancelled()) && steps.provider_config.outcome == 'success' && steps.prepare.outcome == 'success'`,
+		`BOOTSTRAP_GATE_OUTCOME: ${{ steps.bootstrap_gate.outcome }}`,
+		`if [[ "$BOOTSTRAP_GATE_OUTCOME" != "success" ]]`,
+		`release_failed_run`,
+	} {
+		if !strings.Contains(provision, required) {
+			t.Fatalf("provision workflow missing terminal Bootstrap Gate handling %q", required)
+		}
+	}
+	if strings.Contains(provision, `until scripts/cloud-sim/collect-bootstrap-gate.sh && bundle/bin/wkcloudgate`) {
+		t.Fatal("provision workflow still retries every Bootstrap Gate failure until the deadline")
+	}
+}
+
 func TestCloudSimulationWorkflowRequiresEmpiricalStorageCalibrationForStandardRuns(t *testing.T) {
 	provision := readWorkflowText(t, repositoryRoot(t), "cloud-sim-provision.yml")
 	for _, required := range []string{
-		"storage_calibration_run_id:",
-		"storage_bytes_per_message:",
+		"storage_calibration:",
+		`{"run_id":"...","bytes_per_message":123}`,
+		".bytes_per_message",
 		"48h|168h)",
 		"Standard stability runs require a completed 30m storage calibration",
 		"calibrated_data_disk_gib",
@@ -321,4 +457,304 @@ func assertWorkflowText(t *testing.T, value string, required ...string) {
 			t.Fatalf("workflow missing %q", item)
 		}
 	}
+}
+
+func workflowShellIfBlock(t *testing.T, workflow, guard string) string {
+	t.Helper()
+	start := strings.Index(workflow, guard)
+	if start < 0 {
+		t.Fatalf("workflow missing shell guard %q", guard)
+	}
+	tail := workflow[start:]
+	end := strings.Index(tail, "\n            fi")
+	if end < 0 {
+		t.Fatalf("workflow shell guard %q has no closing fi", guard)
+	}
+	return tail[:end]
+}
+
+func assertWorkflowFailureIsFailClosed(t *testing.T, workflow, errorMarker string) {
+	t.Helper()
+	found := false
+	for offset := 0; offset < len(workflow); {
+		relativeStart := strings.Index(workflow[offset:], errorMarker)
+		if relativeStart < 0 {
+			break
+		}
+		found = true
+		start := offset + relativeStart
+		tail := workflow[start:]
+		end := strings.Index(tail, "\n            fi")
+		if end < 0 {
+			t.Fatalf("workflow failure %q has no closing fi", errorMarker)
+		}
+		block := tail[:end]
+		if !strings.Contains(block, "\n              patrol_failed=1") ||
+			!strings.Contains(block, "\n              continue") {
+			t.Fatalf("workflow failure %q does not fail closed in its branch", errorMarker)
+		}
+		offset = start + len(errorMarker)
+	}
+	if !found {
+		t.Fatalf("workflow missing failure marker %q", errorMarker)
+	}
+}
+
+func workflowStepRun(t *testing.T, root, workflowName, stepName string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(root, ".github", "workflows", workflowName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Name string `yaml:"name"`
+				Run  string `yaml:"run"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(data, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	for _, job := range workflow.Jobs {
+		for _, step := range job.Steps {
+			if step.Name == stepName {
+				if step.Run == "" {
+					t.Fatalf("workflow step %q has no shell body", stepName)
+				}
+				return step.Run
+			}
+		}
+	}
+	t.Fatalf("workflow step %q not found", stepName)
+	return ""
+}
+
+func workflowIntValue(t *testing.T, workflow, pattern string) int {
+	t.Helper()
+	match := regexp.MustCompile(pattern).FindStringSubmatch(workflow)
+	if len(match) != 2 {
+		t.Fatalf("workflow integer pattern %q not found", pattern)
+	}
+	value, err := strconv.Atoi(match[1])
+	if err != nil {
+		t.Fatalf("parse workflow integer %q: %v", match[1], err)
+	}
+	return value
+}
+
+func writeWorkflowExecutable(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func monitorProviderArtifactPages(count int) string {
+	var result strings.Builder
+	result.WriteString(`[{"artifacts":[`)
+	for index := 1; index <= count; index++ {
+		if index > 1 {
+			result.WriteByte(',')
+		}
+		fmt.Fprintf(&result,
+			`{"id":%d,"name":"cloud-sim-provider-config--gh-%d-1--cn-hangzhou--%s","expired":false,"created_at":"2026-07-23T00:00:00Z"}`,
+			index, index, strings.Repeat("a", 64))
+	}
+	result.WriteString(`]}]`)
+	return result.String()
+}
+
+func monitorProviderArtifactBindingPages(count int) string {
+	var result strings.Builder
+	result.WriteString(`[{"artifacts":[`)
+	for index := 1; index <= count; index++ {
+		if index > 1 {
+			result.WriteByte(',')
+		}
+		fmt.Fprintf(&result,
+			`{"id":%d,"name":"cloud-sim-provider-config--gh-%d-1--cn-region-%d--%064x","expired":false,"created_at":"2026-07-23T00:00:00Z"}`,
+			index, index, index, index)
+	}
+	result.WriteString(`]}]`)
+	return result.String()
+}
+
+func monitorInventorySnapshot(runIDs []string) string {
+	var result strings.Builder
+	fmt.Fprintf(&result, `{"authority":{"provider":"alibaba","region":"cn-hangzhou","account_id_hash":"sha256:%s"},"runs":[`, strings.Repeat("a", 64))
+	for index, runID := range runIDs {
+		if index > 0 {
+			result.WriteByte(',')
+		}
+		fmt.Fprintf(&result, `{"id":%q,"provider":"alibaba","region":"cn-hangzhou","account_id_hash":"sha256:%s","repository":"example/repository","state":"running"}`,
+			runID, strings.Repeat("a", 64))
+	}
+	result.WriteString(`]}`)
+	return result.String()
+}
+
+func writeMonitorDiscoveryFakes(t *testing.T, workDir, binDir string) {
+	t.Helper()
+	writeWorkflowExecutable(t, filepath.Join(binDir, "gh"), `#!/bin/bash
+set -euo pipefail
+case "$*" in
+  *"/zip"*)
+    printf 'fake zip\n'
+    ;;
+  *"/actions/artifacts"*)
+    [[ "$*" == *"--paginate --slurp"* && "$*" == *"per_page=100"* ]]
+    printf '%s\n' "$MONITOR_PROVIDER_ARTIFACT_PAGES"
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+`)
+	writeWorkflowExecutable(t, filepath.Join(binDir, "unzip"), `#!/bin/bash
+set -euo pipefail
+destination=""
+while (($#)); do
+  if [[ "$1" == "-d" ]]; then destination="$2"; shift 2; continue; fi
+  shift
+done
+[[ -n "$destination" ]]
+mkdir -p "$destination"
+artifact_id="${destination##*-}"
+printf '{"region":"cn-region-%s","account_id_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n' "$artifact_id" >"$destination/provider.json"
+`)
+	writeWorkflowExecutable(t, filepath.Join(binDir, "timeout"), `#!/bin/bash
+set -euo pipefail
+shift
+exec "$@"
+`)
+	writeWorkflowExecutable(t, filepath.Join(workDir, "scripts", "cloud-sim", "select-provider-config-artifacts.sh"), `#!/bin/bash
+set -euo pipefail
+awk -F '\t' '
+  {
+    count = split($2, parts, "--")
+    binding = parts[count - 1] "--" parts[count]
+    if (!seen[binding]++) print $1
+  }
+'
+`)
+	writeWorkflowExecutable(t, filepath.Join(workDir, "scripts", "cloud-sim", "resolve-exact-provider-config.sh"), `#!/bin/bash
+exit 99
+`)
+	writeWorkflowExecutable(t, filepath.Join(workDir, "wkcloudsim"), `#!/bin/bash
+set -euo pipefail
+[[ "$*" == *" inventory" ]]
+printf '%s\n' "$*" >>"$MONITOR_INVENTORY_CALL_LOG"
+if [[ -n "${MONITOR_INVENTORY_EXIT:-}" ]]; then exit "$MONITOR_INVENTORY_EXIT"; fi
+printf '%s\n' "$MONITOR_INVENTORY_JSON"
+`)
+}
+
+func writeMonitorWorkflowFakes(t *testing.T, workDir, binDir string) {
+	t.Helper()
+	writeWorkflowExecutable(t, filepath.Join(binDir, "gh"), `#!/bin/bash
+set -euo pipefail
+case "$*" in
+  *"/zip"*)
+    printf 'fake zip\n'
+    ;;
+  *"/actions/artifacts"*)
+    [[ "$*" == *"--paginate --slurp"* && "$*" == *"per_page=100"* ]]
+    if [[ "$MONITOR_SCENARIO" == "duplicate" ]]; then
+      printf '%s\n' '[{"artifacts":[{"id":1,"expired":false}]},{"artifacts":[{"id":2,"expired":false}]}]'
+    else
+      printf '%s\n' '[{"artifacts":[{"id":0,"expired":true}]},{"artifacts":[{"id":1,"expired":false}]}]'
+    fi
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+`)
+	writeWorkflowExecutable(t, filepath.Join(binDir, "unzip"), `#!/bin/bash
+set -euo pipefail
+destination=""
+while (($#)); do
+  if [[ "$1" == "-d" ]]; then destination="$2"; shift 2; continue; fi
+  shift
+done
+[[ -n "$destination" ]]
+mkdir -p "$destination"
+printf '%s\n' "$MONITOR_LOCATOR_JSON" >"$destination/run-locator.json"
+`)
+	writeWorkflowExecutable(t, filepath.Join(binDir, "timeout"), `#!/bin/bash
+set -euo pipefail
+shift
+exec "$@"
+`)
+	writeWorkflowExecutable(t, filepath.Join(workDir, "scripts", "cloud-sim", "resolve-exact-provider-config.sh"), `#!/bin/bash
+set -euo pipefail
+if [[ "${EXPECTED_REGION:-}" != "cn-hangzhou" ||
+      "${EXPECTED_ACCOUNT_ID_HASH:-}" != "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ]]; then
+  exit 17
+fi
+if [[ "$MONITOR_SCENARIO" == "provider-failure" ]]; then exit 18; fi
+printf '{}\n' >"$2"
+`)
+	writeWorkflowExecutable(t, filepath.Join(workDir, "wkcloudsim"), `#!/bin/bash
+set -euo pipefail
+case "$MONITOR_SCENARIO" in
+  released|provider-failure)
+    printf '%s\n' '{"state":"released"}'
+    ;;
+  stopped)
+    printf '%s\n' '{"state":"live","run":{"state":"stopped","resources":[]}}'
+    ;;
+  running|targets-failure|targets-invalid|sustained-failure|metric-missing)
+    printf '%s\n' '{"state":"live","run":{"state":"running","resources":[{"kind":"public-address","role":"sim","public_address":"127.0.0.1"}]}}'
+    ;;
+  sim-missing)
+    printf '%s\n' '{"state":"live","run":{"state":"running","resources":[]}}'
+    ;;
+  preflight-failure)
+    exit 19
+    ;;
+  preflight-invalid)
+    printf '%s\n' '{"state":"unexpected"}'
+    ;;
+  *)
+    exit 20
+    ;;
+esac
+`)
+	writeWorkflowExecutable(t, filepath.Join(binDir, "curl"), `#!/bin/bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$MONITOR_PUBLIC_CALL_LOG"
+if [[ "$MONITOR_SCENARIO" == "targets-failure" && "$*" == *"/prometheus/api/v1/targets"* ]]; then exit 22; fi
+if [[ "$MONITOR_SCENARIO" == "sustained-failure" && "$*" == *"min_over_time(up[30m])"* ]]; then exit 23; fi
+case "$*" in
+  *"/cloud-view/status"*)
+    printf '%s\n' '{"run_id":"gh-test-1","persistence_healthy":true}'
+    ;;
+  *"/prometheus/api/v1/targets"*)
+    if [[ "$MONITOR_SCENARIO" == "targets-invalid" ]]; then
+      printf '%s\n' '{}'
+    else
+      printf '%s\n' '{"data":{"activeTargets":[{"health":"up"},{"health":"up"},{"health":"up"},{"health":"up"},{"health":"up"},{"health":"up"},{"health":"up"}]}}'
+    fi
+    ;;
+  *"min_over_time(up[30m])"*)
+    printf '%s\n' '{"data":{"result":[{"value":[1,"1"]}]}}'
+    ;;
+  *"/prometheus/api/v1/query"*)
+    if [[ "$MONITOR_SCENARIO" == "metric-missing" ]]; then
+      printf '%s\n' '{"data":{"result":[]}}'
+    else
+      printf '%s\n' '{"data":{"result":[{"value":[1,"0.1"]}]}}'
+    fi
+    ;;
+  *)
+    exit 21
+    ;;
+esac
+`)
 }

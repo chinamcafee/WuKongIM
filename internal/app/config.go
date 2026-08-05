@@ -26,6 +26,14 @@ var (
 	ErrStopped = errors.New("internal/app: stopped")
 )
 
+const (
+	defaultConversationAuthorityFlushBatchRows = 512
+	// DefaultConversationAuthorityCacheMaxRows is the node-wide authority cache ceiling used when configuration omits it.
+	DefaultConversationAuthorityCacheMaxRows = 100_000
+	// DefaultDeliveryRecipientWorkerConcurrency is the bounded recipient-plan worker count used when configuration omits it.
+	DefaultDeliveryRecipientWorkerConcurrency = 100
+)
+
 // Config contains phase-1 internal app configuration.
 type Config struct {
 	// NodeID is the stable cluster node identity.
@@ -71,8 +79,6 @@ type Config struct {
 	// Plugin configures node-local PDK-compatible plugin runtime integration.
 	Plugin PluginConfig
 }
-
-// APIConfig contains HTTP API settings for the standalone v2 entry.
 type APIConfig struct {
 	// ListenAddr is the HTTP API listen address. An empty value disables the API service.
 	ListenAddr string
@@ -320,7 +326,7 @@ type ChannelAppendConfig struct {
 	AdvancePoolSize int
 	// EffectPoolSize is the direct ants pool size used separately by blocking append calls and post-append recipient effects. Zero derives a CPU-aware default.
 	EffectPoolSize int
-	// RecipientAuthorityDispatchConcurrency bounds per-message recipient authority fanout after append. Zero uses a bounded default.
+	// RecipientAuthorityDispatchConcurrency is retained for configuration compatibility; canonical Online Delivery plans ignore it.
 	RecipientAuthorityDispatchConcurrency int
 }
 
@@ -336,7 +342,7 @@ type ConversationConfig struct {
 	AuthorityListDBWindowMax int
 	// AuthorityHandoffTimeout bounds how long a new authority waits for old-authority drain before explicit abandon.
 	AuthorityHandoffTimeout time.Duration
-	// AuthorityActiveCooldown skips receiver-only active_at flushes newer than the durable row by less than this duration.
+	// AuthorityActiveCooldown coalesces receiver-only active_at persistence while the authority cache keeps the latest activity visible.
 	AuthorityActiveCooldown time.Duration
 	// AuthorityFlushInterval controls how often dirty authority active rows are flushed to durable storage.
 	AuthorityFlushInterval time.Duration
@@ -619,7 +625,7 @@ func defaultDeliveryConfig(cfg DeliveryConfig) DeliveryConfig {
 		cfg.EventQueueSize = 1024
 	}
 	if cfg.RecipientWorkerConcurrency == 0 {
-		cfg.RecipientWorkerConcurrency = 100
+		cfg.RecipientWorkerConcurrency = DefaultDeliveryRecipientWorkerConcurrency
 	}
 	return cfg
 }
@@ -705,7 +711,7 @@ func defaultConversationConfig(cfg ConversationConfig) ConversationConfig {
 		cfg.AuthorityCacheMaxRowsPerUID = 4096
 	}
 	if cfg.AuthorityCacheMaxRows == 0 {
-		cfg.AuthorityCacheMaxRows = 100000
+		cfg.AuthorityCacheMaxRows = DefaultConversationAuthorityCacheMaxRows
 	}
 	if cfg.AuthorityListDBWindowMax == 0 {
 		cfg.AuthorityListDBWindowMax = 1000
@@ -723,7 +729,7 @@ func defaultConversationConfig(cfg ConversationConfig) ConversationConfig {
 		cfg.AuthorityFlushTimeout = 5 * time.Second
 	}
 	if cfg.AuthorityFlushBatchRows == 0 {
-		cfg.AuthorityFlushBatchRows = 128
+		cfg.AuthorityFlushBatchRows = defaultConversationAuthorityFlushBatchRows
 	}
 	if cfg.AuthorityAdmitBatchRows == 0 {
 		cfg.AuthorityAdmitBatchRows = 512

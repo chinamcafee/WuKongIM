@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 	"github.com/WuKongIM/WuKongIM/pkg/workqueue"
 )
 
@@ -40,6 +41,8 @@ const (
 
 // RuntimeOptions configures the bounded webhook runtime.
 type RuntimeOptions struct {
+	// Goroutines receives lifecycle and pool ownership observations.
+	Goroutines *goruntimeregistry.Registry
 	// Sender delivers encoded webhook requests.
 	Sender Sender
 	// Observer receives low-cardinality runtime observations.
@@ -133,15 +136,26 @@ func (r *Runtime) Start(ctx context.Context) error {
 	switch r.state {
 	case runtimeStateStarted:
 		return nil
-	case runtimeStateStopping, runtimeStateStopped:
+	case runtimeStateStopping:
 		return workqueue.ErrClosed
+	case runtimeStateStopped:
+		r.stopCh = make(chan struct{})
 	}
 	r.ensureStopChLocked()
 
+	if r.outbox == nil && (r.enabled(EventMsgNotify) || r.enabled(EventMsgOffline)) {
+		outbox, err := OpenDurableOutbox(r.opts.Outbox)
+		if err != nil {
+			return err
+		}
+		r.outbox = outbox
+	}
 	online, err := workqueue.NewBoundedBatchPool[OnlineStatus](workqueue.BoundedBatchPoolConfig[OnlineStatus]{
-		Name:      webhookOnlineQueue,
-		Workers:   r.opts.Workers,
-		QueueSize: r.opts.QueueSize,
+		Name:       webhookOnlineQueue,
+		Goroutines: r.opts.Goroutines,
+		Task:       goruntimeregistry.TaskWebhookOnline,
+		Workers:    r.opts.Workers,
+		QueueSize:  r.opts.QueueSize,
 		Policy: func(OnlineStatus) workqueue.BatchOptions {
 			return workqueue.BatchOptions{MaxItems: r.opts.OnlineBatchMaxItems, MaxWait: r.opts.OnlineBatchMaxWait}
 		},
@@ -152,13 +166,16 @@ func (r *Runtime) Start(ctx context.Context) error {
 	r.online = online
 	dispatchCtx, dispatchCancel := context.WithCancel(context.Background())
 	r.dispatchCancel = dispatchCancel
-	if r.outbox != nil {
+	outbox := r.outbox
+	if outbox != nil {
 		r.dispatchWG.Add(1)
-		go r.runOutboxMaintenance(dispatchCtx)
-		for worker := 0; worker < r.opts.Workers; worker++ {
-			r.dispatchWG.Add(1)
-			go r.runOutboxDispatcher(dispatchCtx)
-		}
+		goruntimeregistry.SafeGo(r.opts.Goroutines, goruntimeregistry.TaskWebhookOffline, func() {
+			r.runOutboxMaintenance(dispatchCtx, outbox)
+		})
+		r.dispatchWG.Add(r.opts.Workers)
+		goruntimeregistry.SafeGoN(r.opts.Goroutines, goruntimeregistry.TaskWebhookNotify, r.opts.Workers, func(int) {
+			r.runOutboxDispatcher(dispatchCtx, outbox)
+		})
 	}
 	r.state = runtimeStateStarted
 	return nil
@@ -178,6 +195,7 @@ func (r *Runtime) Stop(ctx context.Context) error {
 		r.state = runtimeStateStopped
 		close(r.ensureStopChLocked())
 		outbox := r.outbox
+		r.outbox = nil
 		r.mu.Unlock()
 		if outbox != nil {
 			return outbox.Close()
@@ -193,6 +211,7 @@ func (r *Runtime) Stop(ctx context.Context) error {
 	}
 	r.state = runtimeStateStopping
 	online := r.online
+	outbox := r.outbox
 	dispatchCancel := r.dispatchCancel
 	stopCh := r.ensureStopChLocked()
 	r.mu.Unlock()
@@ -201,10 +220,10 @@ func (r *Runtime) Stop(ctx context.Context) error {
 		dispatchCancel()
 	}
 	dispatchDone := make(chan struct{})
-	go func() {
+	goruntimeregistry.SafeGo(r.opts.Goroutines, goruntimeregistry.TaskWebhookOffline, func() {
 		r.dispatchWG.Wait()
 		close(dispatchDone)
-	}()
+	})
 	var dispatchErr error
 	select {
 	case <-ctx.Done():
@@ -212,12 +231,13 @@ func (r *Runtime) Stop(ctx context.Context) error {
 	case <-dispatchDone:
 	}
 	err := errors.Join(online.Close(ctx), dispatchErr)
-	if r.outbox != nil {
-		err = errors.Join(err, r.outbox.Close())
+	if outbox != nil {
+		err = errors.Join(err, outbox.Close())
 	}
 
 	r.mu.Lock()
 	r.online = nil
+	r.outbox = nil
 	r.dispatchCancel = nil
 	r.state = runtimeStateStopped
 	close(stopCh)
@@ -327,7 +347,7 @@ func (r *Runtime) handleOnlineBatch(ctx context.Context, batch []OnlineStatus) e
 	return nil
 }
 
-func (r *Runtime) runOutboxDispatcher(ctx context.Context) {
+func (r *Runtime) runOutboxDispatcher(ctx context.Context, outbox *DurableOutbox) {
 	defer r.dispatchWG.Done()
 	poll := time.NewTicker(100 * time.Millisecond)
 	defer poll.Stop()
@@ -335,10 +355,10 @@ func (r *Runtime) runOutboxDispatcher(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-r.outbox.Wake():
+		case <-outbox.Wake():
 		case <-poll.C:
 		}
-		entries, err := r.outbox.ClaimDue(time.Now())
+		entries, err := outbox.ClaimDue(time.Now())
 		if err != nil {
 			if errors.Is(err, ErrOutboxClosed) || ctx.Err() != nil {
 				return
@@ -348,37 +368,37 @@ func (r *Runtime) runOutboxDispatcher(ctx context.Context) {
 		}
 		for _, entry := range entries {
 			if ctx.Err() != nil {
-				r.outbox.ReleaseClaim(entry.ID)
+				outbox.ReleaseClaim(entry.ID)
 				continue
 			}
-			r.dispatchOutboxEntry(ctx, entry)
+			r.dispatchOutboxEntry(ctx, outbox, entry)
 		}
 	}
 }
 
-func (r *Runtime) runOutboxMaintenance(ctx context.Context) {
+func (r *Runtime) runOutboxMaintenance(ctx context.Context, outbox *DurableOutbox) {
 	defer r.dispatchWG.Done()
 	statsTicker := time.NewTicker(5 * time.Second)
 	pruneTicker := time.NewTicker(time.Minute)
 	defer statsTicker.Stop()
 	defer pruneTicker.Stop()
-	r.refreshOutboxStats()
+	r.refreshOutboxStats(outbox)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-statsTicker.C:
-			r.refreshOutboxStats()
+			r.refreshOutboxStats(outbox)
 		case now := <-pruneTicker.C:
-			if err := r.outbox.pruneDelivered(now); err != nil && !errors.Is(err, ErrOutboxClosed) {
+			if err := outbox.pruneDelivered(now); err != nil && !errors.Is(err, ErrOutboxClosed) {
 				r.observeSend("outbox", resultOutboxError, 0, 0, 0, err)
 			}
-			r.refreshOutboxStats()
+			r.refreshOutboxStats(outbox)
 		}
 	}
 }
 
-func (r *Runtime) dispatchOutboxEntry(ctx context.Context, entry OutboxEntry) {
+func (r *Runtime) dispatchOutboxEntry(ctx context.Context, outbox *DurableOutbox, entry OutboxEntry) {
 	attemptCtx, cancel := context.WithTimeout(ctx, r.opts.RequestTimeout)
 	started := time.Now()
 	err := r.sender.Send(attemptCtx, SendRequest{
@@ -387,7 +407,7 @@ func (r *Runtime) dispatchOutboxEntry(ctx context.Context, entry OutboxEntry) {
 	cancel()
 	duration := time.Since(started)
 	if err == nil {
-		if markErr := r.outbox.MarkDelivered(entry, time.Now()); markErr != nil {
+		if markErr := outbox.MarkDelivered(entry, time.Now()); markErr != nil {
 			r.observeSend(entry.Event, resultOutboxError, entry.Items, entry.Attempt+1, duration, markErr)
 			return
 		}
@@ -395,10 +415,10 @@ func (r *Runtime) dispatchOutboxEntry(ctx context.Context, entry OutboxEntry) {
 		return
 	}
 	if ctx.Err() != nil {
-		r.outbox.ReleaseClaim(entry.ID)
+		outbox.ReleaseClaim(entry.ID)
 		return
 	}
-	dead, markErr := r.outbox.MarkFailed(entry, r.opts.RetryMaxAttempts, time.Now())
+	dead, markErr := outbox.MarkFailed(entry, r.opts.RetryMaxAttempts, time.Now())
 	if markErr != nil {
 		r.observeSend(entry.Event, resultOutboxError, entry.Items, entry.Attempt+1, duration, markErr)
 		return
@@ -412,29 +432,41 @@ func (r *Runtime) dispatchOutboxEntry(ctx context.Context, entry OutboxEntry) {
 
 // OutboxStats exposes critical webhook backlog and dead-letter state.
 func (r *Runtime) OutboxStats(ctx context.Context) (OutboxStats, error) {
-	if r == nil || r.outbox == nil {
+	if r == nil {
 		return OutboxStats{}, ErrOutboxClosed
 	}
-	return r.outbox.Stats(ctx)
+	r.mu.RLock()
+	outbox := r.outbox
+	r.mu.RUnlock()
+	if outbox == nil {
+		return OutboxStats{}, ErrOutboxClosed
+	}
+	return outbox.Stats(ctx)
 }
 
 // ReplayDeadLetters requeues an explicit, bounded set of stable webhook IDs.
 func (r *Runtime) ReplayDeadLetters(ctx context.Context, ids []string) (int, error) {
-	if r == nil || r.outbox == nil {
+	if r == nil {
 		return 0, ErrOutboxClosed
 	}
-	replayed, err := r.outbox.ReplayDead(ctx, ids)
+	r.mu.RLock()
+	outbox := r.outbox
+	r.mu.RUnlock()
+	if outbox == nil {
+		return 0, ErrOutboxClosed
+	}
+	replayed, err := outbox.ReplayDead(ctx, ids)
 	if err == nil {
-		r.refreshOutboxStats()
+		r.refreshOutboxStats(outbox)
 	}
 	return replayed, err
 }
 
-func (r *Runtime) refreshOutboxStats() {
-	if r == nil || r.outbox == nil {
+func (r *Runtime) refreshOutboxStats(outbox *DurableOutbox) {
+	if r == nil || outbox == nil {
 		return
 	}
-	stats, err := r.outbox.Stats(context.Background())
+	stats, err := outbox.Stats(context.Background())
 	if err == nil {
 		r.observeOutboxStats(stats)
 	}

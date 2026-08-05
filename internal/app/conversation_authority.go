@@ -7,8 +7,11 @@ import (
 	"sync"
 	"time"
 
+	accessnode "github.com/WuKongIM/WuKongIM/internal/access/node"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/conversationactive"
 	conversationusecase "github.com/WuKongIM/WuKongIM/internal/usecase/conversation"
+	clusterpkg "github.com/WuKongIM/WuKongIM/pkg/cluster"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/propose"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 )
 
@@ -22,6 +25,9 @@ type conversationAuthorityStore interface {
 	// TouchConversationActiveAtBatch flushes activity hints across bounded Slot proposals.
 	// An error does not prove that no earlier proposal committed, so callers must retain the full batch for idempotent retry.
 	TouchConversationActiveAtBatch(context.Context, []metadb.ConversationActivePatch) error
+	// HideConversationsBatch durably advances UID-owned delete barriers through Slot ownership.
+	// An error does not prove that no earlier proposal committed.
+	HideConversationsBatch(context.Context, []metadb.ConversationDelete) error
 }
 
 type conversationAuthorityOptions struct {
@@ -39,7 +45,7 @@ type conversationAuthorityOptions struct {
 	AdmissionBatchRows int
 	// AdmissionConcurrency mirrors routed-client admission config and is retained for config compatibility.
 	AdmissionConcurrency int
-	// ActiveCooldown skips receiver-only active_at flushes newer than the durable row by less than this duration.
+	// ActiveCooldown coalesces receiver-only active_at persistence while the authority cache keeps the latest activity visible.
 	ActiveCooldown time.Duration
 	// FlushBatchRows bounds dirty rows per periodic, pressure-woken, and authority handoff flush attempt.
 	FlushBatchRows int
@@ -66,8 +72,26 @@ type conversationAuthority struct {
 	currentRouteTarget func(uint16) (conversationusecase.RouteTarget, bool)
 	// targets stores fenced authority state by full route target.
 	targets map[conversationAuthorityTargetKey]conversationAuthorityState
+	// admissions tracks cache mutations already accepted under each exact
+	// target so handoff can fence new work and wait only for that target.
+	admissions map[conversationAuthorityTargetKey]conversationAuthorityAdmissionState
 	// observer receives authority-specific cache/list/handoff observations.
 	observer conversationAuthorityObserver
+	// beforeActiveMutation is a deterministic test seam between exact-target
+	// validation and the runtime cache mutation. Production wiring leaves it nil.
+	beforeActiveMutation func()
+	restoreGateMu        sync.Mutex
+	restorePaused        bool
+	restoreInflight      int
+	restoreIdle          chan struct{}
+}
+
+// conversationAuthorityAdmissionState tracks in-flight cache mutations for one
+// exact authority target. idle is allocated only when a drain must wait and
+// closes exactly once when inFlight reaches zero.
+type conversationAuthorityAdmissionState struct {
+	inFlight int
+	idle     chan struct{}
 }
 
 // conversationActiveStoreAdapter adapts the app store surface to the runtime active cache store.
@@ -116,9 +140,9 @@ func (s conversationActiveStoreAdapter) store() conversationAuthorityStore {
 }
 
 type conversationAuthorityTargetKey struct {
-	// hashSlot is the logical UID hash slot.
+	// hashSlot is the physical UID hash slot.
 	hashSlot uint16
-	// slotID is the physical Slot that owns hashSlot.
+	// slotID is the logical Slot Raft Group that owns hashSlot.
 	slotID uint32
 	// leaderNodeID is the authority leader for this target.
 	leaderNodeID uint64
@@ -197,7 +221,7 @@ func newConversationAuthority(opts conversationAuthorityOptions) *conversationAu
 		opts.MaxRows = 100000
 	}
 	if opts.FlushBatchRows <= 0 {
-		opts.FlushBatchRows = 128
+		opts.FlushBatchRows = defaultConversationAuthorityFlushBatchRows
 	}
 	authority := &conversationAuthority{
 		localNodeID:        opts.LocalNodeID,
@@ -205,6 +229,7 @@ func newConversationAuthority(opts conversationAuthorityOptions) *conversationAu
 		flushBatchRows:     opts.FlushBatchRows,
 		currentRouteTarget: opts.CurrentRouteTarget,
 		targets:            make(map[conversationAuthorityTargetKey]conversationAuthorityState),
+		admissions:         make(map[conversationAuthorityTargetKey]conversationAuthorityAdmissionState),
 		observer:           opts.Observer,
 	}
 	var activeObserver conversationactive.Observer
@@ -224,9 +249,24 @@ func newConversationAuthority(opts conversationAuthorityOptions) *conversationAu
 
 // markActive marks a fenced target ready for local cache admission and list reads.
 func (a *conversationAuthority) markActive(target conversationusecase.RouteTarget) {
+	if a == nil {
+		return
+	}
+	key := targetKey(target)
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.setTargetStateLocked(targetKey(target), conversationAuthorityActive)
+	alreadyActive := a.targets[key] == conversationAuthorityActive
+	// Purge stale clean rows before publishing the target as active. Publishing
+	// first would allow a concurrent cooldown-suppressed admission to refresh a
+	// clean row that the subsequent purge could then discard.
+	purged := 0
+	if !alreadyActive && a.active != nil {
+		purged = a.active.PurgeCleanHashSlotStateOnly(target.HashSlot)
+	}
+	a.setTargetStateLocked(key, conversationAuthorityActive)
+	a.mu.Unlock()
+	if purged > 0 {
+		a.active.ObserveCacheState()
+	}
 }
 
 // markWarming marks a target as not yet safe to serve active-view reads.
@@ -241,23 +281,29 @@ func (a *conversationAuthority) AdmitPatches(ctx context.Context, target convers
 	if a == nil {
 		return nil
 	}
+	if err := a.beginRestoreMutation(); err != nil {
+		return err
+	}
+	defer a.endRestoreMutation()
 	defer func() {
 		a.observeAdmit(err)
 	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	err = a.ensureTarget(target)
-	if err != nil {
-		return err
-	}
 	activePatches, err := conversationActivePatches(patches)
 	if err != nil {
 		return err
 	}
 	if len(activePatches) == 0 {
-		return nil
+		return a.ensureTarget(target)
 	}
+	reserved, err := a.reserveAdmissionTarget(target)
+	if err != nil {
+		return err
+	}
+	defer a.releaseAdmissionTarget(reserved)
+	a.runBeforeActiveMutationHook()
 	err = mapConversationActiveError(a.active.MarkActiveForHashSlot(ctx, target.HashSlot, activePatches))
 	if errors.Is(err, conversationusecase.ErrCachePressure) {
 		a.observeCachePressure(conversationAuthorityPhaseAdmit, err)
@@ -270,24 +316,193 @@ func (a *conversationAuthority) AdmitActiveBatch(ctx context.Context, target con
 	if a == nil {
 		return nil
 	}
+	if err := a.beginRestoreMutation(); err != nil {
+		return err
+	}
+	defer a.endRestoreMutation()
 	defer func() {
 		a.observeAdmit(err)
 	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	err = a.ensureTarget(target)
-	if err != nil {
-		return err
-	}
 	if !validConversationKind(batch.Kind) {
 		return fmt.Errorf("internal/app: invalid conversation kind %d", batch.Kind)
 	}
+	reserved, err := a.reserveAdmissionTarget(target)
+	if err != nil {
+		return err
+	}
+	defer a.releaseAdmissionTarget(reserved)
+	a.runBeforeActiveMutationHook()
 	err = mapConversationActiveError(a.active.AdmitActiveBatchForHashSlot(ctx, target.HashSlot, batch))
 	if errors.Is(err, conversationusecase.ErrCachePressure) {
 		a.observeCachePressure(conversationAuthorityPhaseAdmit, err)
 	}
 	return err
+}
+
+// AdmitActiveBatches validates aligned exact-target groups and atomically
+// admits every valid sibling through one routed cache mutation. A stale group
+// retains its own result and does not discard independently valid groups.
+func (a *conversationAuthority) AdmitActiveBatches(ctx context.Context, groups []accessnode.ConversationActiveBatchGroup) []accessnode.ConversationActiveBatchResult {
+	results := make([]accessnode.ConversationActiveBatchResult, len(groups))
+	if a == nil || len(groups) == 0 {
+		return results
+	}
+	if err := a.beginRestoreMutation(); err != nil {
+		for index := range results {
+			results[index].Err = err
+		}
+		return results
+	}
+	defer a.endRestoreMutation()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	eligible := make([]bool, len(groups))
+	for index, group := range groups {
+		if !validConversationKind(group.Batch.Kind) {
+			results[index].Err = fmt.Errorf("internal/app: invalid conversation kind %d", group.Batch.Kind)
+			continue
+		}
+		eligible[index] = true
+	}
+
+	// The common active-target path takes the authority mutex once for exact
+	// validation and unique-target reservation. Lazy activation is retried only
+	// for stale local groups and ends in the same unified revalidation+reserve
+	// critical section. The mutex is never held across the cache mutation below.
+	lazyIndexes := make([]int, 0)
+	lazyEligible := make([]bool, len(groups))
+	reservedTargets := make([]conversationAuthorityTargetKey, 0, len(groups))
+	a.mu.Lock()
+	for index, group := range groups {
+		if !eligible[index] {
+			continue
+		}
+		err := a.ensureTargetKeyLocked(targetKey(group.Target))
+		if errors.Is(err, conversationusecase.ErrStaleRoute) && a.canLazyActivateTarget(group.Target) {
+			lazyIndexes = append(lazyIndexes, index)
+			lazyEligible[index] = true
+			results[index].Err = err
+			continue
+		}
+		results[index].Err = err
+	}
+	if len(lazyIndexes) == 0 {
+		reservedTargets = a.reserveValidAdmissionTargetsLocked(groups, eligible, results, reservedTargets)
+	}
+	a.mu.Unlock()
+	for _, index := range lazyIndexes {
+		results[index].Err = a.ensureTarget(groups[index].Target)
+	}
+	if len(lazyIndexes) > 0 {
+		// Lazy activation replaces any prior local target for the same hash slot.
+		// Revalidate and reserve every eligible sibling together so a target that
+		// changed during activation cannot reach the cache transaction.
+		a.mu.Lock()
+		for index, group := range groups {
+			if eligible[index] && (results[index].Err == nil || lazyEligible[index]) {
+				results[index].Err = a.ensureTargetKeyLocked(targetKey(group.Target))
+			}
+		}
+		reservedTargets = a.reserveValidAdmissionTargetsLocked(groups, eligible, results, reservedTargets)
+		a.mu.Unlock()
+	}
+
+	routed := make([]conversationactive.RoutedActiveBatch, 0, len(groups))
+	validIndexes := make([]int, 0, len(groups))
+	for index, group := range groups {
+		if results[index].Err != nil {
+			continue
+		}
+		validIndexes = append(validIndexes, index)
+		routed = append(routed, conversationactive.RoutedActiveBatch{HashSlot: group.Target.HashSlot, Batch: group.Batch})
+	}
+	if len(routed) > 0 {
+		a.runBeforeActiveMutationHook()
+		err := mapConversationActiveError(a.active.AdmitRoutedActiveBatches(ctx, routed))
+		if err != nil {
+			for _, index := range validIndexes {
+				results[index].Err = err
+			}
+		}
+	}
+	a.releaseAdmissionTargets(reservedTargets)
+	for _, result := range results {
+		a.observeAdmit(result.Err)
+		if errors.Is(result.Err, conversationusecase.ErrCachePressure) {
+			a.observeCachePressure(conversationAuthorityPhaseAdmit, result.Err)
+		}
+	}
+	return results
+}
+
+func (a *conversationAuthority) runBeforeActiveMutationHook() {
+	if a != nil && a.beforeActiveMutation != nil {
+		a.beforeActiveMutation()
+	}
+}
+
+// HideConversationsForTarget persists delete barriers through the exact local
+// authority and then reconciles the corresponding cache rows before success.
+func (a *conversationAuthority) HideConversationsForTarget(ctx context.Context, target conversationusecase.RouteTarget, deletes []metadb.ConversationDelete) (err error) {
+	if a == nil {
+		return conversationusecase.ErrRouteNotReady
+	}
+	if err := a.beginRestoreMutation(); err != nil {
+		return err
+	}
+	defer a.endRestoreMutation()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err = validateConversationDeletes(deletes); err != nil {
+		return err
+	}
+	if len(deletes) == 0 {
+		return nil
+	}
+	if a.store == nil {
+		return conversationusecase.ErrRouteNotReady
+	}
+	if err = a.ensureTarget(target); err != nil {
+		return err
+	}
+
+	deletes = append([]metadb.ConversationDelete(nil), deletes...)
+	err = mapConversationActiveError(a.store.HideConversationsBatch(ctx, deletes))
+	if err != nil {
+		// A bounded multi-proposal error can have an unknown committed prefix.
+		// Invalidate every requested baseline without treating an unconfirmed
+		// tail as deleted; durable hydration decides which barriers committed.
+		a.active.InvalidateConversationDeleteAttempts(deletes)
+		return err
+	}
+	a.active.ApplyConversationDeletes(deletes)
+	a.mu.Lock()
+	err = a.ensureTargetKeyLocked(targetKey(target))
+	a.mu.Unlock()
+	return err
+}
+
+func validateConversationDeletes(deletes []metadb.ConversationDelete) error {
+	var uid string
+	for _, req := range deletes {
+		if req.UID == "" || req.ChannelID == "" || req.ChannelType <= 0 || req.ChannelType > 255 || req.DeletedToSeq == 0 || !validConversationKind(req.Kind) {
+			return fmt.Errorf("internal/app: invalid conversation delete")
+		}
+		if uid == "" {
+			uid = req.UID
+			continue
+		}
+		if req.UID != uid {
+			return fmt.Errorf("internal/app: conversation deletes span multiple UIDs")
+		}
+	}
+	return nil
 }
 
 func (a *conversationAuthority) ensureTargetLocked(target conversationusecase.RouteTarget) error {
@@ -308,17 +523,129 @@ func (a *conversationAuthority) ensureTarget(target conversationusecase.RouteTar
 	if !errors.Is(err, conversationusecase.ErrStaleRoute) || !a.canLazyActivateTarget(target) {
 		return err
 	}
-	current, ok := a.currentRouteTarget(target.HashSlot)
-	if !ok || targetKey(current) != key {
-		return err
-	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if err := a.ensureTargetKeyLocked(key); err == nil {
+		a.mu.Unlock()
 		return nil
 	}
+	// Re-read the authoritative route only after serializing with lifecycle
+	// marks. Otherwise a newer markActive can win between the route lookup and
+	// this lazy activation, only to be overwritten by the stale target.
+	current, ok := a.currentRouteTarget(target.HashSlot)
+	if !ok || targetKey(current) != key {
+		a.mu.Unlock()
+		return err
+	}
+	purged := 0
+	if a.active != nil {
+		purged = a.active.PurgeCleanHashSlotStateOnly(target.HashSlot)
+	}
 	a.setTargetStateLocked(key, conversationAuthorityActive)
+	a.mu.Unlock()
+	if purged > 0 {
+		a.active.ObserveCacheState()
+	}
 	return nil
+}
+
+// reserveAdmissionTarget validates and reserves one exact target atomically on
+// the active fast path. Lazy activation always ends with the same locked
+// revalidation and reservation before the runtime cache can be mutated.
+func (a *conversationAuthority) reserveAdmissionTarget(target conversationusecase.RouteTarget) (conversationAuthorityTargetKey, error) {
+	if a == nil {
+		return conversationAuthorityTargetKey{}, conversationusecase.ErrRouteNotReady
+	}
+	key := targetKey(target)
+	a.mu.Lock()
+	err := a.ensureTargetKeyLocked(key)
+	if err == nil {
+		a.reserveAdmissionTargetKeyLocked(key)
+		a.mu.Unlock()
+		return key, nil
+	}
+	a.mu.Unlock()
+	if !errors.Is(err, conversationusecase.ErrStaleRoute) || !a.canLazyActivateTarget(target) {
+		return conversationAuthorityTargetKey{}, err
+	}
+	if err := a.ensureTarget(target); err != nil {
+		return conversationAuthorityTargetKey{}, err
+	}
+	a.mu.Lock()
+	err = a.ensureTargetKeyLocked(key)
+	if err == nil {
+		a.reserveAdmissionTargetKeyLocked(key)
+	}
+	a.mu.Unlock()
+	if err != nil {
+		return conversationAuthorityTargetKey{}, err
+	}
+	return key, nil
+}
+
+func (a *conversationAuthority) reserveValidAdmissionTargetsLocked(groups []accessnode.ConversationActiveBatchGroup, eligible []bool, results []accessnode.ConversationActiveBatchResult, reserved []conversationAuthorityTargetKey) []conversationAuthorityTargetKey {
+	for index, group := range groups {
+		if index >= len(eligible) || index >= len(results) || !eligible[index] || results[index].Err != nil {
+			continue
+		}
+		key := targetKey(group.Target)
+		if containsConversationAuthorityTargetKey(reserved, key) {
+			continue
+		}
+		a.reserveAdmissionTargetKeyLocked(key)
+		reserved = append(reserved, key)
+	}
+	return reserved
+}
+
+func (a *conversationAuthority) reserveAdmissionTargetKeyLocked(target conversationAuthorityTargetKey) {
+	state := a.admissions[target]
+	state.inFlight++
+	a.admissions[target] = state
+}
+
+func (a *conversationAuthority) releaseAdmissionTarget(target conversationAuthorityTargetKey) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.releaseAdmissionTargetKeyLocked(target)
+	a.mu.Unlock()
+}
+
+func (a *conversationAuthority) releaseAdmissionTargets(targets []conversationAuthorityTargetKey) {
+	if a == nil || len(targets) == 0 {
+		return
+	}
+	a.mu.Lock()
+	for _, target := range targets {
+		a.releaseAdmissionTargetKeyLocked(target)
+	}
+	a.mu.Unlock()
+}
+
+func (a *conversationAuthority) releaseAdmissionTargetKeyLocked(target conversationAuthorityTargetKey) {
+	state, ok := a.admissions[target]
+	if !ok || state.inFlight <= 0 {
+		return
+	}
+	state.inFlight--
+	if state.inFlight > 0 {
+		a.admissions[target] = state
+		return
+	}
+	delete(a.admissions, target)
+	if state.idle != nil {
+		close(state.idle)
+	}
+}
+
+func containsConversationAuthorityTargetKey(targets []conversationAuthorityTargetKey, target conversationAuthorityTargetKey) bool {
+	for _, existing := range targets {
+		if existing == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *conversationAuthority) canLazyActivateTarget(target conversationusecase.RouteTarget) bool {
@@ -343,8 +670,14 @@ func (a *conversationAuthority) ensureTargetKeyLocked(target conversationAuthori
 }
 
 func (a *conversationAuthority) setTargetStateLocked(target conversationAuthorityTargetKey, state conversationAuthorityState) {
-	for existing := range a.targets {
+	for existing, existingState := range a.targets {
 		if existing != target && a.sameLocalAuthorityTarget(existing, target) {
+			// A warming or draining successor must not discard an older drain
+			// that still owns accepted admission reservations. A newly active
+			// local tenure can safely take over those late cache mutations.
+			if existingState == conversationAuthorityDraining && state != conversationAuthorityActive {
+				continue
+			}
 			delete(a.targets, existing)
 		}
 	}
@@ -379,6 +712,70 @@ func (a *conversationAuthority) FlushActiveRows(ctx context.Context, limit int) 
 	return result, mapConversationActiveError(err)
 }
 
+func (a *conversationAuthority) resetAfterRestore() {
+	if a == nil {
+		return
+	}
+	// Route targets and admission counters remain valid topology state. The
+	// maintenance pause prevents new admissions while the worker drains, so
+	// only the data projection cache must be discarded.
+	a.active.ResetAfterRestore()
+}
+
+func (a *conversationAuthority) pauseForRestore(ctx context.Context) error {
+	if a == nil {
+		return nil
+	}
+	a.restoreGateMu.Lock()
+	a.restorePaused = true
+	idle := a.restoreIdle
+	if a.restoreInflight == 0 {
+		idle = nil
+	}
+	a.restoreGateMu.Unlock()
+	if idle == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-idle:
+		return nil
+	}
+}
+
+func (a *conversationAuthority) resumeAfterRestore() {
+	if a == nil {
+		return
+	}
+	a.restoreGateMu.Lock()
+	a.restorePaused = false
+	a.restoreGateMu.Unlock()
+}
+
+func (a *conversationAuthority) beginRestoreMutation() error {
+	a.restoreGateMu.Lock()
+	defer a.restoreGateMu.Unlock()
+	if a.restorePaused {
+		return conversationusecase.ErrRouteNotReady
+	}
+	if a.restoreInflight == 0 {
+		a.restoreIdle = make(chan struct{})
+	}
+	a.restoreInflight++
+	return nil
+}
+
+func (a *conversationAuthority) endRestoreMutation() {
+	a.restoreGateMu.Lock()
+	defer a.restoreGateMu.Unlock()
+	a.restoreInflight--
+	if a.restoreInflight == 0 && a.restoreIdle != nil {
+		close(a.restoreIdle)
+		a.restoreIdle = nil
+	}
+}
+
 // DrainAuthority marks the target draining and flushes runtime dirty rows for handoff.
 func (a *conversationAuthority) DrainAuthority(ctx context.Context, target conversationusecase.RouteTarget) (result conversationDrainResult, err error) {
 	if a == nil {
@@ -395,7 +792,7 @@ func (a *conversationAuthority) DrainAuthority(ctx context.Context, target conve
 	if err != nil {
 		return result, err
 	}
-	return a.flushDrainingAuthority(ctx, target.HashSlot)
+	return a.flushDrainingAuthority(ctx, target)
 }
 
 func (a *conversationAuthority) beginDrainAuthority(target conversationusecase.RouteTarget) (conversationDrainResult, error) {
@@ -423,20 +820,53 @@ func (a *conversationAuthority) finishDrainingAuthority(ctx context.Context, tar
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return a.flushDrainingAuthority(ctx, target.HashSlot)
+	return a.flushDrainingAuthority(ctx, target)
 }
 
-func (a *conversationAuthority) flushDrainingAuthority(ctx context.Context, hashSlot uint16) (conversationDrainResult, error) {
+func (a *conversationAuthority) flushDrainingAuthority(ctx context.Context, target conversationusecase.RouteTarget) (conversationDrainResult, error) {
+	targetKey := targetKey(target)
+	if err := a.waitForDrainingAdmissions(ctx, targetKey); err != nil {
+		if errors.Is(err, conversationusecase.ErrStaleRoute) {
+			return conversationDrainResultTransferred, nil
+		}
+		return conversationDrainResultBusy, err
+	}
 	selected := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return conversationDrainResultBusy, err
 		}
-		flush, flushErr := a.active.FlushHashSlot(ctx, hashSlot, a.flushBatchRows)
+		if err := a.ensureDrainingTarget(targetKey); err != nil {
+			if errors.Is(err, conversationusecase.ErrStaleRoute) {
+				return conversationDrainResultTransferred, nil
+			}
+			return conversationDrainResultBusy, err
+		}
+		flush, flushErr := a.active.FlushHashSlot(ctx, target.HashSlot, a.flushBatchRows)
 		if flushErr != nil {
 			return conversationDrainResultBusy, mapConversationActiveError(flushErr)
 		}
 		if flush.Selected == 0 {
+			// Keep the exact draining-target check and clean purge atomic with
+			// respect to markActive. An obsolete drain must never purge rows
+			// admitted by a newer local authority tenure for the same hash slot.
+			a.mu.Lock()
+			if err := a.ensureDrainingTargetKeyLocked(targetKey); err != nil {
+				a.mu.Unlock()
+				if errors.Is(err, conversationusecase.ErrStaleRoute) {
+					return conversationDrainResultTransferred, nil
+				}
+				return conversationDrainResultBusy, err
+			}
+			purged := a.active.PurgeCleanHashSlotStateOnly(target.HashSlot)
+			// The exact target is terminally drained. Retiring it in the same
+			// critical section prevents completed handoffs from accumulating
+			// across repeated unknown/remote route churn.
+			delete(a.targets, targetKey)
+			a.mu.Unlock()
+			if purged > 0 {
+				a.active.ObserveCacheState()
+			}
 			if selected == 0 {
 				return conversationDrainResultNoDirty, nil
 			}
@@ -444,6 +874,51 @@ func (a *conversationAuthority) flushDrainingAuthority(ctx context.Context, hash
 		}
 		selected += flush.Selected
 	}
+}
+
+func (a *conversationAuthority) waitForDrainingAdmissions(ctx context.Context, target conversationAuthorityTargetKey) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		a.mu.Lock()
+		if err := a.ensureDrainingTargetKeyLocked(target); err != nil {
+			a.mu.Unlock()
+			return err
+		}
+		state, ok := a.admissions[target]
+		if !ok || state.inFlight == 0 {
+			a.mu.Unlock()
+			return nil
+		}
+		if state.idle == nil {
+			state.idle = make(chan struct{})
+			a.admissions[target] = state
+		}
+		idle := state.idle
+		a.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-idle:
+		}
+	}
+}
+
+func (a *conversationAuthority) ensureDrainingTarget(target conversationAuthorityTargetKey) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ensureDrainingTargetKeyLocked(target)
+}
+
+func (a *conversationAuthority) ensureDrainingTargetKeyLocked(target conversationAuthorityTargetKey) error {
+	if target.leaderNodeID != 0 && target.leaderNodeID != a.localNodeID {
+		return conversationusecase.ErrNotLeader
+	}
+	if a.targets[target] != conversationAuthorityDraining {
+		return conversationusecase.ErrStaleRoute
+	}
+	return nil
 }
 
 // ListConversationActiveView is a conservative test/backward adapter for unscoped reads.
@@ -561,6 +1036,7 @@ func conversationActivePatches(patches []conversationusecase.ActivePatch) ([]con
 			ChannelType: uint8(patch.ChannelType),
 			ActiveAtMS:  patch.ActiveAt,
 			ReadSeq:     patch.ReadSeq,
+			MessageSeq:  patch.MessageSeq,
 		})
 	}
 	return activePatches, nil
@@ -580,6 +1056,11 @@ func mapConversationActiveError(err error) error {
 		return nil
 	}
 	switch {
+	case errors.Is(err, clusterpkg.ErrNotLeader), errors.Is(err, propose.ErrNotLeader):
+		return fmt.Errorf("%w: %w", conversationusecase.ErrNotLeader, err)
+	case errors.Is(err, clusterpkg.ErrRouteNotReady), errors.Is(err, clusterpkg.ErrNoSlotLeader),
+		errors.Is(err, propose.ErrProposalBackpressure), errors.Is(err, propose.ErrBackgroundProposalThrottled):
+		return fmt.Errorf("%w: %w", conversationusecase.ErrRouteNotReady, err)
 	case errors.Is(err, conversationactive.ErrCachePressure):
 		return conversationusecase.ErrCachePressure
 	case errors.Is(err, conversationactive.ErrStoreRequired):

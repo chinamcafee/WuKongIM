@@ -7,6 +7,7 @@ import (
 	"time"
 
 	pluginevents "github.com/WuKongIM/WuKongIM/internal/contracts/pluginevents"
+	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 )
 
@@ -46,6 +47,11 @@ type PersistAfterUsecase interface {
 // ReceiveUsecase runs one ReceiveOffline plugin hook invocation.
 type ReceiveUsecase interface {
 	ReceiveOffline(context.Context, pluginevents.ReceiveOffline) error
+}
+
+// ReceiveBatchUsecase runs one batch while applying timeout independently to each recipient.
+type ReceiveBatchUsecase interface {
+	ReceiveOfflineBatchWithTimeout(context.Context, pluginevents.ReceiveOfflineBatch, time.Duration) error
 }
 
 // Observer records enqueue and invoke outcomes for plugin hook runtime metrics.
@@ -89,18 +95,21 @@ type hookEventKind uint8
 const (
 	hookEventPersistAfter hookEventKind = iota + 1
 	hookEventReceive
+	hookEventReceiveBatch
 )
 
 type hookEvent struct {
 	kind         hookEventKind
 	persistAfter pluginevents.PersistAfterCommitted
 	receive      pluginevents.ReceiveOffline
+	receiveBatch pluginevents.ReceiveOfflineBatch
 }
 
 // Worker provides fail-open bounded admission for async plugin hook side effects.
 type Worker struct {
 	usecase        PersistAfterUsecase
 	receiveUsecase ReceiveUsecase
+	receiveBatch   ReceiveBatchUsecase
 	queueSize      int
 	workers        int
 	timeout        time.Duration
@@ -136,9 +145,16 @@ func NewWorker(opts Options) *Worker {
 			receiveUsecase = candidate
 		}
 	}
+	var receiveBatch ReceiveBatchUsecase
+	if candidate, ok := receiveUsecase.(ReceiveBatchUsecase); ok {
+		receiveBatch = candidate
+	} else if candidate, ok := opts.Usecase.(ReceiveBatchUsecase); ok {
+		receiveBatch = candidate
+	}
 	return &Worker{
 		usecase:        opts.Usecase,
 		receiveUsecase: receiveUsecase,
+		receiveBatch:   receiveBatch,
 		queueSize:      queueSize,
 		workers:        workers,
 		timeout:        timeout,
@@ -184,15 +200,15 @@ func (w *Worker) Start(ctx context.Context) error {
 	var runWG sync.WaitGroup
 	runWG.Add(w.workers)
 	for i := 0; i < w.workers; i++ {
-		go func() {
+		goruntimeregistry.SafeGo(nil, goruntimeregistry.TaskPluginHookWorker, func() {
 			defer runWG.Done()
 			w.runWorker(run)
-		}()
+		})
 	}
-	go func() {
+	goruntimeregistry.SafeGo(nil, goruntimeregistry.TaskPluginHookFinalize, func() {
 		runWG.Wait()
 		close(run.done)
-	}()
+	})
 	return nil
 }
 
@@ -226,6 +242,11 @@ func (w *Worker) EnqueuePersistAfter(_ context.Context, event pluginevents.Persi
 // EnqueueReceive clones the event and attempts bounded admission without failing the caller.
 func (w *Worker) EnqueueReceive(_ context.Context, event pluginevents.ReceiveOffline) {
 	w.enqueue(hookEvent{kind: hookEventReceive, receive: event.Clone()}, w.observeReceiveEnqueue)
+}
+
+// EnqueueReceiveBatch clones shared mutable fields once and admits the whole recipient batch.
+func (w *Worker) EnqueueReceiveBatch(_ context.Context, event pluginevents.ReceiveOfflineBatch) {
+	w.enqueue(hookEvent{kind: hookEventReceiveBatch, receiveBatch: event.Clone()}, w.observeReceiveEnqueue)
 }
 
 func (w *Worker) enqueue(event hookEvent, observe func(string, time.Duration)) {
@@ -308,7 +329,7 @@ func (w *Worker) beginStop() (*workerRun, error) {
 		if run != nil {
 			run.cancel()
 			close(run.acceptDone)
-			go w.finalizeRun(run)
+			goruntimeregistry.SafeGo(nil, goruntimeregistry.TaskPluginHookFinalize, func() { w.finalizeRun(run) })
 		}
 		return run, nil
 	case workerStateClosing:
@@ -363,7 +384,11 @@ func (w *Worker) invoke(runCtx context.Context, event hookEvent) {
 		w.observeInvoke(event.kind, result, time.Since(startedAt))
 	}()
 
-	invokeCtx, cancel := context.WithTimeout(runCtx, w.timeout)
+	invokeCtx := runCtx
+	cancel := func() {}
+	if event.kind != hookEventReceiveBatch {
+		invokeCtx, cancel = context.WithTimeout(runCtx, w.timeout)
+	}
 	defer cancel()
 
 	if err := w.invokeEvent(invokeCtx, event); err != nil {
@@ -390,6 +415,26 @@ func (w *Worker) invokeEvent(ctx context.Context, event hookEvent) error {
 			return errNilReceiveUsecase
 		}
 		return w.receiveUsecase.ReceiveOffline(ctx, event.receive)
+	case hookEventReceiveBatch:
+		if w.receiveBatch != nil {
+			return w.receiveBatch.ReceiveOfflineBatchWithTimeout(ctx, event.receiveBatch, w.timeout)
+		}
+		if w.receiveUsecase == nil {
+			return errNilReceiveUsecase
+		}
+		var joined error
+		for _, uid := range event.receiveBatch.UIDs {
+			itemCtx, cancel := context.WithTimeout(ctx, w.timeout)
+			err := w.receiveUsecase.ReceiveOffline(itemCtx, event.receiveBatch.ForUID(uid))
+			cancel()
+			if err != nil {
+				joined = errors.Join(joined, err)
+				if ctx.Err() != nil {
+					break
+				}
+			}
+		}
+		return joined
 	default:
 		return nil
 	}
@@ -424,7 +469,7 @@ func (w *Worker) observeInvoke(kind hookEventKind, result string, d time.Duratio
 		return
 	}
 	switch kind {
-	case hookEventReceive:
+	case hookEventReceive, hookEventReceiveBatch:
 		w.observer.ObserveReceiveInvoke(result, d)
 	default:
 		w.observer.ObservePersistAfterInvoke(result, d)

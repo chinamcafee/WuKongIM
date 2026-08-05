@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	clusternet "github.com/WuKongIM/WuKongIM/pkg/cluster/net"
+	controller "github.com/WuKongIM/WuKongIM/pkg/controller"
 )
 
 // ControlWriteApplier applies generic Controller writes.
@@ -23,6 +24,14 @@ type ControlWriteApplier interface {
 	RequestSlotReplicaMove(context.Context, SlotReplicaMoveRequest) (SlotReplicaMoveResult, error)
 	// PromoteControllerVoter submits an online Controller voter promotion.
 	PromoteControllerVoter(context.Context, PromoteControllerVoterRequest) (PromoteControllerVoterResult, error)
+}
+
+type scheduledBackupStateReplacer interface {
+	ReplaceScheduledBackupState(context.Context, uint64, controller.ScheduledBackupState) error
+}
+
+type opsMCPControlWriteApplier interface {
+	ReplaceOpsMCPState(context.Context, uint64, controller.OpsMCPState) error
 }
 
 // ControlWriteClient forwards generic Controller writes to a remote node.
@@ -101,6 +110,30 @@ func NewControlWriteHandler(applier ControlWriteApplier) clusternet.Handler {
 			resp.PromoteControllerVoter = result
 		case ControlWriteActionReportNodeHealth:
 			if err := applier.ReportNode(ctx, req.ReportNodeHealth); err != nil {
+				return encodeControlWriteErrorResponse(err)
+			}
+		case ControlWriteActionReplaceScheduledBackup:
+			replacer, ok := applier.(scheduledBackupStateReplacer)
+			if !ok {
+				return nil, fmt.Errorf("control write: scheduled backup replacement is unsupported")
+			}
+			if err := replacer.ReplaceScheduledBackupState(
+				ctx,
+				req.ReplaceScheduledBackup.ExpectedRevision,
+				req.ReplaceScheduledBackup.Replacement,
+			); err != nil {
+				return encodeControlWriteErrorResponse(err)
+			}
+		case ControlWriteActionReplaceOpsMCP:
+			opsMCPApplier, ok := applier.(opsMCPControlWriteApplier)
+			if !ok {
+				return nil, fmt.Errorf("control write: ops MCP replacement is unsupported")
+			}
+			if err := opsMCPApplier.ReplaceOpsMCPState(
+				ctx,
+				req.ReplaceOpsMCP.ExpectedRevision,
+				req.ReplaceOpsMCP.State,
+			); err != nil {
 				return encodeControlWriteErrorResponse(err)
 			}
 		default:

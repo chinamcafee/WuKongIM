@@ -165,6 +165,8 @@ func TestExactProviderConfigResolverBindsArtifactAndOptionalLocator(t *testing.T
 		`test "$(jq -er .region "$destination")" = "$artifact_region"`,
 		`test "$(jq -er .account_id_hash "$destination")" = "$artifact_account_id_hash"`,
 		`locator_name="cloud-sim-locator-${run_id}"`,
+		`gh api --paginate --slurp`,
+		`[.[] | .artifacts[]? | select(.expired == false)] | length`,
 		`test "$(jq -er .run_id "$temporary/locator/run-locator.json")" = "$run_id"`,
 		`case "$locator_count" in`,
 		`0)`,
@@ -258,7 +260,23 @@ func TestCloudSimulationWorkflowsPersistAndReuseDiscoveredProviderConfig(t *test
 		"go build -trimpath -o wkcloudsim ./cmd/wkcloudsim",
 		"discover-config --region \"$ALIBABA_REGION\" >provider.json",
 		"./scripts/cloud-sim/write-ssh-config.sh",
+		"source ./scripts/cloud-sim/ssh-retry.sh",
+		`echo "bootstrap_deadline_epoch=$((until_epoch - 180))" >>"$GITHUB_OUTPUT"`,
+		"WK_CLOUD_SSH_DEADLINE_EPOCH: ${{ steps.ingress.outputs.bootstrap_deadline_epoch }}",
 		"ssh_opts=(-F cloud-sim-ssh-config)",
+		"cloud_ssh_retry sim-ready 30 5 ssh",
+		"cloud_ssh_retry sim-upload 3 5 scp",
+		`cloud_ssh_retry "${role}-ready" 12 5 ssh`,
+		`cloud_ssh_retry "${role}-upload" 3 5 scp`,
+		`cloud_ssh_retry_capture "${role}-data-device" 3 5 ssh`,
+		`cloud_ssh_retry "${role}-install" 3 5 ssh`,
+		"cloud_ssh_retry_capture sim-data-device 3 5 ssh",
+		"cloud_ssh_retry sim-install 3 5 ssh",
+		"id: preserve_failed_provisioning",
+		"released=true",
+		`trap 'printf "released=%s\n" "$released" >>"$GITHUB_OUTPUT"' EXIT`,
+		"steps.preserve_failed_provisioning.outputs.released != 'true'",
+		"steps.preserve_failed_provisioning.outputs.released != 'true' && steps.create.outputs.sim_public != ''",
 		"ssh_opts=(-F cloud-sim-ssh-config -o ConnectTimeout=5)",
 		"name: cloud-sim-provider-config--${{ needs.build.outputs.run_id }}--${{ inputs.region }}--${{ steps.provider_config.outputs.account_hash_hex }}",
 		"retention-days: 90",
@@ -276,6 +294,15 @@ func TestCloudSimulationWorkflowsPersistAndReuseDiscoveredProviderConfig(t *test
 	if strings.Contains(provision, `ProxyJump=wukong@${SIM_PUBLIC}`) {
 		t.Fatal("provision workflow uses a ProxyJump whose connection does not pin the bootstrap identity")
 	}
+	transferStart := strings.Index(provision, "      - name: Transfer and install the same verified bundle on all hosts")
+	transferEnd := strings.Index(provision, "      - name: Prove Bootstrap Gate")
+	if transferStart < 0 || transferEnd <= transferStart {
+		t.Fatal("provision workflow does not retain the bounded transfer step")
+	}
+	transferStep := provision[transferStart:transferEnd]
+	if !strings.Contains(transferStep, "WK_CLOUD_SSH_DEADLINE_EPOCH: ${{ steps.ingress.outputs.bootstrap_deadline_epoch }}") {
+		t.Fatal("provision transfer step does not receive the bounded SSH deadline")
+	}
 
 	cleanup := read("cloud-sim-cleanup.yml")
 	for _, fragment := range []string{
@@ -292,6 +319,26 @@ func TestCloudSimulationWorkflowsPersistAndReuseDiscoveredProviderConfig(t *test
 	analyze := read("cloud-sim-analyze.yml")
 	if got := strings.Count(analyze, "resolve-exact-provider-config.sh"); got != 2 {
 		t.Fatalf("analysis provider config selector count = %d, want 2", got)
+	}
+	if got := strings.Count(analyze, "timeout 90s ./wkcloudsim --provider alibaba --provider-config provider.json open-analysis"); got != 2 {
+		t.Fatalf("bounded analysis ingress count = %d, want 2", got)
+	}
+	if got := strings.Count(analyze, "timeout 90s ./wkcloudsim --provider alibaba --provider-config provider.json close-analysis"); got != 3 {
+		t.Fatalf("bounded analysis ingress cleanup count = %d, want 3", got)
+	}
+	handoffStart := strings.Index(analyze, "      - name: Encrypt handoff and move ingress to local Codex")
+	handoffEnd := strings.Index(analyze, "      - name: Materialize terminal session state")
+	if handoffStart < 0 || handoffEnd <= handoffStart {
+		t.Fatal("analysis workflow does not retain the bounded handoff step")
+	}
+	handoff := analyze[handoffStart:handoffEnd]
+	closeIndex := strings.Index(handoff, `close-analysis "$RUN_ID"`)
+	openIndex := strings.Index(handoff, `open-analysis "$RUN_ID"`)
+	if closeIndex < 0 || openIndex <= closeIndex {
+		t.Fatal("analysis handoff does not close the previous /32 before opening its replacement")
+	}
+	if !strings.Contains(analyze, `curl --fail --silent --show-error --connect-timeout 5 --max-time 10 --proto '=https' --tlsv1.2 https://api.ipify.org`) {
+		t.Fatal("analysis runner public-IP discovery is not bounded")
 	}
 	if strings.Contains(analyze, "\n      PROVIDER_CONFIG_JSON: ${{ vars.ALIBABA_CLOUD_SIM_CONFIG_JSON }}") {
 		t.Fatal("analysis workflow still requires the setup-created provider config variable")

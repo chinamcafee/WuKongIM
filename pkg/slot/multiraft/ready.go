@@ -29,6 +29,11 @@ func (s *storageAdapter) load(ctx context.Context) (BootstrapState, raftpb.Snaps
 	if err != nil {
 		return BootstrapState{}, raftpb.Snapshot{}, nil, err
 	}
+	// Defensively start strictly after the authoritative snapshot even if a
+	// storage adapter reports an inconsistent earlier first index.
+	if !raft.IsEmptySnap(snap) && first <= snap.Metadata.Index {
+		first = snap.Metadata.Index + 1
+	}
 	last, err := s.storage.LastIndex(ctx)
 	if err != nil {
 		return BootstrapState{}, raftpb.Snapshot{}, nil, err
