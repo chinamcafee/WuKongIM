@@ -178,9 +178,10 @@ message.ChannelMessageQuery
 
 The reader adapter trims `limit+1` results to preserve the legacy `more`
 contract and returns messages to the usecase in ascending sequence order. It
-preserves the committed message setting bitset so the message usecase can
-enrich only stream messages with event projections; legacy HTTP-only field
-shaping remains in `internal/access/api`.
+preserves the committed message setting bitset and converts the committed
+server timestamp from milliseconds to the legacy Unix-seconds response field,
+so the message usecase can enrich only stream messages with event projections;
+legacy HTTP-only field shaping remains in `internal/access/api`.
 
 ## Message Event Projection Flow
 
