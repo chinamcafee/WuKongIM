@@ -2,6 +2,7 @@ package conversation
 
 import (
 	"context"
+	"math"
 	"sort"
 	"time"
 
@@ -49,13 +50,35 @@ func (a *App) Sync(ctx context.Context, query SyncQuery) (SyncResult, error) {
 	if err != nil {
 		return SyncResult{}, err
 	}
+	unreadRequests := make([]UnreadCountRequest, 0, len(keys))
+	for _, key := range keys {
+		candidate := candidates[key]
+		latest, ok := latestByKey[key]
+		if candidate == nil || !ok {
+			continue
+		}
+		floor := maxUint64(candidate.state.ReadSeq, candidate.state.DeletedToSeq)
+		if latest.MessageSeq > floor {
+			unreadRequests = append(unreadRequests, UnreadCountRequest{
+				ChannelID: key.ChannelID, ChannelType: key.ChannelType,
+				AfterSeq: floor, ThroughSeq: latest.MessageSeq,
+			})
+		}
+	}
+	unreadCounts, err := a.messages.CountUnreadMessages(ctx, query.UID, unreadRequests)
+	if err != nil {
+		return SyncResult{}, err
+	}
 	views := make([]syncConversationView, 0, len(keys))
 	for _, key := range keys {
 		latest, ok := latestByKey[key]
 		if !ok {
 			continue
 		}
-		view, ok := buildSyncConversationView(query, candidates[key], latest)
+		view, ok := buildSyncConversationView(
+			query, candidates[key], latest,
+			unreadCounts[metadb.ConversationKey{ChannelID: key.ChannelID, ChannelType: key.ChannelType}],
+		)
 		if !ok {
 			continue
 		}
@@ -165,7 +188,12 @@ func (a *App) loadSyncLatestMessages(ctx context.Context, keys []ConversationKey
 	return out, nil
 }
 
-func buildSyncConversationView(query SyncQuery, candidate *syncCandidate, latest LastMessage) (syncConversationView, bool) {
+func buildSyncConversationView(
+	query SyncQuery,
+	candidate *syncCandidate,
+	latest LastMessage,
+	exactUnread uint64,
+) (syncConversationView, bool) {
 	if candidate == nil || latest.MessageSeq == 0 {
 		return syncConversationView{}, false
 	}
@@ -176,14 +204,10 @@ func buildSyncConversationView(query SyncQuery, candidate *syncCandidate, latest
 	if latest.MessageSeq <= candidate.state.DeletedToSeq {
 		return syncConversationView{}, false
 	}
-	unread := 0
-	if latest.MessageSeq > baseReadedTo {
-		unread = int(latest.MessageSeq - baseReadedTo)
-	}
 	readedTo := baseReadedTo
-	if latest.FromUID == query.UID {
-		unread = 0
-		readedTo = latest.MessageSeq
+	unread := int(exactUnread)
+	if exactUnread > uint64(math.MaxInt) {
+		unread = math.MaxInt
 	}
 	if query.OnlyUnread && unread == 0 {
 		return syncConversationView{}, false

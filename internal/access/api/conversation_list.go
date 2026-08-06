@@ -39,13 +39,14 @@ type conversationListItem struct {
 }
 
 type conversationLastMessage struct {
-	MessageID         uint64 `json:"message_id"`
-	MessageIDStr      string `json:"message_idstr"`
-	MessageSeq        uint64 `json:"message_seq"`
-	FromUID           string `json:"from_uid"`
-	ClientMsgNo       string `json:"client_msg_no"`
-	ServerTimestampMS int64  `json:"server_timestamp_ms"`
-	Payload           []byte `json:"payload"`
+	Header            legacyMessageHeader `json:"header"`
+	MessageID         uint64              `json:"message_id"`
+	MessageIDStr      string              `json:"message_idstr"`
+	MessageSeq        uint64              `json:"message_seq"`
+	FromUID           string              `json:"from_uid"`
+	ClientMsgNo       string              `json:"client_msg_no"`
+	ServerTimestampMS int64               `json:"server_timestamp_ms"`
+	Payload           []byte              `json:"payload"`
 }
 
 func (s *Server) registerConversationRoutes() {
@@ -149,6 +150,11 @@ func newConversationListItem(uid string, item conversationusecase.Conversation) 
 	}
 	if item.LastMessage != nil {
 		out.LastMessage = &conversationLastMessage{
+			Header: legacyMessageHeader{
+				NoPersist: 0,
+				RedDot:    boolToInt(item.LastMessage.RedDot),
+				SyncOnce:  boolToInt(item.LastMessage.SyncOnce),
+			},
 			MessageID:         item.LastMessage.MessageID,
 			MessageIDStr:      strconv.FormatUint(item.LastMessage.MessageID, 10),
 			MessageSeq:        item.LastMessage.MessageSeq,

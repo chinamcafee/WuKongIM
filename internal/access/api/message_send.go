@@ -63,6 +63,8 @@ func (s *Server) registerMessageRoutes() {
 	s.engine.POST("/message/event", s.handleMessageEventAppend)
 	s.engine.POST("/message/sync", s.handleMessageSync)
 	s.engine.POST("/message/syncack", s.handleMessageSyncAck)
+	s.engine.POST("/v3/message/commands/sync", s.handleV3CommandSync)
+	s.engine.POST("/v3/message/commands/ack", s.handleV3CommandAck)
 	s.engine.POST("/channel/messagesync", s.handleChannelMessageSync)
 }
 
@@ -102,7 +104,7 @@ func (s *Server) handleSendMessage(c *gin.Context) {
 		writeSendJSONError(c, http.StatusBadRequest, "persist_timeout_ms requires wait_for_persist=1")
 		return
 	}
-	if req.WaitForPersist == 1 && (noPersist || requestScoped) {
+	if req.WaitForPersist == 1 && noPersist {
 		writeSendJSONError(c, http.StatusBadRequest, "this message mode cannot wait for persistence")
 		return
 	}

@@ -90,8 +90,8 @@ func TestSyncUsesReadDeleteFloorAndSortsDeterministically(t *testing.T) {
 		t.Fatalf("Sync(): %v", err)
 	}
 	if want := []messageLoadCall{
-		{key: CommandChannelKey{ChannelID: runtimechannelid.ToCommandChannel("b"), ChannelType: 2}, fromSeq: 4, limit: 10},
-		{key: CommandChannelKey{ChannelID: runtimechannelid.ToCommandChannel("a"), ChannelType: 2}, fromSeq: 1, limit: 10},
+		{key: CommandChannelKey{ChannelID: runtimechannelid.ToCommandChannel("b"), ChannelType: 2}, fromSeq: 4, limit: 11},
+		{key: CommandChannelKey{ChannelID: runtimechannelid.ToCommandChannel("a"), ChannelType: 2}, fromSeq: 1, limit: 11},
 	}; !reflect.DeepEqual(store.messageCalls, want) {
 		t.Fatalf("message calls = %#v, want %#v", store.messageCalls, want)
 	}
@@ -127,6 +127,144 @@ func TestSyncRecordsLatestGenerationOnly(t *testing.T) {
 	}
 	if len(store.upserts) != 1 || store.upserts[0].ChannelID != runtimechannelid.ToCommandChannel("new") || store.upserts[0].ReadSeq != 9 {
 		t.Fatalf("upserts = %+v, want latest generation only", store.upserts)
+	}
+}
+
+func TestBatchSyncReturnsExplicitCursorsAndMore(t *testing.T) {
+	store := newCmdSyncStore()
+	channelID := runtimechannelid.ToCommandChannel("g1")
+	store.active = []metadb.ConversationState{{
+		UID: "u1", Kind: metadb.ConversationKindCMD, ChannelID: channelID, ChannelType: 2, ActiveAt: 100,
+	}}
+	store.messages[CommandChannelKey{ChannelID: channelID, ChannelType: 2}] = []SyncedMessage{
+		{MessageID: 1, MessageSeq: 1, ChannelID: channelID, ChannelType: 2, ServerTimestampMS: 1, RedDot: true},
+		{MessageID: 2, MessageSeq: 2, ChannelID: channelID, ChannelType: 2, ServerTimestampMS: 2},
+	}
+	app := New(Options{States: store, Messages: store, DefaultLimit: 1, MaxLimit: 10})
+
+	got, err := app.BatchSync(context.Background(), BatchSyncQuery{UID: "u1", Limit: 1})
+	if err != nil {
+		t.Fatalf("BatchSync(): %v", err)
+	}
+	if got.BatchID == "" || !got.More || len(got.Messages) != 1 || got.Messages[0].ChannelID != "g1" || !got.Messages[0].RedDot {
+		t.Fatalf("batch = %#v, want one stripped red-dot message and more", got)
+	}
+	wantCursors := []AckCursor{{CommandChannelID: channelID, ChannelType: 2, ThroughSeq: 1}}
+	if !reflect.DeepEqual(got.AckCursors, wantCursors) {
+		t.Fatalf("ack cursors = %#v, want %#v", got.AckCursors, wantCursors)
+	}
+}
+
+func TestBatchAckSurvivesAppRecreationAndIsMonotonic(t *testing.T) {
+	store := newCmdSyncStore()
+	channelID := runtimechannelid.ToCommandChannel("g1")
+	store.active = []metadb.ConversationState{{
+		UID: "u1", Kind: metadb.ConversationKindCMD, ChannelID: channelID, ChannelType: 2, ActiveAt: 100,
+	}}
+	store.messages[CommandChannelKey{ChannelID: channelID, ChannelType: 2}] = []SyncedMessage{{
+		MessageID: 1, MessageSeq: 5, ChannelID: channelID, ChannelType: 2,
+	}}
+	firstApp := New(Options{States: store, Messages: store})
+	batch, err := firstApp.BatchSync(context.Background(), BatchSyncQuery{UID: "u1", Limit: 10})
+	if err != nil {
+		t.Fatalf("BatchSync(): %v", err)
+	}
+
+	recreatedApp := New(Options{States: store, Messages: store})
+	if err := recreatedApp.BatchAck(context.Background(), BatchAckCommand{
+		UID: "u1", BatchID: batch.BatchID, AckCursors: batch.AckCursors,
+	}); err != nil {
+		t.Fatalf("BatchAck() after app recreation: %v", err)
+	}
+	if len(store.upserts) != 1 || store.upserts[0].ChannelID != channelID || store.upserts[0].ReadSeq != 5 {
+		t.Fatalf("upserts = %#v, want command read seq 5", store.upserts)
+	}
+}
+
+func TestBatchSyncReplayReturnsSameDeterministicBatch(t *testing.T) {
+	store := newCmdSyncStore()
+	channelID := runtimechannelid.ToCommandChannel("g1")
+	store.active = []metadb.ConversationState{{
+		UID: "u1", Kind: metadb.ConversationKindCMD, ChannelID: channelID, ChannelType: 2, ActiveAt: 100,
+	}}
+	store.messages[CommandChannelKey{ChannelID: channelID, ChannelType: 2}] = []SyncedMessage{{
+		MessageID: 1, MessageSeq: 5, ChannelID: channelID, ChannelType: 2, Payload: []byte("cmd"),
+	}}
+	app := New(Options{States: store, Messages: store})
+
+	first, err := app.BatchSync(context.Background(), BatchSyncQuery{UID: "u1", Limit: 10})
+	if err != nil {
+		t.Fatalf("first BatchSync(): %v", err)
+	}
+	second, err := app.BatchSync(context.Background(), BatchSyncQuery{UID: "u1", Limit: 10})
+	if err != nil {
+		t.Fatalf("second BatchSync(): %v", err)
+	}
+	if first.BatchID == "" || first.BatchID != second.BatchID ||
+		!reflect.DeepEqual(first.AckCursors, second.AckCursors) ||
+		!reflect.DeepEqual(first.Messages, second.Messages) {
+		t.Fatalf("replayed batches differ: first=%#v second=%#v", first, second)
+	}
+}
+
+func TestBatchAckReplayAndNewerThenOlderAckRemainSafe(t *testing.T) {
+	store := newCmdSyncStore()
+	channelID := runtimechannelid.ToCommandChannel("g1")
+	key := CommandChannelKey{ChannelID: channelID, ChannelType: 2}
+	store.active = []metadb.ConversationState{{
+		UID: "u1", Kind: metadb.ConversationKindCMD, ChannelID: channelID, ChannelType: 2, ActiveAt: 100,
+	}}
+	store.messages[key] = []SyncedMessage{{
+		MessageID: 1, MessageSeq: 1, ChannelID: channelID, ChannelType: 2,
+	}}
+	app := New(Options{States: store, Messages: store})
+	oldBatch, err := app.BatchSync(context.Background(), BatchSyncQuery{UID: "u1", Limit: 10})
+	if err != nil {
+		t.Fatalf("old BatchSync(): %v", err)
+	}
+	store.messages[key] = append(store.messages[key], SyncedMessage{
+		MessageID: 2, MessageSeq: 2, ChannelID: channelID, ChannelType: 2,
+	})
+	newBatch, err := app.BatchSync(context.Background(), BatchSyncQuery{UID: "u1", Limit: 10})
+	if err != nil {
+		t.Fatalf("new BatchSync(): %v", err)
+	}
+
+	for _, batch := range []BatchSyncResult{newBatch, newBatch, oldBatch} {
+		if err := app.BatchAck(context.Background(), BatchAckCommand{
+			UID: "u1", BatchID: batch.BatchID, AckCursors: batch.AckCursors,
+		}); err != nil {
+			t.Fatalf("BatchAck(%s): %v", batch.BatchID, err)
+		}
+	}
+	if got := []uint64{
+		store.upserts[0].ReadSeq,
+		store.upserts[1].ReadSeq,
+		store.upserts[2].ReadSeq,
+	}; !reflect.DeepEqual(got, []uint64{2, 2, 1}) {
+		t.Fatalf("explicit ACK writes = %v, want newer/replay/older cursors; metadata max merge prevents regression", got)
+	}
+}
+
+func TestBatchAckRejectsTamperedOrDuplicateCursors(t *testing.T) {
+	store := newCmdSyncStore()
+	app := New(Options{States: store, Messages: store})
+	cursors := []AckCursor{{CommandChannelID: runtimechannelid.ToCommandChannel("g1"), ChannelType: 2, ThroughSeq: 5}}
+	records, err := syncRecordsFromAckCursors(cursors)
+	if err != nil {
+		t.Fatalf("syncRecordsFromAckCursors(): %v", err)
+	}
+	batchID := commandBatchID("u1", records)
+
+	if err := app.BatchAck(context.Background(), BatchAckCommand{
+		UID: "u1", BatchID: batchID, AckCursors: []AckCursor{{CommandChannelID: cursors[0].CommandChannelID, ChannelType: 2, ThroughSeq: 6}},
+	}); err != ErrBatchIDMismatch {
+		t.Fatalf("tampered BatchAck() error = %v, want %v", err, ErrBatchIDMismatch)
+	}
+	if err := app.BatchAck(context.Background(), BatchAckCommand{
+		UID: "u1", BatchID: batchID, AckCursors: append(cursors, cursors[0]),
+	}); err != ErrAckCursorInvalid {
+		t.Fatalf("duplicate BatchAck() error = %v, want %v", err, ErrAckCursorInvalid)
 	}
 }
 

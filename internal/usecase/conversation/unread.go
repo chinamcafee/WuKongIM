@@ -17,14 +17,18 @@ func (a *App) ClearUnread(ctx context.Context, cmd ClearUnreadCommand) error {
 		return err
 	}
 	key := ConversationKey{ChannelID: cmd.ChannelID, ChannelType: int64(cmd.ChannelType)}
-	latestSeq, ok, err := a.latestConversationSeq(ctx, key, cmd.MessageSeq)
+	latestSeq, ok, err := a.latestConversationSeq(ctx, key, 0)
 	if err != nil {
 		return err
 	}
 	if !ok || latestSeq == 0 {
 		return nil
 	}
-	return a.advanceReadSeq(ctx, cmd.UID, key, latestSeq)
+	target := latestSeq
+	if cmd.MessageSeq > 0 && cmd.MessageSeq < target {
+		target = cmd.MessageSeq
+	}
+	return a.advanceReadSeq(ctx, cmd.UID, key, target)
 }
 
 // SetUnread marks enough messages as read so at most cmd.Unread messages remain unread.

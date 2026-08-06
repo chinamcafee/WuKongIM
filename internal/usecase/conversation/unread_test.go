@@ -32,6 +32,57 @@ func TestClearUnreadAdvancesReadSeqToLatestMessage(t *testing.T) {
 	}
 }
 
+func TestClearUnreadWithExplicitSequenceDoesNotClearNewerConcurrentMessage(t *testing.T) {
+	now := time.Unix(0, 234)
+	store := newConversationMutationStore()
+	store.latest[metadb.ConversationKey{ChannelID: "g1", ChannelType: 2}] = LastMessage{MessageSeq: 14}
+	app := New(Options{Store: store, Messages: store, Now: func() time.Time { return now }})
+
+	if err := app.ClearUnread(context.Background(), ClearUnreadCommand{
+		UID: "u1", ChannelID: "g1", ChannelType: 2, MessageSeq: 12,
+	}); err != nil {
+		t.Fatalf("ClearUnread() error = %v", err)
+	}
+
+	if len(store.upserts) != 1 || store.upserts[0].ReadSeq != 12 {
+		t.Fatalf("upserts = %#v, want explicit read seq 12", store.upserts)
+	}
+}
+
+func TestClearUnreadClampsExplicitSequenceToLatestVisibleMessage(t *testing.T) {
+	store := newConversationMutationStore()
+	store.latest[metadb.ConversationKey{ChannelID: "g1", ChannelType: 2}] = LastMessage{MessageSeq: 14}
+	app := New(Options{Store: store, Messages: store})
+
+	if err := app.ClearUnread(context.Background(), ClearUnreadCommand{
+		UID: "u1", ChannelID: "g1", ChannelType: 2, MessageSeq: 99,
+	}); err != nil {
+		t.Fatalf("ClearUnread() error = %v", err)
+	}
+
+	if len(store.upserts) != 1 || store.upserts[0].ReadSeq != 14 {
+		t.Fatalf("upserts = %#v, want clamped read seq 14", store.upserts)
+	}
+}
+
+func TestClearUnreadNeverRegressesExistingReadSequence(t *testing.T) {
+	store := newConversationMutationStore()
+	key := ConversationKey{ChannelID: "g1", ChannelType: 2}
+	store.states[key] = metadb.ConversationState{Kind: metadb.ConversationKindNormal, ReadSeq: 13}
+	store.latest[metadb.ConversationKey{ChannelID: "g1", ChannelType: 2}] = LastMessage{MessageSeq: 14}
+	app := New(Options{Store: store, Messages: store})
+
+	if err := app.ClearUnread(context.Background(), ClearUnreadCommand{
+		UID: "u1", ChannelID: "g1", ChannelType: 2, MessageSeq: 12,
+	}); err != nil {
+		t.Fatalf("ClearUnread() error = %v", err)
+	}
+
+	if len(store.upserts) != 0 {
+		t.Fatalf("upserts = %#v, want no regression write", store.upserts)
+	}
+}
+
 func TestSetUnreadAdvancesReadSeqToKeepRequestedUnreadTail(t *testing.T) {
 	now := time.Unix(0, 456)
 	store := newConversationMutationStore()
@@ -108,6 +159,14 @@ func (s *conversationMutationStore) GetLastVisibleMessages(_ context.Context, re
 		if ok && msg.MessageSeq > req.VisibleAfterSeq {
 			out[key] = msg
 		}
+	}
+	return out, nil
+}
+
+func (s *conversationMutationStore) CountUnreadMessages(_ context.Context, _ string, requests []UnreadCountRequest) (map[metadb.ConversationKey]uint64, error) {
+	out := make(map[metadb.ConversationKey]uint64, len(requests))
+	for _, req := range requests {
+		out[metadb.ConversationKey{ChannelID: req.ChannelID, ChannelType: req.ChannelType}] = req.ThroughSeq - req.AfterSeq
 	}
 	return out, nil
 }

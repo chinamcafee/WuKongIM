@@ -97,6 +97,8 @@ type MessageUsecase interface {
 type CMDSyncUsecase interface {
 	Sync(context.Context, cmdsyncusecase.SyncQuery) (cmdsyncusecase.SyncResult, error)
 	SyncAck(context.Context, cmdsyncusecase.SyncAckCommand) error
+	BatchSync(context.Context, cmdsyncusecase.BatchSyncQuery) (cmdsyncusecase.BatchSyncResult, error)
+	BatchAck(context.Context, cmdsyncusecase.BatchAckCommand) error
 }
 
 // ConversationUsecase coordinates compatible conversation list and sync routes.

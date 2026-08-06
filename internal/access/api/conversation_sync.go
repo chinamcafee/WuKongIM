@@ -161,6 +161,11 @@ func newLegacyConversationResponse(uid string, item conversationusecase.SyncConv
 
 func newLegacyConversationRecentResp(uid string, msg conversationusecase.SyncMessage) legacyMessageResp {
 	return newLegacyMessageResp(uid, messageusecase.SyncedMessage{
+		Flags: messageusecase.MessageFlags{
+			NoPersist: false,
+			RedDot:    msg.RedDot,
+			SyncOnce:  msg.SyncOnce,
+		},
 		MessageID:   msg.MessageID,
 		ClientMsgNo: msg.ClientMsgNo,
 		MessageSeq:  msg.MessageSeq,

@@ -181,7 +181,8 @@ message.ChannelMessageQuery
 
 The reader adapter trims `limit+1` results to preserve the legacy `more`
 contract and returns messages to the usecase in ascending sequence order. It
-preserves the committed message setting bitset and converts the committed
+preserves the committed message setting bitset, Topic, Expire, RedDot, and
+SyncOnce fields and converts the committed
 server timestamp from milliseconds to the legacy Unix-seconds response field,
 so the message usecase can enrich only stream messages with event projections;
 legacy HTTP-only field shaping remains in `internal/access/api`.
@@ -219,22 +220,31 @@ layers or later phases.
 
 ```text
 cmdsync.Sync
-  -> ListConversationActivePage(ConversationKindCMD, uid)
+  -> ListConversationActivePage(ConversationKindCMD, uid, cursor) until done
   -> ReadChannelCommitted(command channel/source SyncOnce channel, forward from read cursor)
        -> page forward until enough SyncOnce/command-channel messages are found
   -> cmdsync.SyncedMessage
 
 cmdsync.SyncAck
   -> UpsertConversationStatesBatch(kind forced to ConversationKindCMD)
+
+cmdsync.BatchSync / BatchAck
+  -> the same durable reads and writes with explicit per-channel ACK cursors
 ```
 
 `CMDSyncStore` is the single internal adapter for durable command-message
 sync. It reads CMD rows from the unified UID-owned conversation projection and
 advances read progress by writing CMD-kind `ConversationState` rows back through
 cluster Slot metadata. It does not create a second CMD-specific metadata
-table or a pending overlay. Channel log reads use Channel runtime committed forward
+table or a pending overlay. The active-index limit is a per-page bound, not a
+total-channel cap: the adapter rejects a repeated cursor and continues until the
+authority reports `done`, so a channel outside the first page cannot starve.
+Channel log reads use Channel runtime committed forward
 reads, filter out ordinary source-channel messages, and return cloned payloads
 to keep access/usecase layers from aliasing storage-owned memory.
+The v3 batch contract is stateless at this adapter boundary: its batch digest
+and cursor validation live in the usecase, and metadata's monotonic merge keeps
+late or repeated ACK writes from regressing `ReadSeq`.
 
 ## Management Message Flow
 
@@ -627,6 +637,13 @@ conversation sync usecase
        -> ReadChannelCommitted(reverse, latest, paged)
        -> filter SyncOnce/CMD rows from ordinary legacy recents
        -> channel-owned committed rows used for legacy recents
+
+conversation exact unread hydration
+  -> CountUnreadMessages(uid, per-channel read/delete floor and visible tail)
+       -> ReadChannelCommitted(forward, floor + 1, visible tail, paged)
+       -> count only ordinary RedDot messages whose FromUID differs from uid
+       -> ignore sequence gaps, silent messages, SyncOnce/CMD rows, and self sends
+       -> bound parallel channel scans with MaxLastMessageConcurrency
 
 conversation read-state mutation usecase
   -> UpsertConversationStates(uid-owned normal-kind read row)

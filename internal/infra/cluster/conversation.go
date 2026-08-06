@@ -159,6 +159,142 @@ func (s *ConversationStore) GetLastVisibleMessages(ctx context.Context, requests
 	return out, nil
 }
 
+// CountUnreadMessages counts only ordinary, red-dot, non-self durable messages
+// in each requested read interval. Sequence gaps, silent messages, command
+// messages, and messages sent by the requesting UID never inflate unread.
+func (s *ConversationStore) CountUnreadMessages(
+	ctx context.Context,
+	uid string,
+	requests []conversationusecase.UnreadCountRequest,
+) (map[metadb.ConversationKey]uint64, error) {
+	out := make(map[metadb.ConversationKey]uint64, len(requests))
+	if len(requests) == 0 {
+		return out, nil
+	}
+	if s == nil || s.node == nil || uid == "" {
+		return nil, metadb.ErrNotFound
+	}
+	if s.maxLastMessageConcurrency > 1 && len(requests) > 1 {
+		return s.countUnreadMessagesConcurrent(ctx, uid, requests)
+	}
+	for _, req := range requests {
+		key, count, err := s.countUnreadMessages(ctx, uid, req)
+		if err != nil {
+			return nil, err
+		}
+		out[key] = count
+	}
+	return out, nil
+}
+
+func (s *ConversationStore) countUnreadMessagesConcurrent(
+	ctx context.Context,
+	uid string,
+	requests []conversationusecase.UnreadCountRequest,
+) (map[metadb.ConversationKey]uint64, error) {
+	workers := s.maxLastMessageConcurrency
+	if workers > len(requests) {
+		workers = len(requests)
+	}
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan conversationusecase.UnreadCountRequest)
+	out := make(map[metadb.ConversationKey]uint64, len(requests))
+	var outMu sync.Mutex
+	var firstErr error
+	var firstErrOnce sync.Once
+	setErr := func(err error) {
+		if err == nil {
+			return
+		}
+		firstErrOnce.Do(func() {
+			firstErr = err
+			cancel()
+		})
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		goruntimeregistry.SafeGo(nil, goruntimeregistry.TaskConversationBatchRead, func() {
+			defer wg.Done()
+			for req := range jobs {
+				key, count, err := s.countUnreadMessages(workCtx, uid, req)
+				if err != nil {
+					setErr(err)
+					continue
+				}
+				outMu.Lock()
+				out[key] = count
+				outMu.Unlock()
+			}
+		})
+	}
+send:
+	for _, req := range requests {
+		select {
+		case <-workCtx.Done():
+			break send
+		case jobs <- req:
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *ConversationStore) countUnreadMessages(
+	ctx context.Context,
+	uid string,
+	req conversationusecase.UnreadCountRequest,
+) (metadb.ConversationKey, uint64, error) {
+	if req.ChannelID == "" || req.ChannelType <= 0 || req.ChannelType > 255 ||
+		req.ThroughSeq <= req.AfterSeq || req.AfterSeq == maxUint64() {
+		return metadb.ConversationKey{}, 0,
+			fmt.Errorf("internal/infra/cluster: invalid conversation unread request")
+	}
+	key := metadb.ConversationKey{ChannelID: req.ChannelID, ChannelType: req.ChannelType}
+	nextSeq := req.AfterSeq + 1
+	var unread uint64
+	for nextSeq <= req.ThroughSeq {
+		if err := ctx.Err(); err != nil {
+			return metadb.ConversationKey{}, 0, err
+		}
+		read, err := s.node.ReadChannelCommitted(
+			ctx,
+			channelruntime.ChannelID{ID: req.ChannelID, Type: uint8(req.ChannelType)},
+			channelstore.ReadCommittedRequest{
+				FromSeq: nextSeq, MaxSeq: req.ThroughSeq,
+				Limit: conversationReadMaxPageLimit, MaxBytes: maxInt(),
+			},
+		)
+		if err != nil {
+			if isMissingLastMessage(err) {
+				return key, unread, nil
+			}
+			return metadb.ConversationKey{}, 0, err
+		}
+		for _, msg := range read.Messages {
+			if msg.MessageSeq <= req.AfterSeq || msg.MessageSeq > req.ThroughSeq {
+				continue
+			}
+			if isOrdinaryConversationMessage(msg) && msg.RedDot && msg.FromUID != uid {
+				unread++
+			}
+		}
+		if read.NextSeq == 0 || read.NextSeq <= nextSeq || read.NextSeq > req.ThroughSeq {
+			break
+		}
+		nextSeq = read.NextSeq
+	}
+	return key, unread, nil
+}
+
 func (s *ConversationStore) getLastVisibleMessagesConcurrent(ctx context.Context, requests []conversationusecase.LastVisibleMessageRequest) (map[metadb.ConversationKey]conversationusecase.LastMessage, error) {
 	workers := s.maxLastMessageConcurrency
 	if workers > len(requests) {
@@ -353,6 +489,8 @@ func (s *ConversationStore) readRecentOrdinaryMessages(ctx context.Context, key 
 
 func lastMessageFromChannel(msg channelruntime.Message) conversationusecase.LastMessage {
 	return conversationusecase.LastMessage{
+		RedDot:            msg.RedDot,
+		SyncOnce:          msg.SyncOnce,
 		MessageID:         msg.MessageID,
 		MessageSeq:        msg.MessageSeq,
 		FromUID:           msg.FromUID,
@@ -369,6 +507,8 @@ func syncMessagesFromChannel(messages []channelruntime.Message) []conversationus
 			continue
 		}
 		out = append(out, conversationusecase.SyncMessage{
+			RedDot:            msg.RedDot,
+			SyncOnce:          msg.SyncOnce,
 			MessageID:         msg.MessageID,
 			MessageSeq:        msg.MessageSeq,
 			FromUID:           msg.FromUID,

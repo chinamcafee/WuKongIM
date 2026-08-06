@@ -19,7 +19,8 @@ List(uid, cursor, limit)
   -> build current-page ordinary last-message requests with visible_after_seq = deleted_to_seq
   -> batch-read newest non-CMD visible messages from each channel-owned message log
   -> keep conversation rows whose channel has no visible last message
-  -> calculate unread as max(last_message_seq - max(read_seq, deleted_to_seq), 0)
+  -> scan the committed interval (max(read_seq, deleted_to_seq), last_message_seq]
+  -> count only ordinary red-dot messages whose sender differs from uid
   -> clone payloads before returning
 ```
 
@@ -43,8 +44,9 @@ Sync(uid, last_msg_seqs, msg_count, only_unread, excluded_types, limit)
   -> skip excluded channel types
   -> batch-read newest non-CMD channel messages for all candidate keys
   -> hide rows whose newest message is at or below deleted_to_seq
-  -> calculate unread from max(read_seq, deleted_to_seq)
-  -> suppress self-sent unread and apply only_unread
+  -> scan each committed interval above max(read_seq, deleted_to_seq)
+  -> count only ordinary red-dot messages whose sender differs from uid
+  -> apply only_unread to that exact count
   -> sort by newest message time, channel type, then channel id
   -> trim to the final limit
   -> load recent messages only for the final returned window when msg_count > 0
@@ -59,13 +61,21 @@ ordinary message is newer than the client-supplied sequence. Recent messages
 are filtered by the row delete floor, exclude CMD/SyncOnce messages, and are
 cloned before returning.
 
+Unread is not a sequence gap: silent `RedDot=false` entries, SyncOnce/CMD
+entries, sender-owned messages, delete-covered rows, and sequence gaps do not
+contribute. The cluster adapter pages committed channel logs and bounds parallel
+channel scans with the same conversation-read concurrency option. This exact
+scan is the correctness baseline; a future rebuildable red-dot ordinal can
+replace it if profiling shows large unread intervals need constant-time reads.
+
 ## Mutation Flow
 
 ```text
 ClearUnread(uid, channel, optional message_seq)
   -> read newest channel-owned visible message
-  -> fall back to the legacy message_seq when no newest message is available
-  -> upsert UID-owned ReadSeq to the latest known sequence
+  -> when message_seq > 0, clamp it to the newest visible sequence
+  -> when message_seq = 0, retain legacy clear-through-latest behavior
+  -> monotonically upsert UID-owned ReadSeq to that exact target
 
 SetUnread(uid, channel, unread)
   -> read newest channel-owned visible message

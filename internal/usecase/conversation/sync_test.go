@@ -129,6 +129,7 @@ func TestSyncPreservesUint64MessageSequences(t *testing.T) {
 	store.latest[ConversationKey{ChannelID: "g-u64", ChannelType: 2}] = LastMessage{
 		MessageSeq: want, FromUID: "u1", ServerTimestampMS: 1000,
 	}
+	store.unreadCounts[ConversationKey{ChannelID: "g-u64", ChannelType: 2}] = 0
 
 	got, err := New(Options{Store: store, StateStore: store, Messages: store}).Sync(
 		context.Background(), SyncQuery{UID: "u1"},
@@ -136,8 +137,29 @@ func TestSyncPreservesUint64MessageSequences(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sync(): %v", err)
 	}
-	if len(got.Conversations) != 1 || got.Conversations[0].LastMsgSeq != want || got.Conversations[0].ReadToMsgSeq != want {
+	if len(got.Conversations) != 1 || got.Conversations[0].LastMsgSeq != want || got.Conversations[0].ReadToMsgSeq != want-1 || got.Conversations[0].Unread != 0 {
 		t.Fatalf("conversation = %#v, want uint64 sequence %d", got.Conversations, want)
+	}
+}
+
+func TestSyncSaturatesExactUnreadAtPlatformMaxInt(t *testing.T) {
+	store := newConversationSyncStore()
+	key := ConversationKey{ChannelID: "g-overflow", ChannelType: 2}
+	store.active = []metadb.ConversationState{{
+		UID: "u1", Kind: metadb.ConversationKindNormal,
+		ChannelID: key.ChannelID, ChannelType: key.ChannelType, ActiveAt: 100,
+	}}
+	store.latest[key] = LastMessage{MessageSeq: 1, FromUID: "u2", ServerTimestampMS: 1000}
+	store.unreadCounts[key] = uint64(^uint(0)>>1) + 1
+
+	got, err := New(Options{Store: store, StateStore: store, Messages: store}).Sync(
+		context.Background(), SyncQuery{UID: "u1"},
+	)
+	if err != nil {
+		t.Fatalf("Sync(): %v", err)
+	}
+	if len(got.Conversations) != 1 || got.Conversations[0].Unread != int(^uint(0)>>1) {
+		t.Fatalf("conversation = %#v, want unread saturated at max int", got.Conversations)
 	}
 }
 
@@ -191,6 +213,7 @@ type conversationSyncStore struct {
 	states           map[metadb.ConversationKey]metadb.ConversationState
 	latest           map[ConversationKey]LastMessage
 	recents          map[ConversationKey][]SyncMessage
+	unreadCounts     map[ConversationKey]uint64
 	activeCalls      []activeViewCall
 	stateCalls       []stateCall
 	lastMessageCalls [][]LastVisibleMessageRequest
@@ -206,10 +229,24 @@ type stateCall struct {
 
 func newConversationSyncStore() *conversationSyncStore {
 	return &conversationSyncStore{
-		states:  make(map[metadb.ConversationKey]metadb.ConversationState),
-		latest:  make(map[ConversationKey]LastMessage),
-		recents: make(map[ConversationKey][]SyncMessage),
+		states:       make(map[metadb.ConversationKey]metadb.ConversationState),
+		latest:       make(map[ConversationKey]LastMessage),
+		recents:      make(map[ConversationKey][]SyncMessage),
+		unreadCounts: make(map[ConversationKey]uint64),
 	}
+}
+
+func (s *conversationSyncStore) CountUnreadMessages(_ context.Context, _ string, requests []UnreadCountRequest) (map[metadb.ConversationKey]uint64, error) {
+	out := make(map[metadb.ConversationKey]uint64, len(requests))
+	for _, req := range requests {
+		key := ConversationKey{ChannelID: req.ChannelID, ChannelType: req.ChannelType}
+		if count, ok := s.unreadCounts[key]; ok {
+			out[metadb.ConversationKey{ChannelID: key.ChannelID, ChannelType: key.ChannelType}] = count
+		} else {
+			out[metadb.ConversationKey{ChannelID: key.ChannelID, ChannelType: key.ChannelType}] = req.ThroughSeq - req.AfterSeq
+		}
+	}
+	return out, nil
 }
 
 func (s *conversationSyncStore) ListConversationActiveView(_ context.Context, kind metadb.ConversationKind, uid string, after metadb.ConversationActiveCursor, limit int) (ActiveViewPage, error) {

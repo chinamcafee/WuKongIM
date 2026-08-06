@@ -12,8 +12,10 @@ conversation, channel, user, or management business state directly. Channel
 management requests forward to the channel usecase supplied by the composition
 root, `/user*` requests forward to the user usecase, and compatible message
 send and channel-message sync requests forward to the message usecase.
-`/message/sync` and `/message/syncack` requests forward to the CMD sync
-usecase. `/conversation/list` and `/conversation/sync` requests forward to the
+Deprecated `/message/sync` and `/message/syncack` requests forward to the CMD
+sync compatibility usecase. `/v3/message/commands/sync` and
+`/v3/message/commands/ack` expose restart-safe explicit command batches.
+`/conversation/list` and `/conversation/sync` requests forward to the
 conversation usecase and keep ordering, cursor rules, sync candidate selection,
 and message reads out of the HTTP layer. When the composition root provides a
 benchmark data writer,
@@ -64,6 +66,8 @@ POST /message/send
 POST /message/event
 POST /message/sync
 POST /message/syncack
+POST /v3/message/commands/sync
+POST /v3/message/commands/ack
 POST /conversation/list
 POST /conversation/sync
 POST /conversations/clearUnread
@@ -175,6 +179,11 @@ envelopes while keeping CMD projection reads and read-cursor writes out of the
 HTTP layer. They operate on `ConversationKindCMD` rows from the shared UID-owned
 conversation projection and return only durable command messages, stripping one
 command-channel suffix from client-facing channel IDs when present.
+The v3 command routes return the same durable messages plus a deterministic
+`batch_id`, explicit per-command-channel `ack_channels`, and `more`. ACK
+revalidates the digest against those cursors and therefore does not depend on
+the process-local latest legacy sync generation. The two legacy routes remain
+registered for compatibility but are deprecated in OpenAPI.
 `/channel/messagesync` keeps the legacy response shape, converts canonical
 person-channel IDs back to the peer UID for the logged-in user, and maps message
 event summaries to the legacy `event_meta`, `event_sync_hint`, and stream fields
@@ -185,7 +194,9 @@ legacy envelopes.
 
 Durable `/message/send` requests require a non-empty `client_msg_no`. Internal
 callers may set `wait_for_persist=1` with a bounded `persist_timeout_ms` from
-100 through 10000 milliseconds (default 3000). The v3 send usecase already
+100 through 10000 milliseconds (default 3000). Durable request-scoped
+`subscribers + sync_once` sends may also wait for their derived command-channel
+commit. Only no-persist sends are rejected from wait mode. The v3 send usecase already
 returns after the configured Channel commit boundary, so this option reuses the
 same synchronous result and only adds a request deadline plus the durable
 receipt envelope. A matching retry returns the original id/sequence with
@@ -264,8 +275,9 @@ not by the HTTP adapter directly. The user adapter maps JSON into
 directly. The message adapter decodes legacy HTTP payloads and trace headers
 but leaves send orchestration, request-scoped command-channel derivation, and
 channel message reads to `internal/usecase/message`.
-The CMD sync adapter validates only request shape, UID presence, non-negative
-limits, and non-zero `last_message_seq` for syncack; CMD row selection,
+The CMD sync adapter validates request shape, UID presence, non-negative
+limits, legacy non-zero `last_message_seq`, v3 SHA-256 batch IDs, and bounded
+explicit ACK cursor arrays; CMD row selection,
 message ordering, command suffix stripping, and read-cursor writes over
 `ConversationKindCMD` stay in `internal/usecase/cmdsync`.
 The conversation adapter validates only request shape and UID presence; active

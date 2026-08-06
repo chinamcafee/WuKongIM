@@ -32,6 +32,40 @@ func TestCMDSyncStoreListsCMDKindOnly(t *testing.T) {
 	}
 }
 
+func TestCMDSyncStoreListsEveryCMDActivePage(t *testing.T) {
+	firstCursor := metadb.ConversationActiveCursor{ActiveAt: 200, ChannelID: "cmd-1____cmd", ChannelType: 2}
+	node := &cmdSyncNodeFake{
+		activePages: map[metadb.ConversationActiveCursor]cmdSyncActivePageFake{
+			{}: {
+				rows: []metadb.ConversationState{{
+					UID: "u1", Kind: metadb.ConversationKindCMD,
+					ChannelID: "cmd-1____cmd", ChannelType: 2, ActiveAt: 200,
+				}},
+				next: firstCursor,
+			},
+			firstCursor: {
+				rows: []metadb.ConversationState{{
+					UID: "u1", Kind: metadb.ConversationKindCMD,
+					ChannelID: "cmd-2____cmd", ChannelType: 2, ActiveAt: 100,
+				}},
+				done: true,
+			},
+		},
+	}
+	store := NewCMDSyncStore(node)
+
+	rows, err := store.ListConversationActiveView(context.Background(), "u1", 1)
+	if err != nil {
+		t.Fatalf("ListConversationActiveView(): %v", err)
+	}
+	if len(rows) != 2 || rows[0].ChannelID != "cmd-1____cmd" || rows[1].ChannelID != "cmd-2____cmd" {
+		t.Fatalf("rows = %+v, want every active page", rows)
+	}
+	if len(node.activeCalls) != 2 || node.activeCalls[0].limit != 1 || node.activeCalls[1].limit != 1 {
+		t.Fatalf("active calls = %#v, want two bounded pages", node.activeCalls)
+	}
+}
+
 func TestCMDSyncStoreUpsertsCMDKindRows(t *testing.T) {
 	node := &cmdSyncNodeFake{}
 	store := NewCMDSyncStore(node)
@@ -118,6 +152,7 @@ type cmdSyncActiveCallFake struct {
 
 type cmdSyncNodeFake struct {
 	rows         []metadb.ConversationState
+	activePages  map[metadb.ConversationActiveCursor]cmdSyncActivePageFake
 	activeCalls  []cmdSyncActiveCallFake
 	upserts      []metadb.ConversationState
 	lastReadID   channelruntime.ChannelID
@@ -127,8 +162,18 @@ type cmdSyncNodeFake struct {
 	readFromSeqs []uint64
 }
 
-func (n *cmdSyncNodeFake) ListConversationActivePage(_ context.Context, kind metadb.ConversationKind, uid string, _ metadb.ConversationActiveCursor, limit int) ([]metadb.ConversationState, metadb.ConversationActiveCursor, bool, error) {
+type cmdSyncActivePageFake struct {
+	rows []metadb.ConversationState
+	next metadb.ConversationActiveCursor
+	done bool
+}
+
+func (n *cmdSyncNodeFake) ListConversationActivePage(_ context.Context, kind metadb.ConversationKind, uid string, after metadb.ConversationActiveCursor, limit int) ([]metadb.ConversationState, metadb.ConversationActiveCursor, bool, error) {
 	n.activeCalls = append(n.activeCalls, cmdSyncActiveCallFake{kind: kind, uid: uid, limit: limit})
+	if n.activePages != nil {
+		page := n.activePages[after]
+		return cloneConversationStates(page.rows), page.next, page.done, nil
+	}
 	rows := make([]metadb.ConversationState, 0, len(n.rows))
 	for _, row := range n.rows {
 		if row.UID == uid && row.Kind == kind {

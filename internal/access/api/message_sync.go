@@ -87,6 +87,7 @@ func (s *Server) handleMessageSyncAck(c *gin.Context) {
 func cmdSyncMessageToLegacy(msg cmdsyncusecase.SyncedMessage) messageusecase.SyncedMessage {
 	return messageusecase.SyncedMessage{
 		Flags: messageusecase.MessageFlags{
+			RedDot:   msg.RedDot,
 			SyncOnce: msg.SyncOnce,
 		},
 		MessageID:   msg.MessageID,

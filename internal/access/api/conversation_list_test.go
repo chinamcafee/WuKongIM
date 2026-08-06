@@ -26,6 +26,8 @@ func TestConversationListMapsRequestToUsecaseAndReturnsPage(t *testing.T) {
 				UpdatedAt:    1235,
 				Unread:       4,
 				LastMessage: &conversationusecase.LastMessage{
+					RedDot:            true,
+					SyncOnce:          false,
 					MessageID:         99,
 					MessageSeq:        7,
 					FromUID:           "u2",
@@ -67,6 +69,7 @@ func TestConversationListMapsRequestToUsecaseAndReturnsPage(t *testing.T) {
 			"sparse_active":true,
 			"unread":4,
 			"last_message":{
+				"header":{"no_persist":0,"red_dot":1,"sync_once":0},
 				"message_id":99,
 				"message_idstr":"99",
 				"message_seq":7,
@@ -182,6 +185,7 @@ func TestConversationListReturnsPeerIDForPersonChannel(t *testing.T) {
 			"sparse_active":false,
 			"unread":0,
 			"last_message":{
+				"header":{"no_persist":0,"red_dot":0,"sync_once":0},
 				"message_id":100,
 				"message_idstr":"100",
 				"message_seq":8,

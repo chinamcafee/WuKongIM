@@ -83,11 +83,18 @@ func syncedMessagesFromChannel(in []channelruntime.Message) []message.SyncedMess
 	out := make([]message.SyncedMessage, 0, len(in))
 	for _, msg := range in {
 		out = append(out, message.SyncedMessage{
+			Flags: message.MessageFlags{
+				NoPersist: false,
+				RedDot:    msg.RedDot,
+				SyncOnce:  msg.SyncOnce,
+			},
 			MessageID:   msg.MessageID,
 			MessageSeq:  msg.MessageSeq,
 			ChannelID:   msg.ChannelID,
 			ChannelType: msg.ChannelType,
 			Setting:     msg.Setting,
+			Topic:       msg.Topic,
+			Expire:      msg.Expire,
 			FromUID:     msg.FromUID,
 			ClientMsgNo: msg.ClientMsgNo,
 			Timestamp:   int32(msg.ServerTimestampMS / 1000),

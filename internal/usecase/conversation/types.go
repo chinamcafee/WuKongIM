@@ -64,7 +64,7 @@ type SyncQuery struct {
 	Limit int
 }
 
-// ClearUnreadCommand advances a user's read cursor to the channel latest sequence.
+// ClearUnreadCommand advances a user's read cursor to an explicit visible sequence.
 type ClearUnreadCommand struct {
 	// UID identifies the user whose conversation read cursor should advance.
 	UID string
@@ -72,7 +72,8 @@ type ClearUnreadCommand struct {
 	ChannelID string
 	// ChannelType identifies the protocol channel category.
 	ChannelType uint8
-	// MessageSeq is a legacy client-supplied latest sequence fallback.
+	// MessageSeq is the exact client-displayed sequence. Zero preserves the legacy
+	// clear-through-latest behavior.
 	MessageSeq uint64
 }
 
@@ -102,6 +103,10 @@ type DeleteConversationCommand struct {
 
 // LastMessage is the newest visible durable message for a conversation row.
 type LastMessage struct {
+	// RedDot reports whether this durable message contributes to unread UI state.
+	RedDot bool
+	// SyncOnce reports whether this message belongs to one-shot command sync.
+	SyncOnce bool
 	// MessageID is the durable message id.
 	MessageID uint64
 	// MessageSeq is the channel-local message sequence.
@@ -118,6 +123,10 @@ type LastMessage struct {
 
 // SyncMessage is one recent message returned by legacy-compatible conversation sync.
 type SyncMessage struct {
+	// RedDot reports whether this durable message contributes to unread UI state.
+	RedDot bool
+	// SyncOnce reports whether this message belongs to one-shot command sync.
+	SyncOnce bool
 	// MessageID is the durable message id.
 	MessageID uint64
 	// MessageSeq is the channel-local message sequence.
@@ -142,7 +151,8 @@ type SyncConversation struct {
 	ChannelID string
 	// ChannelType identifies the protocol channel category.
 	ChannelType uint8
-	// Unread is the unread message count derived from read/delete floors.
+	// Unread counts committed ordinary red-dot messages from another sender above
+	// the effective read/delete floor.
 	Unread int
 	// Timestamp is the latest message timestamp in Unix seconds.
 	Timestamp int64
@@ -186,7 +196,8 @@ type Conversation struct {
 	UpdatedAt int64
 	// LastMessage is the newest visible message for display, when one exists.
 	LastMessage *LastMessage
-	// Unread is the first-version unread count derived from row read state and the last message sequence.
+	// Unread counts committed ordinary red-dot messages from another sender above
+	// the effective read/delete floor.
 	Unread uint64
 }
 

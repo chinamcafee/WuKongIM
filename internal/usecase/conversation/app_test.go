@@ -118,6 +118,30 @@ func TestListCalculatesUnreadFromReadAndDeletedFloor(t *testing.T) {
 	}
 }
 
+func TestListUsesExactRedDotUnreadCountFromMessageStore(t *testing.T) {
+	key := metadb.ConversationKey{ChannelID: "g-a", ChannelType: 2}
+	store := &recordingActiveStore{rows: []metadb.ConversationState{{
+		UID: "u1", Kind: metadb.ConversationKindNormal,
+		ChannelID: "g-a", ChannelType: 2, ActiveAt: 100, ReadSeq: 5,
+	}}}
+	messages := &recordingMessageStore{
+		rows: map[metadb.ConversationKey]LastMessage{
+			key: {MessageSeq: 10, FromUID: "u2"},
+		},
+		unreadCounts: map[metadb.ConversationKey]uint64{key: 1},
+	}
+
+	got, err := New(Options{Store: store, Messages: messages}).List(
+		context.Background(), ListRequest{UID: "u1"},
+	)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(got.Items) != 1 || got.Items[0].Unread != 1 {
+		t.Fatalf("items = %#v, want exact unread 1 instead of sequence gap 5", got.Items)
+	}
+}
+
 func TestListReturnsConversationWhenLastMessageMissing(t *testing.T) {
 	store := &recordingActiveStore{
 		rows: []metadb.ConversationState{
@@ -349,8 +373,22 @@ func (s *dbStyleActiveViewStore) ListConversationActiveView(_ context.Context, k
 }
 
 type recordingMessageStore struct {
-	rows  map[metadb.ConversationKey]LastMessage
-	calls [][]LastVisibleMessageRequest
+	rows         map[metadb.ConversationKey]LastMessage
+	unreadCounts map[metadb.ConversationKey]uint64
+	calls        [][]LastVisibleMessageRequest
+}
+
+func (s *recordingMessageStore) CountUnreadMessages(_ context.Context, _ string, requests []UnreadCountRequest) (map[metadb.ConversationKey]uint64, error) {
+	out := make(map[metadb.ConversationKey]uint64, len(requests))
+	for _, req := range requests {
+		key := metadb.ConversationKey{ChannelID: req.ChannelID, ChannelType: req.ChannelType}
+		if count, ok := s.unreadCounts[key]; ok {
+			out[key] = count
+		} else {
+			out[key] = req.ThroughSeq - req.AfterSeq
+		}
+	}
+	return out, nil
 }
 
 func (s *recordingMessageStore) GetLastVisibleMessages(_ context.Context, requests []LastVisibleMessageRequest) (map[metadb.ConversationKey]LastMessage, error) {

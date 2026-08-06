@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/WuKongIM/WuKongIM/internal/usecase/cmdsync"
 	channelruntime "github.com/WuKongIM/WuKongIM/pkg/channel"
@@ -11,6 +12,8 @@ import (
 )
 
 const cmdSyncReadPageLimit = 256
+const cmdSyncActivePageLimit = 2000
+const cmdSyncMaxActivePages = 10000
 
 // CMDSyncNode exposes cluster reads and writes needed by CMD sync.
 type CMDSyncNode interface {
@@ -37,11 +40,28 @@ func (s *CMDSyncStore) ListConversationActiveView(ctx context.Context, uid strin
 	if s == nil || s.node == nil {
 		return nil, metadb.ErrNotFound
 	}
-	rows, _, _, err := s.node.ListConversationActivePage(ctx, metadb.ConversationKindCMD, uid, metadb.ConversationActiveCursor{}, limit)
-	if err != nil {
-		return nil, err
+	if limit <= 0 {
+		limit = cmdSyncActivePageLimit
 	}
-	return cloneConversationStates(rows), nil
+	rows := make([]metadb.ConversationState, 0, limit)
+	cursor := metadb.ConversationActiveCursor{}
+	for page := 0; page < cmdSyncMaxActivePages; page++ {
+		pageRows, nextCursor, done, err := s.node.ListConversationActivePage(
+			ctx, metadb.ConversationKindCMD, uid, cursor, limit,
+		)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, pageRows...)
+		if done {
+			return cloneConversationStates(rows), nil
+		}
+		if nextCursor == (metadb.ConversationActiveCursor{}) || nextCursor == cursor {
+			return nil, fmt.Errorf("internal/infra/cluster: cmd active cursor did not advance")
+		}
+		cursor = nextCursor
+	}
+	return nil, fmt.Errorf("internal/infra/cluster: cmd active scan exceeded %d pages", cmdSyncMaxActivePages)
 }
 
 // UpsertConversationStates advances CMD-kind read state in the unified projection.
@@ -118,6 +138,7 @@ func cmdSyncedMessageFromChannel(msg channelruntime.Message) cmdsync.SyncedMessa
 		FromUID:           msg.FromUID,
 		ClientMsgNo:       msg.ClientMsgNo,
 		ServerTimestampMS: msg.ServerTimestampMS,
+		RedDot:            msg.RedDot,
 		SyncOnce:          msg.SyncOnce || runtimechannelid.IsCommandChannel(msg.ChannelID),
 		Payload:           append([]byte(nil), msg.Payload...),
 	}

@@ -98,6 +98,7 @@ func TestConversationStoreReadsLastVisibleMessages(t *testing.T) {
 				ChannelType:       2,
 				FromUID:           "u2",
 				ClientMsgNo:       "client-12",
+				RedDot:            true,
 				ServerTimestampMS: 900,
 				Payload:           []byte("visible"),
 			}, ok: true},
@@ -123,7 +124,7 @@ func TestConversationStoreReadsLastVisibleMessages(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing visible message for %#v", keyA)
 	}
-	if msg.MessageID != 12 || msg.MessageSeq != 12 || msg.FromUID != "u2" || msg.ClientMsgNo != "client-12" || msg.ServerTimestampMS != 900 || string(msg.Payload) != "visible" {
+	if msg.MessageID != 12 || msg.MessageSeq != 12 || msg.FromUID != "u2" || msg.ClientMsgNo != "client-12" || !msg.RedDot || msg.SyncOnce || msg.ServerTimestampMS != 900 || string(msg.Payload) != "visible" {
 		t.Fatalf("last message = %#v, want durable channel message fields", msg)
 	}
 	if _, ok := got[metadb.ConversationKey{ChannelID: "g-b", ChannelType: 2}]; ok {
@@ -216,6 +217,7 @@ func TestConversationStoreReadsDurableStateAndRecentMessages(t *testing.T) {
 					ChannelType:       2,
 					FromUID:           "u2",
 					ClientMsgNo:       "client-12",
+					RedDot:            true,
 					ServerTimestampMS: 900,
 					Payload:           []byte("recent"),
 				},
@@ -233,7 +235,7 @@ func TestConversationStoreReadsDurableStateAndRecentMessages(t *testing.T) {
 		t.Fatalf("GetRecentMessages() error = %v", err)
 	}
 	key := conversationusecase.ConversationKey{ChannelID: "g-a", ChannelType: 2}
-	if len(recent[key]) != 1 || recent[key][0].MessageID != 12 || string(recent[key][0].Payload) != "recent" {
+	if len(recent[key]) != 1 || recent[key][0].MessageID != 12 || !recent[key][0].RedDot || recent[key][0].SyncOnce || string(recent[key][0].Payload) != "recent" {
 		t.Fatalf("recent messages = %#v, want durable fields", recent[key])
 	}
 	recent[key][0].Payload[0] = 'X'
@@ -249,6 +251,73 @@ func TestConversationStoreReadsDurableStateAndRecentMessages(t *testing.T) {
 		{channelID: channelruntime.ChannelID{ID: "g-a", Type: 2}, req: channelstore.ReadCommittedRequest{FromSeq: maxUint64(), MaxSeq: maxUint64(), Limit: conversationReadMinPageLimit, MaxBytes: maxInt(), Reverse: true}},
 	}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("committed calls = %#v, want %#v", got, want)
+	}
+}
+
+func TestConversationStoreCountsOnlyIncomingRedDotOrdinaryMessages(t *testing.T) {
+	node := &conversationNodeFake{
+		committed: map[metadb.ConversationKey][]channelruntime.Message{
+			{ChannelID: "g-a", ChannelType: 2}: {
+				{MessageSeq: 6, ChannelID: "g-a", ChannelType: 2, FromUID: "u2", RedDot: false},
+				{MessageSeq: 7, ChannelID: "g-a", ChannelType: 2, FromUID: "u2", RedDot: true},
+				{MessageSeq: 8, ChannelID: "g-a", ChannelType: 2, FromUID: "u1", RedDot: true},
+				{MessageSeq: 9, ChannelID: "g-a", ChannelType: 2, FromUID: "u2", RedDot: true, SyncOnce: true},
+				{MessageSeq: 10, ChannelID: "g-a", ChannelType: 2, FromUID: "u3", RedDot: false},
+			},
+		},
+	}
+	store := NewConversationStore(node)
+
+	got, err := store.CountUnreadMessages(
+		context.Background(),
+		"u1",
+		[]conversationusecase.UnreadCountRequest{{
+			ChannelID: "g-a", ChannelType: 2, AfterSeq: 5, ThroughSeq: 10,
+		}},
+	)
+	if err != nil {
+		t.Fatalf("CountUnreadMessages() error = %v", err)
+	}
+	key := metadb.ConversationKey{ChannelID: "g-a", ChannelType: 2}
+	if got[key] != 1 {
+		t.Fatalf("unread = %d, want only incoming red-dot ordinary message", got[key])
+	}
+	if got, want := node.committedCalls, []committedCallFake{{
+		channelID: channelruntime.ChannelID{ID: "g-a", Type: 2},
+		req: channelstore.ReadCommittedRequest{
+			FromSeq: 6, MaxSeq: 10, Limit: conversationReadMaxPageLimit, MaxBytes: maxInt(),
+		},
+	}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("committed calls = %#v, want %#v", got, want)
+	}
+}
+
+func TestConversationStorePagesExactUnreadIntervalWithoutLosingMessages(t *testing.T) {
+	messages := make([]channelruntime.Message, 0, 300)
+	for seq := uint64(1); seq <= 300; seq++ {
+		messages = append(messages, channelruntime.Message{
+			MessageSeq: seq, ChannelID: "g-paged", ChannelType: 2,
+			FromUID: "u2", RedDot: true,
+		})
+	}
+	node := &conversationNodeFake{committed: map[metadb.ConversationKey][]channelruntime.Message{
+		{ChannelID: "g-paged", ChannelType: 2}: messages,
+	}}
+	store := NewConversationStore(node)
+
+	got, err := store.CountUnreadMessages(context.Background(), "u1", []conversationusecase.UnreadCountRequest{{
+		ChannelID: "g-paged", ChannelType: 2, AfterSeq: 0, ThroughSeq: 300,
+	}})
+	if err != nil {
+		t.Fatalf("CountUnreadMessages() error = %v", err)
+	}
+	if count := got[metadb.ConversationKey{ChannelID: "g-paged", ChannelType: 2}]; count != 300 {
+		t.Fatalf("unread = %d, want all 300 paged messages", count)
+	}
+	if len(node.committedCalls) != 2 ||
+		node.committedCalls[0].req.FromSeq != 1 ||
+		node.committedCalls[1].req.FromSeq != 257 {
+		t.Fatalf("committed calls = %#v, want forward pages from 1 then 257", node.committedCalls)
 	}
 }
 
@@ -407,11 +476,22 @@ func (n *conversationNodeFake) ReadChannelCommitted(_ context.Context, id channe
 	if !ok {
 		return channelstore.ReadCommittedResult{}, channelruntime.ErrChannelNotFound
 	}
-	out := append([]channelruntime.Message(nil), messages...)
+	out := make([]channelruntime.Message, 0, len(messages))
+	for _, message := range messages {
+		if !req.Reverse && (message.MessageSeq < req.FromSeq || message.MessageSeq > req.MaxSeq) {
+			continue
+		}
+		out = append(out, message)
+	}
+	var nextSeq uint64
+	if !req.Reverse && req.Limit > 0 && len(out) > req.Limit {
+		out = out[:req.Limit]
+		nextSeq = out[len(out)-1].MessageSeq + 1
+	}
 	for i := range out {
 		out[i].Payload = append([]byte(nil), out[i].Payload...)
 	}
-	return channelstore.ReadCommittedResult{Messages: out}, nil
+	return channelstore.ReadCommittedResult{Messages: out, NextSeq: nextSeq}, nil
 }
 
 func TestConversationStorePropagatesLastMessageRouteErrors(t *testing.T) {

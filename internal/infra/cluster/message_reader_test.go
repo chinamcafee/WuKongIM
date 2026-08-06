@@ -12,7 +12,7 @@ import (
 func TestChannelMessageReaderMapsPullUpRequestAndTrimsHasMore(t *testing.T) {
 	node := &recordingReadNode{
 		result: channelstore.ReadCommittedResult{Messages: []channelruntime.Message{
-			{MessageID: 10, MessageSeq: 2, ChannelID: "g1", ChannelType: 2, Setting: 2, FromUID: "u1", ClientMsgNo: "c1", ServerTimestampMS: 1713859200123, Payload: []byte("a")},
+			{MessageID: 10, MessageSeq: 2, ChannelID: "g1", ChannelType: 2, Setting: 2, Topic: "topic-a", Expire: 60, RedDot: true, SyncOnce: true, FromUID: "u1", ClientMsgNo: "c1", ServerTimestampMS: 1713859200123, Payload: []byte("a")},
 			{MessageID: 11, MessageSeq: 3, ChannelID: "g1", ChannelType: 2, FromUID: "u1", ClientMsgNo: "c2", Payload: []byte("b")},
 			{MessageID: 12, MessageSeq: 4, ChannelID: "g1", ChannelType: 2, FromUID: "u1", ClientMsgNo: "c3", Payload: []byte("c")},
 		}},
@@ -44,6 +44,12 @@ func TestChannelMessageReaderMapsPullUpRequestAndTrimsHasMore(t *testing.T) {
 	}
 	if page.Messages[0].Setting != 2 {
 		t.Fatalf("message setting = %d, want 2", page.Messages[0].Setting)
+	}
+	if page.Messages[0].Flags.NoPersist || !page.Messages[0].Flags.RedDot || !page.Messages[0].Flags.SyncOnce {
+		t.Fatalf("message flags = %#v, want durable red-dot sync-once", page.Messages[0].Flags)
+	}
+	if page.Messages[0].Topic != "topic-a" || page.Messages[0].Expire != 60 {
+		t.Fatalf("topic/expire = %q/%d, want topic-a/60", page.Messages[0].Topic, page.Messages[0].Expire)
 	}
 	if page.Messages[0].Timestamp != 1713859200 {
 		t.Fatalf("message timestamp = %d, want committed timestamp in Unix seconds", page.Messages[0].Timestamp)

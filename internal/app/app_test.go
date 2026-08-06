@@ -2476,11 +2476,23 @@ func TestManagerServerListsRecentConversationsFromConversationUsecase(t *testing
 			}},
 		},
 		conversationMessages: map[metadb.ConversationKey][]channelruntime.Message{
-			{ChannelID: "g1", ChannelType: 2}: {{
-				MessageID: 99, MessageSeq: 7, ClientMsgNo: "c7",
-				ChannelID: "g1", ChannelType: 2, FromUID: "u2",
-				ServerTimestampMS: 200000, Payload: []byte("hello"),
-			}},
+			{ChannelID: "g1", ChannelType: 2}: {
+				{
+					MessageID: 97, MessageSeq: 5, ClientMsgNo: "c5",
+					ChannelID: "g1", ChannelType: 2, FromUID: "u2", RedDot: true,
+					ServerTimestampMS: 198000, Payload: []byte("older-1"),
+				},
+				{
+					MessageID: 98, MessageSeq: 6, ClientMsgNo: "c6",
+					ChannelID: "g1", ChannelType: 2, FromUID: "u2", RedDot: true,
+					ServerTimestampMS: 199000, Payload: []byte("older-2"),
+				},
+				{
+					MessageID: 99, MessageSeq: 7, ClientMsgNo: "c7",
+					ChannelID: "g1", ChannelType: 2, FromUID: "u2", RedDot: true,
+					ServerTimestampMS: 200000, Payload: []byte("hello"),
+				},
+			},
 		},
 	}
 	app, err := newTestApp(t, Config{

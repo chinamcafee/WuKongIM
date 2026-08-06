@@ -54,9 +54,19 @@ type LastVisibleMessageRequest struct {
 	VisibleAfterSeq uint64
 }
 
+// UnreadCountRequest identifies the exact durable message interval whose
+// red-dot messages contribute to one user's unread count.
+type UnreadCountRequest struct {
+	ChannelID   string
+	ChannelType int64
+	AfterSeq    uint64
+	ThroughSeq  uint64
+}
+
 // MessageStore reads channel-owned message log tails for the current page.
 type MessageStore interface {
 	GetLastVisibleMessages(ctx context.Context, requests []LastVisibleMessageRequest) (map[metadb.ConversationKey]LastMessage, error)
+	CountUnreadMessages(ctx context.Context, uid string, requests []UnreadCountRequest) (map[metadb.ConversationKey]uint64, error)
 }
 
 // RecentMessageStore reads newest channel messages for legacy-compatible sync responses.
@@ -152,7 +162,13 @@ func (a *App) List(ctx context.Context, req ListRequest) (ListResult, error) {
 	if err != nil {
 		return ListResult{}, err
 	}
-	items := conversationsFromRows(rows, lastMessages)
+	unreadCounts, err := a.messages.CountUnreadMessages(
+		ctx, req.UID, unreadCountRequests(rows, lastMessages),
+	)
+	if err != nil {
+		return ListResult{}, err
+	}
+	items := conversationsFromRows(rows, lastMessages, unreadCounts)
 	result := ListResult{
 		Items:   items,
 		HasMore: hasMore,
@@ -222,16 +238,41 @@ func lastVisibleMessageRequests(rows []metadb.ConversationState) []LastVisibleMe
 	return requests
 }
 
-func conversationsFromRows(rows []metadb.ConversationState, lastMessages map[metadb.ConversationKey]LastMessage) []Conversation {
+func unreadCountRequests(
+	rows []metadb.ConversationState,
+	lastMessages map[metadb.ConversationKey]LastMessage,
+) []UnreadCountRequest {
+	requests := make([]UnreadCountRequest, 0, len(rows))
+	for _, row := range rows {
+		key := metadb.ConversationKey{ChannelID: row.ChannelID, ChannelType: row.ChannelType}
+		last, ok := lastMessages[key]
+		if !ok {
+			continue
+		}
+		floor := maxUint64(row.ReadSeq, row.DeletedToSeq)
+		if last.MessageSeq <= floor {
+			continue
+		}
+		requests = append(requests, UnreadCountRequest{
+			ChannelID: row.ChannelID, ChannelType: row.ChannelType,
+			AfterSeq: floor, ThroughSeq: last.MessageSeq,
+		})
+	}
+	return requests
+}
+
+func conversationsFromRows(
+	rows []metadb.ConversationState,
+	lastMessages map[metadb.ConversationKey]LastMessage,
+	unreadCounts map[metadb.ConversationKey]uint64,
+) []Conversation {
 	items := make([]Conversation, 0, len(rows))
 	for _, row := range rows {
 		key := metadb.ConversationKey{ChannelID: row.ChannelID, ChannelType: row.ChannelType}
 		var last *LastMessage
-		var unread uint64
 		if msg, ok := lastMessages[key]; ok {
 			msg.Payload = append([]byte(nil), msg.Payload...)
 			last = &msg
-			unread = unreadCount(row, msg.MessageSeq)
 		}
 		items = append(items, Conversation{
 			ChannelID:    row.ChannelID,
@@ -242,19 +283,8 @@ func conversationsFromRows(rows []metadb.ConversationState, lastMessages map[met
 			SparseActive: row.SparseActive,
 			UpdatedAt:    row.UpdatedAt,
 			LastMessage:  last,
-			Unread:       unread,
+			Unread:       unreadCounts[key],
 		})
 	}
 	return items
-}
-
-func unreadCount(row metadb.ConversationState, lastMessageSeq uint64) uint64 {
-	floor := row.ReadSeq
-	if row.DeletedToSeq > floor {
-		floor = row.DeletedToSeq
-	}
-	if lastMessageSeq <= floor {
-		return 0
-	}
-	return lastMessageSeq - floor
 }

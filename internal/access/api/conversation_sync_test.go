@@ -30,6 +30,7 @@ func TestConversationSyncMapsLegacyRequestAndResponse(t *testing.T) {
 				ReadToMsgSeq:    3,
 				Version:         456,
 				Recents: []conversationusecase.SyncMessage{{
+					RedDot:            true,
 					MessageID:         99,
 					MessageSeq:        8,
 					FromUID:           "u2",
@@ -72,7 +73,7 @@ func TestConversationSyncMapsLegacyRequestAndResponse(t *testing.T) {
 		"readed_to_msg_seq":3,
 		"version":456,
 		"recents":[{
-			"header":{"no_persist":0,"red_dot":0,"sync_once":0},
+			"header":{"no_persist":0,"red_dot":1,"sync_once":0},
 			"setting":0,
 			"message_id":99,
 			"message_idstr":"99",

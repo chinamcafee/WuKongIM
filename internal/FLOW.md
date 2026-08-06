@@ -95,14 +95,17 @@ ordinary conversation list/sync
   -> ListConversationActiveView(ConversationKindNormal, uid)
   -> read latest non-CMD Channel runtime messages for visible rows
 
-CMD offline sync/syncack
-  -> internal/access/api /message/sync or /message/syncack
+CMD offline sync/ack
+  -> internal/access/api /v3/message/commands/sync or /v3/message/commands/ack
   -> internal/usecase/cmdsync
   -> internal/infra/cluster CMDSyncStore
-  -> ListConversationActivePage(ConversationKindCMD, uid)
+  -> paginate ListConversationActivePage(ConversationKindCMD, uid) to completion
   -> read only SyncOnce or command-channel Channel runtime messages
-  -> syncack writes ConversationKindCMD read cursors
+  -> explicit per-channel ACK writes monotonic ConversationKindCMD read cursors
 ```
+
+Deprecated `/message/sync` and `/message/syncack` remain compatibility adapters
+over the same usecase but are not the v3-native client contract.
 
 `pkg/db/meta` owns one canonical conversation projection table keyed by
 `(uid, kind, channel_id, channel_type)`. Both ordinary and CMD rows are routed

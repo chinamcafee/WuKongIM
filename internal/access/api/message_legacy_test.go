@@ -128,6 +128,63 @@ func TestSendMessageWaitForPersistReturnsDurableReceipt(t *testing.T) {
 	}
 }
 
+func TestSendMessageWaitForPersistSupportsDurableRequestScopedCommand(t *testing.T) {
+	messages := &recordingMessageUsecase{sendResult: messageusecase.SendResult{
+		MessageID: 43, MessageSeq: 10, Reason: messageusecase.ReasonSuccess,
+	}}
+	srv := New(Options{Messages: messages})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/message/send", bytes.NewBufferString(`{"from_uid":"____system","client_msg_no":"cmd-1","payload":"aGk=","subscribers":["u1"],"header":{"sync_once":1},"wait_for_persist":1,"persist_timeout_ms":1000}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s, want 200", rec.Code, rec.Body.String())
+	}
+	if !jsonEqual(rec.Body.String(), `{"status":200,"message_id":"43","message_seq":10,"client_msg_no":"cmd-1","deduplicated":0}`) {
+		t.Fatalf("body = %q, want durable request-scoped receipt", rec.Body.String())
+	}
+	if len(messages.sendCalls) != 1 || !messages.sendCalls[0].RequestScoped || messages.sendCalls[0].NoPersist || !messages.sendCalls[0].SyncOnce {
+		t.Fatalf("send calls = %#v, want durable request-scoped sync-once command", messages.sendCalls)
+	}
+}
+
+func TestSendMessageWaitForPersistReturnsDeduplicatedRequestScopedReceipt(t *testing.T) {
+	messages := &recordingMessageUsecase{sendResult: messageusecase.SendResult{
+		MessageID: 43, MessageSeq: 10, Reason: messageusecase.ReasonSuccess, Deduplicated: true,
+	}}
+	srv := New(Options{Messages: messages})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/message/send", bytes.NewBufferString(`{"from_uid":"____system","client_msg_no":"cmd-1","payload":"aGk=","subscribers":["u1"],"header":{"sync_once":1},"wait_for_persist":1,"persist_timeout_ms":1000}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s, want 200", rec.Code, rec.Body.String())
+	}
+	if !jsonEqual(rec.Body.String(), `{"status":200,"message_id":"43","message_seq":10,"client_msg_no":"cmd-1","deduplicated":1}`) {
+		t.Fatalf("body = %q, want deduplicated durable request-scoped receipt", rec.Body.String())
+	}
+}
+
+func TestSendMessageWaitForPersistMapsRequestScopedTimeout(t *testing.T) {
+	srv := New(Options{Messages: &recordingMessageUsecase{sendErr: context.DeadlineExceeded}})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/message/send", bytes.NewBufferString(`{"from_uid":"____system","client_msg_no":"cmd-timeout","payload":"aGk=","subscribers":["u1"],"header":{"sync_once":1},"wait_for_persist":1,"persist_timeout_ms":100}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d body = %s, want 504", rec.Code, rec.Body.String())
+	}
+	if !jsonEqual(rec.Body.String(), `{"status":504,"code":"persist_timeout","msg":"消息持久化确认超时","retryable":true}`) {
+		t.Fatalf("body = %q, want retryable request-scoped persist timeout", rec.Body.String())
+	}
+}
+
 func TestSendMessageWaitForPersistRejectsNonSuccessReason(t *testing.T) {
 	messages := &recordingMessageUsecase{sendResult: messageusecase.SendResult{
 		Reason: messageusecase.ReasonNotInWhitelist,
@@ -179,6 +236,22 @@ func TestSendMessageReturnsIdempotencyConflict(t *testing.T) {
 	}
 }
 
+func TestSendMessageReturnsRequestScopedIdempotencyConflict(t *testing.T) {
+	srv := New(Options{Messages: &recordingMessageUsecase{sendErr: messageusecase.ErrIdempotencyConflict}})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/message/send", bytes.NewBufferString(`{"from_uid":"____system","client_msg_no":"cmd-conflict","payload":"aGk=","subscribers":["u1"],"header":{"sync_once":1},"wait_for_persist":1}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d body = %s, want 409", rec.Code, rec.Body.String())
+	}
+	if !jsonEqual(rec.Body.String(), `{"status":409,"code":"idempotency_conflict","msg":"client_msg_no已被不同消息使用","retryable":false}`) {
+		t.Fatalf("body = %q, want request-scoped idempotency conflict", rec.Body.String())
+	}
+}
+
 func TestChannelMessageSyncMapsCompatibleRequestToUsecase(t *testing.T) {
 	messages := &recordingMessageUsecase{
 		syncResult: messageusecase.SyncChannelMessagesResult{
@@ -218,6 +291,40 @@ func TestChannelMessageSyncMapsCompatibleRequestToUsecase(t *testing.T) {
 	got := messages.syncQueries[0]
 	if got.LoginUID != "u1" || got.ChannelID != "u2" || got.ChannelType != frame.ChannelTypePerson || got.StartMessageSeq != 2 || got.EndMessageSeq != 5 || got.Limit != 10 || got.PullMode != messageusecase.PullModeUp || !got.IncludeEventMeta || got.EventSummaryMode != "compat" {
 		t.Fatalf("sync query = %#v, want mapped request", got)
+	}
+}
+
+func TestChannelMessageSyncPreservesHeaderTimestampAndUint64Literals(t *testing.T) {
+	const maxUint64 = ^uint64(0)
+	messages := &recordingMessageUsecase{
+		syncResult: messageusecase.SyncChannelMessagesResult{
+			Messages: []messageusecase.SyncedMessage{{
+				Flags:       messageusecase.MessageFlags{RedDot: true},
+				MessageID:   maxUint64,
+				MessageSeq:  maxUint64,
+				ClientMsgNo: "large-message",
+				FromUID:     "u2",
+				ChannelID:   "u1@u2",
+				ChannelType: frame.ChannelTypePerson,
+				Timestamp:   2147483647,
+			}},
+		},
+	}
+	srv := New(Options{Messages: messages})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/channel/messagesync", bytes.NewBufferString(`{"login_uid":"u1","channel_id":"u2","channel_type":1,"start_message_seq":18446744073709551615,"end_message_seq":18446744073709551615}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s, want 200", rec.Code, rec.Body.String())
+	}
+	// message_id is the legacy signed compatibility field; message_idstr is the
+	// authoritative lossless uint64 representation consumed by JS clients.
+	want := `{"start_message_seq":18446744073709551615,"end_message_seq":18446744073709551615,"more":0,"messages":[{"header":{"no_persist":0,"red_dot":1,"sync_once":0},"setting":0,"message_id":-1,"message_idstr":"18446744073709551615","client_msg_no":"large-message","message_seq":18446744073709551615,"from_uid":"u2","channel_id":"u2","channel_type":1,"expire":0,"timestamp":2147483647,"payload":null}]}`
+	if rec.Body.String() != want {
+		t.Fatalf("body = %q, want exact lossless uint64 literals and header/timestamp", rec.Body.String())
 	}
 }
 
