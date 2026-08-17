@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"strconv"
-	"time"
 )
 
 type messageResp struct {
@@ -21,8 +20,11 @@ type messageResp struct {
 	FromUID      string        `json:"from_uid"`
 	ChannelID    string        `json:"channel_id"`
 	ChannelType  uint8         `json:"channel_type"`
-	Timestamp    int32         `json:"timestamp"`
-	Payload      []byte        `json:"payload"`
+	// ServerTimestampMS is copied from the durable message record without
+	// reducing its precision. Downstream consumers use this as the only trusted
+	// occurrence time for push-policy decisions.
+	ServerTimestampMS int64  `json:"server_timestamp_ms"`
+	Payload           []byte `json:"payload"`
 }
 
 type messageHeader struct {
@@ -85,18 +87,18 @@ func messageRespFromMessage(msg Message) messageResp {
 			RedDot:    boolToUint8(msg.RedDot),
 			SyncOnce:  boolToUint8(msg.SyncOnce),
 		},
-		Setting:      msg.Setting,
-		Topic:        msg.Topic,
-		Expire:       msg.Expire,
-		MessageID:    msg.MessageID,
-		MessageIDStr: uint64String(msg.MessageID),
-		ClientMsgNo:  msg.ClientMsgNo,
-		MessageSeq:   msg.MessageSeq,
-		FromUID:      msg.FromUID,
-		ChannelID:    msg.ChannelID,
-		ChannelType:  msg.ChannelType,
-		Timestamp:    int32(time.UnixMilli(msg.ServerTimestampMS).Unix()),
-		Payload:      append([]byte(nil), msg.Payload...),
+		Setting:           msg.Setting,
+		Topic:             msg.Topic,
+		Expire:            msg.Expire,
+		MessageID:         msg.MessageID,
+		MessageIDStr:      uint64String(msg.MessageID),
+		ClientMsgNo:       msg.ClientMsgNo,
+		MessageSeq:        msg.MessageSeq,
+		FromUID:           msg.FromUID,
+		ChannelID:         msg.ChannelID,
+		ChannelType:       msg.ChannelType,
+		ServerTimestampMS: msg.ServerTimestampMS,
+		Payload:           append([]byte(nil), msg.Payload...),
 	}
 }
 

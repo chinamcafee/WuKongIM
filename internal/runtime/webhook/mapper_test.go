@@ -49,6 +49,12 @@ func TestBuildNotifyBodyMapsCommittedMessages(t *testing.T) {
 	if msg["channel_id"] != "group-a" || msg["from_uid"] != "alice" {
 		t.Fatalf("channel/from = %#v", msg)
 	}
+	if msg["server_timestamp_ms"] != float64(10000) {
+		t.Fatalf("server_timestamp_ms = %v, want 10000", msg["server_timestamp_ms"])
+	}
+	if _, exists := msg["timestamp"]; exists {
+		t.Fatalf("legacy second-resolution timestamp must not be emitted: %#v", msg)
+	}
 	if msg["payload"] != base64.StdEncoding.EncodeToString([]byte("hello")) {
 		t.Fatalf("payload = %v", msg["payload"])
 	}
@@ -93,6 +99,12 @@ func TestBuildOfflineBodyChunksAndCompressesUIDs(t *testing.T) {
 	}
 	if got["setting"] != float64(9) || got["topic"] != "topic-a" || got["expire"] != float64(3600) || got["source_id"] != float64(7) {
 		t.Fatalf("legacy offline fields = setting:%v topic:%v expire:%v source:%v, want 9/topic-a/3600/7", got["setting"], got["topic"], got["expire"], got["source_id"])
+	}
+	if got["server_timestamp_ms"] != float64(10000) {
+		t.Fatalf("server_timestamp_ms = %v, want 10000", got["server_timestamp_ms"])
+	}
+	if _, exists := got["timestamp"]; exists {
+		t.Fatalf("legacy second-resolution timestamp must not be emitted: %#v", got)
 	}
 	compressed, ok := got["compress_to_uids"].(string)
 	if !ok {

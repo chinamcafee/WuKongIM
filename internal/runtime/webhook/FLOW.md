@@ -36,6 +36,12 @@ Manager auth is enabled and never accepts an unbounded “replay all” request.
   -> webhook runtime syncs each `OfflineMessage` chunk into the durable outbox
   -> bounded outbox workers send one JSON object to `{HTTPAddr}?event=msg.offline`
 
+Both critical message payloads expose the committed message's durable
+`ServerTimestampMS` as `server_timestamp_ms`. The mapper copies the Unix
+millisecond value without truncation. It does not emit the former second-level
+`timestamp` field, and consumers must not synthesize an occurrence time from
+delivery time or another fallback.
+
 ## Best-Effort Presence Flow
 
 `user.onlinestatus` is mapped to the legacy-compatible status string, admitted to
