@@ -124,6 +124,7 @@ func exportMetaFiles(ctx context.Context, root string, meta *metadb.MetaDB, opts
 		{table: "subscriber", path: "meta/subscribers.jsonl", kind: FileKindMetaSubscribers, convert: exportSubscriberRecord, count: func(s *ExportStats) { s.SubscribersExported++ }},
 		{table: "user_channel_membership", path: "meta/memberships.jsonl", kind: FileKindMetaUserChannelMemberships, convert: exportUserChannelMembershipRecord},
 		{table: "conversation", path: "meta/conversations.jsonl", kind: FileKindMetaConversations, convert: exportConversationRecord},
+		{table: "cmd_device_cursor", path: "meta/cmd_device_cursors.jsonl", kind: FileKindMetaCMDDeviceCursors, convert: exportCMDDeviceCursorRecord},
 		{table: "channel_latest", path: "meta/channel_latest.jsonl", kind: FileKindMetaChannelLatest, convert: exportChannelLatestRecord},
 	}
 
@@ -488,7 +489,45 @@ func exportDeviceRecord(slot uint16, row metadb.InspectRow) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return DeviceRecord{HashSlot: slot, UID: uid, DeviceFlag: deviceFlag, Token: token, DeviceLevel: deviceLevel}, nil
+	credentialVersion, err := rowUint64(row, "credential_version")
+	if err != nil {
+		return nil, err
+	}
+	loginSessionID, err := rowString(row, "login_session_id")
+	if err != nil {
+		return nil, err
+	}
+	operationID, err := rowString(row, "operation_id")
+	if err != nil {
+		return nil, err
+	}
+	operationDigest, err := rowString(row, "operation_digest")
+	if err != nil {
+		return nil, err
+	}
+	credentialStatus, err := rowString(row, "credential_status")
+	if err != nil {
+		return nil, err
+	}
+	expiresAtUnixMS, err := rowInt64(row, "expires_at_unix_ms")
+	if err != nil {
+		return nil, err
+	}
+	updatedAtUnixMS, err := rowInt64(row, "updated_at_unix_ms")
+	if err != nil {
+		return nil, err
+	}
+	terminationCause, err := rowString(row, "termination_cause")
+	if err != nil {
+		return nil, err
+	}
+	return DeviceRecord{
+		HashSlot: slot, UID: uid, DeviceFlag: deviceFlag, Token: token, DeviceLevel: deviceLevel,
+		CredentialVersion: Uint64(credentialVersion), LoginSessionID: loginSessionID,
+		OperationID: operationID, OperationDigest: operationDigest, CredentialStatus: credentialStatus,
+		ExpiresAtUnixMS: expiresAtUnixMS, UpdatedAtUnixMS: updatedAtUnixMS,
+		TerminationCause: terminationCause,
+	}, nil
 }
 
 func exportChannelRecord(slot uint16, row metadb.InspectRow) (any, error) {
@@ -641,6 +680,47 @@ func exportConversationKind(row metadb.InspectRow) (string, error) {
 	default:
 		return "", fmt.Errorf("%w: unknown conversation kind %d", ErrValidation, kind)
 	}
+}
+
+func exportCMDDeviceCursorRecord(slot uint16, row metadb.InspectRow) (any, error) {
+	uid, err := rowString(row, "uid")
+	if err != nil {
+		return nil, err
+	}
+	deviceFlag, err := rowInt64(row, "device_flag")
+	if err != nil {
+		return nil, err
+	}
+	channelID, err := rowString(row, "command_channel_id")
+	if err != nil {
+		return nil, err
+	}
+	channelType, err := rowInt64(row, "channel_type")
+	if err != nil {
+		return nil, err
+	}
+	readSeq, err := rowUint64(row, "read_seq")
+	if err != nil {
+		return nil, err
+	}
+	deletedToSeq, err := rowUint64(row, "deleted_to_seq")
+	if err != nil {
+		return nil, err
+	}
+	activeAt, err := rowInt64(row, "active_at")
+	if err != nil {
+		return nil, err
+	}
+	updatedAt, err := rowInt64(row, "updated_at")
+	if err != nil {
+		return nil, err
+	}
+	return CMDDeviceCursorRecord{
+		HashSlot: slot, UID: uid, DeviceFlag: deviceFlag,
+		CommandChannelID: channelID, ChannelType: channelType,
+		ReadSeq: Uint64(readSeq), DeletedToSeq: Uint64(deletedToSeq),
+		ActiveAt: activeAt, UpdatedAt: updatedAt,
+	}, nil
 }
 
 func exportChannelLatestRecord(slot uint16, row metadb.InspectRow) (any, error) {

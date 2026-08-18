@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"github.com/WuKongIM/WuKongIM/pkg/gateway/transport"
@@ -493,6 +494,64 @@ func (c *stateConn) WriteWebSocketMessage(data []byte, messageType transport.Web
 		return c.writeWebSocketCompact(data, messageType)
 	}
 	return c.writeWebSocketVector(data, messageType)
+}
+
+// WriteAndWait writes one final ordered payload and waits for gnet's completion callback.
+func (c *stateConn) WriteAndWait(data []byte, messageType transport.WebSocketMessageType, timeout time.Duration) (transport.WriteCompletion, error) {
+	var result transport.WriteCompletion
+	if c == nil || c.state == nil {
+		return result, errors.New("gateway/transport/gnet: connection unavailable")
+	}
+	payload := data
+	if c.state.runtime != nil && c.state.runtime.opts.Network == "websocket" {
+		var err error
+		payload, err = encodeWSFrame(wsFrame{final: true, opcode: c.webSocketWriteOpcode(messageType), payload: data})
+		if err != nil {
+			return result, err
+		}
+	}
+	completed := make(chan error, 1)
+	tracked := c.state.maxOutboundBytes > 0 && len(payload) > 0
+	var snapshot transportPressureSnapshot
+	if tracked {
+		var admitted bool
+		snapshot, admitted = c.state.beginOutboundWrite(len(payload))
+		if !admitted {
+			return result, transport.ErrOutboundBytesExceeded
+		}
+	}
+	callback := func(conn gnetv2.Conn, err error) error {
+		if tracked {
+			c.state.finishNextOutboundWrite(conn, err)
+		}
+		select {
+		case completed <- err:
+		default:
+		}
+		return nil
+	}
+	if err := c.state.raw.AsyncWrite(payload, callback); err != nil {
+		if tracked {
+			c.state.finishNextOutboundWrite(nil, err)
+		}
+		return result, err
+	}
+	result.Enqueued = true
+	if tracked {
+		c.state.observeTransportSnapshot(snapshot)
+	}
+	if timeout <= 0 {
+		timeout = 250 * time.Millisecond
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-completed:
+		result.Flushed = err == nil
+		return result, err
+	case <-timer.C:
+		return result, nil
+	}
 }
 
 func (c *stateConn) writeWebSocket(data []byte, messageType transport.WebSocketMessageType) error {

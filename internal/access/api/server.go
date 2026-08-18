@@ -191,6 +191,12 @@ type UserUsecase interface {
 	RemoveSystemUIDsFromCache(uids []string) error
 }
 
+// DeviceCredentialUsecase owns the internal versioned credential mutations.
+type DeviceCredentialUsecase interface {
+	ApplyDeviceCredentials(context.Context, []userusecase.ApplyDeviceCredentialCommand) []userusecase.DeviceCredentialResult
+	RevokeDeviceCredentials(context.Context, []userusecase.RevokeDeviceCredentialCommand) []userusecase.DeviceCredentialResult
+}
+
 // BenchChannelMutation describes one benchmark channel metadata upsert.
 type BenchChannelMutation struct {
 	// ChannelID identifies the benchmark channel.
@@ -236,6 +242,12 @@ type Options struct {
 	BenchMaxBatchSize int
 	// BenchMaxPayloadBytes limits bench mutation JSON request bodies in bytes.
 	BenchMaxPayloadBytes int64
+	// InternalCredentialHMACSecret authenticates Link-U credential mutations.
+	InternalCredentialHMACSecret string
+	// InternalCredentialReplayWindow bounds accepted timestamps and nonce retention.
+	InternalCredentialReplayWindow time.Duration
+	// InternalCredentialMaxBatchSize bounds independently linearized items per request.
+	InternalCredentialMaxBatchSize int
 	// Gateway contains the published gateway addresses returned by /bench/v1/capacity-target.
 	Gateway GatewayAddresses
 	// BenchRuntime controls benchmark-only channel runtime diagnostics when configured.
@@ -250,6 +262,8 @@ type Options struct {
 	Channels ChannelUsecase
 	// Users handles compatible user token, device, online-status, and system UID routes.
 	Users UserUsecase
+	// DeviceCredentials handles authenticated Link-U internal credential mutations.
+	DeviceCredentials DeviceCredentialUsecase
 	// Messages handles compatible message send and channel message sync routes.
 	Messages MessageUsecase
 	// CMDSync handles compatible durable command-message sync routes.
@@ -284,42 +298,47 @@ type Options struct {
 
 // Server exposes health, readiness, and the minimum bench/v1 target surface for wukongim.
 type Server struct {
-	mu                       sync.RWMutex
-	engine                   *gin.Engine
-	httpServer               *http.Server
-	listener                 net.Listener
-	listenAddr               string
-	addr                     string
-	readyz                   func(context.Context) (bool, any)
-	maintenance              func() bool
-	benchEnabled             bool
-	benchToken               string
-	benchMaxBatchSize        int
-	benchMaxPayloadBytes     int64
-	gateway                  GatewayAddresses
-	benchRuntime             ChannelRuntimeBenchController
-	benchPresence            PresenceBenchController
-	benchData                BenchData
-	top                      TopSnapshotProvider
-	channels                 ChannelUsecase
-	users                    UserUsecase
-	messages                 MessageUsecase
-	cmdSync                  CMDSyncUsecase
-	conversations            ConversationUsecase
-	conversationObserver     ConversationListObserver
-	conversationSyncObserver ConversationSyncObserver
-	legacyRouteExternal      LegacyRouteAddresses
-	legacyRouteIntranet      LegacyRouteAddresses
-	legacyRouteNodes         map[uint64]LegacyRouteNodeAddresses
-	metricsHandler           http.Handler
-	debugAPIEnabled          bool
-	debugConfig              func() any
-	debugCluster             func() any
-	goroutineSnapshot        func() any
-	diagnostics              DiagnosticsReader
-	logger                   wklog.Logger
-	counts                   map[string]int
-	started                  bool
+	mu                             sync.RWMutex
+	engine                         *gin.Engine
+	httpServer                     *http.Server
+	listener                       net.Listener
+	listenAddr                     string
+	addr                           string
+	readyz                         func(context.Context) (bool, any)
+	maintenance                    func() bool
+	benchEnabled                   bool
+	benchToken                     string
+	benchMaxBatchSize              int
+	benchMaxPayloadBytes           int64
+	internalCredentialHMACSecret   string
+	internalCredentialReplayWindow time.Duration
+	internalCredentialMaxBatchSize int
+	internalCredentialNonces       *credentialNonceCache
+	gateway                        GatewayAddresses
+	benchRuntime                   ChannelRuntimeBenchController
+	benchPresence                  PresenceBenchController
+	benchData                      BenchData
+	top                            TopSnapshotProvider
+	channels                       ChannelUsecase
+	users                          UserUsecase
+	deviceCredentials              DeviceCredentialUsecase
+	messages                       MessageUsecase
+	cmdSync                        CMDSyncUsecase
+	conversations                  ConversationUsecase
+	conversationObserver           ConversationListObserver
+	conversationSyncObserver       ConversationSyncObserver
+	legacyRouteExternal            LegacyRouteAddresses
+	legacyRouteIntranet            LegacyRouteAddresses
+	legacyRouteNodes               map[uint64]LegacyRouteNodeAddresses
+	metricsHandler                 http.Handler
+	debugAPIEnabled                bool
+	debugConfig                    func() any
+	debugCluster                   func() any
+	goroutineSnapshot              func() any
+	diagnostics                    DiagnosticsReader
+	logger                         wklog.Logger
+	counts                         map[string]int
+	started                        bool
 }
 
 // New creates a minimal internal API server.
@@ -331,38 +350,49 @@ func New(opts Options) *Server {
 	engine.Use(openCORSMiddleware())
 	engine.HandleMethodNotAllowed = true
 	s := &Server{
-		engine:                   engine,
-		listenAddr:               strings.TrimSpace(opts.ListenAddr),
-		readyz:                   opts.Readyz,
-		maintenance:              opts.Maintenance,
-		benchEnabled:             opts.BenchEnabled,
-		benchToken:               strings.TrimSpace(opts.BenchToken),
-		benchMaxBatchSize:        opts.BenchMaxBatchSize,
-		benchMaxPayloadBytes:     opts.BenchMaxPayloadBytes,
-		gateway:                  opts.Gateway,
-		benchRuntime:             opts.BenchRuntime,
-		benchPresence:            opts.BenchPresence,
-		benchData:                opts.BenchData,
-		top:                      opts.Top,
-		channels:                 opts.Channels,
-		users:                    opts.Users,
-		messages:                 opts.Messages,
-		cmdSync:                  opts.CMDSync,
-		conversations:            opts.Conversations,
-		conversationObserver:     opts.ConversationListObserver,
-		conversationSyncObserver: opts.ConversationSyncObserver,
-		legacyRouteExternal:      opts.LegacyRouteExternal,
-		legacyRouteIntranet:      opts.LegacyRouteIntranet,
-		legacyRouteNodes:         cloneLegacyRouteNodes(opts.LegacyRouteNodes),
-		metricsHandler:           opts.MetricsHandler,
-		debugAPIEnabled:          opts.DebugAPIEnabled,
-		debugConfig:              opts.DebugConfig,
-		debugCluster:             opts.DebugCluster,
-		goroutineSnapshot:        opts.GoroutineSnapshot,
-		diagnostics:              opts.Diagnostics,
-		logger:                   opts.Logger,
-		counts:                   map[string]int{},
+		engine:                         engine,
+		listenAddr:                     strings.TrimSpace(opts.ListenAddr),
+		readyz:                         opts.Readyz,
+		maintenance:                    opts.Maintenance,
+		benchEnabled:                   opts.BenchEnabled,
+		benchToken:                     strings.TrimSpace(opts.BenchToken),
+		benchMaxBatchSize:              opts.BenchMaxBatchSize,
+		benchMaxPayloadBytes:           opts.BenchMaxPayloadBytes,
+		internalCredentialHMACSecret:   strings.TrimSpace(opts.InternalCredentialHMACSecret),
+		internalCredentialReplayWindow: opts.InternalCredentialReplayWindow,
+		internalCredentialMaxBatchSize: opts.InternalCredentialMaxBatchSize,
+		gateway:                        opts.Gateway,
+		benchRuntime:                   opts.BenchRuntime,
+		benchPresence:                  opts.BenchPresence,
+		benchData:                      opts.BenchData,
+		top:                            opts.Top,
+		channels:                       opts.Channels,
+		users:                          opts.Users,
+		deviceCredentials:              opts.DeviceCredentials,
+		messages:                       opts.Messages,
+		cmdSync:                        opts.CMDSync,
+		conversations:                  opts.Conversations,
+		conversationObserver:           opts.ConversationListObserver,
+		conversationSyncObserver:       opts.ConversationSyncObserver,
+		legacyRouteExternal:            opts.LegacyRouteExternal,
+		legacyRouteIntranet:            opts.LegacyRouteIntranet,
+		legacyRouteNodes:               cloneLegacyRouteNodes(opts.LegacyRouteNodes),
+		metricsHandler:                 opts.MetricsHandler,
+		debugAPIEnabled:                opts.DebugAPIEnabled,
+		debugConfig:                    opts.DebugConfig,
+		debugCluster:                   opts.DebugCluster,
+		goroutineSnapshot:              opts.GoroutineSnapshot,
+		diagnostics:                    opts.Diagnostics,
+		logger:                         opts.Logger,
+		counts:                         map[string]int{},
 	}
+	if s.internalCredentialReplayWindow <= 0 {
+		s.internalCredentialReplayWindow = 5 * time.Minute
+	}
+	if s.internalCredentialMaxBatchSize <= 0 {
+		s.internalCredentialMaxBatchSize = 100
+	}
+	s.internalCredentialNonces = newCredentialNonceCache(10000)
 	if s.logger == nil {
 		s.logger = wklog.NewNop()
 	}
@@ -522,6 +552,7 @@ func (s *Server) registerRoutes() {
 	s.registerDemoRoutes()
 	s.registerChannelRoutes()
 	s.registerUserRoutes()
+	s.registerDeviceCredentialRoutes()
 	s.registerMessageRoutes()
 	s.registerConversationRoutes()
 	s.engine.GET("/top/v1/snapshot", s.handleTopSnapshot)

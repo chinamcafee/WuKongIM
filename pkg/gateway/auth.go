@@ -12,17 +12,21 @@ import (
 type Authenticator = gatewaytypes.Authenticator
 type AuthenticatorFunc = gatewaytypes.AuthenticatorFunc
 type AuthResult = gatewaytypes.AuthResult
+type CredentialAuthResult = gatewaytypes.CredentialAuthResult
 
 const (
-	SessionValueUID               = gatewaytypes.SessionValueUID
-	SessionValueDeviceID          = gatewaytypes.SessionValueDeviceID
-	SessionValueDeviceFlag        = gatewaytypes.SessionValueDeviceFlag
-	SessionValueDeviceLevel       = gatewaytypes.SessionValueDeviceLevel
-	SessionValueProtocolVersion   = gatewaytypes.SessionValueProtocolVersion
-	SessionValueEncryptionEnabled = gatewaytypes.SessionValueEncryptionEnabled
-	SessionValueAESKey            = gatewaytypes.SessionValueAESKey
-	SessionValueAESIV             = gatewaytypes.SessionValueAESIV
-	SessionValueCrypto            = gatewaytypes.SessionValueCrypto
+	SessionValueUID                 = gatewaytypes.SessionValueUID
+	SessionValueDeviceID            = gatewaytypes.SessionValueDeviceID
+	SessionValueDeviceFlag          = gatewaytypes.SessionValueDeviceFlag
+	SessionValueDeviceLevel         = gatewaytypes.SessionValueDeviceLevel
+	SessionValueProtocolVersion     = gatewaytypes.SessionValueProtocolVersion
+	SessionValueEncryptionEnabled   = gatewaytypes.SessionValueEncryptionEnabled
+	SessionValueAESKey              = gatewaytypes.SessionValueAESKey
+	SessionValueAESIV               = gatewaytypes.SessionValueAESIV
+	SessionValueCrypto              = gatewaytypes.SessionValueCrypto
+	SessionValueCredentialVersion   = gatewaytypes.SessionValueCredentialVersion
+	SessionValueLoginSessionID      = gatewaytypes.SessionValueLoginSessionID
+	SessionValueCredentialExpiresAt = gatewaytypes.SessionValueCredentialExpiresAt
 )
 
 type WKProtoAuthOptions struct {
@@ -36,7 +40,9 @@ type WKProtoAuthOptions struct {
 
 	IsVisitor   func(uid string) bool
 	VerifyToken func(ctx context.Context, uid string, deviceFlag frame.DeviceFlag, token string) (frame.DeviceLevel, error)
-	IsBanned    func(uid string) (bool, error)
+	// VerifyCredential returns the complete durable admission fence. It takes precedence over VerifyToken.
+	VerifyCredential func(ctx context.Context, uid string, deviceFlag frame.DeviceFlag, token string) (CredentialAuthResult, error)
+	IsBanned         func(uid string) (bool, error)
 }
 
 func NewWKProtoAuthenticator(opts WKProtoAuthOptions) Authenticator {
@@ -69,8 +75,11 @@ func NewWKProtoAuthenticator(opts WKProtoAuthOptions) Authenticator {
 		}
 
 		deviceLevel := frame.DeviceLevelSlave
+		var credentialVersion uint64
+		var loginSessionID string
+		var credentialExpiresAt int64
 		if opts.TokenAuthOn && !isVisitor(opts.IsVisitor, connect.UID) {
-			if connect.Token == "" || opts.VerifyToken == nil {
+			if connect.Token == "" || (opts.VerifyCredential == nil && opts.VerifyToken == nil) {
 				return &AuthResult{
 					Connack: &frame.ConnackPacket{ReasonCode: frame.ReasonAuthFail},
 				}, nil
@@ -80,13 +89,22 @@ func NewWKProtoAuthenticator(opts WKProtoAuthOptions) Authenticator {
 			if authContext != nil && authContext.RequestContext != nil {
 				ctx = authContext.RequestContext
 			}
-			level, err := opts.VerifyToken(ctx, connect.UID, connect.DeviceFlag, connect.Token)
+			var err error
+			if opts.VerifyCredential != nil {
+				credential, verifyErr := opts.VerifyCredential(ctx, connect.UID, connect.DeviceFlag, connect.Token)
+				err = verifyErr
+				deviceLevel = credential.DeviceLevel
+				credentialVersion = credential.CredentialVersion
+				loginSessionID = credential.LoginSessionID
+				credentialExpiresAt = credential.ExpiresAtUnixMS
+			} else {
+				deviceLevel, err = opts.VerifyToken(ctx, connect.UID, connect.DeviceFlag, connect.Token)
+			}
 			if err != nil {
 				return &AuthResult{
 					Connack: &frame.ConnackPacket{ReasonCode: frame.ReasonAuthFail},
 				}, nil
 			}
-			deviceLevel = level
 		}
 
 		if opts.IsBanned != nil {
@@ -123,6 +141,11 @@ func NewWKProtoAuthenticator(opts WKProtoAuthOptions) Authenticator {
 			SessionValueDeviceFlag:      connect.DeviceFlag,
 			SessionValueDeviceLevel:     deviceLevel,
 			SessionValueProtocolVersion: serverVersion,
+		}
+		if credentialVersion != 0 {
+			sessionValues[SessionValueCredentialVersion] = credentialVersion
+			sessionValues[SessionValueLoginSessionID] = loginSessionID
+			sessionValues[SessionValueCredentialExpiresAt] = credentialExpiresAt
 		}
 		if encryptionEnabled {
 			if connect.ClientKey == "" {

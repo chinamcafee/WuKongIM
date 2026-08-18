@@ -52,26 +52,27 @@ func TestWebhookConfigSnapshotUsesNormalizedStartupConfig(t *testing.T) {
 	snapshot, err := app.WebhookConfigSnapshot(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, accessmanager.WebhookConfigSnapshot{
-		Enabled:                   true,
-		HTTPAddr:                  "http://127.0.0.1:8080/webhook",
-		FocusEvents:               []string{runtimewebhook.EventMsgNotify},
-		SupportedEvents:           []string{runtimewebhook.EventMsgNotify, runtimewebhook.EventMsgOffline, runtimewebhook.EventUserOnlineStatus},
-		QueueSize:                 2048,
-		Workers:                   8,
-		OnlineStatusBatchMaxItems: 512,
-		OnlineStatusBatchMaxWait:  "2s",
-		OfflineUIDBatchSize:       512,
-		RequestTimeout:            "5s",
-		RetryMaxAttempts:          3,
-		OutboxDir:                 dataDir + "/webhook-outbox",
-		OutboxMaxEntries:          1_000_000,
-		OutboxMaxBytes:            4 << 30,
-		OutboxDispatchBatchSize:   100,
-		OutboxRetryBaseDelay:      "1s",
-		OutboxRetryMaxDelay:       "5m0s",
-		OutboxDeliveredRetention:  "168h0m0s",
-		Source:                    "startup_config",
-		RequiresRestart:           true,
+		Enabled:                        true,
+		HTTPAddr:                       "http://127.0.0.1:8080/webhook",
+		FocusEvents:                    []string{runtimewebhook.EventMsgNotify},
+		SupportedEvents:                []string{runtimewebhook.EventMsgNotify, runtimewebhook.EventMsgOffline, runtimewebhook.EventUserOnlineStatus},
+		QueueSize:                      2048,
+		Workers:                        8,
+		OnlineStatusBatchMaxItems:      512,
+		OnlineStatusBatchMaxWait:       "2s",
+		OfflineUIDBatchSize:            512,
+		OfflineNotificationDeviceFlags: []int{0},
+		RequestTimeout:                 "5s",
+		RetryMaxAttempts:               3,
+		OutboxDir:                      dataDir + "/webhook-outbox",
+		OutboxMaxEntries:               1_000_000,
+		OutboxMaxBytes:                 4 << 30,
+		OutboxDispatchBatchSize:        100,
+		OutboxRetryBaseDelay:           "1s",
+		OutboxRetryMaxDelay:            "5m0s",
+		OutboxDeliveredRetention:       "168h0m0s",
+		Source:                         "startup_config",
+		RequiresRestart:                true,
 	}, snapshot)
 
 	snapshot.FocusEvents[0] = runtimewebhook.EventMsgOffline
@@ -87,25 +88,26 @@ func TestWebhookConfigSnapshotReportsDisabledDefaults(t *testing.T) {
 	snapshot, err := app.WebhookConfigSnapshot(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, accessmanager.WebhookConfigSnapshot{
-		Enabled:                   false,
-		HTTPAddr:                  "",
-		FocusEvents:               []string{},
-		SupportedEvents:           []string{runtimewebhook.EventMsgNotify, runtimewebhook.EventMsgOffline, runtimewebhook.EventUserOnlineStatus},
-		QueueSize:                 1024,
-		Workers:                   16,
-		OnlineStatusBatchMaxItems: 512,
-		OnlineStatusBatchMaxWait:  "2s",
-		OfflineUIDBatchSize:       512,
-		RequestTimeout:            "5s",
-		RetryMaxAttempts:          3,
-		OutboxMaxEntries:          1_000_000,
-		OutboxMaxBytes:            4 << 30,
-		OutboxDispatchBatchSize:   100,
-		OutboxRetryBaseDelay:      "1s",
-		OutboxRetryMaxDelay:       "5m0s",
-		OutboxDeliveredRetention:  "168h0m0s",
-		Source:                    "startup_config",
-		RequiresRestart:           true,
+		Enabled:                        false,
+		HTTPAddr:                       "",
+		FocusEvents:                    []string{},
+		SupportedEvents:                []string{runtimewebhook.EventMsgNotify, runtimewebhook.EventMsgOffline, runtimewebhook.EventUserOnlineStatus},
+		QueueSize:                      1024,
+		Workers:                        16,
+		OnlineStatusBatchMaxItems:      512,
+		OnlineStatusBatchMaxWait:       "2s",
+		OfflineUIDBatchSize:            512,
+		OfflineNotificationDeviceFlags: []int{0},
+		RequestTimeout:                 "5s",
+		RetryMaxAttempts:               3,
+		OutboxMaxEntries:               1_000_000,
+		OutboxMaxBytes:                 4 << 30,
+		OutboxDispatchBatchSize:        100,
+		OutboxRetryBaseDelay:           "1s",
+		OutboxRetryMaxDelay:            "5m0s",
+		OutboxDeliveredRetention:       "168h0m0s",
+		Source:                         "startup_config",
+		RequiresRestart:                true,
 	}, snapshot)
 }
 
@@ -156,11 +158,13 @@ func TestComposeOfflineRecipientObserversKeepsPluginSingleAndWebhookBatch(t *tes
 
 	batch.ObserveOfflineRecipients(context.Background(), channelappend.OfflineRecipientsEvent{
 		Event: channelappend.CommittedEnvelope{MessageID: 101, MessageSeq: 1, ChannelID: "g1", ChannelType: 2},
-		UIDs:  []string{"u1", "u2"},
+		Targets: []channelappend.OfflineTarget{
+			{UID: "u1", DeviceFlag: 0}, {UID: "u2", DeviceFlag: 2},
+		},
 	})
 
 	require.Equal(t, []string{"u1", "u2"}, plugin.uids)
-	require.Equal(t, [][]string{{"u1", "u2"}}, webhook.uidBatches)
+	require.Equal(t, [][]channelappend.OfflineTarget{{{UID: "u1", DeviceFlag: 0}, {UID: "u2", DeviceFlag: 2}}}, webhook.targetBatches)
 }
 
 func TestComposeOfflineRecipientObserversUsesPluginBatchWhenAvailable(t *testing.T) {
@@ -170,12 +174,14 @@ func TestComposeOfflineRecipientObserversUsesPluginBatchWhenAvailable(t *testing
 
 	batch.ObserveOfflineRecipients(context.Background(), channelappend.OfflineRecipientsEvent{
 		Event: channelappend.CommittedEnvelope{MessageID: 101, MessageSeq: 1, ChannelID: "g1", ChannelType: 2},
-		UIDs:  []string{"u1", "u2"},
+		Targets: []channelappend.OfflineTarget{
+			{UID: "u1", DeviceFlag: 0}, {UID: "u2", DeviceFlag: 2},
+		},
 	})
 
 	require.Empty(t, plugin.singleUIDs)
-	require.Equal(t, [][]string{{"u1", "u2"}}, plugin.uidBatches)
-	require.Equal(t, [][]string{{"u1", "u2"}}, webhook.uidBatches)
+	require.Equal(t, [][]channelappend.OfflineTarget{{{UID: "u1", DeviceFlag: 0}, {UID: "u2", DeviceFlag: 2}}}, plugin.targetBatches)
+	require.Equal(t, [][]channelappend.OfflineTarget{{{UID: "u1", DeviceFlag: 0}, {UID: "u2", DeviceFlag: 2}}}, webhook.targetBatches)
 }
 
 func TestComposeOfflineRecipientObserversKeepsPluginWithoutWebhook(t *testing.T) {
@@ -185,7 +191,9 @@ func TestComposeOfflineRecipientObserversKeepsPluginWithoutWebhook(t *testing.T)
 	require.NotNil(t, batch)
 	batch.ObserveOfflineRecipients(context.Background(), channelappend.OfflineRecipientsEvent{
 		Event: channelappend.CommittedEnvelope{MessageID: 101},
-		UIDs:  []string{"u1", "u2"},
+		Targets: []channelappend.OfflineTarget{
+			{UID: "u1", DeviceFlag: 0}, {UID: "u2", DeviceFlag: 2},
+		},
 	})
 
 	require.Equal(t, []string{"u1", "u2"}, plugin.uids)
@@ -198,11 +206,13 @@ func TestComposeOfflineRecipientObserversKeepsPluginBatchWithoutWebhook(t *testi
 	require.NotNil(t, batch)
 	batch.ObserveOfflineRecipients(context.Background(), channelappend.OfflineRecipientsEvent{
 		Event: channelappend.CommittedEnvelope{MessageID: 101},
-		UIDs:  []string{"u1", "u2"},
+		Targets: []channelappend.OfflineTarget{
+			{UID: "u1", DeviceFlag: 0}, {UID: "u2", DeviceFlag: 2},
+		},
 	})
 
 	require.Empty(t, plugin.singleUIDs)
-	require.Equal(t, [][]string{{"u1", "u2"}}, plugin.uidBatches)
+	require.Equal(t, [][]channelappend.OfflineTarget{{{UID: "u1", DeviceFlag: 0}, {UID: "u2", DeviceFlag: 2}}}, plugin.targetBatches)
 }
 
 func TestWebhookNotifyEnqueuerMapsCommittedEnvelopeAndCopiesSlices(t *testing.T) {
@@ -259,16 +269,18 @@ func TestWebhookOfflineObserverChunksRecipientsAndCopiesSlices(t *testing.T) {
 			FromUID:     "sender-u1",
 			Payload:     []byte("payload"),
 		},
-		UIDs: []string{"u1", "u2", "u3"},
+		Targets: []channelappend.OfflineTarget{
+			{UID: "u1", DeviceFlag: 0}, {UID: "u2", DeviceFlag: 2}, {UID: "u3", DeviceFlag: 0},
+		},
 	}
 
 	observer.ObserveOfflineRecipients(context.Background(), source)
 	source.Event.Payload[0] = 'X'
-	source.UIDs[0] = "mutated"
+	source.Targets[0].UID = "mutated"
 
 	require.Len(t, runtime.offline, 2)
-	require.Equal(t, []string{"u1", "u2"}, runtime.offline[0].ToUIDs)
-	require.Equal(t, []string{"u3"}, runtime.offline[1].ToUIDs)
+	require.Equal(t, []runtimewebhook.OfflineTarget{{UID: "u1", DeviceFlag: 0}, {UID: "u2", DeviceFlag: 2}}, runtime.offline[0].Targets)
+	require.Equal(t, []runtimewebhook.OfflineTarget{{UID: "u3", DeviceFlag: 0}}, runtime.offline[1].Targets)
 	require.Equal(t, []byte("payload"), runtime.offline[0].Message.Payload)
 }
 
@@ -399,12 +411,12 @@ func (r *recordingOfflineRecipientObserverForWebhookTest) ObserveOfflineRecipien
 }
 
 type recordingOfflineRecipientsObserverForWebhookTest struct {
-	uidBatches [][]string
+	targetBatches [][]channelappend.OfflineTarget
 }
 
 type recordingBatchOfflineRecipientObserverForWebhookTest struct {
-	singleUIDs []string
-	uidBatches [][]string
+	singleUIDs    []string
+	targetBatches [][]channelappend.OfflineTarget
 }
 
 func (r *recordingBatchOfflineRecipientObserverForWebhookTest) ObserveOfflineRecipient(_ context.Context, event channelappend.OfflineRecipientEvent) {
@@ -412,9 +424,9 @@ func (r *recordingBatchOfflineRecipientObserverForWebhookTest) ObserveOfflineRec
 }
 
 func (r *recordingBatchOfflineRecipientObserverForWebhookTest) ObserveOfflineRecipients(_ context.Context, event channelappend.OfflineRecipientsEvent) {
-	r.uidBatches = append(r.uidBatches, append([]string(nil), event.UIDs...))
+	r.targetBatches = append(r.targetBatches, append([]channelappend.OfflineTarget(nil), event.Targets...))
 }
 
 func (r *recordingOfflineRecipientsObserverForWebhookTest) ObserveOfflineRecipients(_ context.Context, event channelappend.OfflineRecipientsEvent) {
-	r.uidBatches = append(r.uidBatches, append([]string(nil), event.UIDs...))
+	r.targetBatches = append(r.targetBatches, append([]channelappend.OfflineTarget(nil), event.Targets...))
 }

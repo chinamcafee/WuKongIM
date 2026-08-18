@@ -172,6 +172,8 @@ const (
 	TableIDMessageEventCursor uint32 = 14
 	// TableIDMessageEventApplied stores applied event idempotency records.
 	TableIDMessageEventApplied uint32 = 15
+	// TableIDCMDDeviceCursor stores device-scoped command-message consumer cursors.
+	TableIDCMDDeviceCursor uint32 = 16
 )
 
 const (
@@ -202,6 +204,9 @@ const (
 
 	messageEventAppliedPrimaryFamilyID uint16 = 0
 	messageEventAppliedPrimaryIndexID  uint16 = 1
+
+	cmdDeviceCursorPrimaryFamilyID uint16 = 0
+	cmdDeviceCursorPrimaryIndexID  uint16 = 1
 
 	conversationPrimaryIndexID uint16 = 1
 	conversationActiveIndexID  uint16 = 2

@@ -37,3 +37,9 @@ drained repeatedly in the same flush.
 `Snapshot` counts pending routes, active routes, and dirty touched routes across
 all shards. It is intended for benchmark diagnostics and does not expose
 concrete `LocalSession` handles.
+
+Owner routes also carry durable credential version, Link-U login session ID,
+and absolute expiry. Delayed actions must match those fields plus owner boot and
+owner sequence before `MarkClosingAndUnregister`; the optional `KickSessionHandle`
+keeps protocol control-frame delivery distinct from ordinary close behavior and
+returns independent enqueue, transport-flush, and hard-close evidence.

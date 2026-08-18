@@ -101,6 +101,9 @@ func (v *bundleValidator) Visit(kind FileKind, record any) error {
 	case FileKindMetaConversations:
 		row := record.(ConversationRecord)
 		return v.validateHashSlot("conversations", row.UID, row.HashSlot)
+	case FileKindMetaCMDDeviceCursors:
+		row := record.(CMDDeviceCursorRecord)
+		return v.validateHashSlot("cmd_device_cursors", row.UID, row.HashSlot)
 	case FileKindMetaChannelLatest:
 		row := record.(ChannelLatestRecord)
 		return v.validateHashSlot("channel_latest", row.ChannelID, row.HashSlot)

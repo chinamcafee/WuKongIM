@@ -183,12 +183,13 @@ recipient_authority_dispatch_concurrency = 0
 # For production, inject the endpoint with WK_WEBHOOK_HTTP_ADDR instead of
 # committing a real credential-bearing URL.
 http_addr = "http://linku-im-processor:LinkU-WuKongIM-Webhook-2026@localhost/link-u-im-processor/webhook"
-focus_events = ["msg.offline", "msg.notify"]
+focus_events = ["msg.offline.v2", "msg.notify"]
 queue_size = 1024
 workers = 16
 online_status_batch_max_items = 512
 online_status_batch_max_wait = "2s"
 offline_uid_batch_size = 512
+offline_notification_device_flags = [0]
 request_timeout = "5s"
 retry_max_attempts = 5
 outbox_dir = "./wukongimdata/webhook-outbox"

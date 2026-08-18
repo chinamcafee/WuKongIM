@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"encoding/base64"
 	"encoding/json"
+	"sort"
 	"strconv"
 )
 
@@ -35,10 +36,11 @@ type messageHeader struct {
 
 type offlineResp struct {
 	MessageResp
-	ToUIDs         []string `json:"to_uids,omitempty"`
-	Compress       string   `json:"compress,omitempty"`
-	CompressToUIDs string   `json:"compress_to_uids,omitempty"`
-	SourceID       int64    `json:"source_id,omitempty"`
+	SchemaVersion          int             `json:"schema_version"`
+	OfflineTargets         []OfflineTarget `json:"offline_targets,omitempty"`
+	Compress               string          `json:"compress,omitempty"`
+	CompressOfflineTargets string          `json:"compress_offline_targets,omitempty"`
+	SourceID               int64           `json:"source_id,omitempty"`
 }
 
 // MessageResp exposes the legacy-compatible encoded message shape for app adapters.
@@ -53,19 +55,20 @@ func buildNotifyBody(messages []Message) ([]byte, error) {
 }
 
 func buildOfflineBody(message OfflineMessage, compressThreshold int) ([]byte, error) {
-	resp := offlineResp{MessageResp: messageRespFromMessage(message.Message)}
+	targets := canonicalOfflineTargets(message.Targets)
+	resp := offlineResp{MessageResp: messageRespFromMessage(message.Message), SchemaVersion: 2}
 	if message.Message.SourceID != 0 {
 		resp.SourceID = int64(message.Message.SourceID)
 	}
-	if compressThreshold > 0 && len(message.ToUIDs) >= compressThreshold {
-		compressed, err := gzipJSONStringSlice(message.ToUIDs)
+	if compressThreshold > 0 && len(targets) >= compressThreshold {
+		compressed, err := gzipJSON(targets)
 		if err != nil {
 			return nil, err
 		}
 		resp.Compress = "gzip"
-		resp.CompressToUIDs = base64.StdEncoding.EncodeToString(compressed)
+		resp.CompressOfflineTargets = base64.StdEncoding.EncodeToString(compressed)
 	} else {
-		resp.ToUIDs = append([]string(nil), message.ToUIDs...)
+		resp.OfflineTargets = targets
 	}
 	return json.Marshal(resp)
 }
@@ -102,10 +105,10 @@ func messageRespFromMessage(msg Message) messageResp {
 	}
 }
 
-func gzipJSONStringSlice(values []string) ([]byte, error) {
+func gzipJSON(value any) ([]byte, error) {
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)
-	if err := json.NewEncoder(zw).Encode(values); err != nil {
+	if err := json.NewEncoder(zw).Encode(value); err != nil {
 		_ = zw.Close()
 		return nil, err
 	}
@@ -113,6 +116,27 @@ func gzipJSONStringSlice(values []string) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func canonicalOfflineTargets(values []OfflineTarget) []OfflineTarget {
+	targets := append([]OfflineTarget(nil), values...)
+	sort.Slice(targets, func(i, j int) bool {
+		if targets[i].UID != targets[j].UID {
+			return targets[i].UID < targets[j].UID
+		}
+		return targets[i].DeviceFlag < targets[j].DeviceFlag
+	})
+	result := targets[:0]
+	for _, target := range targets {
+		if target.UID == "" {
+			continue
+		}
+		if len(result) != 0 && result[len(result)-1] == target {
+			continue
+		}
+		result = append(result, target)
+	}
+	return result
 }
 
 func boolToUint8(v bool) uint8 {

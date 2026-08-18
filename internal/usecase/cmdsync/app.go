@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/internal/contracts/protocolmeta"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 	runtimechannelid "github.com/WuKongIM/WuKongIM/pkg/protocol/channelid"
 )
@@ -23,6 +24,8 @@ const (
 // App owns durable CMD sync and ack business rules.
 type App struct {
 	states          StateStore
+	deviceStates    DeviceStateStore
+	principals      PrincipalStore
 	messages        MessageStore
 	records         *SyncRecordCache
 	now             func() time.Time
@@ -51,8 +54,20 @@ func New(opts Options) *App {
 	if opts.Records == nil {
 		opts.Records = NewSyncRecordCache(SyncRecordCacheOptions{Now: opts.Now, MaxRecordsPerUID: opts.MaxLimit})
 	}
+	if opts.DeviceStates == nil {
+		if store, ok := opts.States.(DeviceStateStore); ok {
+			opts.DeviceStates = store
+		}
+	}
+	if opts.Principals == nil {
+		if store, ok := opts.States.(PrincipalStore); ok {
+			opts.Principals = store
+		}
+	}
 	return &App{
 		states:          opts.States,
+		deviceStates:    opts.DeviceStates,
+		principals:      opts.Principals,
 		messages:        opts.Messages,
 		records:         opts.Records,
 		now:             opts.Now,
@@ -111,11 +126,17 @@ func (a *App) BatchSync(ctx context.Context, query BatchSyncQuery) (BatchSyncRes
 	if a == nil || a.states == nil {
 		return BatchSyncResult{}, ErrStateStoreRequired
 	}
+	if a.deviceStates == nil {
+		return BatchSyncResult{}, ErrDeviceStateStoreRequired
+	}
+	if err := a.verifyPrincipal(ctx, uid, query.DeviceFlag, query.LoginSessionID, query.CredentialVersion); err != nil {
+		return BatchSyncResult{}, err
+	}
 	if a.messages == nil {
 		return BatchSyncResult{}, ErrMessageStoreRequired
 	}
 	limit := a.normalizeLimit(query.Limit)
-	candidates, more, err := a.loadSyncCandidates(ctx, uid, limit)
+	candidates, more, err := a.loadDeviceSyncCandidates(ctx, uid, query.DeviceFlag, limit)
 	if err != nil {
 		return BatchSyncResult{}, err
 	}
@@ -142,7 +163,7 @@ func (a *App) BatchSync(ctx context.Context, query BatchSyncQuery) (BatchSyncRes
 	records := syncRecordsFromMap(recordsByKey)
 	result.AckCursors = ackCursorsFromRecords(records)
 	if len(records) > 0 {
-		result.BatchID = commandBatchID(uid, records)
+		result.BatchID = commandBatchID(uid, query.DeviceFlag, records)
 	}
 	return result, nil
 }
@@ -156,6 +177,12 @@ func (a *App) BatchAck(ctx context.Context, cmd BatchAckCommand) error {
 	if a == nil || a.states == nil {
 		return ErrStateStoreRequired
 	}
+	if a.deviceStates == nil {
+		return ErrDeviceStateStoreRequired
+	}
+	if err := a.verifyPrincipal(ctx, uid, cmd.DeviceFlag, cmd.LoginSessionID, cmd.CredentialVersion); err != nil {
+		return err
+	}
 	if strings.TrimSpace(cmd.BatchID) == "" {
 		return ErrBatchIDRequired
 	}
@@ -163,11 +190,11 @@ func (a *App) BatchAck(ctx context.Context, cmd BatchAckCommand) error {
 	if err != nil {
 		return err
 	}
-	expected := commandBatchID(uid, records)
+	expected := commandBatchID(uid, cmd.DeviceFlag, records)
 	if subtle.ConstantTimeCompare([]byte(expected), []byte(strings.TrimSpace(cmd.BatchID))) != 1 {
 		return ErrBatchIDMismatch
 	}
-	return a.ackSyncRecords(ctx, uid, records)
+	return a.ackDeviceSyncRecords(ctx, uid, cmd.DeviceFlag, records)
 }
 
 // SyncAck advances read cursors for the latest sync generation only.
@@ -228,6 +255,43 @@ func (a *App) loadSyncCandidates(ctx context.Context, uid string, limit int) ([]
 	return candidates, more, nil
 }
 
+func (a *App) loadDeviceSyncCandidates(ctx context.Context, uid string, deviceFlag uint8, limit int) ([]syncMessageCandidate, bool, error) {
+	states, err := a.deviceStates.ListDeviceConversationActiveView(ctx, uid, deviceFlag, a.activeScanLimit)
+	if err != nil {
+		return nil, false, err
+	}
+	return a.loadSyncCandidatesFromStates(ctx, states, limit)
+}
+
+func (a *App) loadSyncCandidatesFromStates(ctx context.Context, states []metadb.ConversationState, limit int) ([]syncMessageCandidate, bool, error) {
+	channels := cmdSyncCandidatesFromStates(states)
+	sortSyncChannelCandidates(channels)
+	candidates := make([]syncMessageCandidate, 0, limit+1)
+	perChannelLimit := limit + 1
+	for _, candidate := range channels {
+		key := candidate.key
+		msgs, err := a.messages.LoadCommandMessages(ctx, key, candidate.readSeq+1, perChannelLimit)
+		if err != nil {
+			return nil, false, err
+		}
+		for _, msg := range msgs {
+			candidates = append(candidates, syncMessageCandidate{
+				commandChannelID: key.ChannelID,
+				channelType:      key.ChannelType,
+				message:          msg,
+			})
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return syncMessageLess(candidates[i], candidates[j])
+	})
+	more := len(candidates) > limit
+	if more {
+		candidates = candidates[:limit]
+	}
+	return candidates, more, nil
+}
+
 func (a *App) ackSyncRecords(ctx context.Context, uid string, records []SyncRecord) error {
 	updatedAt := a.now().UnixNano()
 	states := make([]metadb.ConversationState, 0, len(records))
@@ -242,6 +306,41 @@ func (a *App) ackSyncRecords(ctx context.Context, uid string, records []SyncReco
 		})
 	}
 	return a.states.UpsertConversationStates(ctx, states)
+}
+
+func (a *App) ackDeviceSyncRecords(ctx context.Context, uid string, deviceFlag uint8, records []SyncRecord) error {
+	updatedAt := a.now().UnixNano()
+	cursors := make([]metadb.CMDDeviceCursor, 0, len(records))
+	for _, record := range records {
+		cursors = append(cursors, metadb.CMDDeviceCursor{
+			UID: uid, DeviceFlag: int64(deviceFlag), ChannelID: record.CommandChannelID,
+			ChannelType: int64(record.ChannelType), ReadSeq: record.LastReturnedMsgSeq,
+			ActiveAt: updatedAt, UpdatedAt: updatedAt,
+		})
+	}
+	return a.deviceStates.UpsertCMDDeviceCursors(ctx, cursors)
+}
+
+func (a *App) verifyPrincipal(ctx context.Context, uid string, deviceFlag uint8, sessionID string, credentialVersion uint64) error {
+	if a == nil || a.principals == nil {
+		return ErrPrincipalStoreRequired
+	}
+	flag := protocolmeta.DeviceFlag(deviceFlag)
+	if (flag != protocolmeta.DeviceFlagApp && flag != protocolmeta.DeviceFlagPC) ||
+		strings.TrimSpace(sessionID) == "" || credentialVersion == 0 {
+		return ErrPrincipalInvalid
+	}
+	device, err := a.principals.GetDevice(ctx, uid, int64(flag))
+	if err != nil {
+		return ErrPrincipalStale
+	}
+	if device.CredentialStatus != metadb.DeviceCredentialStatusActive ||
+		device.CredentialVersion != credentialVersion ||
+		device.LoginSessionID != strings.TrimSpace(sessionID) ||
+		device.ExpiresAtUnixMS <= a.now().UnixMilli() {
+		return ErrPrincipalStale
+	}
+	return nil
 }
 
 func ackCursorsFromRecords(records []SyncRecord) []AckCursor {
@@ -282,9 +381,9 @@ func syncRecordsFromAckCursors(cursors []AckCursor) ([]SyncRecord, error) {
 	return syncRecordsFromMap(recordsByKey), nil
 }
 
-func commandBatchID(uid string, records []SyncRecord) string {
+func commandBatchID(uid string, deviceFlag uint8, records []SyncRecord) string {
 	digest := sha256.New()
-	_, _ = fmt.Fprintf(digest, "%d:%s|", len(uid), uid)
+	_, _ = fmt.Fprintf(digest, "%d:%s|%d|", len(uid), uid, deviceFlag)
 	for _, record := range records {
 		_, _ = fmt.Fprintf(digest, "%d:%s|%d|%d;", len(record.CommandChannelID), record.CommandChannelID, record.ChannelType, record.LastReturnedMsgSeq)
 	}

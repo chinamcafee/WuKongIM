@@ -13,6 +13,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func testCredentialDevice(uid string, flag int64, token string, level int64, version uint64) metadb.Device {
+	return metadb.Device{
+		UID: uid, DeviceFlag: flag, Token: token, DeviceLevel: level,
+		CredentialVersion: version, LoginSessionID: fmt.Sprintf("session-%d", version),
+		OperationID: fmt.Sprintf("operation-%d", version), OperationDigest: fmt.Sprintf("digest-%d", version),
+		CredentialStatus: metadb.DeviceCredentialStatusActive,
+		ExpiresAtUnixMS:  2000000000000, UpdatedAtUnixMS: 1900000000000,
+	}
+}
+
+func TestDeviceCredentialMutationResultCodecRoundTrip(t *testing.T) {
+	want := metadb.DeviceCredentialMutationResult{
+		Outcome: metadb.DeviceCredentialOutcomeIdempotencyConflict, CurrentVersion: 42,
+	}
+	got, err := DecodeDeviceCredentialMutationResult(EncodeDeviceCredentialMutationResult(&want))
+	if err != nil || got != want {
+		t.Fatalf("credential result round trip = %#v, %v, want %#v", got, err, want)
+	}
+}
+
 func TestStateMachineEncodeUpsertCommands(t *testing.T) {
 	userCmd := EncodeUpsertUserCommand(metadb.User{UID: "u1", Token: "t1", DeviceFlag: 3, DeviceLevel: 7})
 	decoded, err := decodeCommand(userCmd)
@@ -75,7 +95,7 @@ func TestStateMachineEncodeUpsertCommands(t *testing.T) {
 		t.Fatalf("decoded create user = %+v", cuc.user)
 	}
 
-	deviceData := EncodeUpsertDeviceCommand(metadb.Device{UID: "u-device", DeviceFlag: 6, Token: "device-token", DeviceLevel: 9})
+	deviceData := EncodeUpsertDeviceCommand(testCredentialDevice("u-device", 6, "device-token", 9, 1))
 	decoded, err = decodeCommand(deviceData)
 	if err != nil {
 		t.Fatalf("decodeCommand(device) error = %v", err)

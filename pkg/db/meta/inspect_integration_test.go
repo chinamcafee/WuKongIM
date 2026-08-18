@@ -23,6 +23,7 @@ func TestInspectTablesIncludesRegisteredSchemas(t *testing.T) {
 		"channel_runtime_meta",
 		"subscriber",
 		"conversation",
+		"cmd_device_cursor",
 		"plugin_binding",
 		"channel_migration",
 		"hashslot_migration",
@@ -183,7 +184,7 @@ func TestInspectScanDeviceByUID(t *testing.T) {
 	store := openTestMetaStore(t)
 	defer store.close(t)
 	ctx := context.Background()
-	device := Device{UID: "u-device", DeviceFlag: 3, Token: "device-token", DeviceLevel: 9}
+	device := testActiveDevice("u-device", 3, "device-token", 9, 7)
 	if err := store.db.HashSlot(5).UpsertDevice(ctx, device); err != nil {
 		t.Fatalf("UpsertDevice(): %v", err)
 	}
@@ -202,7 +203,8 @@ func TestInspectScanDeviceByUID(t *testing.T) {
 		t.Fatalf("rows len = %d, want 1: %+v", len(got.Rows), got.Rows)
 	}
 	row := got.Rows[0]
-	if row["device_flag"] != int64(3) || row["token"] != "device-token" || row["device_level"] != int64(9) {
+	if row["device_flag"] != int64(3) || row["token"] != "device-token" || row["device_level"] != int64(9) ||
+		row["credential_version"] != uint64(7) || row["credential_status"] != string(DeviceCredentialStatusActive) {
 		t.Fatalf("row = %+v, want device fields", row)
 	}
 }
@@ -213,8 +215,8 @@ func TestInspectScanDeviceFilterUsesPrimaryPrefix(t *testing.T) {
 	ctx := context.Background()
 	shard := store.db.HashSlot(5)
 	for _, device := range []Device{
-		{UID: "u-prefix", DeviceFlag: 1, Token: "match"},
-		{UID: "z-other", DeviceFlag: 1, Token: "skip"},
+		testActiveDevice("u-prefix", 1, "match", 1, 1),
+		testActiveDevice("z-other", 1, "skip", 1, 1),
 	} {
 		if err := shard.UpsertDevice(ctx, device); err != nil {
 			t.Fatalf("UpsertDevice(%+v): %v", device, err)
@@ -248,8 +250,8 @@ func TestInspectScanDeviceCursorAcceptsJSONFloat64NumericPart(t *testing.T) {
 	ctx := context.Background()
 	shard := store.db.HashSlot(5)
 	for _, device := range []Device{
-		{UID: "u-device", DeviceFlag: 1, Token: "first"},
-		{UID: "u-device", DeviceFlag: 2, Token: "second"},
+		testActiveDevice("u-device", 1, "first", 1, 1),
+		testActiveDevice("u-device", 2, "second", 1, 1),
 	} {
 		if err := shard.UpsertDevice(ctx, device); err != nil {
 			t.Fatalf("UpsertDevice(%+v): %v", device, err)
@@ -412,6 +414,23 @@ func TestInspectScanRemainingTablesSmoke(t *testing.T) {
 				t.Helper()
 				if row["uid"] != "u-conv" || row["kind"] != uint8(ConversationKindNormal) || row["read_seq"] != uint64(3) || row["updated_at"] != int64(11) || row["sparse_active"] != true {
 					t.Fatalf("conversation row = %+v", row)
+				}
+			},
+		},
+		{
+			name:  "cmd_device_cursor",
+			table: "cmd_device_cursor",
+			slot:  13,
+			seed: func(ctx context.Context, shard *Shard) error {
+				return shard.UpsertCMDDeviceCursor(ctx, CMDDeviceCursor{
+					UID: "u-cmd", DeviceFlag: 2, ChannelID: "u-cmd-channel", ChannelType: 7,
+					ReadSeq: 9, DeletedToSeq: 4, ActiveAt: 12, UpdatedAt: 13,
+				})
+			},
+			assert: func(t *testing.T, row InspectRow) {
+				t.Helper()
+				if row["uid"] != "u-cmd" || row["device_flag"] != int64(2) || row["command_channel_id"] != "u-cmd-channel" || row["read_seq"] != uint64(9) {
+					t.Fatalf("cmd device cursor row = %+v", row)
 				}
 			},
 		},

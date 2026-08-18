@@ -103,6 +103,8 @@ func InspectScan(ctx context.Context, db *MetaDB, req InspectScanRequest) (Inspe
 		return inspectScanTable(ctx, db, req, slots, messageEventAppliedTable, inspectMessageEventAppliedRow)
 	case "conversation":
 		return inspectScanTable(ctx, db, req, slots, conversationTable, inspectConversationRow)
+	case "cmd_device_cursor":
+		return inspectScanTable(ctx, db, req, slots, cmdDeviceCursorTable, inspectCMDDeviceCursorRow)
 	case "plugin_binding":
 		return inspectScanTable(ctx, db, req, slots, pluginBindingTable, inspectPluginBindingRow)
 	case "channel_migration":
@@ -448,10 +450,18 @@ func inspectUserRow(user User) InspectRow {
 
 func inspectDeviceRow(device Device) InspectRow {
 	return InspectRow{
-		"uid":          device.UID,
-		"device_flag":  device.DeviceFlag,
-		"token":        device.Token,
-		"device_level": device.DeviceLevel,
+		"uid":                device.UID,
+		"device_flag":        device.DeviceFlag,
+		"token":              device.Token,
+		"device_level":       device.DeviceLevel,
+		"credential_version": device.CredentialVersion,
+		"login_session_id":   device.LoginSessionID,
+		"operation_id":       device.OperationID,
+		"operation_digest":   device.OperationDigest,
+		"credential_status":  string(device.CredentialStatus),
+		"expires_at_unix_ms": device.ExpiresAtUnixMS,
+		"updated_at_unix_ms": device.UpdatedAtUnixMS,
+		"termination_cause":  device.TerminationCause,
 	}
 }
 
@@ -577,6 +587,19 @@ func inspectConversationRow(state ConversationState) InspectRow {
 		"active_at":      state.ActiveAt,
 		"updated_at":     state.UpdatedAt,
 		"sparse_active":  state.SparseActive,
+	}
+}
+
+func inspectCMDDeviceCursorRow(cursor CMDDeviceCursor) InspectRow {
+	return InspectRow{
+		"uid":                cursor.UID,
+		"device_flag":        cursor.DeviceFlag,
+		"command_channel_id": cursor.ChannelID,
+		"channel_type":       cursor.ChannelType,
+		"read_seq":           cursor.ReadSeq,
+		"deleted_to_seq":     cursor.DeletedToSeq,
+		"active_at":          cursor.ActiveAt,
+		"updated_at":         cursor.UpdatedAt,
 	}
 }
 

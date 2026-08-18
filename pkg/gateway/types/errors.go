@@ -18,6 +18,7 @@ var (
 	ErrAsyncDispatchQueueFull   = errors.New("gateway: async send dispatch queue is full")
 	ErrAsyncAuthQueueFull       = errors.New("gateway: async auth queue is full")
 	ErrIdleTimeout              = errors.New("gateway: idle timeout")
+	ErrCredentialExpired        = errors.New("gateway: credential expired")
 )
 
 type CloseReason string

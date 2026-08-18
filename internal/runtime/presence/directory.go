@@ -1,6 +1,7 @@
 package presence
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"sync"
@@ -17,7 +18,8 @@ const (
 // Directory stores authoritative presence routes for locally led hash slots.
 type Directory struct {
 	// localNodeID optionally verifies that incoming RouteTarget values point here.
-	localNodeID uint64
+	localNodeID      uint64
+	credentialFences CredentialFenceLoader
 	// shards spreads hash-slot authority state across independent locks.
 	shards []directoryShard
 	// touchRoutesTotal counts route touch entries accepted by the target fence.
@@ -54,6 +56,12 @@ type authoritySlot struct {
 	expiryByKey map[identityKey]*expiryBucket
 	// nextID allocates shard-local pending route tokens.
 	nextID uint64
+	// credentialFences stores current admission state by UID/device flag.
+	credentialFences map[credentialFenceKey]CredentialFence
+	// credentialActions retains owner reconciliation work until the authority
+	// receives an explicit acknowledgement. Equal-version retries therefore
+	// cannot incorrectly report completion after a transient owner failure.
+	credentialActions map[credentialActionKey]credentialAction
 }
 
 type pendingRoute struct {
@@ -74,6 +82,26 @@ type identityKey struct {
 	sessionID uint64
 }
 
+type credentialFenceKey struct {
+	uid  string
+	flag uint8
+}
+
+type credentialActionKey struct {
+	uid                       string
+	ownerNodeID               uint64
+	ownerBootID               uint64
+	sessionID                 uint64
+	expectedOwnerSeq          uint64
+	expectedCredentialVersion uint64
+	expectedLoginSessionID    string
+}
+
+type credentialAction struct {
+	deviceFlag uint8
+	action     RouteAction
+}
+
 // NewDirectory creates a sharded in-memory authority directory.
 func NewDirectory(opts DirectoryOptions) *Directory {
 	shardCount := opts.ShardCount
@@ -81,13 +109,22 @@ func NewDirectory(opts DirectoryOptions) *Directory {
 		shardCount = defaultShardCount
 	}
 	d := &Directory{
-		localNodeID: opts.LocalNodeID,
-		shards:      make([]directoryShard, shardCount),
+		localNodeID:      opts.LocalNodeID,
+		credentialFences: opts.CredentialFences,
+		shards:           make([]directoryShard, shardCount),
 	}
 	for i := range d.shards {
 		d.shards[i].slots = make(map[uint16]*authoritySlot)
 	}
 	return d
+}
+
+// SetCredentialFenceLoader installs the durable admission reader before the directory serves traffic.
+func (d *Directory) SetCredentialFenceLoader(loader CredentialFenceLoader) {
+	if d == nil {
+		return
+	}
+	d.credentialFences = loader
 }
 
 // BecomeAuthority installs a fresh authority identity for one hash slot.
@@ -119,6 +156,19 @@ func (d *Directory) LoseAuthority(hashSlot uint16) {
 
 // RegisterRoute registers a route or stores it as pending when conflicts exist.
 func (d *Directory) RegisterRoute(target RouteTarget, route Route) (RegisterResult, error) {
+	return d.RegisterRouteContext(context.Background(), target, route)
+}
+
+// RegisterRouteContext validates durable credential state before entering the authority critical section.
+func (d *Directory) RegisterRouteContext(ctx context.Context, target RouteTarget, route Route) (RegisterResult, error) {
+	var loaded *CredentialFence
+	if d != nil && d.credentialFences != nil {
+		fence, err := d.credentialFences.LoadCredentialFence(ctx, route.UID, route.DeviceFlag)
+		if err != nil {
+			return RegisterResult{}, ErrRouteNotReady
+		}
+		loaded = &fence
+	}
 	shard := d.shard(target.HashSlot)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -127,11 +177,37 @@ func (d *Directory) RegisterRoute(target RouteTarget, route Route) (RegisterResu
 	if err != nil {
 		return RegisterResult{}, err
 	}
-	return slot.registerLocked(route)
+	return slot.registerLocked(route, loaded, time.Now().UnixMilli())
 }
 
 // CommitRoute promotes a pending conflict candidate and removes acknowledged conflicts.
 func (d *Directory) CommitRoute(target RouteTarget, token PendingRouteToken) error {
+	return d.CommitRouteContext(context.Background(), target, token)
+}
+
+// CommitRouteContext revalidates the pending route against durable credential
+// metadata before it can become active. The load happens outside the shard lock.
+func (d *Directory) CommitRouteContext(ctx context.Context, target RouteTarget, token PendingRouteToken) error {
+	var loaded *CredentialFence
+	if d != nil && d.credentialFences != nil {
+		shard := d.shard(target.HashSlot)
+		shard.mu.RLock()
+		slot, err := d.validateTargetLocked(shard, target)
+		if err != nil {
+			shard.mu.RUnlock()
+			return err
+		}
+		pending, ok := slot.pending[token]
+		shard.mu.RUnlock()
+		if !ok {
+			return ErrRouteNotReady
+		}
+		fence, err := d.credentialFences.LoadCredentialFence(ctx, pending.route.UID, pending.route.DeviceFlag)
+		if err != nil {
+			return ErrRouteNotReady
+		}
+		loaded = &fence
+	}
 	shard := d.shard(target.HashSlot)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -140,7 +216,13 @@ func (d *Directory) CommitRoute(target RouteTarget, token PendingRouteToken) err
 	if err != nil {
 		return err
 	}
-	return slot.commitRouteLocked(token)
+	if loaded != nil {
+		if err := slot.mergeLoadedFenceLocked(*loaded); err != nil {
+			delete(slot.pending, token)
+			return err
+		}
+	}
+	return slot.commitRouteLocked(token, time.Now().UnixMilli())
 }
 
 // AbortRoute drops a pending conflict candidate without touching active routes.
@@ -190,6 +272,26 @@ func (d *Directory) UnregisterRoute(target RouteTarget, identity RouteIdentity, 
 
 // TouchRoutes refreshes active owner activity and recreates non-conflicting missing routes.
 func (d *Directory) TouchRoutes(target RouteTarget, routes []Route) error {
+	return d.TouchRoutesContext(context.Background(), target, routes)
+}
+
+// TouchRoutesContext reloads every distinct durable UID/device fence before
+// refreshing or recreating routes, so heartbeats cannot revive stale sessions.
+func (d *Directory) TouchRoutesContext(ctx context.Context, target RouteTarget, routes []Route) error {
+	loaded := make(map[credentialFenceKey]CredentialFence)
+	if d != nil && d.credentialFences != nil {
+		for _, route := range routes {
+			key := credentialFenceKey{uid: route.UID, flag: route.DeviceFlag}
+			if _, ok := loaded[key]; ok {
+				continue
+			}
+			fence, err := d.credentialFences.LoadCredentialFence(ctx, route.UID, route.DeviceFlag)
+			if err != nil {
+				return ErrRouteNotReady
+			}
+			loaded[key] = fence
+		}
+	}
 	shard := d.shard(target.HashSlot)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -198,8 +300,13 @@ func (d *Directory) TouchRoutes(target RouteTarget, routes []Route) error {
 	if err != nil {
 		return err
 	}
+	for _, fence := range loaded {
+		if err := slot.mergeLoadedFenceLocked(fence); err != nil {
+			return err
+		}
+	}
 	for _, route := range routes {
-		slot.touchLocked(route)
+		slot.touchLocked(route, time.Now().UnixMilli())
 	}
 	d.touchRoutesTotal.Add(uint64(len(routes)))
 	return nil
@@ -352,8 +459,9 @@ func (d *Directory) EndpointsByTargets(groups []EndpointLookupGroup) []EndpointL
 			groupStart := writeIndex
 			for _, uid := range group.UIDs {
 				uidStart := writeIndex
+				nowUnixMS := time.Now().UnixMilli()
 				for key := range slot.byUID[uid] {
-					if route, ok := slot.active[key]; ok {
+					if route, ok := slot.active[key]; ok && slot.routeAdmittedLocked(route, nowUnixMS) {
 						shardRoutes[writeIndex] = route
 						writeIndex++
 					}
@@ -375,8 +483,9 @@ func (s *authoritySlot) endpointsByUIDLocked(uid string) []Route {
 		return nil
 	}
 	routes := make([]Route, 0, len(keys))
+	nowUnixMS := time.Now().UnixMilli()
 	for key := range keys {
-		if route, ok := s.active[key]; ok {
+		if route, ok := s.active[key]; ok && s.routeAdmittedLocked(route, nowUnixMS) {
 			routes = append(routes, route)
 		}
 	}
@@ -420,19 +529,34 @@ func (d *Directory) shard(hashSlot uint16) *directoryShard {
 
 func newAuthoritySlot(target RouteTarget) *authoritySlot {
 	return &authoritySlot{
-		target:       target,
-		active:       make(map[identityKey]Route),
-		byUID:        make(map[string]map[identityKey]struct{}),
-		pending:      make(map[PendingRouteToken]pendingRoute),
-		ownerSeq:     make(map[identityKey]uint64),
-		tombstoneSeq: make(map[identityKey]uint64),
-		expiryHeap:   make(expiryBucketHeap, 0),
-		expiryBySeen: make(map[int64]*expiryBucket),
-		expiryByKey:  make(map[identityKey]*expiryBucket),
+		target:            target,
+		active:            make(map[identityKey]Route),
+		byUID:             make(map[string]map[identityKey]struct{}),
+		pending:           make(map[PendingRouteToken]pendingRoute),
+		credentialFences:  make(map[credentialFenceKey]CredentialFence),
+		credentialActions: make(map[credentialActionKey]credentialAction),
+		ownerSeq:          make(map[identityKey]uint64),
+		tombstoneSeq:      make(map[identityKey]uint64),
+		expiryHeap:        make(expiryBucketHeap, 0),
+		expiryBySeen:      make(map[int64]*expiryBucket),
+		expiryByKey:       make(map[identityKey]*expiryBucket),
 	}
 }
 
-func (s *authoritySlot) registerLocked(route Route) (RegisterResult, error) {
+func (s *authoritySlot) registerLocked(route Route, loaded *CredentialFence, nowUnixMS int64) (RegisterResult, error) {
+	if loaded != nil {
+		if err := s.mergeLoadedFenceLocked(*loaded); err != nil {
+			return RegisterResult{}, err
+		}
+	} else if route.CredentialVersion > 0 {
+		_ = s.mergeLoadedFenceLocked(CredentialFence{
+			UID: route.UID, DeviceFlag: route.DeviceFlag, CredentialVersion: route.CredentialVersion,
+			LoginSessionID: route.LoginSessionID, Status: CredentialStatusActive, ExpiresAtUnixMS: route.ExpiresAtUnixMS,
+		})
+	}
+	if !s.routeAdmittedLocked(route, nowUnixMS) {
+		return RegisterResult{}, ErrStaleRoute
+	}
 	key := makeRouteIdentityKey(route)
 	if tombstone, ok := s.tombstoneSeq[key]; ok && route.OwnerSeq <= tombstone {
 		return RegisterResult{}, ErrStaleRoute
@@ -464,10 +588,14 @@ func (s *authoritySlot) registerLocked(route Route) (RegisterResult, error) {
 	}, nil
 }
 
-func (s *authoritySlot) commitRouteLocked(token PendingRouteToken) error {
+func (s *authoritySlot) commitRouteLocked(token PendingRouteToken, nowUnixMS int64) error {
 	pending, ok := s.pending[token]
 	if !ok {
 		return ErrRouteNotReady
+	}
+	if !s.routeAdmittedLocked(pending.route, nowUnixMS) {
+		delete(s.pending, token)
+		return ErrStaleRoute
 	}
 	key := makeRouteIdentityKey(pending.route)
 	if tombstone, ok := s.tombstoneSeq[key]; ok && pending.route.OwnerSeq <= tombstone {
@@ -497,8 +625,15 @@ func (s *authoritySlot) commitRouteLocked(token PendingRouteToken) error {
 	return nil
 }
 
-func (s *authoritySlot) touchLocked(route Route) {
+func (s *authoritySlot) touchLocked(route Route, nowUnixMS int64) {
 	if route.UID == "" {
+		return
+	}
+	if !s.routeAdmittedLocked(route, nowUnixMS) {
+		key := makeRouteIdentityKey(route)
+		if existing, ok := s.active[key]; ok && existing.OwnerSeq <= route.OwnerSeq {
+			s.removeActiveLocked(key, existing)
+		}
 		return
 	}
 	key := makeRouteIdentityKey(route)
@@ -521,6 +656,168 @@ func (s *authoritySlot) touchLocked(route Route) {
 		return
 	}
 	s.upsertActiveLocked(route)
+}
+
+// AdvanceCredentialFence atomically advances admission state and removes stale active/pending routes.
+func (d *Directory) AdvanceCredentialFence(target RouteTarget, fence CredentialFence) (CredentialFenceAdvanceResult, error) {
+	shard := d.shard(target.HashSlot)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	slot, err := d.validateTargetLocked(shard, target)
+	if err != nil {
+		return CredentialFenceAdvanceResult{}, err
+	}
+	return slot.advanceCredentialFenceLocked(fence, time.Now().UnixMilli())
+}
+
+func (s *authoritySlot) advanceCredentialFenceLocked(fence CredentialFence, nowUnixMS int64) (CredentialFenceAdvanceResult, error) {
+	key := credentialFenceKey{uid: fence.UID, flag: fence.DeviceFlag}
+	current, exists := s.credentialFences[key]
+	if exists && fence.CredentialVersion < current.CredentialVersion {
+		return CredentialFenceAdvanceResult{CurrentVersion: current.CredentialVersion}, nil
+	}
+	if exists && fence.CredentialVersion == current.CredentialVersion && !sameCredentialFence(current, fence) {
+		return CredentialFenceAdvanceResult{CurrentVersion: current.CredentialVersion}, ErrCredentialFenceConflict
+	}
+	if err := validateCredentialFence(fence); err != nil {
+		return CredentialFenceAdvanceResult{}, err
+	}
+	s.credentialFences[key] = fence
+	result := CredentialFenceAdvanceResult{CurrentVersion: fence.CredentialVersion}
+	for routeKey := range s.byUID[fence.UID] {
+		route, ok := s.active[routeKey]
+		if !ok || route.DeviceFlag != fence.DeviceFlag || routeMatchesFence(route, fence, nowUnixMS) {
+			continue
+		}
+		s.rememberCredentialActionLocked(fence.DeviceFlag, actionForCredentialFence(fence, route))
+		s.removeActiveLocked(routeKey, route)
+		result.ActiveFenced++
+	}
+	for token, pending := range s.pending {
+		route := pending.route
+		if route.UID != fence.UID || route.DeviceFlag != fence.DeviceFlag || routeMatchesFence(route, fence, nowUnixMS) {
+			continue
+		}
+		s.rememberCredentialActionLocked(fence.DeviceFlag, actionForCredentialFence(fence, route))
+		delete(s.pending, token)
+		result.PendingFenced++
+	}
+	result.Actions = s.credentialActionsForFenceLocked(key)
+	return result, nil
+}
+
+// AcknowledgeCredentialAction removes one exact owner action only after the
+// caller has proved local fencing/close or an exact stale no-op.
+func (d *Directory) AcknowledgeCredentialAction(target RouteTarget, action RouteAction) error {
+	shard := d.shard(target.HashSlot)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	slot, err := d.validateTargetLocked(shard, target)
+	if err != nil {
+		return err
+	}
+	key := makeCredentialActionKey(action)
+	if retained, ok := slot.credentialActions[key]; ok && retained.action == action {
+		delete(slot.credentialActions, key)
+	}
+	return nil
+}
+
+func (s *authoritySlot) rememberCredentialActionLocked(deviceFlag uint8, action RouteAction) {
+	if s.credentialActions == nil {
+		s.credentialActions = make(map[credentialActionKey]credentialAction)
+	}
+	s.credentialActions[makeCredentialActionKey(action)] = credentialAction{deviceFlag: deviceFlag, action: action}
+}
+
+func (s *authoritySlot) credentialActionsForFenceLocked(fenceKey credentialFenceKey) []RouteAction {
+	actions := make([]RouteAction, 0)
+	for _, retained := range s.credentialActions {
+		if retained.action.UID == fenceKey.uid && retained.deviceFlag == fenceKey.flag {
+			actions = append(actions, retained.action)
+		}
+	}
+	sort.Slice(actions, func(i, j int) bool {
+		if actions[i].SessionID != actions[j].SessionID {
+			return actions[i].SessionID < actions[j].SessionID
+		}
+		return actions[i].OwnerNodeID < actions[j].OwnerNodeID
+	})
+	return actions
+}
+
+func makeCredentialActionKey(action RouteAction) credentialActionKey {
+	return credentialActionKey{
+		uid: action.UID, ownerNodeID: action.OwnerNodeID, ownerBootID: action.OwnerBootID,
+		sessionID: action.SessionID, expectedOwnerSeq: action.ExpectedOwnerSeq,
+		expectedCredentialVersion: action.ExpectedCredentialVersion,
+		expectedLoginSessionID:    action.ExpectedLoginSessionID,
+	}
+}
+
+func (s *authoritySlot) mergeLoadedFenceLocked(fence CredentialFence) error {
+	if err := validateCredentialFence(fence); err != nil {
+		return err
+	}
+	key := credentialFenceKey{uid: fence.UID, flag: fence.DeviceFlag}
+	current, exists := s.credentialFences[key]
+	if exists && current.CredentialVersion > fence.CredentialVersion {
+		return ErrStaleRoute
+	}
+	if exists && current.CredentialVersion == fence.CredentialVersion && !sameCredentialFence(current, fence) {
+		return ErrCredentialFenceConflict
+	}
+	s.credentialFences[key] = fence
+	return nil
+}
+
+func (s *authoritySlot) routeAdmittedLocked(route Route, nowUnixMS int64) bool {
+	fence, ok := s.credentialFences[credentialFenceKey{uid: route.UID, flag: route.DeviceFlag}]
+	if !ok {
+		return route.CredentialVersion == 0
+	}
+	return routeMatchesFence(route, fence, nowUnixMS)
+}
+
+func validateCredentialFence(fence CredentialFence) error {
+	if fence.UID == "" || fence.CredentialVersion == 0 || fence.LoginSessionID == "" {
+		return ErrRouteNotReady
+	}
+	switch fence.Status {
+	case CredentialStatusActive:
+		if fence.ExpiresAtUnixMS <= 0 {
+			return ErrRouteNotReady
+		}
+	case CredentialStatusRevoked:
+	default:
+		return ErrRouteNotReady
+	}
+	return nil
+}
+
+func sameCredentialFence(left, right CredentialFence) bool {
+	return left.UID == right.UID && left.DeviceFlag == right.DeviceFlag &&
+		left.CredentialVersion == right.CredentialVersion && left.LoginSessionID == right.LoginSessionID &&
+		left.Status == right.Status && left.ExpiresAtUnixMS == right.ExpiresAtUnixMS
+}
+
+func routeMatchesFence(route Route, fence CredentialFence, nowUnixMS int64) bool {
+	return fence.Status == CredentialStatusActive && fence.ExpiresAtUnixMS > nowUnixMS &&
+		route.CredentialVersion == fence.CredentialVersion &&
+		route.LoginSessionID == fence.LoginSessionID && route.ExpiresAtUnixMS == fence.ExpiresAtUnixMS
+}
+
+func actionForCredentialFence(fence CredentialFence, route Route) RouteAction {
+	reason := fence.MachineReason
+	if reason == "" {
+		reason = "SESSION_REPLACED_SAME_DEVICE_CLASS"
+	}
+	return RouteAction{
+		UID: route.UID, OwnerNodeID: route.OwnerNodeID, OwnerBootID: route.OwnerBootID,
+		SessionID: route.SessionID, ExpectedOwnerSeq: route.OwnerSeq,
+		ExpectedCredentialVersion: route.CredentialVersion, ExpectedLoginSessionID: route.LoginSessionID,
+		Kind: "kick_then_close", Reason: reason,
+	}
 }
 
 func (s *authoritySlot) conflictsLocked(route Route) []identityKey {
@@ -599,16 +896,19 @@ func conflicts(incoming, existing Route) bool {
 
 func actionForReplacement(incoming, existing Route) RouteAction {
 	kind := "close"
-	if incoming.DeviceLevel == deviceLevelMaster && incoming.DeviceID != existing.DeviceID {
+	if incoming.DeviceLevel == deviceLevelMaster && incoming.LoginSessionID != existing.LoginSessionID {
 		kind = "kick_then_close"
 	}
 	return RouteAction{
-		UID:         existing.UID,
-		OwnerNodeID: existing.OwnerNodeID,
-		OwnerBootID: existing.OwnerBootID,
-		SessionID:   existing.SessionID,
-		Kind:        kind,
-		Reason:      "presence_conflict",
+		UID:                       existing.UID,
+		OwnerNodeID:               existing.OwnerNodeID,
+		OwnerBootID:               existing.OwnerBootID,
+		SessionID:                 existing.SessionID,
+		ExpectedOwnerSeq:          existing.OwnerSeq,
+		ExpectedCredentialVersion: existing.CredentialVersion,
+		ExpectedLoginSessionID:    existing.LoginSessionID,
+		Kind:                      kind,
+		Reason:                    "presence_conflict",
 	}
 }
 

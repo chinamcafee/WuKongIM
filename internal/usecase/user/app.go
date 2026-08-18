@@ -3,6 +3,7 @@ package user
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/contracts/protocolmeta"
@@ -30,12 +31,29 @@ func (a *App) UpdateToken(ctx context.Context, cmd UpdateTokenCommand) error {
 	} else if err != nil {
 		return err
 	}
-	if err := a.devices.UpsertDevice(ctx, metadb.Device{
-		UID:         cmd.UID,
-		DeviceFlag:  int64(cmd.DeviceFlag),
-		Token:       cmd.Token,
-		DeviceLevel: int64(cmd.DeviceLevel),
-	}); err != nil {
+	currentVersion := uint64(0)
+	if a.deviceReader != nil {
+		if current, readErr := a.deviceReader.GetDevice(ctx, cmd.UID, int64(cmd.DeviceFlag)); readErr == nil {
+			currentVersion = current.CredentialVersion
+		} else if !errors.Is(readErr, metadb.ErrNotFound) {
+			return readErr
+		}
+	}
+	nowMS := time.Now().UnixMilli()
+	device := metadb.Device{
+		UID:               cmd.UID,
+		DeviceFlag:        int64(cmd.DeviceFlag),
+		Token:             cmd.Token,
+		DeviceLevel:       int64(cmd.DeviceLevel),
+		CredentialVersion: currentVersion + 1,
+		LoginSessionID:    "legacy-maintenance:" + cmd.UID,
+		OperationID:       fmt.Sprintf("legacy-token:%s:%d:%d", cmd.UID, cmd.DeviceFlag, currentVersion+1),
+		CredentialStatus:  metadb.DeviceCredentialStatusActive,
+		ExpiresAtUnixMS:   nowMS + int64((24*time.Hour)/time.Millisecond),
+		UpdatedAtUnixMS:   nowMS,
+	}
+	device.OperationDigest = credentialOperationDigest(device, "LEGACY_MAINTENANCE", "LEGACY_TOKEN_UPDATE")
+	if err := a.devices.UpsertDevice(ctx, device); err != nil {
 		return err
 	}
 	if cmd.DeviceLevel == protocolmeta.DeviceLevelMaster {
@@ -222,12 +240,24 @@ func (a *App) quitDevice(ctx context.Context, uid string, flag protocolmeta.Devi
 	if device.UID == "" {
 		return nil
 	}
-	if err := a.devices.UpsertDevice(ctx, metadb.Device{
-		UID:         uid,
-		DeviceFlag:  int64(flag),
-		Token:       deviceQuitMissingToken,
-		DeviceLevel: int64(protocolmeta.DeviceLevelMaster),
-	}); err != nil {
+	nowMS := time.Now().UnixMilli()
+	revoked := metadb.Device{
+		UID:               uid,
+		DeviceFlag:        int64(flag),
+		Token:             deviceQuitMissingToken,
+		DeviceLevel:       int64(protocolmeta.DeviceLevelMaster),
+		CredentialVersion: device.CredentialVersion + 1,
+		LoginSessionID:    device.LoginSessionID,
+		OperationID:       fmt.Sprintf("legacy-device-quit:%s:%d:%d", uid, flag, device.CredentialVersion+1),
+		CredentialStatus:  metadb.DeviceCredentialStatusRevoked,
+		UpdatedAtUnixMS:   nowMS,
+		TerminationCause:  "SESSION_LOGGED_OUT",
+	}
+	if revoked.LoginSessionID == "" {
+		revoked.LoginSessionID = "legacy-maintenance:" + uid
+	}
+	revoked.OperationDigest = credentialOperationDigest(revoked, "REVOKE", revoked.TerminationCause)
+	if err := a.devices.UpsertDevice(ctx, revoked); err != nil {
 		return err
 	}
 	a.kickLocalDevice(uid, flag, deviceQuitCloseDelay, "")

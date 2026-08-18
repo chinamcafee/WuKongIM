@@ -89,6 +89,9 @@ description: 完整列出公开 TOML 字段、WK_* 环境变量、值类型和�
 | TOML | Environment | Kind | Constraint |
 | --- | --- | --- | --- |
 | `api.listen_addr` | `WK_API_LISTEN_ADDR` | `string` | — |
+| `api.internal_credential_hmac_secret` | `WK_API_INTERNAL_CREDENTIAL_HMAC_SECRET` | `string` | 敏感值；至少 32 字节 |
+| `api.internal_credential_replay_window` | `WK_API_INTERNAL_CREDENTIAL_REPLAY_WINDOW` | `duration` | 必须为正时长 |
+| `api.internal_credential_max_batch_size` | `WK_API_INTERNAL_CREDENTIAL_MAX_BATCH_SIZE` | `int` | 必须为正数 |
 | `api.external_tcp_addr` | `WK_EXTERNAL_TCPADDR` | `string` | — |
 | `api.external_ws_addr` | `WK_EXTERNAL_WSADDR` | `string` | 诊断制品脱敏 |
 | `api.external_wss_addr` | `WK_EXTERNAL_WSSADDR` | `string` | 诊断制品脱敏 |
@@ -241,6 +244,7 @@ description: 完整列出公开 TOML 字段、WK_* 环境变量、值类型和�
 | `webhook.online_status_batch_max_items` | `WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_ITEMS` | `int` | — |
 | `webhook.online_status_batch_max_wait` | `WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_WAIT` | `duration` | — |
 | `webhook.offline_uid_batch_size` | `WK_WEBHOOK_OFFLINE_UID_BATCH_SIZE` | `int` | — |
+| `webhook.offline_notification_device_flags` | `WK_WEBHOOK_OFFLINE_NOTIFICATION_DEVICE_FLAGS` | `int_list` | 仅允许 MOBILE/APP 设备标志 `0`；DESKTOP/PC 不产生离线推送；默认 `[0]` |
 | `webhook.request_timeout` | `WK_WEBHOOK_REQUEST_TIMEOUT` | `duration` | — |
 | `webhook.retry_max_attempts` | `WK_WEBHOOK_RETRY_MAX_ATTEMPTS` | `int` | — |
 | `webhook.outbox_dir` | `WK_WEBHOOK_OUTBOX_DIR` | `string` | 节点本地持久 Outbox 目录 |

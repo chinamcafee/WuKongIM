@@ -182,8 +182,26 @@ func (db *MetaDB) importHashSlotSnapshotReader(ctx context.Context, hashSlots []
 
 func invalidateSnapshotAuthenticationToken(key, value []byte, hashSlots []HashSlot) ([]byte, error) {
 	for _, hashSlot := range hashSlots {
-		if !bytesHasPrefix(key, encodeRowPrefix(hashSlot, TableIDUser)) && !bytesHasPrefix(key, encodeRowPrefix(hashSlot, TableIDDevice)) {
+		isUser := bytesHasPrefix(key, encodeRowPrefix(hashSlot, TableIDUser))
+		isDevice := bytesHasPrefix(key, encodeRowPrefix(hashSlot, TableIDDevice))
+		if !isUser && !isDevice {
 			continue
+		}
+		if isDevice {
+			device, err := decodeDeviceValue("restore-device", 0, value)
+			if err != nil {
+				return nil, err
+			}
+			device.Token = ""
+			device.CredentialStatus = DeviceCredentialStatusRevoked
+			device.ExpiresAtUnixMS = 0
+			device.OperationID += ":restore-invalidated"
+			device.OperationDigest = "restore-invalidated:" + device.OperationDigest
+			device.TerminationCause = "RESTORE_INVALIDATED"
+			if err := validateDevice(device); err != nil {
+				return nil, err
+			}
+			return encodeDeviceValue(device), nil
 		}
 		_, rest, err := readValueString(value)
 		if err != nil {

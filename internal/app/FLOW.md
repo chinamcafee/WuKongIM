@@ -796,3 +796,11 @@ Status repair runs before terminal tracking-label removal; a status failure
 therefore retains `ready-for-agent` so the bounded sweep retries the projection.
 Projection failures are emitted as typed Workflow warnings without discarding
 the committed result.
+
+The composition root wires Slot-authoritative device credential CAS into the
+user usecase, installs the same metadata reader as Presence's durable fence
+loader, and injects full credential verification into Gateway auth. Admission
+requires ACTIVE status, exact token, nonzero version/session, and future
+expiry. Owner actions fence the exact local route before ordered protocol kick
+and close, returning independently observed frame-enqueue, transport-flush and
+hard-close evidence.

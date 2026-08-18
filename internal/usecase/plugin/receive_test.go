@@ -355,13 +355,17 @@ func testReceiveOfflineEvent(fromUID string) pluginevents.ReceiveOffline {
 
 func testReceiveOfflineBatchEvent(fromUID string, uids ...string) pluginevents.ReceiveOfflineBatch {
 	event := testReceiveOfflineEvent(fromUID)
+	targets := make([]pluginevents.ReceiveOfflineTarget, len(uids))
+	for index, uid := range uids {
+		targets[index] = pluginevents.ReceiveOfflineTarget{UID: uid, DeviceFlag: 0}
+	}
 	return pluginevents.ReceiveOfflineBatch{
 		MessageID:         event.MessageID,
 		MessageSeq:        event.MessageSeq,
 		ChannelID:         event.ChannelID,
 		ChannelType:       event.ChannelType,
 		FromUID:           event.FromUID,
-		UIDs:              append([]string(nil), uids...),
+		Targets:           targets,
 		ClientMsgNo:       event.ClientMsgNo,
 		ServerTimestampMS: event.ServerTimestampMS,
 		Payload:           append([]byte(nil), event.Payload...),

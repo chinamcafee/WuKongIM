@@ -85,6 +85,37 @@ func TestCMDSyncStoreUpsertsCMDKindRows(t *testing.T) {
 	}
 }
 
+func TestCMDSyncStoreOverlaysAndWritesDeviceScopedCursors(t *testing.T) {
+	key := metadb.CMDDeviceCursorKey{UID: "u1", DeviceFlag: 0, ChannelID: "g1____cmd", ChannelType: 2}
+	node := &cmdSyncNodeFake{
+		rows: []metadb.ConversationState{{
+			UID: "u1", Kind: metadb.ConversationKindCMD, ChannelID: key.ChannelID,
+			ChannelType: key.ChannelType, ReadSeq: 99, DeletedToSeq: 88, ActiveAt: 100,
+		}},
+		deviceCursors: map[metadb.CMDDeviceCursorKey]metadb.CMDDeviceCursor{
+			key: {UID: "u1", DeviceFlag: 0, ChannelID: key.ChannelID, ChannelType: 2, ReadSeq: 7, DeletedToSeq: 8},
+		},
+	}
+	store := NewCMDSyncStore(node)
+
+	appRows, err := store.ListDeviceConversationActiveView(context.Background(), "u1", 0, 10)
+	if err != nil || len(appRows) != 1 || appRows[0].ReadSeq != 7 || appRows[0].DeletedToSeq != 8 {
+		t.Fatalf("APP rows = %#v err=%v, want device floors", appRows, err)
+	}
+	pcRows, err := store.ListDeviceConversationActiveView(context.Background(), "u1", 2, 10)
+	if err != nil || len(pcRows) != 1 || pcRows[0].ReadSeq != 0 || pcRows[0].DeletedToSeq != 0 {
+		t.Fatalf("PC rows = %#v err=%v, want new-device zero floors", pcRows, err)
+	}
+	cursors := []metadb.CMDDeviceCursor{{UID: "u1", DeviceFlag: 2, ChannelID: key.ChannelID, ChannelType: 2, ReadSeq: 9}}
+	if err := store.UpsertCMDDeviceCursors(context.Background(), cursors); err != nil {
+		t.Fatalf("UpsertCMDDeviceCursors(): %v", err)
+	}
+	cursors[0].ReadSeq = 1
+	if len(node.deviceUpserts) != 1 || node.deviceUpserts[0].DeviceFlag != 2 || node.deviceUpserts[0].ReadSeq != 9 {
+		t.Fatalf("device upserts = %#v, want cloned PC cursor", node.deviceUpserts)
+	}
+}
+
 func TestCMDMessageReaderReadsCommittedCommandMessages(t *testing.T) {
 	node := &cmdSyncNodeFake{
 		readResult: channelstore.ReadCommittedResult{Messages: []channelruntime.Message{
@@ -151,15 +182,18 @@ type cmdSyncActiveCallFake struct {
 }
 
 type cmdSyncNodeFake struct {
-	rows         []metadb.ConversationState
-	activePages  map[metadb.ConversationActiveCursor]cmdSyncActivePageFake
-	activeCalls  []cmdSyncActiveCallFake
-	upserts      []metadb.ConversationState
-	lastReadID   channelruntime.ChannelID
-	lastReadReq  channelstore.ReadCommittedRequest
-	readResult   channelstore.ReadCommittedResult
-	readPages    map[uint64]channelstore.ReadCommittedResult
-	readFromSeqs []uint64
+	rows          []metadb.ConversationState
+	activePages   map[metadb.ConversationActiveCursor]cmdSyncActivePageFake
+	activeCalls   []cmdSyncActiveCallFake
+	upserts       []metadb.ConversationState
+	lastReadID    channelruntime.ChannelID
+	lastReadReq   channelstore.ReadCommittedRequest
+	readResult    channelstore.ReadCommittedResult
+	readPages     map[uint64]channelstore.ReadCommittedResult
+	readFromSeqs  []uint64
+	deviceCursors map[metadb.CMDDeviceCursorKey]metadb.CMDDeviceCursor
+	deviceUpserts []metadb.CMDDeviceCursor
+	device        metadb.Device
 }
 
 type cmdSyncActivePageFake struct {
@@ -189,6 +223,28 @@ func (n *cmdSyncNodeFake) ListConversationActivePage(_ context.Context, kind met
 func (n *cmdSyncNodeFake) UpsertConversationStatesBatch(_ context.Context, states []metadb.ConversationState) error {
 	n.upserts = append(n.upserts, states...)
 	return nil
+}
+
+func (n *cmdSyncNodeFake) GetCMDDeviceCursorsBatch(_ context.Context, keys []metadb.CMDDeviceCursorKey) (map[metadb.CMDDeviceCursorKey]metadb.CMDDeviceCursor, error) {
+	out := make(map[metadb.CMDDeviceCursorKey]metadb.CMDDeviceCursor)
+	for _, key := range keys {
+		if cursor, ok := n.deviceCursors[key]; ok {
+			out[key] = cursor
+		}
+	}
+	return out, nil
+}
+
+func (n *cmdSyncNodeFake) UpsertCMDDeviceCursorsBatch(_ context.Context, cursors []metadb.CMDDeviceCursor) error {
+	n.deviceUpserts = append(n.deviceUpserts, cursors...)
+	return nil
+}
+
+func (n *cmdSyncNodeFake) GetDeviceMetadata(_ context.Context, uid string, deviceFlag int64) (metadb.Device, error) {
+	device := n.device
+	device.UID = uid
+	device.DeviceFlag = deviceFlag
+	return device, nil
 }
 
 func (n *cmdSyncNodeFake) ReadChannelCommitted(_ context.Context, id channelruntime.ChannelID, req channelstore.ReadCommittedRequest) (channelstore.ReadCommittedResult, error) {

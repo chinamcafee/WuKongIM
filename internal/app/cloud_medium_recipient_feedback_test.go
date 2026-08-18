@@ -225,7 +225,7 @@ func newCloudMediumRecipientFeedbackHarness() (*cloudMediumRecipientFeedbackHarn
 					OwnerSeq:      nextSessionID,
 					SessionID:     nextSessionID,
 					DeviceID:      "feedback-device",
-					DeviceFlag:    1,
+					DeviceFlag:    0,
 					DeviceLevel:   1,
 					ConnectedUnix: 1,
 					LastSeenUnix:  1,

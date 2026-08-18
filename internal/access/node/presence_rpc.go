@@ -32,14 +32,16 @@ const (
 	rpcStatusInvalidArgument         = "invalid_argument"
 	rpcStatusRejected                = "rejected"
 
-	presenceOpRegisterRoute      = "register_route"
-	presenceOpCommitRoute        = "commit_route"
-	presenceOpAbortRoute         = "abort_route"
-	presenceOpUnregisterRoute    = "unregister_route"
-	presenceOpEndpointsByUID     = "endpoints_by_uid"
-	presenceOpEndpointsByTargets = "endpoints_by_targets"
-	presenceOpTouchRoutes        = "touch_routes"
-	presenceOpApplyRouteAction   = "apply_route_action"
+	presenceOpRegisterRoute          = "register_route"
+	presenceOpCommitRoute            = "commit_route"
+	presenceOpAbortRoute             = "abort_route"
+	presenceOpUnregisterRoute        = "unregister_route"
+	presenceOpEndpointsByUID         = "endpoints_by_uid"
+	presenceOpEndpointsByTargets     = "endpoints_by_targets"
+	presenceOpTouchRoutes            = "touch_routes"
+	presenceOpApplyRouteAction       = "apply_route_action"
+	presenceOpAdvanceCredentialFence = "advance_credential_fence"
+	presenceOpAckCredentialAction    = "ack_credential_action"
 )
 
 // PresenceAuthorityRPCServiceID is the cluster RPC service for UID route authority calls.
@@ -58,6 +60,16 @@ type PresenceAuthority interface {
 	TouchRoutes(context.Context, presence.RouteTarget, []presence.Route) error
 }
 
+// PresenceCredentialAuthority advances durable UID/device admission fences.
+type PresenceCredentialAuthority interface {
+	AdvanceCredentialFence(context.Context, presence.RouteTarget, presence.CredentialFence) (presence.CredentialFenceAdvanceResult, error)
+}
+
+// PresenceCredentialActionAuthority acknowledges exact owner reconciliation work.
+type PresenceCredentialActionAuthority interface {
+	AcknowledgeCredentialAction(context.Context, presence.RouteTarget, presence.RouteAction) error
+}
+
 // PresenceBatchAuthority optionally resolves multiple UIDs under one exact authority fence.
 type PresenceBatchAuthority interface {
 	EndpointsByUIDs(context.Context, presence.RouteTarget, []string) ([]presence.Route, error)
@@ -72,6 +84,11 @@ type PresenceTargetBatchAuthority interface {
 // PresenceOwner applies authority-requested actions to owner-local sessions.
 type PresenceOwner interface {
 	ApplyRouteAction(context.Context, presence.RouteAction) error
+}
+
+// PresenceOwnerDetailed optionally returns transport and owner-local fence evidence.
+type PresenceOwnerDetailed interface {
+	ApplyRouteActionDetailed(context.Context, presence.RouteAction) (presence.RouteActionResult, error)
 }
 
 // DeliveryOwnerPush accepts owner-node delivery batches over node RPC.
@@ -460,6 +477,24 @@ func (a *Adapter) HandlePresenceAuthorityRPC(ctx context.Context, payload []byte
 		status := presenceRPCStatusForError(err)
 		a.logPresenceAuthorityError(req, status, err)
 		return encodePresenceRPCResponseBinary(presenceRPCResponse{Status: status})
+	case presenceOpAdvanceCredentialFence:
+		credentialAuthority, ok := a.authority.(PresenceCredentialAuthority)
+		if !ok {
+			return encodePresenceRPCResponseBinary(presenceRPCResponse{Status: rpcStatusRejected})
+		}
+		result, err := credentialAuthority.AdvanceCredentialFence(ctx, req.Target, req.CredentialFence)
+		status := presenceRPCStatusForError(err)
+		a.logPresenceAuthorityError(req, status, err)
+		return encodePresenceRPCResponseBinary(presenceRPCResponse{Status: status, CredentialFenceAdvance: result})
+	case presenceOpAckCredentialAction:
+		actionAuthority, ok := a.authority.(PresenceCredentialActionAuthority)
+		if !ok {
+			return encodePresenceRPCResponseBinary(presenceRPCResponse{Status: rpcStatusRejected})
+		}
+		err := actionAuthority.AcknowledgeCredentialAction(ctx, req.Target, req.Action)
+		status := presenceRPCStatusForError(err)
+		a.logPresenceAuthorityError(req, status, err)
+		return encodePresenceRPCResponseBinary(presenceRPCResponse{Status: status})
 	default:
 		err := fmt.Errorf("internal/access/node: unknown presence rpc op %q", req.Op)
 		a.rpcLogger().Warn("presence authority rpc unknown operation",
@@ -551,7 +586,16 @@ func (a *Adapter) HandlePresenceOwnerRPC(ctx context.Context, payload []byte) ([
 		)
 		return nil, err
 	}
-	err = a.owner.ApplyRouteAction(ctx, req.Action)
+	var actionResult presence.RouteActionResult
+	if detailed, ok := a.owner.(PresenceOwnerDetailed); ok {
+		actionResult, err = detailed.ApplyRouteActionDetailed(ctx, req.Action)
+	} else {
+		err = a.owner.ApplyRouteAction(ctx, req.Action)
+		if err == nil {
+			actionResult.LocalFenced = true
+			actionResult.HardClosed = true
+		}
+	}
 	status := presenceRPCStatusForError(err)
 	if status == rpcStatusRejected {
 		fields := []wklog.Field{
@@ -567,7 +611,7 @@ func (a *Adapter) HandlePresenceOwnerRPC(ctx context.Context, payload []byte) ([
 		}
 		a.rpcLogger().Warn("presence owner rpc rejected", fields...)
 	}
-	return encodePresenceRPCResponseBinary(presenceRPCResponse{Status: status})
+	return encodePresenceRPCResponseBinary(presenceRPCResponse{Status: status, ActionResult: actionResult})
 }
 
 func (a *Adapter) rpcLogger() wklog.Logger {
@@ -753,13 +797,40 @@ func (c *Client) TouchRoutes(ctx context.Context, target presence.RouteTarget, r
 	return presenceRPCErrorForStatus(resp.Status)
 }
 
-// ApplyRouteAction applies one conflict action on the owner node.
-func (c *Client) ApplyRouteAction(ctx context.Context, ownerNodeID uint64, action presence.RouteAction) error {
-	resp, err := c.callService(ctx, ownerNodeID, PresenceOwnerRPCServiceID, presenceRPCRequest{Op: presenceOpApplyRouteAction, Action: action})
+// AdvanceCredentialFence advances durable admission on an authority leader.
+func (c *Client) AdvanceCredentialFence(ctx context.Context, target presence.RouteTarget, fence presence.CredentialFence) (presence.CredentialFenceAdvanceResult, error) {
+	resp, err := c.call(ctx, target, presenceRPCRequest{Op: presenceOpAdvanceCredentialFence, Target: target, CredentialFence: fence})
+	if err != nil {
+		return presence.CredentialFenceAdvanceResult{}, err
+	}
+	if err := presenceRPCErrorForStatus(resp.Status); err != nil {
+		return resp.CredentialFenceAdvance, err
+	}
+	return resp.CredentialFenceAdvance, nil
+}
+
+// AcknowledgeCredentialAction removes one exact retained owner action at its authority.
+func (c *Client) AcknowledgeCredentialAction(ctx context.Context, target presence.RouteTarget, action presence.RouteAction) error {
+	resp, err := c.call(ctx, target, presenceRPCRequest{Op: presenceOpAckCredentialAction, Target: target, Action: action})
 	if err != nil {
 		return err
 	}
 	return presenceRPCErrorForStatus(resp.Status)
+}
+
+// ApplyRouteAction applies one conflict action on the owner node.
+func (c *Client) ApplyRouteAction(ctx context.Context, ownerNodeID uint64, action presence.RouteAction) error {
+	_, err := c.ApplyRouteActionDetailed(ctx, ownerNodeID, action)
+	return err
+}
+
+// ApplyRouteActionDetailed applies one owner action and returns structured execution evidence.
+func (c *Client) ApplyRouteActionDetailed(ctx context.Context, ownerNodeID uint64, action presence.RouteAction) (presence.RouteActionResult, error) {
+	resp, err := c.callService(ctx, ownerNodeID, PresenceOwnerRPCServiceID, presenceRPCRequest{Op: presenceOpApplyRouteAction, Action: action})
+	if err != nil {
+		return presence.RouteActionResult{}, err
+	}
+	return resp.ActionResult, presenceRPCErrorForStatus(resp.Status)
 }
 
 func (c *Client) call(ctx context.Context, target presence.RouteTarget, req presenceRPCRequest) (presenceRPCResponse, error) {

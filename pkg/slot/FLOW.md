@@ -291,8 +291,12 @@ Meta  (0x12): [0x12][hashSlot:2][...]                             元信息
 | 10 | HashSlotMigration | (hash_slot) | - |
 | 11 | UserChannelMembership | (uid, channel_id, channel_type) | - |
 | 12 | ChannelLatest | (channel_id, channel_type) | - |
+| 13 | MessageEventState | (channel_id, channel_type, client_msg_no, event_key) | - |
+| 14 | MessageEventCursor | (channel_id, channel_type, client_msg_no) | - |
+| 15 | MessageEventApplied | (channel_id, channel_type, client_msg_no, event_id) | - |
+| 16 | CMDDeviceCursor | (uid, device_flag, command_channel_id, channel_type) | - |
 
-## 7. FSM 命令类型（42 种，其中 2 个为保留用途）
+## 7. FSM 命令类型（44 种，其中 2 个为保留用途）
 
 TLV 格式: `[Version:1][CmdType:1][Tag:1 + Length:4 + Value:N]...`
 未知 Tag 自动跳过（前向兼容）。详见 `fsm/command.go`。
@@ -321,6 +325,7 @@ TLV 格式: `[Version:1][CmdType:1][Tag:1 + Length:4 + Value:N]...`
 46: UpsertChannelLatest               47: UpsertChannelLatestBatch
 48: AppendMessageEvent                49: AppendMessageEventsBatch
 50: CreateChannel                     51: PatchChannelBusinessFlags
+52: ApplyDeviceCredential              53: UpsertCMDDeviceCursors
 ```
 
 ## 8. RPC Service IDs（proxy 层）
@@ -368,7 +373,8 @@ TLV 格式: `[Version:1][CmdType:1][Tag:1 + Length:4 + Value:N]...`
 - **命令 16 升级约束**: 混合版本 Slot 副本不能安全接收 `HideUserConversations`；发布时需要 stop-the-world 升级或后续 capability gate。
 - **命令 50/51 升级约束**: 混合版本 Slot 副本不能安全接收 Manager Channel 条件 create/patch；发布时需要 stop-the-world 升级或 capability gate。
 - **统一会话投影**: 旧 `UserConversation*` / `CMDConversation*` proxy 名称只是源码兼容入口，FSM command 会映射为统一 conversation command。存储层只读写 Table ID 6，并通过 `(uid, kind, channel_id, channel_type)` 区分 `ConversationKindNormal` 与 `ConversationKindCMD`；Table ID 7 是开发期 split CMD 表保留 ID，不能注册或复用。
-- **CMD read cursor 单调推进**: `AdvanceCMDConversationReadSeq` 只在新 `ReadSeq` 更大时推进，旧 syncack 重试不能回退 cursor。
+- **设备级 CMD cursor 单调推进**: 命令 53 只按 `(uid, device_flag, command_channel_id, channel_type)` 单调合并 `ReadSeq` / `DeletedToSeq` / 时间戳；APP(0) 与 PC(2) 相互隔离，旧 ACK 重试不能回退 cursor，也不能修改普通会话或 UID 级 CMD discovery 行。
+- **CMD cursor 升级约束**: Table ID 16 与命令 53 是稳定持久化格式；Table ID 7 仍为保留 ID。混合版本 Slot 副本不能安全接收命令 53，发布需 stop-the-world 升级或 capability gate。
 - **PluginUserBinding UID 路由**: 插件绑定表使用 `(uid, plugin_no)` 主键和 `idx_plugin_no_uid(plugin_no, uid)` 二级索引；写入、解绑、按 UID 查询必须以 UID 作为 hash slot 路由 key，按 plugin_no 扫描是诊断/管理查询，需要按 Slot 权威分页聚合。
 - **PluginUserBinding plugin_no 分页**: plugin_no 维度扫描的公开 cursor 以 `(plugin_no, uid, slot_id, hash_slot)` 做总序断点，避免不同 hash slot 中出现相同 `(plugin_no, uid)` 时翻页跳项；远端扫描请求必须校验 `hash_slot` 属于目标物理 Slot。
 - **PluginUserBinding 只表达集群绑定**: 表内只保存 UID 到 plugin_no 的权威关联，不保存节点本地插件配置、启停状态或进程状态；这些状态属于 `pkg/plugin/pluginhost` 的 node-local desired/observed state。
@@ -382,3 +388,4 @@ TLV 格式: `[Version:1][CmdType:1][Tag:1 + Length:4 + Value:N]...`
 - **写入 Key 路由**: `HashSlotForKey(key)` 先算逻辑 hash slot，再通过 `SlotForKey(key)` 查表定位物理 Slot；**同一实体必须使用同一 Key**（User 用 uid，Channel 用 channelID，Device 用 uid 而非 deviceFlag）。用错 Key 会写到不同 hash slot / Slot，读不到。
 - **值 CRC 校验失败**: Pebble 存储值带 CRC32，校验失败返回 `ErrCorruptValue`。表明磁盘损坏或编解码器版本不兼容。
 - **备份快照边界**: `CaptureHashSlotSnapshot` 只在本地 Slot leader 上证明 commit index 等于 durable applied index 后建立固定 Pebble 视图，并返回 SlotID、hashSlot、term、commit/applied index 与证据 UTC watermark；备份层必须在读取期间复核这些 fence，不能把未提交日志、apply lag 或迁移中的临时路由状态当成业务恢复数据。
+- **设备凭证版本栅栏**: `ApplyDeviceCredential` 是带 apply-result 的 Slot 命令；FSM 必须在同一 hash-slot commit 临界区比较版本并返回稳定结果，proxy/cluster 不得先读后无条件写。identity RPC response v2 必须携带完整 credential version/session/status/expiry/tombstone 字段，否则远端 Gateway 和 Presence 会错误放行。

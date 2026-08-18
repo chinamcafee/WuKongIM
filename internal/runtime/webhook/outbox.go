@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -126,16 +125,19 @@ func OpenDurableOutbox(opts OutboxOptions) (*DurableOutbox, error) {
 }
 
 // StableEventID derives the delivery identity used for HTTP retries and dedupe.
-func StableEventID(event string, message Message, recipientUIDs []string) string {
-	uids := append([]string(nil), recipientUIDs...)
-	sort.Strings(uids)
+func StableEventID(event string, message Message, targets []OfflineTarget) string {
+	targets = canonicalOfflineTargets(targets)
+	canonicalTargets := make([]string, 0, len(targets))
+	for _, target := range targets {
+		canonicalTargets = append(canonicalTargets, target.UID+":"+strconv.Itoa(int(target.DeviceFlag)))
+	}
 	canonical := strings.Join([]string{
 		event,
 		strconv.FormatUint(message.MessageID, 10),
 		strconv.FormatUint(message.MessageSeq, 10),
 		message.ChannelID,
 		strconv.Itoa(int(message.ChannelType)),
-		strings.Join(uids, ","),
+		strings.Join(canonicalTargets, ","),
 	}, "|")
 	digest := sha256.Sum256([]byte(canonical))
 	return "wh_" + hex.EncodeToString(digest[:16])

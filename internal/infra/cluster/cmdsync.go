@@ -19,6 +19,9 @@ const cmdSyncMaxActivePages = 10000
 type CMDSyncNode interface {
 	ListConversationActivePage(context.Context, metadb.ConversationKind, string, metadb.ConversationActiveCursor, int) ([]metadb.ConversationState, metadb.ConversationActiveCursor, bool, error)
 	UpsertConversationStatesBatch(context.Context, []metadb.ConversationState) error
+	GetCMDDeviceCursorsBatch(context.Context, []metadb.CMDDeviceCursorKey) (map[metadb.CMDDeviceCursorKey]metadb.CMDDeviceCursor, error)
+	UpsertCMDDeviceCursorsBatch(context.Context, []metadb.CMDDeviceCursor) error
+	GetDeviceMetadata(context.Context, string, int64) (metadb.Device, error)
 	ReadChannelCommitted(context.Context, channelruntime.ChannelID, channelstore.ReadCommittedRequest) (channelstore.ReadCommittedResult, error)
 }
 
@@ -28,11 +31,62 @@ type CMDSyncStore struct {
 }
 
 var _ cmdsync.StateStore = (*CMDSyncStore)(nil)
+var _ cmdsync.DeviceStateStore = (*CMDSyncStore)(nil)
+var _ cmdsync.PrincipalStore = (*CMDSyncStore)(nil)
 var _ cmdsync.MessageStore = (*CMDSyncStore)(nil)
 
 // NewCMDSyncStore creates a cluster-backed CMD sync store.
 func NewCMDSyncStore(node CMDSyncNode) *CMDSyncStore {
 	return &CMDSyncStore{node: node}
+}
+
+// ListDeviceConversationActiveView overlays one device class's cursor floors on
+// the UID-level CMD channel discovery view.
+func (s *CMDSyncStore) ListDeviceConversationActiveView(ctx context.Context, uid string, deviceFlag uint8, limit int) ([]metadb.ConversationState, error) {
+	rows, err := s.ListConversationActiveView(ctx, uid, limit)
+	if err != nil || len(rows) == 0 {
+		return rows, err
+	}
+	keys := make([]metadb.CMDDeviceCursorKey, 0, len(rows))
+	for _, row := range rows {
+		keys = append(keys, metadb.CMDDeviceCursorKey{
+			UID: uid, DeviceFlag: int64(deviceFlag), ChannelID: row.ChannelID, ChannelType: row.ChannelType,
+		})
+	}
+	cursors, err := s.node.GetCMDDeviceCursorsBatch(ctx, keys)
+	if err != nil {
+		return nil, err
+	}
+	for i, key := range keys {
+		cursor, ok := cursors[key]
+		if !ok {
+			rows[i].ReadSeq = 0
+			rows[i].DeletedToSeq = 0
+			continue
+		}
+		rows[i].ReadSeq = cursor.ReadSeq
+		rows[i].DeletedToSeq = cursor.DeletedToSeq
+	}
+	return rows, nil
+}
+
+// UpsertCMDDeviceCursors advances independent device-class command progress.
+func (s *CMDSyncStore) UpsertCMDDeviceCursors(ctx context.Context, cursors []metadb.CMDDeviceCursor) error {
+	if len(cursors) == 0 {
+		return nil
+	}
+	if s == nil || s.node == nil {
+		return metadb.ErrNotFound
+	}
+	return s.node.UpsertCMDDeviceCursorsBatch(ctx, append([]metadb.CMDDeviceCursor(nil), cursors...))
+}
+
+// GetDevice reads the durable credential authority for principal fencing.
+func (s *CMDSyncStore) GetDevice(ctx context.Context, uid string, deviceFlag int64) (metadb.Device, error) {
+	if s == nil || s.node == nil {
+		return metadb.Device{}, metadb.ErrNotFound
+	}
+	return s.node.GetDeviceMetadata(ctx, uid, deviceFlag)
 }
 
 // ListConversationActiveView reads the UID-owned CMD projection view.

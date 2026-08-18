@@ -151,5 +151,9 @@ func (o onlineDeliveryOfflineObserver) ObserveOfflineRecipients(ctx context.Cont
 	if o.next == nil || !channelappend.OfflineRecipientObserverEligible(event.Event) {
 		return
 	}
-	o.next.ObserveOfflineRecipients(ctx, channelappend.OfflineRecipientsEvent{Event: event.Event, UIDs: event.UIDs})
+	targets := make([]channelappend.OfflineTarget, len(event.Targets))
+	for i, target := range event.Targets {
+		targets[i] = channelappend.OfflineTarget{UID: target.UID, DeviceFlag: target.DeviceFlag}
+	}
+	o.next.ObserveOfflineRecipients(ctx, channelappend.OfflineRecipientsEvent{Event: event.Event, Targets: targets})
 }

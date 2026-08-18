@@ -12,9 +12,9 @@ conversation, channel, user, or management business state directly. Channel
 management requests forward to the channel usecase supplied by the composition
 root, `/user*` requests forward to the user usecase, and compatible message
 send and channel-message sync requests forward to the message usecase.
-Deprecated `/message/sync` and `/message/syncack` requests forward to the CMD
-sync compatibility usecase. `/v3/message/commands/sync` and
-`/v3/message/commands/ack` expose restart-safe explicit command batches.
+`/v3/message/commands/sync` and `/v3/message/commands/ack` expose restart-safe,
+signed internal command batches. Deprecated `/message/sync` and
+`/message/syncack` are intentionally not registered.
 `/conversation/list` and `/conversation/sync` requests forward to the
 conversation usecase and keep ordering, cursor rules, sync candidate selection,
 and message reads out of the HTTP layer. When the composition root provides a
@@ -64,8 +64,6 @@ POST /bench/v1/channels/subscribers
 POST /bench/v1/channels/subscribers/remove
 POST /message/send
 POST /message/event
-POST /message/sync
-POST /message/syncack
 POST /v3/message/commands/sync
 POST /v3/message/commands/ack
 POST /conversation/list
@@ -172,18 +170,19 @@ and returns the legacy `{"status":200,"data":...}` envelope with the projected
 stream status and `msg_event_seq` when the event has reached durable projection.
 In-flight `stream.open`, `stream.delta`, and `stream.snapshot` cache responses
 may return `msg_event_seq=0` until a terminal stream event is proposed.
-`/message/sync` and
-`/message/syncack` forward durable CMD message sync and ack requests to
-`internal/usecase/cmdsync`, preserving legacy validation messages and response
-envelopes while keeping CMD projection reads and read-cursor writes out of the
-HTTP layer. They operate on `ConversationKindCMD` rows from the shared UID-owned
-conversation projection and return only durable command messages, stripping one
-command-channel suffix from client-facing channel IDs when present.
-The v3 command routes return the same durable messages plus a deterministic
+The v3 command routes forward durable CMD message sync and ACK requests to
+`internal/usecase/cmdsync`. They return durable command messages plus a deterministic
 `batch_id`, explicit per-command-channel `ack_channels`, and `more`. ACK
-revalidates the digest against those cursors and therefore does not depend on
-the process-local latest legacy sync generation. The two legacy routes remain
-registered for compatibility but are deprecated in OpenAPI.
+revalidates a digest that includes UID, device flag, and cursors, then advances
+only that device flag's monotonic cursor. Both routes require the internal HMAC
+headers `X-LinkU-UID`, `X-LinkU-Device-Flag`, `X-LinkU-Login-Session-ID`,
+`X-LinkU-Credential-Version`, timestamp, nonce, and signature. Middleware hashes
+the exact body bytes, enforces the replay window/nonce namespace, and places the
+verified principal in request context. UID, device flag, session ID, and version
+are rejected when supplied in the body. The usecase then rechecks the signed
+fence against the current durable ACTIVE, unexpired Device row. Unsigned,
+tampered, stale-session, stale-version, and replayed requests fail closed.
+Deprecated `/message/sync` and `/message/syncack` return 404.
 `/channel/messagesync` keeps the legacy response shape, converts canonical
 person-channel IDs back to the peer UID for the logged-in user, and maps message
 event summaries to the legacy `event_meta`, `event_sync_hint`, and stream fields
@@ -287,3 +286,9 @@ reads stay in `internal/usecase/conversation`. The adapter observes
 successful and failed list requests without adding UID or channel labels, so
 performance triage can inspect list cost without increasing metrics
 cardinality.
+
+Link-U device credential mutations use the exact internal v3 apply/revoke
+paths. The adapter authenticates method, exact path, timestamp, nonce, and body
+digest with HMAC before JSON binding, rejects replay from a bounded nonce cache,
+caps payload and item counts, and delegates per-item policy validation to the
+user usecase. Tokens must never be written to request or response logs.

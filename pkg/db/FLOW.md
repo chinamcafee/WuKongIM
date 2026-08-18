@@ -28,3 +28,8 @@ Current flow:
 
 Pebble-specific code must stay under `pkg/db/internal/*` and must not leak into
 callers.
+
+Portable transfer records preserve the complete versioned device credential,
+including ACTIVE/REVOKED status and tombstone metadata. Restore-time auth
+invalidation converts device rows to valid REVOKED tombstones; it must not only
+blank the token or corrupt the device value codec marker.

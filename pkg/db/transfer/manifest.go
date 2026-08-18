@@ -95,6 +95,7 @@ func knownFileKind(kind FileKind) bool {
 		FileKindMetaSubscribers,
 		FileKindMetaUserChannelMemberships,
 		FileKindMetaConversations,
+		FileKindMetaCMDDeviceCursors,
 		FileKindMetaChannelLatest,
 		FileKindMessageChannels,
 		FileKindMessageMessages:

@@ -37,3 +37,10 @@ The usecase treats a single node as a single-node cluster. Durable metadata
 access happens through injected ports supplied by `internal/app`. The
 restore-only read is selected only by `ReloadSystemUIDCache`; ordinary user
 operations continue through the foreground-fenced store methods.
+
+Internal device credential apply/revoke is item-wise and version fenced. The
+usecase fixes APP/PC to MASTER, allow-lists operation/cause pairs, derives an
+operation digest without logging plaintext tokens, persists ACTIVE or REVOKED
+tombstones through Slot CAS, and always advances/reconciles Presence for both
+APPLIED and IDEMPOTENT results. Durable credential outcome and route outcome
+are independent response axes.

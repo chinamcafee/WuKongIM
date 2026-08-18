@@ -1,6 +1,9 @@
 package presence
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
 // ErrNotLeader reports that a RouteTarget no longer matches local authority state.
 var ErrNotLeader = errors.New("internal/runtime/presence: not leader")
@@ -10,6 +13,46 @@ var ErrStaleRoute = errors.New("internal/runtime/presence: stale route")
 
 // ErrRouteNotReady reports that a pending route token cannot be committed or aborted.
 var ErrRouteNotReady = errors.New("internal/runtime/presence: route not ready")
+
+// ErrCredentialFenceConflict reports equal-version credential metadata disagreement.
+var ErrCredentialFenceConflict = errors.New("internal/runtime/presence: credential fence conflict")
+
+// CredentialStatus is the authority admission state for one UID/device flag.
+type CredentialStatus string
+
+const (
+	CredentialStatusActive  CredentialStatus = "ACTIVE"
+	CredentialStatusRevoked CredentialStatus = "REVOKED"
+)
+
+// CredentialFence is the durable admission projection used by one UID authority.
+type CredentialFence struct {
+	UID               string
+	DeviceFlag        uint8
+	CredentialVersion uint64
+	LoginSessionID    string
+	Status            CredentialStatus
+	ExpiresAtUnixMS   int64
+	MachineReason     string
+}
+
+// CredentialFenceLoader reads current durable device metadata before authority admission.
+type CredentialFenceLoader interface {
+	LoadCredentialFence(context.Context, string, uint8) (CredentialFence, error)
+}
+
+// CredentialFenceAdvanceResult describes routes atomically fenced at the authority.
+type CredentialFenceAdvanceResult struct {
+	CurrentVersion   uint64
+	ActiveFenced     int
+	PendingFenced    int
+	OwnerLocalFenced int
+	FrameEnqueued    int
+	TransportFlushed int
+	HardClosed       int
+	StaleNoop        int
+	Actions          []RouteAction
+}
 
 // RouteTarget fences an authority operation to one observed hash-slot route.
 type RouteTarget struct {
@@ -65,6 +108,12 @@ type Route struct {
 	DeviceFlag uint8
 	// DeviceLevel is the WuKong protocol device conflict level.
 	DeviceLevel uint8
+	// CredentialVersion is the durable device admission version.
+	CredentialVersion uint64
+	// LoginSessionID binds this route to one Link-U business session.
+	LoginSessionID string
+	// ExpiresAtUnixMS is the absolute credential deadline.
+	ExpiresAtUnixMS int64
 	// Listener records the gateway listener that accepted the session.
 	Listener string
 	// ConnectedUnix records when the owner accepted the route.
@@ -83,12 +132,28 @@ type RouteAction struct {
 	OwnerBootID uint64
 	// SessionID is the owner-local session to close or kick.
 	SessionID uint64
+	// ExpectedOwnerSeq prevents a delayed action from closing a newer owner route.
+	ExpectedOwnerSeq uint64
+	// ExpectedCredentialVersion prevents an old operation from closing an equal/newer credential route.
+	ExpectedCredentialVersion uint64
+	// ExpectedLoginSessionID prevents a delayed action from crossing business sessions.
+	ExpectedLoginSessionID string
 	// Kind names the owner action to apply.
 	Kind string
 	// Reason explains why the authority requested the action.
 	Reason string
 	// DelayMS optionally delays the owner action.
 	DelayMS int64
+}
+
+// RouteActionResult is owner-local evidence for one requested route action.
+// Authority fencing and owner execution remain separate correctness axes.
+type RouteActionResult struct {
+	LocalFenced      bool
+	FrameEnqueued    bool
+	TransportFlushed bool
+	HardClosed       bool
+	StaleNoop        bool
 }
 
 // RouteIdentity identifies one route independently from mutable route metadata.
@@ -150,4 +215,6 @@ type DirectoryOptions struct {
 	LocalNodeID uint64
 	// ShardCount controls the number of hash-slot shards; values <= 0 use the default.
 	ShardCount int
+	// CredentialFences fail-closes registration against durable device metadata when configured.
+	CredentialFences CredentialFenceLoader
 }

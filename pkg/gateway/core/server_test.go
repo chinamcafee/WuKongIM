@@ -18,6 +18,44 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestServerCredentialExpiryStopsLiveSessionAndWritesDisconnect(t *testing.T) {
+	handler := newTestHandler()
+	proto := newScriptedProtocol("wkproto")
+	proto.encodedBytes = []byte("encoded-frame")
+	proto.pushDecode(decodeResult{
+		frames:   []frame.Frame{&frame.ConnectPacket{UID: "u1", DeviceID: "device-1", Token: "token-1"}},
+		consumed: 1,
+	})
+	expiresAt := time.Now().Add(150 * time.Millisecond).UnixMilli()
+	srv, transportFactory := newTestServerWithAuthenticator(t, handler, proto, gateway.SessionOptions{}, gateway.AuthenticatorFunc(func(*gateway.Context, *frame.ConnectPacket) (*gateway.AuthResult, error) {
+		return &gateway.AuthResult{
+			Connack: &frame.ConnackPacket{ReasonCode: frame.ReasonSuccess},
+			SessionValues: map[string]any{
+				gateway.SessionValueCredentialExpiresAt: expiresAt,
+			},
+		}, nil
+	}))
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Stop() })
+
+	conn := transportFactory.MustOpen("listener-a", 1)
+	transportFactory.MustData("listener-a", 1, []byte("connect"))
+	waitFor(t, func() bool { return len(conn.Writes()) >= 1 })
+	select {
+	case <-conn.CloseCh():
+	case <-time.After(time.Second):
+		t.Fatal("credential expiry did not close the live connection")
+	}
+	if writes := conn.Writes(); len(writes) < 2 {
+		t.Fatalf("writes = %#v, want CONNACK followed by DISCONNECT before close", writes)
+	}
+	if summary := srv.SessionSummary(); summary.GatewaySessions != 0 {
+		t.Fatalf("SessionSummary() = %#v, want expired session unregistered", summary)
+	}
+}
+
 func TestServer(t *testing.T) {
 	t.Run("unauthenticated wkproto frames are rejected before reaching the handler", func(t *testing.T) {
 		handler := newTestHandler()

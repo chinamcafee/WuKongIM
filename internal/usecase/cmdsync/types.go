@@ -15,6 +15,14 @@ var (
 	ErrStateStoreRequired = errors.New("internal/usecase/cmdsync: state store required")
 	// ErrMessageStoreRequired reports a missing command-channel message dependency.
 	ErrMessageStoreRequired = errors.New("internal/usecase/cmdsync: message store required")
+	// ErrDeviceStateStoreRequired reports a missing device-scoped cursor dependency.
+	ErrDeviceStateStoreRequired = errors.New("internal/usecase/cmdsync: device state store required")
+	// ErrPrincipalStoreRequired reports a missing authoritative credential dependency.
+	ErrPrincipalStoreRequired = errors.New("internal/usecase/cmdsync: principal store required")
+	// ErrPrincipalInvalid reports a structurally invalid trusted principal.
+	ErrPrincipalInvalid = errors.New("internal/usecase/cmdsync: invalid command principal")
+	// ErrPrincipalStale reports a principal that no longer matches durable device authority.
+	ErrPrincipalStale = errors.New("internal/usecase/cmdsync: stale command principal")
 	// ErrBatchIDRequired reports a missing v3 command batch identifier.
 	ErrBatchIDRequired = errors.New("internal/usecase/cmdsync: batch id required")
 	// ErrBatchIDMismatch reports that an ACK does not match its explicit channel cursors.
@@ -45,6 +53,12 @@ type SyncAckCommand struct {
 type BatchSyncQuery struct {
 	// UID identifies the user whose durable command messages are synced.
 	UID string
+	// DeviceFlag isolates native APP and desktop consumer progress.
+	DeviceFlag uint8
+	// LoginSessionID is the Link-U authenticated session bound into the S2S signature.
+	LoginSessionID string
+	// CredentialVersion fences stale sessions after login takeover or logout.
+	CredentialVersion uint64
 	// Limit bounds the number of messages returned in this batch.
 	Limit int
 }
@@ -63,6 +77,12 @@ type AckCursor struct {
 type BatchAckCommand struct {
 	// UID identifies the owner of the command read cursors.
 	UID string
+	// DeviceFlag identifies the independent command consumer.
+	DeviceFlag uint8
+	// LoginSessionID is the signed Link-U session identifier.
+	LoginSessionID string
+	// CredentialVersion fences stale session acknowledgments.
+	CredentialVersion uint64
 	// BatchID is the deterministic digest returned by BatchSync.
 	BatchID string
 	// AckCursors are the exact per-channel frontiers covered by BatchID.
@@ -125,6 +145,17 @@ type StateStore interface {
 	UpsertConversationStates(ctx context.Context, states []metadb.ConversationState) error
 }
 
+// DeviceStateStore supplies independent v3 command cursors by device class.
+type DeviceStateStore interface {
+	ListDeviceConversationActiveView(ctx context.Context, uid string, deviceFlag uint8, limit int) ([]metadb.ConversationState, error)
+	UpsertCMDDeviceCursors(ctx context.Context, cursors []metadb.CMDDeviceCursor) error
+}
+
+// PrincipalStore reads authoritative device credentials used to fence CMD sync.
+type PrincipalStore interface {
+	GetDevice(ctx context.Context, uid string, deviceFlag int64) (metadb.Device, error)
+}
+
 // MessageStore loads authoritative messages from command-channel logs.
 type MessageStore interface {
 	LoadCommandMessages(ctx context.Context, key CommandChannelKey, fromSeq uint64, limit int) ([]SyncedMessage, error)
@@ -134,6 +165,10 @@ type MessageStore interface {
 type Options struct {
 	// States supplies CMD-kind unified conversation rows and persists read progress.
 	States StateStore
+	// DeviceStates supplies v3 device-scoped command cursors.
+	DeviceStates DeviceStateStore
+	// Principals verifies the signed session tuple against durable authority.
+	Principals PrincipalStore
 	// Messages loads command-channel messages.
 	Messages MessageStore
 	// Records stores the latest unacknowledged sync generation per UID.

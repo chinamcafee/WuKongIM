@@ -97,7 +97,12 @@ func TestClusterSingleNodeUserMetadataFacadePersistsByUIDHashSlot(t *testing.T) 
 	if err := node.CreateUserMetadata(ctx, metadb.User{UID: "u1"}); err != nil {
 		t.Fatalf("CreateUserMetadata() error = %v", err)
 	}
-	if err := node.UpsertDeviceMetadata(ctx, metadb.Device{UID: "u1", DeviceFlag: 1, Token: "token-1", DeviceLevel: 2}); err != nil {
+	if err := node.UpsertDeviceMetadata(ctx, metadb.Device{
+		UID: "u1", DeviceFlag: 1, Token: "token-1", DeviceLevel: 2,
+		CredentialVersion: 1, LoginSessionID: "session-1", OperationID: "operation-1",
+		OperationDigest: "digest-1", CredentialStatus: metadb.DeviceCredentialStatusActive,
+		ExpiresAtUnixMS: 2000000000000, UpdatedAtUnixMS: 1900000000000,
+	}); err != nil {
 		t.Fatalf("UpsertDeviceMetadata() error = %v", err)
 	}
 

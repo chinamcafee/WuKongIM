@@ -195,7 +195,7 @@ func TestImportHashSlotSnapshotReaderForRestoreInvalidatesAuthenticationTokens(t
 	if err := shard.CreateUser(ctx, User{UID: "u-stream", Token: "user-token", DeviceFlag: 1, DeviceLevel: 2}); err != nil {
 		t.Fatalf("CreateUser(): %v", err)
 	}
-	if err := shard.UpsertDevice(ctx, Device{UID: "u-stream", DeviceFlag: 1, Token: "device-token", DeviceLevel: 2}); err != nil {
+	if err := shard.UpsertDevice(ctx, testActiveDevice("u-stream", 1, "device-token", 2, 1)); err != nil {
 		t.Fatalf("UpsertDevice(): %v", err)
 	}
 	reader, err := source.db.OpenBackupHashSlotSnapshot(ctx, []uint16{5})
@@ -215,7 +215,8 @@ func TestImportHashSlotSnapshotReaderForRestoreInvalidatesAuthenticationTokens(t
 		t.Fatalf("restored user = %#v, %v, %v", user, ok, err)
 	}
 	device, ok, err := target.db.HashSlot(5).GetDevice(ctx, "u-stream", 1)
-	if err != nil || !ok || device.Token != "" || device.DeviceLevel != 2 {
+	if err != nil || !ok || device.Token != "" || device.DeviceLevel != 2 ||
+		device.CredentialStatus != DeviceCredentialStatusRevoked || device.TerminationCause != "RESTORE_INVALIDATED" {
 		t.Fatalf("restored device = %#v, %v, %v", device, ok, err)
 	}
 }
@@ -257,6 +258,13 @@ func TestSnapshotHashSlotRoundTripAndDeleteHashSlotData(t *testing.T) {
 	if err := left.BindPluginUser(ctx, PluginUserBinding{UID: "u1", PluginNo: "bot-a", CreatedAtMS: 1, UpdatedAtMS: 2}); err != nil {
 		t.Fatalf("BindPluginUser(): %v", err)
 	}
+	wantCursor := CMDDeviceCursor{
+		UID: "u1", DeviceFlag: 0, ChannelID: "u1-cmd", ChannelType: 7,
+		ReadSeq: 8, DeletedToSeq: 3, ActiveAt: 20, UpdatedAt: 21,
+	}
+	if err := left.UpsertCMDDeviceCursor(ctx, wantCursor); err != nil {
+		t.Fatalf("UpsertCMDDeviceCursor(): %v", err)
+	}
 	if err := right.CreateUser(ctx, User{UID: "u1", Token: "right"}); err != nil {
 		t.Fatalf("right CreateUser(): %v", err)
 	}
@@ -284,6 +292,9 @@ func TestSnapshotHashSlotRoundTripAndDeleteHashSlotData(t *testing.T) {
 	if _, ok, err := left.GetUser(ctx, "u1"); err != nil || ok {
 		t.Fatalf("left GetUser(after delete) ok=%v err=%v, want missing", ok, err)
 	}
+	if _, ok, err := left.GetCMDDeviceCursor(ctx, CMDDeviceCursorKey{UID: "u1", DeviceFlag: 0, ChannelID: "u1-cmd", ChannelType: 7}); err != nil || ok {
+		t.Fatalf("left GetCMDDeviceCursor(after delete) ok=%v err=%v, want missing", ok, err)
+	}
 	if user, ok, err := right.GetUser(ctx, "u1"); err != nil || !ok || user.Token != "right" {
 		t.Fatalf("right user after delete = %+v ok=%v err=%v, want right", user, ok, err)
 	}
@@ -296,6 +307,9 @@ func TestSnapshotHashSlotRoundTripAndDeleteHashSlotData(t *testing.T) {
 	}
 	if channel, ok, err := left.GetChannel(ctx, "c1", 1); err != nil || !ok || channel.Ban != 1 {
 		t.Fatalf("restored channel = %+v ok=%v err=%v, want ban 1", channel, ok, err)
+	}
+	if cursor, ok, err := left.GetCMDDeviceCursor(ctx, CMDDeviceCursorKey{UID: "u1", DeviceFlag: 0, ChannelID: "u1-cmd", ChannelType: 7}); err != nil || !ok || cursor != wantCursor {
+		t.Fatalf("restored cmd device cursor = %+v ok=%v err=%v, want %+v", cursor, ok, err, wantCursor)
 	}
 	bindings, err := left.ListPluginBindingsByUID(ctx, "u1")
 	if err != nil || len(bindings) != 1 || bindings[0].PluginNo != "bot-a" {

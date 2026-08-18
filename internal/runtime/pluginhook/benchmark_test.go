@@ -54,8 +54,10 @@ func BenchmarkPluginHookReceiveBatchAdmission(b *testing.B) {
 	for _, recipients := range []int{512, 10000} {
 		b.Run(fmt.Sprintf("recipients_%d", recipients), func(b *testing.B) {
 			uids := make([]string, recipients)
+			targets := make([]pluginevents.ReceiveOfflineTarget, recipients)
 			for i := range uids {
 				uids[i] = fmt.Sprintf("u-%05d", i)
+				targets[i] = pluginevents.ReceiveOfflineTarget{UID: uids[i], DeviceFlag: 0}
 			}
 			payload := bytes.Repeat([]byte("a"), 1024)
 			worker := NewWorker(Options{
@@ -80,7 +82,7 @@ func BenchmarkPluginHookReceiveBatchAdmission(b *testing.B) {
 				event := pluginevents.ReceiveOfflineBatch{
 					MessageID:  1,
 					MessageSeq: 1,
-					UIDs:       uids,
+					Targets:    targets,
 					Payload:    payload,
 				}
 				b.ReportAllocs()

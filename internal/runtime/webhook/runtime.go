@@ -279,13 +279,13 @@ func (r *Runtime) Notify(ctx context.Context, msg Message) {
 	r.observeAdmission(EventMsgNotify, webhookNotifyQueue, result, 1, 0, r.opts.Outbox.MaxEntries, nil)
 }
 
-// Offline admits one bounded recipient chunk for msg.offline delivery.
+// Offline admits one bounded target chunk for msg.offline.v2 delivery.
 func (r *Runtime) Offline(ctx context.Context, msg OfflineMessage) {
 	if r == nil || !r.enabled(EventMsgOffline) {
 		return
 	}
 	msg = cloneOfflineMessage(msg)
-	items := len(msg.ToUIDs)
+	items := len(msg.Targets)
 	if items == 0 {
 		return
 	}
@@ -303,7 +303,7 @@ func (r *Runtime) Offline(ctx context.Context, msg OfflineMessage) {
 		return
 	}
 	inserted, err := outbox.Enqueue(ctx, OutboxEntry{
-		ID: StableEventID(EventMsgOffline, msg.Message, msg.ToUIDs), Event: EventMsgOffline,
+		ID: StableEventID(EventMsgOffline, msg.Message, msg.Targets), Event: EventMsgOffline,
 		Body: body, Items: items,
 	})
 	if err != nil {
@@ -618,7 +618,7 @@ func cloneMessage(msg Message) Message {
 
 func cloneOfflineMessage(msg OfflineMessage) OfflineMessage {
 	msg.Message = cloneMessage(msg.Message)
-	msg.ToUIDs = append([]string(nil), msg.ToUIDs...)
+	msg.Targets = append([]OfflineTarget(nil), msg.Targets...)
 	return msg
 }
 

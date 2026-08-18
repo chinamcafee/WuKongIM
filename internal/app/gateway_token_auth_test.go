@@ -14,7 +14,9 @@ import (
 func TestGatewayTokenVerifierAcceptsAuthoritativeDeviceAndLevel(t *testing.T) {
 	reader := &gatewayTokenReaderStub{device: metadb.Device{
 		UID: "u1", DeviceFlag: int64(frame.APP), Token: "token-current",
-		DeviceLevel: int64(frame.DeviceLevelMaster),
+		DeviceLevel: int64(frame.DeviceLevelMaster), CredentialVersion: 7,
+		LoginSessionID: "session-7", CredentialStatus: metadb.DeviceCredentialStatusActive,
+		ExpiresAtUnixMS: time.Now().Add(time.Hour).UnixMilli(),
 	}}
 	verify := newGatewayTokenVerifier(reader, time.Second)
 
@@ -30,10 +32,46 @@ func TestGatewayTokenVerifierAcceptsAuthoritativeDeviceAndLevel(t *testing.T) {
 	}
 }
 
+func TestGatewayCredentialVerifierReturnsDurableAdmissionFence(t *testing.T) {
+	expires := time.Now().Add(time.Hour).UnixMilli()
+	reader := &gatewayTokenReaderStub{device: metadb.Device{
+		UID: "u1", DeviceFlag: int64(frame.PC), Token: "desktop-token",
+		DeviceLevel: int64(frame.DeviceLevelMaster), CredentialVersion: 11,
+		LoginSessionID: "desktop-session", CredentialStatus: metadb.DeviceCredentialStatusActive,
+		ExpiresAtUnixMS: expires,
+	}}
+	verify := newGatewayCredentialVerifier(reader, time.Second)
+
+	result, err := verify(context.Background(), "u1", frame.PC, "desktop-token")
+	if err != nil || result.DeviceLevel != frame.DeviceLevelMaster || result.CredentialVersion != 11 ||
+		result.LoginSessionID != "desktop-session" || result.ExpiresAtUnixMS != expires {
+		t.Fatalf("verify() = %#v, %v, want complete durable admission fence", result, err)
+	}
+}
+
+func TestGatewayCredentialVerifierRejectsRevokedAndExpiredRows(t *testing.T) {
+	reader := &gatewayTokenReaderStub{device: metadb.Device{
+		UID: "u1", DeviceFlag: int64(frame.APP), Token: "token",
+		DeviceLevel: int64(frame.DeviceLevelMaster), CredentialVersion: 3,
+		LoginSessionID: "session-3", CredentialStatus: metadb.DeviceCredentialStatusRevoked,
+	}}
+	verify := newGatewayCredentialVerifier(reader, time.Second)
+	if _, err := verify(context.Background(), "u1", frame.APP, "token"); !errors.Is(err, errGatewayTokenRejected) {
+		t.Fatalf("revoked verify error = %v, want rejected", err)
+	}
+	reader.device.CredentialStatus = metadb.DeviceCredentialStatusActive
+	reader.device.ExpiresAtUnixMS = time.Now().Add(-time.Millisecond).UnixMilli()
+	if _, err := verify(context.Background(), "u1", frame.APP, "token"); !errors.Is(err, errGatewayTokenRejected) {
+		t.Fatalf("expired verify error = %v, want rejected", err)
+	}
+}
+
 func TestGatewayTokenVerifierRejectsWrongRotatedAndMismatchedDeviceTokens(t *testing.T) {
 	reader := &gatewayTokenReaderStub{device: metadb.Device{
 		UID: "u1", DeviceFlag: int64(frame.APP), Token: "token-current",
-		DeviceLevel: int64(frame.DeviceLevelSlave),
+		DeviceLevel: int64(frame.DeviceLevelSlave), CredentialVersion: 7,
+		LoginSessionID: "session-7", CredentialStatus: metadb.DeviceCredentialStatusActive,
+		ExpiresAtUnixMS: time.Now().Add(time.Hour).UnixMilli(),
 	}}
 	verify := newGatewayTokenVerifier(reader, time.Second)
 
@@ -78,6 +116,9 @@ func TestGatewayTokenVerifierFailsClosedOnMetadataErrorTimeoutAndInvalidLevel(t 
 	reader.waitForContext = false
 	reader.device = metadb.Device{
 		UID: "u1", DeviceFlag: int64(frame.APP), Token: "token", DeviceLevel: 9,
+		CredentialVersion: 7, LoginSessionID: "session-7",
+		CredentialStatus: metadb.DeviceCredentialStatusActive,
+		ExpiresAtUnixMS:  time.Now().Add(time.Hour).UnixMilli(),
 	}
 	if _, err := verify(context.Background(), "u1", frame.APP, "token"); !errors.Is(err, errGatewayTokenRejected) {
 		t.Fatalf("invalid device level = %v, want token rejected", err)

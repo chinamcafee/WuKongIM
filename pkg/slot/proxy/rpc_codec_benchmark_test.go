@@ -291,7 +291,10 @@ func benchmarkIdentityRPCResponse() identityRPCResponse {
 	return identityRPCResponse{
 		Status: rpcStatusOK,
 		User:   &metadb.User{UID: "uid-001", Token: "identity-token", DeviceFlag: 1, DeviceLevel: 2},
-		Device: &metadb.Device{UID: "uid-001", DeviceFlag: 1, Token: "device-token", DeviceLevel: 2},
+		Device: func() *metadb.Device {
+			device := proxyTestCredentialDevice("uid-001", 1, "device-token", 2, 1)
+			return &device
+		}(),
 	}
 }
 

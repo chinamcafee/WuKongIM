@@ -137,6 +137,21 @@ func decodeRecord(kind FileKind, line []byte) (any, error) {
 			return nil, err
 		}
 		return record, nil
+	case FileKindMetaCMDDeviceCursors:
+		var record CMDDeviceCursorRecord
+		if err := decodeStrict(line, &record); err != nil {
+			return nil, err
+		}
+		if err := requireString("uid", record.UID); err != nil {
+			return nil, err
+		}
+		if err := requireString("command_channel_id", record.CommandChannelID); err != nil {
+			return nil, err
+		}
+		if record.DeviceFlag < 0 || record.DeviceFlag > 255 {
+			return nil, fmt.Errorf("device_flag must be in [0,255]")
+		}
+		return record, nil
 	case FileKindMetaChannelLatest:
 		var wire channelLatestRecordWire
 		if err := decodeStrict(line, &wire); err != nil {

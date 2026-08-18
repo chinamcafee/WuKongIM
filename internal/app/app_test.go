@@ -5522,6 +5522,36 @@ func TestPresenceOwnerActionsClosesAndUnregistersMatchingLocalSession(t *testing
 	}
 }
 
+func TestPresenceOwnerActionsReportsObservedKickEvidence(t *testing.T) {
+	reg := online.NewRegistry(online.RegistryOptions{ShardCount: 1})
+	session := &recordingKickSessionHandle{result: online.KickSessionResult{
+		FrameEnqueued: true, TransportFlushed: false, HardClosed: true,
+	}}
+	route := online.OwnerRoute{
+		UID: "u1", OwnerNodeID: 1, OwnerBootID: 7, OwnerSeq: 11, SessionID: 101,
+		CredentialVersion: 3, LoginSessionID: "login-3", ConnectedUnix: 1001,
+	}
+	if err := reg.RegisterPending(online.LocalSession{Route: route, Session: session}); err != nil {
+		t.Fatalf("RegisterPending() error = %v", err)
+	}
+
+	result, err := (presenceOwnerActions{local: reg}).ApplyRouteActionDetailed(context.Background(), presence.RouteAction{
+		UID: route.UID, OwnerNodeID: route.OwnerNodeID, OwnerBootID: route.OwnerBootID,
+		SessionID: route.SessionID, ExpectedOwnerSeq: route.OwnerSeq,
+		ExpectedCredentialVersion: route.CredentialVersion, ExpectedLoginSessionID: route.LoginSessionID,
+		Kind: "kick_then_close", Reason: "SESSION_REPLACED_SAME_DEVICE_CLASS",
+	})
+	if err != nil {
+		t.Fatalf("ApplyRouteActionDetailed() error = %v", err)
+	}
+	if !result.LocalFenced || !result.FrameEnqueued || result.TransportFlushed || !result.HardClosed || result.StaleNoop {
+		t.Fatalf("ApplyRouteActionDetailed() = %#v", result)
+	}
+	if session.reason != "SESSION_REPLACED_SAME_DEVICE_CLASS" {
+		t.Fatalf("kick reason = %q", session.reason)
+	}
+}
+
 func TestPresenceOwnerActionsIgnoresMismatchedLocalSession(t *testing.T) {
 	reg := online.NewRegistry(online.RegistryOptions{ShardCount: 1})
 	session := &recordingSessionHandle{}
@@ -5923,7 +5953,7 @@ func TestAppWiresConversationListRouteToUsecase(t *testing.T) {
 	}
 }
 
-func TestAppWiresMessageSyncRouteToCMDSyncUsecase(t *testing.T) {
+func TestAppDoesNotExposeDeprecatedUnauthenticatedMessageSyncRoute(t *testing.T) {
 	cluster := newFakePresenceCluster(1, nil)
 	cluster.snapshot = readyFakeClusterSnapshot(1, 16)
 	app, err := newTestApp(t, Config{
@@ -5942,11 +5972,8 @@ func TestAppWiresMessageSyncRouteToCMDSyncUsecase(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	apiSrv.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d body = %s, want 200", rec.Code, rec.Body.String())
-	}
-	if rec.Body.String() != "[]" {
-		t.Fatalf("body = %s, want empty CMD sync array", rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d body = %s, want 404", rec.Code, rec.Body.String())
 	}
 }
 
@@ -8250,6 +8277,12 @@ type recordingSessionHandle struct {
 	writes   []any
 }
 
+type recordingKickSessionHandle struct {
+	recordingSessionHandle
+	result online.KickSessionResult
+	err    error
+}
+
 type fakeDeliverySubscriberSource struct {
 	requests []channelappend.SubscriberPageRequest
 	pages    []channelappend.SubscriberPage
@@ -8306,6 +8339,11 @@ func (r *recordingSessionHandle) WriteDelivery(payload any) error {
 func (r *recordingSessionHandle) CloseSession(reason string) error {
 	r.reason = reason
 	return nil
+}
+
+func (r *recordingKickSessionHandle) KickSession(reason string, _ time.Duration) (online.KickSessionResult, error) {
+	r.reason = reason
+	return r.result, r.err
 }
 
 func (r *recordingTouchAuthority) ResolveRouteTargets(ctx context.Context, uids []string) []presence.RouteTargetResult {

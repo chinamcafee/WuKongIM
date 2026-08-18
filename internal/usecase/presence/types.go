@@ -41,6 +41,12 @@ type ActivateCommand struct {
 	DeviceFlag uint8
 	// DeviceLevel is the protocol device conflict level for the session.
 	DeviceLevel uint8
+	// CredentialVersion is the durable device admission version authenticated by Gateway.
+	CredentialVersion uint64
+	// LoginSessionID binds the route to the Link-U business session.
+	LoginSessionID string
+	// ExpiresAtUnixMS is the absolute credential deadline.
+	ExpiresAtUnixMS int64
 	// Listener records the gateway listener that accepted the session.
 	Listener string
 	// ConnectedUnix records when the gateway session was accepted locally.
@@ -102,8 +108,24 @@ type RouteIdentity = authority.RouteIdentity
 // RouteAction asks an owner node to resolve an authority-side route conflict.
 type RouteAction = authority.RouteAction
 
+// RouteActionResult reports structured owner-local kick/close evidence.
+type RouteActionResult = authority.RouteActionResult
+
 // PendingRouteToken names a conflict candidate waiting for action completion.
 type PendingRouteToken = authority.PendingRouteToken
 
 // RegisterResult describes immediate or pending authority registration work.
 type RegisterResult = authority.RegisterResult
+
+// CredentialFence is the durable UID/device admission projection.
+type CredentialFence = authority.CredentialFence
+
+// CredentialFenceAdvanceResult describes stale routes fenced by an advance.
+type CredentialFenceAdvanceResult = authority.CredentialFenceAdvanceResult
+
+type CredentialStatus = authority.CredentialStatus
+
+const (
+	CredentialStatusActive  = authority.CredentialStatusActive
+	CredentialStatusRevoked = authority.CredentialStatusRevoked
+)

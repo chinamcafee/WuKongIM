@@ -88,6 +88,12 @@ type APIConfig struct {
 	ExternalWSAddr string
 	// ExternalWSSAddr is the published secure WebSocket gateway address returned by bench capacity discovery.
 	ExternalWSSAddr string
+	// InternalCredentialHMACSecret authenticates Link-U device credential batches.
+	InternalCredentialHMACSecret string
+	// InternalCredentialReplayWindow bounds signed request clock skew and nonce retention.
+	InternalCredentialReplayWindow time.Duration
+	// InternalCredentialMaxBatchSize bounds independently linearized credential items.
+	InternalCredentialMaxBatchSize int
 }
 
 // ManagerConfig configures the dedicated manager HTTP service.
@@ -408,6 +414,8 @@ type WebhookConfig struct {
 	OnlineBatchMaxWait time.Duration
 	// OfflineUIDBatchSize limits offline recipient UIDs sent in one msg.offline request.
 	OfflineUIDBatchSize int
+	// OfflineNotificationDeviceFlags selects device shapes observed for offline notification.
+	OfflineNotificationDeviceFlags []uint8
 	// RequestTimeout bounds one outbound webhook request attempt.
 	RequestTimeout time.Duration
 	// RetryMaxAttempts bounds attempts before a critical delivery moves to dead-letter.
@@ -455,6 +463,9 @@ func defaultWebhookConfig(cfg WebhookConfig) WebhookConfig {
 	if cfg.OfflineUIDBatchSize == 0 {
 		cfg.OfflineUIDBatchSize = 512
 	}
+	if cfg.OfflineNotificationDeviceFlags == nil {
+		cfg.OfflineNotificationDeviceFlags = []uint8{0}
+	}
 	if cfg.RequestTimeout == 0 {
 		cfg.RequestTimeout = 5 * time.Second
 	}
@@ -500,6 +511,21 @@ func validateWebhookConfig(cfg WebhookConfig) error {
 	}
 	if cfg.OfflineUIDBatchSize < 0 {
 		return fmt.Errorf("%w: webhook OfflineUIDBatchSize must be >= 0", ErrInvalidConfig)
+	}
+	if len(cfg.OfflineNotificationDeviceFlags) == 0 {
+		return fmt.Errorf("%w: webhook OfflineNotificationDeviceFlags must not be empty", ErrInvalidConfig)
+	}
+	seenFlags := make(map[uint8]struct{}, len(cfg.OfflineNotificationDeviceFlags))
+	for _, flag := range cfg.OfflineNotificationDeviceFlags {
+		// Link-U 只允许 MOBILE/APP(flag=0) 形成系统离线通知目标；
+		// DESKTOP/PC(flag=2) 可实时收发与独立同步，但不得因配置误开 JPush 数据面。
+		if flag != 0 {
+			return fmt.Errorf("%w: webhook OfflineNotificationDeviceFlags contains unsupported flag %d", ErrInvalidConfig, flag)
+		}
+		if _, exists := seenFlags[flag]; exists {
+			return fmt.Errorf("%w: webhook OfflineNotificationDeviceFlags contains duplicate flag %d", ErrInvalidConfig, flag)
+		}
+		seenFlags[flag] = struct{}{}
 	}
 	if cfg.RequestTimeout < 0 {
 		return fmt.Errorf("%w: webhook RequestTimeout must be >= 0", ErrInvalidConfig)

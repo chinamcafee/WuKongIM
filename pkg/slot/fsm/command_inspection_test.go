@@ -507,3 +507,17 @@ func TestDecodeCommandInspectionExpandsApplyDeltaPluginBindingCommand(t *testing
 		"updated_at_ms": int64(101),
 	}, got.Payload["original"])
 }
+
+func TestDecodeCommandInspectionIncludesDeviceScopedCMDCursors(t *testing.T) {
+	got, err := DecodeCommandInspection(EncodeUpsertCMDDeviceCursorsCommand([]metadb.CMDDeviceCursor{{
+		UID: "u1", DeviceFlag: 2, ChannelID: "g1____cmd", ChannelType: 2,
+		ReadSeq: 9, DeletedToSeq: 3, ActiveAt: 100, UpdatedAt: 110,
+	}}))
+	require.NoError(t, err)
+	require.Equal(t, "upsert_cmd_device_cursors", got.Type)
+	cursors, ok := got.Payload["cursors"].([]map[string]any)
+	require.True(t, ok)
+	require.Len(t, cursors, 1)
+	require.Equal(t, int64(2), cursors[0]["device_flag"])
+	require.Equal(t, uint64(9), cursors[0]["read_seq"])
+}

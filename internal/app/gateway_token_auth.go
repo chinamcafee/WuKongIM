@@ -9,6 +9,7 @@ import (
 	"time"
 
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
+	"github.com/WuKongIM/WuKongIM/pkg/gateway"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
 )
 
@@ -28,6 +29,18 @@ func newGatewayTokenVerifier(
 	reader gatewayTokenMetadataReader,
 	timeout time.Duration,
 ) func(context.Context, string, frame.DeviceFlag, string) (frame.DeviceLevel, error) {
+	verifyCredential := newGatewayCredentialVerifier(reader, timeout)
+	return func(ctx context.Context, uid string, deviceFlag frame.DeviceFlag, token string) (frame.DeviceLevel, error) {
+		result, err := verifyCredential(ctx, uid, deviceFlag, token)
+		return result.DeviceLevel, err
+	}
+}
+
+// newGatewayCredentialVerifier returns the complete durable admission fence.
+func newGatewayCredentialVerifier(
+	reader gatewayTokenMetadataReader,
+	timeout time.Duration,
+) func(context.Context, string, frame.DeviceFlag, string) (gateway.CredentialAuthResult, error) {
 	if timeout <= 0 {
 		timeout = defaultGatewayTokenLookupTimeout
 	}
@@ -36,28 +49,34 @@ func newGatewayTokenVerifier(
 		uid string,
 		deviceFlag frame.DeviceFlag,
 		token string,
-	) (frame.DeviceLevel, error) {
+	) (gateway.CredentialAuthResult, error) {
 		if reader == nil || parent == nil || !validGatewayAuthIdentity(uid, token) {
-			return 0, errGatewayTokenRejected
+			return gateway.CredentialAuthResult{}, errGatewayTokenRejected
 		}
 		if !validGatewayDeviceFlag(deviceFlag) {
-			return 0, errGatewayTokenRejected
+			return gateway.CredentialAuthResult{}, errGatewayTokenRejected
 		}
 		ctx, cancel := context.WithTimeout(parent, timeout)
 		defer cancel()
 
 		device, err := reader.GetDevice(ctx, uid, int64(deviceFlag))
 		if err != nil || device.UID != uid || device.DeviceFlag != int64(deviceFlag) {
-			return 0, errGatewayTokenRejected
+			return gateway.CredentialAuthResult{}, errGatewayTokenRejected
 		}
-		if !constantTimeTokenEqual(device.Token, token) {
-			return 0, errGatewayTokenRejected
+		if device.CredentialStatus != metadb.DeviceCredentialStatusActive ||
+			device.CredentialVersion == 0 || device.LoginSessionID == "" ||
+			device.ExpiresAtUnixMS <= time.Now().UnixMilli() ||
+			!constantTimeTokenEqual(device.Token, token) {
+			return gateway.CredentialAuthResult{}, errGatewayTokenRejected
 		}
 		level := frame.DeviceLevel(device.DeviceLevel)
 		if level != frame.DeviceLevelSlave && level != frame.DeviceLevelMaster {
-			return 0, errGatewayTokenRejected
+			return gateway.CredentialAuthResult{}, errGatewayTokenRejected
 		}
-		return level, nil
+		return gateway.CredentialAuthResult{
+			DeviceLevel: level, CredentialVersion: device.CredentialVersion,
+			LoginSessionID: device.LoginSessionID, ExpiresAtUnixMS: device.ExpiresAtUnixMS,
+		}, nil
 	}
 }
 

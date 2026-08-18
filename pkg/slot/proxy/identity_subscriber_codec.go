@@ -8,7 +8,7 @@ import (
 
 var (
 	identityRPCRequestMagic    = [...]byte{'W', 'K', 'I', 'Q', 1}
-	identityRPCResponseMagic   = [...]byte{'W', 'K', 'I', 'S', 1}
+	identityRPCResponseMagic   = [...]byte{'W', 'K', 'I', 'S', 2}
 	subscriberRPCRequestMagic  = [...]byte{'W', 'K', 'S', 'Q', 1}
 	subscriberRPCResponseMagic = [...]byte{'W', 'K', 'S', 'S', 1}
 )
@@ -195,6 +195,14 @@ func appendIdentityDevicePtr(dst []byte, device *metadb.Device) []byte {
 	dst = runtimeMetaAppendVarint(dst, device.DeviceFlag)
 	dst = runtimeMetaAppendString(dst, device.Token)
 	dst = runtimeMetaAppendVarint(dst, device.DeviceLevel)
+	dst = runtimeMetaAppendUvarint(dst, device.CredentialVersion)
+	dst = runtimeMetaAppendString(dst, device.LoginSessionID)
+	dst = runtimeMetaAppendString(dst, device.OperationID)
+	dst = runtimeMetaAppendString(dst, device.OperationDigest)
+	dst = runtimeMetaAppendString(dst, string(device.CredentialStatus))
+	dst = runtimeMetaAppendVarint(dst, device.ExpiresAtUnixMS)
+	dst = runtimeMetaAppendVarint(dst, device.UpdatedAtUnixMS)
+	dst = runtimeMetaAppendString(dst, device.TerminationCause)
 	return dst
 }
 
@@ -214,6 +222,32 @@ func readIdentityDevicePtr(body []byte, offset int) (*metadb.Device, int, error)
 		return nil, offset, err
 	}
 	if device.DeviceLevel, next, err = runtimeMetaReadVarint(body, next); err != nil {
+		return nil, offset, err
+	}
+	if device.CredentialVersion, next, err = runtimeMetaReadUvarint(body, next); err != nil {
+		return nil, offset, err
+	}
+	if device.LoginSessionID, next, err = runtimeMetaReadString(body, next); err != nil {
+		return nil, offset, err
+	}
+	if device.OperationID, next, err = runtimeMetaReadString(body, next); err != nil {
+		return nil, offset, err
+	}
+	if device.OperationDigest, next, err = runtimeMetaReadString(body, next); err != nil {
+		return nil, offset, err
+	}
+	var credentialStatus string
+	if credentialStatus, next, err = runtimeMetaReadString(body, next); err != nil {
+		return nil, offset, err
+	}
+	device.CredentialStatus = metadb.DeviceCredentialStatus(credentialStatus)
+	if device.ExpiresAtUnixMS, next, err = runtimeMetaReadVarint(body, next); err != nil {
+		return nil, offset, err
+	}
+	if device.UpdatedAtUnixMS, next, err = runtimeMetaReadVarint(body, next); err != nil {
+		return nil, offset, err
+	}
+	if device.TerminationCause, next, err = runtimeMetaReadString(body, next); err != nil {
 		return nil, offset, err
 	}
 	return &device, next, nil

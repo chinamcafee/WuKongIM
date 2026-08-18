@@ -89,6 +89,9 @@ Kinds: `string`, `bool`, integer `int`/`uint*`, `float`, Go-format `duration`, a
 | TOML | Environment | Kind | Constraint |
 | --- | --- | --- | --- |
 | `api.listen_addr` | `WK_API_LISTEN_ADDR` | `string` | — |
+| `api.internal_credential_hmac_secret` | `WK_API_INTERNAL_CREDENTIAL_HMAC_SECRET` | `string` | Sensitive; at least 32 bytes |
+| `api.internal_credential_replay_window` | `WK_API_INTERNAL_CREDENTIAL_REPLAY_WINDOW` | `duration` | Must be positive |
+| `api.internal_credential_max_batch_size` | `WK_API_INTERNAL_CREDENTIAL_MAX_BATCH_SIZE` | `int` | Must be positive |
 | `api.external_tcp_addr` | `WK_EXTERNAL_TCPADDR` | `string` | — |
 | `api.external_ws_addr` | `WK_EXTERNAL_WSADDR` | `string` | Redacted in diagnostic artifacts |
 | `api.external_wss_addr` | `WK_EXTERNAL_WSSADDR` | `string` | Redacted in diagnostic artifacts |
@@ -241,6 +244,7 @@ Kinds: `string`, `bool`, integer `int`/`uint*`, `float`, Go-format `duration`, a
 | `webhook.online_status_batch_max_items` | `WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_ITEMS` | `int` | — |
 | `webhook.online_status_batch_max_wait` | `WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_WAIT` | `duration` | — |
 | `webhook.offline_uid_batch_size` | `WK_WEBHOOK_OFFLINE_UID_BATCH_SIZE` | `int` | — |
+| `webhook.offline_notification_device_flags` | `WK_WEBHOOK_OFFLINE_NOTIFICATION_DEVICE_FLAGS` | `int_list` | MOBILE/APP flag `0` only; DESKTOP/PC never produces offline push targets; default `[0]` |
 | `webhook.request_timeout` | `WK_WEBHOOK_REQUEST_TIMEOUT` | `duration` | — |
 | `webhook.retry_max_attempts` | `WK_WEBHOOK_RETRY_MAX_ATTEMPTS` | `int` | — |
 | `webhook.outbox_dir` | `WK_WEBHOOK_OUTBOX_DIR` | `string` | Node-local durable Outbox directory |

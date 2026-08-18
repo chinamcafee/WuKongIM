@@ -9,6 +9,125 @@ import (
 	"time"
 )
 
+type mutableCredentialFenceLoader struct {
+	fence CredentialFence
+	err   error
+}
+
+func (l *mutableCredentialFenceLoader) LoadCredentialFence(_ context.Context, uid string, flag uint8) (CredentialFence, error) {
+	if l.err != nil {
+		return CredentialFence{}, l.err
+	}
+	fence := l.fence
+	fence.UID = uid
+	fence.DeviceFlag = flag
+	return fence, nil
+}
+
+func TestDirectoryCommitAndTouchReloadDurableCredentialFence(t *testing.T) {
+	expires := time.Now().Add(time.Hour).UnixMilli()
+	loader := &mutableCredentialFenceLoader{fence: CredentialFence{
+		CredentialVersion: 1, LoginSessionID: "session-1", Status: CredentialStatusActive, ExpiresAtUnixMS: expires,
+	}}
+	dir := NewDirectory(DirectoryOptions{LocalNodeID: 1, ShardCount: 1, CredentialFences: loader})
+	target := RouteTarget{HashSlot: 1, SlotID: 1, LeaderNodeID: 1, LeaderTerm: 1, ConfigEpoch: 1}
+	dir.BecomeAuthority(target)
+	old := Route{
+		UID: "u1", OwnerNodeID: 1, OwnerBootID: 1, OwnerSeq: 1, SessionID: 10,
+		DeviceID: "old", DeviceFlag: 0, DeviceLevel: deviceLevelMaster,
+		CredentialVersion: 1, LoginSessionID: "session-1", ExpiresAtUnixMS: expires,
+	}
+	if _, err := dir.RegisterRouteContext(context.Background(), target, old); err != nil {
+		t.Fatalf("RegisterRouteContext(old) error = %v", err)
+	}
+	incoming := old
+	incoming.OwnerSeq = 2
+	incoming.SessionID = 11
+	incoming.DeviceID = "new-connection"
+	registered, err := dir.RegisterRouteContext(context.Background(), target, incoming)
+	if err != nil || registered.PendingToken == "" {
+		t.Fatalf("RegisterRouteContext(incoming) = %#v, %v, want pending conflict", registered, err)
+	}
+
+	loader.fence = CredentialFence{
+		CredentialVersion: 2, LoginSessionID: "session-2", Status: CredentialStatusActive,
+		ExpiresAtUnixMS: time.Now().Add(2 * time.Hour).UnixMilli(),
+	}
+	if err := dir.CommitRouteContext(context.Background(), target, registered.PendingToken); !errors.Is(err, ErrStaleRoute) {
+		t.Fatalf("CommitRouteContext(stale pending) error = %v, want ErrStaleRoute", err)
+	}
+	if routes, err := dir.EndpointsByUID(target, "u1"); err != nil || len(routes) != 0 {
+		t.Fatalf("EndpointsByUID() = %#v, %v, want durable-fenced empty view", routes, err)
+	}
+
+	if err := dir.TouchRoutesContext(context.Background(), target, []Route{old}); err != nil {
+		t.Fatalf("TouchRoutesContext(stale) error = %v", err)
+	}
+	if routes, err := dir.EndpointsByUID(target, "u1"); err != nil || len(routes) != 0 {
+		t.Fatalf("EndpointsByUID() after stale touch = %#v, %v, want empty", routes, err)
+	}
+}
+
+func TestDirectoryCredentialFenceAdvanceRemovesOldFlagOnly(t *testing.T) {
+	dir := NewDirectory(DirectoryOptions{LocalNodeID: 1, ShardCount: 1})
+	target := RouteTarget{HashSlot: 1, SlotID: 1, LeaderNodeID: 1, LeaderTerm: 1, ConfigEpoch: 1}
+	dir.BecomeAuthority(target)
+	expires := time.Now().Add(time.Hour).UnixMilli()
+	for _, route := range []Route{
+		{UID: "u1", OwnerNodeID: 1, OwnerBootID: 1, OwnerSeq: 1, SessionID: 10, DeviceFlag: 0, CredentialVersion: 1, LoginSessionID: "mobile-1", ExpiresAtUnixMS: expires},
+		{UID: "u1", OwnerNodeID: 1, OwnerBootID: 1, OwnerSeq: 1, SessionID: 20, DeviceFlag: 2, CredentialVersion: 1, LoginSessionID: "desktop-1", ExpiresAtUnixMS: expires},
+	} {
+		if _, err := dir.RegisterRoute(target, route); err != nil {
+			t.Fatalf("RegisterRoute(%d) error = %v", route.DeviceFlag, err)
+		}
+	}
+	result, err := dir.AdvanceCredentialFence(target, CredentialFence{
+		UID: "u1", DeviceFlag: 0, CredentialVersion: 2, LoginSessionID: "mobile-2",
+		Status: CredentialStatusActive, ExpiresAtUnixMS: time.Now().Add(2 * time.Hour).UnixMilli(),
+		MachineReason: "SESSION_REPLACED_SAME_DEVICE_CLASS",
+	})
+	if err != nil || result.ActiveFenced != 1 || len(result.Actions) != 1 || result.Actions[0].SessionID != 10 {
+		t.Fatalf("AdvanceCredentialFence() = %#v, %v, want one mobile action", result, err)
+	}
+	routes, err := dir.EndpointsByUID(target, "u1")
+	if err != nil || len(routes) != 1 || routes[0].DeviceFlag != 2 {
+		t.Fatalf("EndpointsByUID() = %#v, %v, want desktop preserved", routes, err)
+	}
+}
+
+func TestDirectoryCredentialFenceActionRetainedUntilAcknowledged(t *testing.T) {
+	dir := NewDirectory(DirectoryOptions{LocalNodeID: 1, ShardCount: 1})
+	target := RouteTarget{HashSlot: 1, SlotID: 1, LeaderNodeID: 1, LeaderTerm: 1, ConfigEpoch: 1}
+	dir.BecomeAuthority(target)
+	expires := time.Now().Add(time.Hour).UnixMilli()
+	old := Route{
+		UID: "u1", OwnerNodeID: 2, OwnerBootID: 3, OwnerSeq: 4, SessionID: 10,
+		DeviceFlag: 0, CredentialVersion: 1, LoginSessionID: "mobile-1", ExpiresAtUnixMS: expires,
+	}
+	if _, err := dir.RegisterRoute(target, old); err != nil {
+		t.Fatalf("RegisterRoute() error = %v", err)
+	}
+	fence := CredentialFence{
+		UID: "u1", DeviceFlag: 0, CredentialVersion: 2, LoginSessionID: "mobile-2",
+		Status: CredentialStatusActive, ExpiresAtUnixMS: time.Now().Add(2 * time.Hour).UnixMilli(),
+	}
+	first, err := dir.AdvanceCredentialFence(target, fence)
+	if err != nil || len(first.Actions) != 1 || first.ActiveFenced != 1 {
+		t.Fatalf("first AdvanceCredentialFence() = %#v, %v", first, err)
+	}
+	retry, err := dir.AdvanceCredentialFence(target, fence)
+	if err != nil || len(retry.Actions) != 1 || retry.ActiveFenced != 0 || retry.Actions[0] != first.Actions[0] {
+		t.Fatalf("retry AdvanceCredentialFence() = %#v, %v, want retained action", retry, err)
+	}
+	if err := dir.AcknowledgeCredentialAction(target, first.Actions[0]); err != nil {
+		t.Fatalf("AcknowledgeCredentialAction() error = %v", err)
+	}
+	completed, err := dir.AdvanceCredentialFence(target, fence)
+	if err != nil || len(completed.Actions) != 0 {
+		t.Fatalf("completed AdvanceCredentialFence() = %#v, %v, want no action", completed, err)
+	}
+}
+
 func TestDirectoryRejectsStaleTarget(t *testing.T) {
 	dir := NewDirectory(DirectoryOptions{ShardCount: 4})
 	target := RouteTarget{HashSlot: 1, SlotID: 1, LeaderNodeID: 1, LeaderTerm: 9, ConfigEpoch: 3, RouteRevision: 2, AuthorityEpoch: 2}

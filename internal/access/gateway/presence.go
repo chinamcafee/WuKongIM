@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/internal/runtime/online"
 	"github.com/WuKongIM/WuKongIM/internal/usecase/presence"
 	coregateway "github.com/WuKongIM/WuKongIM/pkg/gateway"
 	"github.com/WuKongIM/WuKongIM/pkg/gateway/session"
@@ -26,15 +27,49 @@ func activateCommandFromContext(ctx *coregateway.Context, now time.Time) (presen
 	}
 
 	return presence.ActivateCommand{
-		UID:           uid,
-		DeviceID:      deviceIDFromValue(ctx.Session.Value(coregateway.SessionValueDeviceID)),
-		DeviceFlag:    deviceFlagFromValue(ctx.Session.Value(coregateway.SessionValueDeviceFlag)),
-		DeviceLevel:   deviceLevelFromValue(ctx.Session.Value(coregateway.SessionValueDeviceLevel)),
-		Listener:      listener,
-		ConnectedUnix: now.Unix(),
-		SessionID:     ctx.Session.ID(),
-		Session:       gatewayPresenceSession{ctx: ctx},
+		UID:               uid,
+		DeviceID:          deviceIDFromValue(ctx.Session.Value(coregateway.SessionValueDeviceID)),
+		DeviceFlag:        deviceFlagFromValue(ctx.Session.Value(coregateway.SessionValueDeviceFlag)),
+		DeviceLevel:       deviceLevelFromValue(ctx.Session.Value(coregateway.SessionValueDeviceLevel)),
+		CredentialVersion: uint64FromValue(ctx.Session.Value(coregateway.SessionValueCredentialVersion)),
+		LoginSessionID:    stringFromValue(ctx.Session.Value(coregateway.SessionValueLoginSessionID)),
+		ExpiresAtUnixMS:   int64FromValue(ctx.Session.Value(coregateway.SessionValueCredentialExpiresAt)),
+		Listener:          listener,
+		ConnectedUnix:     now.Unix(),
+		SessionID:         ctx.Session.ID(),
+		Session:           gatewayPresenceSession{ctx: ctx},
 	}, nil
+}
+
+func stringFromValue(value any) string {
+	result, _ := value.(string)
+	return result
+}
+
+func uint64FromValue(value any) uint64 {
+	switch v := value.(type) {
+	case uint64:
+		return v
+	case int64:
+		return uint64(v)
+	case int:
+		return uint64(v)
+	default:
+		return 0
+	}
+}
+
+func int64FromValue(value any) int64 {
+	switch v := value.(type) {
+	case int64:
+		return v
+	case uint64:
+		return int64(v)
+	case int:
+		return int64(v)
+	default:
+		return 0
+	}
 }
 
 func deactivateCommandFromContext(ctx *coregateway.Context) presence.DeactivateCommand {
@@ -126,6 +161,24 @@ func (s gatewayPresenceSession) CloseSession(reason string) error {
 		err = errors.New(reason)
 	}
 	return s.ctx.CloseSession(coregateway.CloseReasonPolicyViolation, err)
+}
+
+// KickSession sends DISCONNECT(ReasonConnectKick) and closes after transport completion or timeout.
+func (s gatewayPresenceSession) KickSession(machineReason string, flushTimeout time.Duration) (online.KickSessionResult, error) {
+	if s.ctx == nil {
+		return online.KickSessionResult{}, session.ErrSessionClosed
+	}
+	var closeErr error
+	if machineReason != "" {
+		closeErr = errors.New(machineReason)
+	}
+	result, err := s.ctx.KickSession(&frame.DisconnectPacket{
+		ReasonCode: frame.ReasonConnectKick,
+		Reason:     machineReason,
+	}, flushTimeout, closeErr)
+	return online.KickSessionResult{
+		FrameEnqueued: result.FrameEnqueued, TransportFlushed: result.TransportFlushed, HardClosed: result.HardClosed,
+	}, err
 }
 
 // RemoteAddr returns the client address observed by the concrete gateway session.

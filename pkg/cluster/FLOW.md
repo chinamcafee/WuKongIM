@@ -593,6 +593,14 @@ UIDs against one route snapshot before issuing hash-slot-local point reads.
 Legacy `channel_latest` remains a channel-owned
 projection for old callers and is not the recent-conversation active path.
 
+Device-scoped CMD progress uses `UpsertCMDDeviceCursorsBatch` and
+`GetCMDDeviceCursorsBatch`. Both route by UID, so APP flag 0 and PC flag 2 rows
+land on the same authoritative UID hash slot but retain independent cursors.
+Writes are chunked to at most 512 rows per Slot FSM command (type 53); reads
+resolve a single route snapshot and point-read Table ID 16. UID-level
+`ConversationKindCMD` remains channel discovery only and is not advanced by a
+device ACK.
+
 ## Channel runtime Flow
 
 ```text
@@ -855,9 +863,10 @@ Restore methods require Controller maintenance and operate only on local
 physical replicas. They verify portable metadata/message streams before
 mutation, discard the current Hash Slot partition, install the staged
 point-in-time data, rebuild local Channel runtime metadata from restored
-boundaries, and support a separate rollback snapshot. Client tokens are
-ordinary restored metadata and remain valid; Manager session invalidation is
-owned by Controller backup state.
+boundaries, and support a separate rollback snapshot. Restore-time auth
+invalidation clears legacy user tokens and converts versioned device
+credentials to REVOKED tombstones; Manager session invalidation is owned by
+Controller backup state.
 
 Maintenance pauses the default Channel tick, physical-retention, and migration
 loops before restore can replace Slot metadata or message rows. Runtime
@@ -867,3 +876,8 @@ once and atomically retargets RPCs to the rebuilt service. Resume restarts the
 paused loops only after activation. A separate maintenance-only local
 subscriber page read exists solely to rebuild the restored system-UID privilege
 cache; ordinary metadata reads remain fenced with `ErrMaintenance`.
+
+Device credential mutations use `ProposeResult` on the UID key so the Slot FSM
+performs compare-and-apply and returns APPLIED, IDEMPOTENT, STALE_VERSION, or
+IDEMPOTENCY_CONFLICT from the authoritative commit. Device reads preserve the
+complete version/session/status/expiry record across local and remote routes.

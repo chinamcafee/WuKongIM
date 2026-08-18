@@ -3,6 +3,7 @@ package delivery
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -67,6 +68,8 @@ type RuntimeOptions struct {
 	SessionWriter LocalSessionWriter
 	// OfflineRecipientsObserver receives durable-only offline batches.
 	OfflineRecipientsObserver OfflineRecipientsObserver
+	// OfflineNotificationDeviceFlags selects device shapes observed for offline effects.
+	OfflineNotificationDeviceFlags []uint8
 	// QueueSize bounds accepted Recipient Delivery Plans.
 	QueueSize int
 	// Workers bounds concurrent plan processing.
@@ -111,6 +114,8 @@ type Runtime struct {
 	sessionWriter LocalSessionWriter
 	// offlineRecipientsObserver receives durable-only auxiliary effects.
 	offlineRecipientsObserver OfflineRecipientsObserver
+	// offlineNotificationDeviceFlags is the validated immutable observed shape list.
+	offlineNotificationDeviceFlags []uint8
 	// queue is the fixed-capacity ownership-transfer boundary for plans.
 	queue chan onlinedelivery.RecipientDeliveryPlan
 	// workers is the fixed plan-processing concurrency.
@@ -192,28 +197,30 @@ func NewRuntime(opts RuntimeOptions) *Runtime {
 	if acks == nil {
 		acks = NewAckTracker(AckTrackerOptions{})
 	}
+	offlineFlags := normalizeOfflineNotificationDeviceFlags(opts.OfflineNotificationDeviceFlags)
 	return &Runtime{
-		localNodeID:               opts.LocalNodeID,
-		presence:                  opts.Presence,
-		remoteOwnerPusher:         opts.RemoteOwnerPusher,
-		sessionWriter:             opts.SessionWriter,
-		offlineRecipientsObserver: opts.OfflineRecipientsObserver,
-		queue:                     make(chan onlinedelivery.RecipientDeliveryPlan, queueSize),
-		workers:                   workers,
-		planTimeout:               planTimeout,
-		maxPlanRecipients:         maxPlanRecipients,
-		ownerPushBatchSize:        ownerPushBatchSize,
-		ownerConcurrency:          ownerConcurrency,
-		retryMaxAttempts:          retryMaxAttempts,
-		retryInitialBackoff:       retryInitialBackoff,
-		retryMaxBackoff:           retryMaxBackoff,
-		pendingAckTTL:             opts.PendingAckTTL,
-		acks:                      acks,
-		ackObserver:               opts.AckObserver,
-		ackBatchObserver:          opts.AckBatchObserver,
-		observer:                  opts.Observer,
-		goroutines:                opts.Goroutines,
-		state:                     runtimeClosed,
+		localNodeID:                    opts.LocalNodeID,
+		presence:                       opts.Presence,
+		remoteOwnerPusher:              opts.RemoteOwnerPusher,
+		sessionWriter:                  opts.SessionWriter,
+		offlineRecipientsObserver:      opts.OfflineRecipientsObserver,
+		offlineNotificationDeviceFlags: offlineFlags,
+		queue:                          make(chan onlinedelivery.RecipientDeliveryPlan, queueSize),
+		workers:                        workers,
+		planTimeout:                    planTimeout,
+		maxPlanRecipients:              maxPlanRecipients,
+		ownerPushBatchSize:             ownerPushBatchSize,
+		ownerConcurrency:               ownerConcurrency,
+		retryMaxAttempts:               retryMaxAttempts,
+		retryInitialBackoff:            retryInitialBackoff,
+		retryMaxBackoff:                retryMaxBackoff,
+		pendingAckTTL:                  opts.PendingAckTTL,
+		acks:                           acks,
+		ackObserver:                    opts.AckObserver,
+		ackBatchObserver:               opts.AckBatchObserver,
+		observer:                       opts.Observer,
+		goroutines:                     opts.Goroutines,
+		state:                          runtimeClosed,
 	}
 }
 
@@ -447,10 +454,10 @@ func (r *Runtime) processPlan(ctx context.Context, plan onlinedelivery.Recipient
 	groupedSamples := make(map[uint64][]PlanFailureSample)
 	ownerOrder := make([]uint64, 0)
 	var firstErr error
-	var offline []string
-	var seenOffline map[string]struct{}
+	var offline []OfflineTarget
+	var seenOffline map[offlineTargetKey]struct{}
 	if plan.Mode == onlinedelivery.ModeDurable && r.offlineRecipientsObserver != nil {
-		seenOffline = make(map[string]struct{}, plan.RecipientCount())
+		seenOffline = make(map[offlineTargetKey]struct{}, plan.RecipientCount()*len(r.offlineNotificationDeviceFlags))
 	}
 	for i, target := range plan.Targets {
 		if i >= len(resolved) {
@@ -466,7 +473,8 @@ func (r *Runtime) processPlan(ctx context.Context, plan onlinedelivery.Recipient
 			continue
 		}
 		if seenOffline != nil {
-			offline = appendOfflineUIDs(offline, seenOffline, target, resolved[i].Routes)
+			offline = appendOfflineTargets(offline, seenOffline, target, resolved[i].Routes,
+				r.offlineNotificationDeviceFlags, plan.Event.FromUID)
 		}
 		for _, route := range resolved[i].Routes {
 			if route.OwnerNodeID == 0 || suppressSenderRoute(plan, route) {
@@ -1026,35 +1034,71 @@ func (r *Runtime) observeAckBatch(event AckBatchEvent) {
 	r.ackBatchObserver.ObserveAckBatch(event)
 }
 
-func (r *Runtime) notifyOfflineSafely(ctx context.Context, plan onlinedelivery.RecipientDeliveryPlan, uids []string) {
-	if plan.Mode != onlinedelivery.ModeDurable || r.offlineRecipientsObserver == nil || len(uids) == 0 {
+func (r *Runtime) notifyOfflineSafely(ctx context.Context, plan onlinedelivery.RecipientDeliveryPlan, targets []OfflineTarget) {
+	if plan.Mode != onlinedelivery.ModeDurable || r.offlineRecipientsObserver == nil || len(targets) == 0 {
 		return
 	}
 	defer func() {
 		_ = recover()
 	}()
 	r.offlineRecipientsObserver.ObserveOfflineRecipients(ctx, OfflineRecipientsEvent{
-		Event: plan.Event,
-		UIDs:  append([]string(nil), uids...),
+		Event:   plan.Event,
+		Targets: append([]OfflineTarget(nil), targets...),
 	})
 }
 
-func appendOfflineUIDs(out []string, seen map[string]struct{}, target onlinedelivery.RecipientTargetBatch, routes []onlinedelivery.Route) []string {
-	online := make(map[string]struct{}, len(routes))
+type offlineTargetKey struct {
+	uid  string
+	flag uint8
+}
+
+func appendOfflineTargets(out []OfflineTarget, seen map[offlineTargetKey]struct{},
+	target onlinedelivery.RecipientTargetBatch, routes []onlinedelivery.Route, flags []uint8,
+	fromUID string) []OfflineTarget {
+	online := make(map[offlineTargetKey]struct{}, len(routes))
 	for _, route := range routes {
-		online[route.UID] = struct{}{}
+		online[offlineTargetKey{uid: route.UID, flag: route.DeviceFlag}] = struct{}{}
 	}
 	for _, recipient := range target.Recipients {
-		if _, ok := online[recipient.UID]; ok {
+		if recipient.UID == "" || recipient.UID == fromUID {
 			continue
 		}
-		if _, ok := seen[recipient.UID]; ok {
-			continue
+		for _, flag := range flags {
+			key := offlineTargetKey{uid: recipient.UID, flag: flag}
+			if _, ok := online[key]; ok {
+				continue
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, OfflineTarget{UID: recipient.UID, DeviceFlag: flag})
 		}
-		seen[recipient.UID] = struct{}{}
-		out = append(out, recipient.UID)
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UID != out[j].UID {
+			return out[i].UID < out[j].UID
+		}
+		return out[i].DeviceFlag < out[j].DeviceFlag
+	})
 	return out
+}
+
+func normalizeOfflineNotificationDeviceFlags(flags []uint8) []uint8 {
+	if len(flags) == 0 {
+		return []uint8{0}
+	}
+	seen := make(map[uint8]struct{}, len(flags))
+	result := make([]uint8, 0, len(flags))
+	for _, flag := range flags {
+		if _, ok := seen[flag]; ok {
+			continue
+		}
+		seen[flag] = struct{}{}
+		result = append(result, flag)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result
 }
 
 func suppressSenderRoute(plan onlinedelivery.RecipientDeliveryPlan, route onlinedelivery.Route) bool {

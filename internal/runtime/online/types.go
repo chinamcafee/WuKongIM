@@ -1,6 +1,9 @@
 package online
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 // ErrInvalidConnection reports a malformed online connection registration.
 var ErrInvalidConnection = errors.New("internal/runtime/online: invalid connection")
@@ -40,6 +43,12 @@ type OwnerRoute struct {
 	DeviceFlag uint8
 	// DeviceLevel is the WuKong protocol device conflict level for the session.
 	DeviceLevel uint8
+	// CredentialVersion is the durable admission fence version.
+	CredentialVersion uint64
+	// LoginSessionID is the authenticated Link-U business session identifier.
+	LoginSessionID string
+	// ExpiresAtUnixMS is the absolute route credential deadline.
+	ExpiresAtUnixMS int64
 	// Listener records the gateway listener that accepted the session.
 	Listener string
 	// ConnectedUnix records when the gateway session was accepted locally.
@@ -74,6 +83,18 @@ type SessionHandle interface {
 	WriteDelivery(any) error
 	// CloseSession closes the concrete session with a stable reason string.
 	CloseSession(reason string) error
+}
+
+// KickSessionResult exposes each observable owner-local kick stage.
+type KickSessionResult struct {
+	FrameEnqueued    bool
+	TransportFlushed bool
+	HardClosed       bool
+}
+
+// KickSessionHandle optionally emits a protocol kick control frame before bounded close.
+type KickSessionHandle interface {
+	KickSession(machineReason string, flushTimeout time.Duration) (KickSessionResult, error)
 }
 
 // RegistryOptions configures the owner-local online registry.

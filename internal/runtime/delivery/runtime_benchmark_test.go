@@ -174,5 +174,5 @@ type benchmarkOfflineRecipientsObserver struct {
 
 func (o *benchmarkOfflineRecipientsObserver) ObserveOfflineRecipients(_ context.Context, event OfflineRecipientsEvent) {
 	o.calls++
-	o.recipients += len(event.UIDs)
+	o.recipients += len(event.Targets)
 }

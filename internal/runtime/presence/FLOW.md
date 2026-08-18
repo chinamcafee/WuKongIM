@@ -88,3 +88,13 @@ to reject activity at or behind its owner sequence.
 target-fenced touch entries and TTL-expiry counters, and exposes bounded aggregate
 expiry-index route and bucket counts. It is used by bench diagnostics only; the
 directory still stores virtual owner routes, not concrete TCP sessions.
+
+Each authority slot maintains a `(uid, deviceFlag)` credential admission fence.
+Register loads durable state before locking; Commit and Touch reload it before
+promotion or refresh. ACTIVE exact version/session/expiry is the only admitted
+state, while REVOKED, expired, mismatched, or unreadable metadata fails closed.
+Linearized advance removes stale active and pending routes in the same critical
+section and emits fully fenced owner actions. Those actions remain retained by
+the authority across equal-version retries until an exact acknowledgement is
+received; endpoint reads never expose a route that no longer matches the
+installed fence.

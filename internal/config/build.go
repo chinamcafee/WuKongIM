@@ -17,9 +17,11 @@ import (
 )
 
 const (
-	defaultBenchAPIMaxBatchSize    = 10000
-	defaultBenchAPIMaxPayloadBytes = 10 * 1024 * 1024
-	defaultGatewayTokenAuthTimeout = 3 * time.Second
+	defaultBenchAPIMaxBatchSize           = 10000
+	defaultBenchAPIMaxPayloadBytes        = 10 * 1024 * 1024
+	defaultGatewayTokenAuthTimeout        = 3 * time.Second
+	defaultInternalCredentialReplayWindow = 5 * time.Minute
+	defaultInternalCredentialMaxBatchSize = 100
 )
 
 // clusterNodeConfig describes one static cluster node from WK_CLUSTER_NODES.
@@ -548,6 +550,26 @@ func buildConfig(values map[string]string) (app.Config, error) {
 	cfg.API.ExternalTCPAddr = configValue(values, "WK_EXTERNAL_TCPADDR")
 	cfg.API.ExternalWSAddr = configValue(values, "WK_EXTERNAL_WSADDR")
 	cfg.API.ExternalWSSAddr = configValue(values, "WK_EXTERNAL_WSSADDR")
+	cfg.API.InternalCredentialHMACSecret = configValue(values, "WK_API_INTERNAL_CREDENTIAL_HMAC_SECRET")
+	if cfg.API.InternalCredentialHMACSecret != "" && len(cfg.API.InternalCredentialHMACSecret) < 32 {
+		return app.Config{}, fmt.Errorf("parse WK_API_INTERNAL_CREDENTIAL_HMAC_SECRET: value must contain at least 32 bytes")
+	}
+	cfg.API.InternalCredentialReplayWindow = defaultInternalCredentialReplayWindow
+	if raw := configValue(values, "WK_API_INTERNAL_CREDENTIAL_REPLAY_WINDOW"); raw != "" {
+		replayWindow, err := parseDuration("WK_API_INTERNAL_CREDENTIAL_REPLAY_WINDOW", raw)
+		if err != nil || replayWindow <= 0 {
+			return app.Config{}, fmt.Errorf("parse WK_API_INTERNAL_CREDENTIAL_REPLAY_WINDOW: value must be a positive duration")
+		}
+		cfg.API.InternalCredentialReplayWindow = replayWindow
+	}
+	cfg.API.InternalCredentialMaxBatchSize = defaultInternalCredentialMaxBatchSize
+	if raw := configValue(values, "WK_API_INTERNAL_CREDENTIAL_MAX_BATCH_SIZE"); raw != "" {
+		maxBatch, err := parseInt("WK_API_INTERNAL_CREDENTIAL_MAX_BATCH_SIZE", raw)
+		if err != nil || maxBatch <= 0 {
+			return app.Config{}, fmt.Errorf("parse WK_API_INTERNAL_CREDENTIAL_MAX_BATCH_SIZE: value must be a positive integer")
+		}
+		cfg.API.InternalCredentialMaxBatchSize = maxBatch
+	}
 	cfg.Manager.ListenAddr = configValue(values, "WK_MANAGER_LISTEN_ADDR")
 	if raw := configValue(values, "WK_MANAGER_AUTH_ON"); raw != "" {
 		authOn, err := parseBool("WK_MANAGER_AUTH_ON", raw)
@@ -1277,6 +1299,13 @@ func buildConfig(values map[string]string) (app.Config, error) {
 		}
 		cfg.Webhook.OfflineUIDBatchSize = batchSize
 	}
+	if raw := configValue(values, "WK_WEBHOOK_OFFLINE_NOTIFICATION_DEVICE_FLAGS"); raw != "" {
+		flags, err := parseUint8List("WK_WEBHOOK_OFFLINE_NOTIFICATION_DEVICE_FLAGS", raw)
+		if err != nil {
+			return app.Config{}, err
+		}
+		cfg.Webhook.OfflineNotificationDeviceFlags = flags
+	}
 	if raw := configValue(values, "WK_WEBHOOK_REQUEST_TIMEOUT"); raw != "" {
 		timeout, err := parseDuration("WK_WEBHOOK_REQUEST_TIMEOUT", raw)
 		if err != nil {
@@ -1482,6 +1511,14 @@ func parseStringList(key, raw string) ([]string, error) {
 	}
 	for i := range values {
 		values[i] = strings.TrimSpace(values[i])
+	}
+	return values, nil
+}
+
+func parseUint8List(key, raw string) ([]uint8, error) {
+	var values []uint8
+	if err := json.Unmarshal([]byte(raw), &values); err != nil {
+		return nil, fmt.Errorf("parse %s as JSON uint8 list: %w", key, err)
 	}
 	return values, nil
 }

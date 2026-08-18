@@ -100,7 +100,7 @@ func tomlValueToString(field fieldSpec, value any) (string, error) {
 		default:
 			return "", fmt.Errorf("parse %s / %s: value must be a number", field.TOMLPath, field.EnvKey)
 		}
-	case kindStringList, kindObjectList:
+	case kindStringList, kindIntList, kindObjectList:
 		if text, ok := value.(string); ok {
 			return strings.TrimSpace(text), nil
 		}

@@ -98,3 +98,9 @@ gateway core; the adapter does not write CONNACK directly.
 - Plugin Send hooks are not invoked in this adapter. They run inside
   `internal/usecase/message` after permission checks, so all entry points
   share the same hook behavior.
+
+Authenticated gateway sessions project credential version, business login
+session ID, and absolute credential expiry into Presence activation. Owner
+actions match all route fences, remove the exact owner-local route first, then
+use the optional kick primitive to enqueue `DISCONNECT(ReasonConnectKick)` and
+perform a bounded flush/hard close.

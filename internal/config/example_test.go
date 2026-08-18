@@ -106,7 +106,7 @@ func TestV2WKYAMLEquivalentTOMLLoads(t *testing.T) {
 			cfg.Delivery.Enabled, cfg.Plugin.Enable)
 	}
 	if !cfg.Webhook.Enabled || cfg.Webhook.HTTPAddr != "http://linku-im-processor:LinkU-WuKongIM-Webhook-2026@localhost/link-u-im-processor/webhook" ||
-		!slices.Equal(cfg.Webhook.FocusEvents, []string{"msg.offline", "msg.notify"}) ||
+		!slices.Equal(cfg.Webhook.FocusEvents, []string{"msg.offline.v2", "msg.notify"}) ||
 		cfg.Webhook.RetryMaxAttempts != 5 {
 		t.Fatalf("webhook config = %#v", cfg.Webhook)
 	}

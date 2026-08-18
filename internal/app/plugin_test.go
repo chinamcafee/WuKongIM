@@ -470,7 +470,8 @@ func TestPluginReceiveObserverMapsOfflineRecipientEvent(t *testing.T) {
 	worker := &recordingPluginReceiveWorker{}
 	observer := pluginReceiveObserver{worker: worker}
 	source := channelappend.OfflineRecipientEvent{
-		UID: "bot",
+		UID:        "bot",
+		DeviceFlag: 2,
 		Event: channelappend.CommittedEnvelope{
 			MessageID:         101,
 			MessageSeq:        202,
@@ -495,6 +496,7 @@ func TestPluginReceiveObserverMapsOfflineRecipientEvent(t *testing.T) {
 		ChannelType:       2,
 		FromUID:           "sender-u1",
 		UID:               "bot",
+		DeviceFlag:        2,
 		ClientMsgNo:       "client-1",
 		ServerTimestampMS: 123456789,
 		Payload:           []byte("payload"),
@@ -506,7 +508,7 @@ func TestPluginReceiveObserverMapsOfflineRecipientBatchWithoutScalarExpansion(t 
 	worker := &recordingPluginReceiveBatchWorker{}
 	observer := pluginReceiveObserver{worker: worker}
 	source := channelappend.OfflineRecipientsEvent{
-		UIDs: []string{"bot", "bot-2"},
+		Targets: []channelappend.OfflineTarget{{UID: "bot", DeviceFlag: 0}, {UID: "bot-2", DeviceFlag: 2}},
 		Event: channelappend.CommittedEnvelope{
 			MessageID:         101,
 			MessageSeq:        202,
@@ -521,7 +523,7 @@ func TestPluginReceiveObserverMapsOfflineRecipientBatchWithoutScalarExpansion(t 
 	}
 
 	observer.ObserveOfflineRecipients(context.Background(), source)
-	source.UIDs[0] = "mutated"
+	source.Targets[0].UID = "mutated"
 	source.Event.Payload[0] = 'X'
 	source.Event.MessageScopedUIDs[0] = "mutated"
 
@@ -532,7 +534,7 @@ func TestPluginReceiveObserverMapsOfflineRecipientBatchWithoutScalarExpansion(t 
 		ChannelID:         "room-a",
 		ChannelType:       2,
 		FromUID:           "sender-u1",
-		UIDs:              []string{"bot", "bot-2"},
+		Targets:           []pluginevents.ReceiveOfflineTarget{{UID: "bot", DeviceFlag: 0}, {UID: "bot-2", DeviceFlag: 2}},
 		ClientMsgNo:       "client-1",
 		ServerTimestampMS: 123456789,
 		Payload:           []byte("payload"),

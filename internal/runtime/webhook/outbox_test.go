@@ -151,13 +151,17 @@ func TestDurableOutboxDeliveredMarkersDoNotConsumeLiveEntryCapacity(t *testing.T
 
 func TestStableEventIDIsRecipientOrderIndependentAndTargetScoped(t *testing.T) {
 	message := Message{MessageID: 9, MessageSeq: 7, ChannelID: "c", ChannelType: 1}
-	left := StableEventID(EventMsgOffline, message, []string{"u2", "u1"})
-	right := StableEventID(EventMsgOffline, message, []string{"u1", "u2"})
+	left := StableEventID(EventMsgOffline, message, []OfflineTarget{{UID: "u2", DeviceFlag: 2}, {UID: "u1", DeviceFlag: 0}})
+	right := StableEventID(EventMsgOffline, message, []OfflineTarget{{UID: "u1", DeviceFlag: 0}, {UID: "u2", DeviceFlag: 2}})
 	if left != right {
 		t.Fatalf("stable ids differ: %q / %q", left, right)
 	}
-	if left == StableEventID(EventMsgOffline, message, []string{"u1"}) {
+	if left == StableEventID(EventMsgOffline, message, []OfflineTarget{{UID: "u1", DeviceFlag: 0}}) {
 		t.Fatalf("different recipient chunk reused id %q", left)
+	}
+	if StableEventID(EventMsgOffline, message, []OfflineTarget{{UID: "u1", DeviceFlag: 0}}) ==
+		StableEventID(EventMsgOffline, message, []OfflineTarget{{UID: "u1", DeviceFlag: 2}}) {
+		t.Fatal("different device shapes reused one stable id")
 	}
 }
 

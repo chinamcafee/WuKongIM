@@ -67,7 +67,7 @@ func TestBuildNotifyBodyMapsCommittedMessages(t *testing.T) {
 	}
 }
 
-func TestBuildOfflineBodyChunksAndCompressesUIDs(t *testing.T) {
+func TestBuildOfflineBodyCompressesCanonicalDeviceTargets(t *testing.T) {
 	body, err := buildOfflineBody(OfflineMessage{
 		Message: Message{
 			MessageID:         10,
@@ -82,7 +82,12 @@ func TestBuildOfflineBodyChunksAndCompressesUIDs(t *testing.T) {
 			ServerTimestampMS: time.Unix(10, 0).UnixMilli(),
 			Payload:           []byte("payload"),
 		},
-		ToUIDs: []string{"u1", "u2", "u3"},
+		Targets: []OfflineTarget{
+			{UID: "u3", DeviceFlag: 2},
+			{UID: "u1", DeviceFlag: 0},
+			{UID: "u2", DeviceFlag: 0},
+			{UID: "u1", DeviceFlag: 0},
+		},
 	}, 2)
 	if err != nil {
 		t.Fatalf("buildOfflineBody() error = %v", err)
@@ -94,8 +99,11 @@ func TestBuildOfflineBodyChunksAndCompressesUIDs(t *testing.T) {
 	if got["compress"] != "gzip" {
 		t.Fatalf("compress = %v, want gzip", got["compress"])
 	}
-	if got["compress_to_uids"] == "" {
-		t.Fatalf("compress_to_uids is empty")
+	if got["schema_version"] != float64(2) {
+		t.Fatalf("schema_version = %v, want 2", got["schema_version"])
+	}
+	if got["compress_offline_targets"] == "" {
+		t.Fatalf("compress_offline_targets is empty")
 	}
 	if got["setting"] != float64(9) || got["topic"] != "topic-a" || got["expire"] != float64(3600) || got["source_id"] != float64(7) {
 		t.Fatalf("legacy offline fields = setting:%v topic:%v expire:%v source:%v, want 9/topic-a/3600/7", got["setting"], got["topic"], got["expire"], got["source_id"])
@@ -106,20 +114,23 @@ func TestBuildOfflineBodyChunksAndCompressesUIDs(t *testing.T) {
 	if _, exists := got["timestamp"]; exists {
 		t.Fatalf("legacy second-resolution timestamp must not be emitted: %#v", got)
 	}
-	compressed, ok := got["compress_to_uids"].(string)
+	compressed, ok := got["compress_offline_targets"].(string)
 	if !ok {
-		t.Fatalf("compress_to_uids = %#v, want string", got["compress_to_uids"])
+		t.Fatalf("compress_offline_targets = %#v, want string", got["compress_offline_targets"])
 	}
-	uids := decodeCompressedUIDs(t, compressed)
-	if want := []string{"u1", "u2", "u3"}; !reflect.DeepEqual(uids, want) {
-		t.Fatalf("compressed uids = %#v, want %#v", uids, want)
+	targets := decodeCompressedOfflineTargets(t, compressed)
+	if want := []OfflineTarget{{UID: "u1", DeviceFlag: 0}, {UID: "u2", DeviceFlag: 0}, {UID: "u3", DeviceFlag: 2}}; !reflect.DeepEqual(targets, want) {
+		t.Fatalf("compressed targets = %#v, want %#v", targets, want)
+	}
+	if _, exists := got["offline_targets"]; exists {
+		t.Fatalf("offline_targets exists for compressed body: %#v", got)
 	}
 	if _, exists := got["to_uids"]; exists {
-		t.Fatalf("to_uids exists for compressed body: %#v", got)
+		t.Fatalf("legacy to_uids exists in v2 body: %#v", got)
 	}
 }
 
-func TestBuildOfflineBodyIncludesUIDsBelowCompressThreshold(t *testing.T) {
+func TestBuildOfflineBodyIncludesDeviceTargetsBelowCompressThreshold(t *testing.T) {
 	body, err := buildOfflineBody(OfflineMessage{
 		Message: Message{
 			MessageID:         10,
@@ -130,24 +141,28 @@ func TestBuildOfflineBodyIncludesUIDsBelowCompressThreshold(t *testing.T) {
 			ServerTimestampMS: time.Unix(10, 0).UnixMilli(),
 			Payload:           []byte("payload"),
 		},
-		ToUIDs: []string{"u1", "u2"},
+		Targets: []OfflineTarget{{UID: "u1", DeviceFlag: 0}, {UID: "u2", DeviceFlag: 2}},
 	}, 3)
 	if err != nil {
 		t.Fatalf("buildOfflineBody() error = %v", err)
 	}
 	var got struct {
-		ToUIDs         []string `json:"to_uids"`
-		Compress       string   `json:"compress"`
-		CompressToUIDs string   `json:"compress_to_uids"`
+		SchemaVersion          int             `json:"schema_version"`
+		OfflineTargets         []OfflineTarget `json:"offline_targets"`
+		Compress               string          `json:"compress"`
+		CompressOfflineTargets string          `json:"compress_offline_targets"`
 	}
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatalf("json.Unmarshal() error = %v body=%s", err, string(body))
 	}
-	if want := []string{"u1", "u2"}; !reflect.DeepEqual(got.ToUIDs, want) {
-		t.Fatalf("to_uids = %#v, want %#v", got.ToUIDs, want)
+	if got.SchemaVersion != 2 {
+		t.Fatalf("schema_version = %d, want 2", got.SchemaVersion)
 	}
-	if got.Compress != "" || got.CompressToUIDs != "" {
-		t.Fatalf("compressed fields = %q/%q, want empty", got.Compress, got.CompressToUIDs)
+	if want := []OfflineTarget{{UID: "u1", DeviceFlag: 0}, {UID: "u2", DeviceFlag: 2}}; !reflect.DeepEqual(got.OfflineTargets, want) {
+		t.Fatalf("offline_targets = %#v, want %#v", got.OfflineTargets, want)
+	}
+	if got.Compress != "" || got.CompressOfflineTargets != "" {
+		t.Fatalf("compressed fields = %q/%q, want empty", got.Compress, got.CompressOfflineTargets)
 	}
 }
 
@@ -169,7 +184,7 @@ func TestBuildOnlineStatusBodyFiltersEmptyValues(t *testing.T) {
 	}
 }
 
-func decodeCompressedUIDs(t *testing.T, encoded string) []string {
+func decodeCompressedOfflineTargets(t *testing.T, encoded string) []OfflineTarget {
 	t.Helper()
 
 	compressed, err := base64.StdEncoding.DecodeString(encoded)
@@ -185,7 +200,7 @@ func decodeCompressedUIDs(t *testing.T, encoded string) []string {
 	if err != nil {
 		t.Fatalf("ReadAll() error = %v", err)
 	}
-	var got []string
+	var got []OfflineTarget
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("json.Unmarshal() error = %v body=%s", err, string(data))
 	}

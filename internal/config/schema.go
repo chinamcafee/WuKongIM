@@ -12,6 +12,7 @@ const (
 	kindFloat      fieldKind = "float"
 	kindDuration   fieldKind = "duration"
 	kindStringList fieldKind = "string_list"
+	kindIntList    fieldKind = "int_list"
 	kindObjectList fieldKind = "object_list"
 )
 
@@ -140,6 +141,9 @@ var schemaFields = []fieldSpec{
 	{TOMLPath: "api.external_tcp_addr", EnvKey: "WK_EXTERNAL_TCPADDR", Kind: kindString, Group: "api", Label: "External TCP address"},
 	{TOMLPath: "api.external_ws_addr", EnvKey: "WK_EXTERNAL_WSADDR", Kind: kindString, Group: "api", Label: "External WebSocket address", DiagnosticSensitive: true},
 	{TOMLPath: "api.external_wss_addr", EnvKey: "WK_EXTERNAL_WSSADDR", Kind: kindString, Group: "api", Label: "External secure WebSocket address", DiagnosticSensitive: true},
+	{TOMLPath: "api.internal_credential_hmac_secret", EnvKey: "WK_API_INTERNAL_CREDENTIAL_HMAC_SECRET", Kind: kindString, Group: "api", Label: "Internal credential HMAC secret", Sensitive: true},
+	{TOMLPath: "api.internal_credential_replay_window", EnvKey: "WK_API_INTERNAL_CREDENTIAL_REPLAY_WINDOW", Kind: kindDuration, Group: "api", Label: "Internal credential replay window"},
+	{TOMLPath: "api.internal_credential_max_batch_size", EnvKey: "WK_API_INTERNAL_CREDENTIAL_MAX_BATCH_SIZE", Kind: kindInt, Group: "api", Label: "Internal credential max batch size"},
 
 	{TOMLPath: "manager.listen_addr", EnvKey: "WK_MANAGER_LISTEN_ADDR", Kind: kindString, Group: "manager", Label: "Manager listen address"},
 	{TOMLPath: "manager.auth_on", EnvKey: "WK_MANAGER_AUTH_ON", Kind: kindBool, Group: "manager", Label: "Manager auth enabled"},
@@ -237,6 +241,7 @@ var schemaFields = []fieldSpec{
 	{TOMLPath: "webhook.online_status_batch_max_items", EnvKey: "WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_ITEMS", Kind: kindInt, Group: "webhook", Label: "Webhook online status batch max items"},
 	{TOMLPath: "webhook.online_status_batch_max_wait", EnvKey: "WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_WAIT", Kind: kindDuration, Group: "webhook", Label: "Webhook online status batch max wait"},
 	{TOMLPath: "webhook.offline_uid_batch_size", EnvKey: "WK_WEBHOOK_OFFLINE_UID_BATCH_SIZE", Kind: kindInt, Group: "webhook", Label: "Webhook offline UID batch size"},
+	{TOMLPath: "webhook.offline_notification_device_flags", EnvKey: "WK_WEBHOOK_OFFLINE_NOTIFICATION_DEVICE_FLAGS", Kind: kindIntList, Group: "webhook", Label: "Webhook offline notification device flags"},
 	{TOMLPath: "webhook.request_timeout", EnvKey: "WK_WEBHOOK_REQUEST_TIMEOUT", Kind: kindDuration, Group: "webhook", Label: "Webhook request timeout"},
 	{TOMLPath: "webhook.retry_max_attempts", EnvKey: "WK_WEBHOOK_RETRY_MAX_ATTEMPTS", Kind: kindInt, Group: "webhook", Label: "Webhook retry max attempts"},
 	{TOMLPath: "webhook.outbox_dir", EnvKey: "WK_WEBHOOK_OUTBOX_DIR", Kind: kindString, Group: "webhook", Label: "Webhook outbox directory"},
@@ -337,6 +342,9 @@ func supportedConfigKeysForBuilder() []string {
 		"WK_CLUSTER_COMMIT_COORDINATOR_MAX_BYTES",
 		"WK_CLUSTER_COMMIT_COORDINATOR_SHARDS",
 		"WK_API_LISTEN_ADDR",
+		"WK_API_INTERNAL_CREDENTIAL_HMAC_SECRET",
+		"WK_API_INTERNAL_CREDENTIAL_REPLAY_WINDOW",
+		"WK_API_INTERNAL_CREDENTIAL_MAX_BATCH_SIZE",
 		"WK_MANAGER_LISTEN_ADDR",
 		"WK_MANAGER_AUTH_ON",
 		"WK_MANAGER_JWT_SECRET",
@@ -425,6 +433,7 @@ func supportedConfigKeysForBuilder() []string {
 		"WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_ITEMS",
 		"WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_WAIT",
 		"WK_WEBHOOK_OFFLINE_UID_BATCH_SIZE",
+		"WK_WEBHOOK_OFFLINE_NOTIFICATION_DEVICE_FLAGS",
 		"WK_WEBHOOK_REQUEST_TIMEOUT",
 		"WK_WEBHOOK_RETRY_MAX_ATTEMPTS",
 		"WK_WEBHOOK_OUTBOX_DIR",

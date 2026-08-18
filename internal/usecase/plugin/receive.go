@@ -51,7 +51,7 @@ func (a *App) receiveOfflineBatch(
 	batch pluginevents.ReceiveOfflineBatch,
 	recipientTimeout time.Duration,
 ) error {
-	if a == nil || !a.offlineReceiveBatchEligible(batch) || len(batch.UIDs) == 0 {
+	if a == nil || !a.offlineReceiveBatchEligible(batch) || len(batch.Targets) == 0 {
 		return nil
 	}
 	setupCtx, cancelSetup := receiveContextWithTimeout(ctx, recipientTimeout)
@@ -64,16 +64,17 @@ func (a *App) receiveOfflineBatch(
 		return ErrReceiveBindingReaderRequired
 	}
 
-	seen := make(map[string]struct{}, len(batch.UIDs))
+	seen := make(map[pluginevents.ReceiveOfflineTarget]struct{}, len(batch.Targets))
 	var joined error
-	for _, uid := range batch.UIDs {
+	for _, target := range batch.Targets {
+		uid := target.UID
 		if uid == "" || uid == batch.FromUID {
 			continue
 		}
-		if _, ok := seen[uid]; ok {
+		if _, ok := seen[target]; ok {
 			continue
 		}
-		seen[uid] = struct{}{}
+		seen[target] = struct{}{}
 
 		recipientCtx, cancelRecipient := receiveContextWithTimeout(ctx, recipientTimeout)
 		plugin, ok, err := a.boundReceivePluginForUIDFromCandidates(recipientCtx, uid, candidates)
@@ -89,7 +90,7 @@ func (a *App) receiveOfflineBatch(
 			cancelRecipient()
 			continue
 		}
-		event := batch.ForUID(uid)
+		event := batch.ForTarget(target)
 		err = a.invokeReceiveOffline(recipientCtx, event, plugin)
 		cancelRecipient()
 		if err != nil {

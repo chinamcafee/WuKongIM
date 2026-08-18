@@ -81,6 +81,43 @@ func TestClusterConversationBatchFacadeRoutesByUIDAndKind(t *testing.T) {
 	}
 }
 
+func TestClusterCMDDeviceCursorFacadeRoutesByUIDAndKeepsFlagsIndependent(t *testing.T) {
+	node := newTestNodeWithMeta(t)
+	ctx := context.Background()
+	uid := uidForHashSlot(t, node.cfg.Slots.HashSlotCount, 5)
+	app := metadb.CMDDeviceCursor{
+		UID: uid, DeviceFlag: 0, ChannelID: uid + "-cmd", ChannelType: 7,
+		ReadSeq: 8, DeletedToSeq: 3, ActiveAt: 10, UpdatedAt: 11,
+	}
+	pc := app
+	pc.DeviceFlag = 2
+	pc.ReadSeq = 2
+	pc.DeletedToSeq = 1
+
+	if err := node.UpsertCMDDeviceCursorsBatch(ctx, []metadb.CMDDeviceCursor{app, pc}); err != nil {
+		t.Fatalf("UpsertCMDDeviceCursorsBatch(): %v", err)
+	}
+	keys := []metadb.CMDDeviceCursorKey{
+		{UID: uid, DeviceFlag: 0, ChannelID: app.ChannelID, ChannelType: app.ChannelType},
+		{UID: uid, DeviceFlag: 2, ChannelID: pc.ChannelID, ChannelType: pc.ChannelType},
+	}
+	got, err := node.GetCMDDeviceCursorsBatch(ctx, keys)
+	if err != nil {
+		t.Fatalf("GetCMDDeviceCursorsBatch(): %v", err)
+	}
+	if got[keys[0]] != app || got[keys[1]] != pc {
+		t.Fatalf("device cursors = %+v, want app=%+v pc=%+v", got, app, pc)
+	}
+	route, err := node.RouteKey(uid)
+	if err != nil {
+		t.Fatalf("RouteKey(): %v", err)
+	}
+	stored, ok, err := node.defaultSlotMetaDB.ForHashSlot(route.HashSlot).GetCMDDeviceCursor(ctx, keys[0])
+	if err != nil || !ok || stored != app {
+		t.Fatalf("routed cursor = %+v, %v, %v, want %+v", stored, ok, err, app)
+	}
+}
+
 func TestClusterTouchConversationActiveAtBatchRoutesByUID(t *testing.T) {
 	node := newDefaultSingleNode(t)
 	startNode(t, node)

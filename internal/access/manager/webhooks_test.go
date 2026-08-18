@@ -92,26 +92,27 @@ func TestManagerWebhookOutboxReplayRejectsDuplicateIDs(t *testing.T) {
 
 func TestManagerWebhookConfigReturnsStartupSnapshot(t *testing.T) {
 	expected := WebhookConfigSnapshot{
-		Enabled:                   true,
-		HTTPAddr:                  "http://127.0.0.1:19090/webhook",
-		FocusEvents:               []string{"msg.notify", "msg.offline"},
-		SupportedEvents:           []string{"msg.notify", "msg.offline", "user.onlinestatus"},
-		QueueSize:                 1024,
-		Workers:                   16,
-		OnlineStatusBatchMaxItems: 512,
-		OnlineStatusBatchMaxWait:  "2s",
-		OfflineUIDBatchSize:       512,
-		RequestTimeout:            "5s",
-		RetryMaxAttempts:          3,
-		OutboxDir:                 "/var/lib/wukongim/webhook-outbox",
-		OutboxMaxEntries:          1000000,
-		OutboxMaxBytes:            4294967296,
-		OutboxDispatchBatchSize:   100,
-		OutboxRetryBaseDelay:      "1s",
-		OutboxRetryMaxDelay:       "5m0s",
-		OutboxDeliveredRetention:  "168h0m0s",
-		Source:                    "startup_config",
-		RequiresRestart:           true,
+		Enabled:                        true,
+		HTTPAddr:                       "http://127.0.0.1:19090/webhook",
+		FocusEvents:                    []string{"msg.notify", "msg.offline.v2"},
+		SupportedEvents:                []string{"msg.notify", "msg.offline.v2", "user.onlinestatus"},
+		QueueSize:                      1024,
+		Workers:                        16,
+		OnlineStatusBatchMaxItems:      512,
+		OnlineStatusBatchMaxWait:       "2s",
+		OfflineUIDBatchSize:            512,
+		OfflineNotificationDeviceFlags: []int{0},
+		RequestTimeout:                 "5s",
+		RetryMaxAttempts:               3,
+		OutboxDir:                      "/var/lib/wukongim/webhook-outbox",
+		OutboxMaxEntries:               1000000,
+		OutboxMaxBytes:                 4294967296,
+		OutboxDispatchBatchSize:        100,
+		OutboxRetryBaseDelay:           "1s",
+		OutboxRetryMaxDelay:            "5m0s",
+		OutboxDeliveredRetention:       "168h0m0s",
+		Source:                         "startup_config",
+		RequiresRestart:                true,
 	}
 	var called bool
 	srv := New(Options{
@@ -147,13 +148,14 @@ func TestManagerWebhookConfigReturnsStartupSnapshot(t *testing.T) {
 	if !jsonEqual(rec.Body.String(), `{
 		"enabled": true,
 		"http_addr": "http://127.0.0.1:19090/webhook",
-		"focus_events": ["msg.notify", "msg.offline"],
-		"supported_events": ["msg.notify", "msg.offline", "user.onlinestatus"],
+		"focus_events": ["msg.notify", "msg.offline.v2"],
+		"supported_events": ["msg.notify", "msg.offline.v2", "user.onlinestatus"],
 		"queue_size": 1024,
 		"workers": 16,
 		"online_status_batch_max_items": 512,
 		"online_status_batch_max_wait": "2s",
 		"offline_uid_batch_size": 512,
+		"offline_notification_device_flags": [0],
 		"request_timeout": "5s",
 		"retry_max_attempts": 3,
 		"outbox_dir": "/var/lib/wukongim/webhook-outbox",
@@ -172,8 +174,8 @@ func TestManagerWebhookConfigReturnsStartupSnapshot(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
-	if len(body) != 20 {
-		t.Fatalf("field count = %d, want 20: %s", len(body), rec.Body.String())
+	if len(body) != 21 {
+		t.Fatalf("field count = %d, want 21: %s", len(body), rec.Body.String())
 	}
 }
 

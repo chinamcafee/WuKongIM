@@ -300,6 +300,17 @@ func (s *Store) UpsertDevice(ctx context.Context, d metadb.Device) error {
 	return proposeWithHashSlot(ctx, s.cluster, slotID, hashSlot, cmd)
 }
 
+// ApplyDeviceCredential atomically compares and applies one credential version.
+func (s *Store) ApplyDeviceCredential(ctx context.Context, d metadb.Device) (metadb.DeviceCredentialMutationResult, error) {
+	slotID := s.cluster.SlotForKey(d.UID)
+	hashSlot := hashSlotForKey(s.cluster, d.UID)
+	resultBytes, err := proposeWithHashSlotResult(ctx, s.cluster, slotID, hashSlot, metafsm.EncodeApplyDeviceCredentialCommand(d))
+	if err != nil {
+		return metadb.DeviceCredentialMutationResult{}, err
+	}
+	return metafsm.DecodeDeviceCredentialMutationResult(resultBytes)
+}
+
 func (s *Store) GetDevice(ctx context.Context, uid string, deviceFlag int64) (metadb.Device, error) {
 	slotID := s.cluster.SlotForKey(uid)
 	hashSlot := hashSlotForKey(s.cluster, uid)

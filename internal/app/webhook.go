@@ -134,22 +134,26 @@ func (e webhookNotifyEnqueuer) EnqueuePersistAfter(ctx context.Context, event ch
 }
 
 func (o webhookOfflineObserver) ObserveOfflineRecipients(ctx context.Context, event channelappend.OfflineRecipientsEvent) {
-	if o.runtime == nil || len(event.UIDs) == 0 {
+	if o.runtime == nil || len(event.Targets) == 0 {
 		return
 	}
 	batchSize := o.uidBatchSize
-	if batchSize <= 0 || batchSize > len(event.UIDs) {
-		batchSize = len(event.UIDs)
+	if batchSize <= 0 || batchSize > len(event.Targets) {
+		batchSize = len(event.Targets)
 	}
 	message := webhookMessageFromCommitted(event.Event)
-	for start := 0; start < len(event.UIDs); start += batchSize {
+	for start := 0; start < len(event.Targets); start += batchSize {
 		end := start + batchSize
-		if end > len(event.UIDs) {
-			end = len(event.UIDs)
+		if end > len(event.Targets) {
+			end = len(event.Targets)
+		}
+		targets := make([]runtimewebhook.OfflineTarget, end-start)
+		for i, target := range event.Targets[start:end] {
+			targets[i] = runtimewebhook.OfflineTarget{UID: target.UID, DeviceFlag: target.DeviceFlag}
 		}
 		o.runtime.Offline(ctx, runtimewebhook.OfflineMessage{
 			Message: message,
-			ToUIDs:  append([]string(nil), event.UIDs[start:end]...),
+			Targets: targets,
 		})
 	}
 }
@@ -159,8 +163,8 @@ func (o webhookOfflineObserver) ObserveOfflineRecipient(ctx context.Context, eve
 		return
 	}
 	o.ObserveOfflineRecipients(ctx, channelappend.OfflineRecipientsEvent{
-		Event: event.Event,
-		UIDs:  []string{event.UID},
+		Event:   event.Event,
+		Targets: []channelappend.OfflineTarget{{UID: event.UID, DeviceFlag: event.DeviceFlag}},
 	})
 }
 
@@ -209,8 +213,10 @@ func composeOfflineRecipientObservers(
 }
 
 func (o singleOfflineRecipientsObserver) ObserveOfflineRecipients(ctx context.Context, event channelappend.OfflineRecipientsEvent) {
-	for _, uid := range event.UIDs {
-		o.next.ObserveOfflineRecipient(ctx, channelappend.OfflineRecipientEvent{Event: event.Event, UID: uid})
+	for _, target := range event.Targets {
+		o.next.ObserveOfflineRecipient(ctx, channelappend.OfflineRecipientEvent{
+			Event: event.Event, UID: target.UID, DeviceFlag: target.DeviceFlag,
+		})
 	}
 }
 
@@ -220,10 +226,9 @@ func (o composedOfflineRecipientsObserver) ObserveOfflineRecipients(ctx context.
 		o.pluginBatch.ObserveOfflineRecipients(ctx, event)
 		return
 	}
-	for _, uid := range event.UIDs {
+	for _, target := range event.Targets {
 		o.pluginSingle.ObserveOfflineRecipient(ctx, channelappend.OfflineRecipientEvent{
-			Event: event.Event,
-			UID:   uid,
+			Event: event.Event, UID: target.UID, DeviceFlag: target.DeviceFlag,
 		})
 	}
 }

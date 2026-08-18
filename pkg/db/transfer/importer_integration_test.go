@@ -46,7 +46,7 @@ func TestImportBundleWritesCurrentStores(t *testing.T) {
 		`{"hash_slot":`+itoa(int(userSlot))+`,"uid":"u1","token":"user-token","device_flag":1,"device_level":2}`,
 	)
 	writeJSONLFile(t, root, "meta/devices.jsonl",
-		`{"hash_slot":`+itoa(int(userSlot))+`,"uid":"u1","device_flag":1,"token":"device-token","device_level":3}`,
+		`{"hash_slot":`+itoa(int(userSlot))+`,"uid":"u1","device_flag":1,"token":"device-token","device_level":3,"credential_version":7,"login_session_id":"session-7","operation_id":"operation-7","operation_digest":"digest-7","credential_status":"ACTIVE","expires_at_unix_ms":2000000000000,"updated_at_unix_ms":1900000000000,"termination_cause":""}`,
 	)
 	writeJSONLFile(t, root, "meta/channels.jsonl",
 		`{"hash_slot":`+itoa(int(channelSlot))+`,"channel_id":"g1","channel_type":2,"ban":0,"disband":0,"send_ban":0,"allow_stranger":1,"large":0,"subscriber_mutation_version":7}`,
@@ -59,6 +59,9 @@ func TestImportBundleWritesCurrentStores(t *testing.T) {
 	)
 	writeJSONLFile(t, root, "meta/conversations.jsonl",
 		`{"hash_slot":`+itoa(int(userSlot))+`,"uid":"u1","kind":"normal","channel_id":"g1","channel_type":2,"read_seq":1,"deleted_to_seq":0,"active_at":2000,"updated_at":2001,"sparse_active":true}`,
+	)
+	writeJSONLFile(t, root, "meta/cmd_device_cursors.jsonl",
+		`{"hash_slot":`+itoa(int(userSlot))+`,"uid":"u1","device_flag":1,"command_channel_id":"u1-cmd","channel_type":7,"read_seq":"18446744073709551615","deleted_to_seq":6,"active_at":2002,"updated_at":2003}`,
 	)
 	writeJSONLFile(t, root, "meta/channel_latest.jsonl",
 		`{"hash_slot":`+itoa(int(channelSlot))+`,"channel_id":"g1","channel_type":2,"last_message_id":1001,"last_message_seq":1,"last_at":3000,"from_uid":"u1","client_msg_no":"c1","last_payload_b64":"aGk=","updated_at":3001}`,
@@ -76,6 +79,7 @@ func TestImportBundleWritesCurrentStores(t *testing.T) {
 		{Path: "meta/subscribers.jsonl", Kind: FileKindMetaSubscribers},
 		{Path: "meta/memberships.jsonl", Kind: FileKindMetaUserChannelMemberships},
 		{Path: "meta/conversations.jsonl", Kind: FileKindMetaConversations},
+		{Path: "meta/cmd_device_cursors.jsonl", Kind: FileKindMetaCMDDeviceCursors},
 		{Path: "meta/channel_latest.jsonl", Kind: FileKindMetaChannelLatest},
 		{Path: "message/messages-000001.jsonl", Kind: FileKindMessageMessages},
 		{Path: "message/channels.jsonl", Kind: FileKindMessageChannels},
@@ -101,7 +105,7 @@ func TestImportBundleWritesCurrentStores(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("GetDevice() ok=%v err=%v, want ok", ok, err)
 	}
-	if device.Token != "device-token" || device.DeviceLevel != 3 {
+	if device != transferTestDevice("u1") {
 		t.Fatalf("device = %+v, want imported device token", device)
 	}
 	channel, ok, err := store.Meta().HashSlot(channelSlot).GetChannel(ctx, "g1", 2)
@@ -117,6 +121,15 @@ func TestImportBundleWritesCurrentStores(t *testing.T) {
 	}
 	if conversation.ReadSeq != 1 || !conversation.SparseActive {
 		t.Fatalf("conversation = %+v, want read seq 1 and sparse active", conversation)
+	}
+	cursor, ok, err := store.Meta().HashSlot(userSlot).GetCMDDeviceCursor(ctx, metadb.CMDDeviceCursorKey{
+		UID: "u1", DeviceFlag: 1, ChannelID: "u1-cmd", ChannelType: 7,
+	})
+	if err != nil || !ok {
+		t.Fatalf("GetCMDDeviceCursor() ok=%v err=%v, want ok", ok, err)
+	}
+	if cursor.ReadSeq != ^uint64(0) || cursor.DeletedToSeq != 6 || cursor.UpdatedAt != 2003 {
+		t.Fatalf("cursor = %+v, want exact uint64 and timestamps", cursor)
 	}
 	latest, ok, err := store.Meta().HashSlot(channelSlot).GetChannelLatest(ctx, "g1", 2)
 	if err != nil || !ok {

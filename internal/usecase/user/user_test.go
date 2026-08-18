@@ -30,9 +30,16 @@ func TestUpdateTokenCreatesMissingUserAndUpsertsDevice(t *testing.T) {
 	if users.getCalls != 1 || len(users.created) != 1 || users.created[0].UID != "u1" {
 		t.Fatalf("user store getCalls=%d created=%#v, want create u1", users.getCalls, users.created)
 	}
-	wantDevice := metadb.Device{UID: "u1", DeviceFlag: int64(frame.APP), Token: "token-1", DeviceLevel: int64(frame.DeviceLevelSlave)}
-	if len(devices.upserted) != 1 || devices.upserted[0] != wantDevice {
-		t.Fatalf("upserted devices = %#v, want %#v", devices.upserted, []metadb.Device{wantDevice})
+	if len(devices.upserted) != 1 {
+		t.Fatalf("upserted devices = %#v, want one device", devices.upserted)
+	}
+	gotDevice := devices.upserted[0]
+	if gotDevice.UID != "u1" || gotDevice.DeviceFlag != int64(frame.APP) ||
+		gotDevice.Token != "token-1" || gotDevice.DeviceLevel != int64(frame.DeviceLevelSlave) ||
+		gotDevice.CredentialVersion != 1 || gotDevice.CredentialStatus != metadb.DeviceCredentialStatusActive ||
+		gotDevice.LoginSessionID == "" || gotDevice.OperationID == "" || gotDevice.OperationDigest == "" ||
+		gotDevice.ExpiresAtUnixMS <= gotDevice.UpdatedAtUnixMS {
+		t.Fatalf("upserted device = %#v, want complete active credential", gotDevice)
 	}
 }
 
@@ -126,9 +133,16 @@ func TestDeviceQuitClearsSelectedTokenAndSchedulesClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeviceQuit() error = %v", err)
 	}
-	want := metadb.Device{UID: "u1", DeviceFlag: int64(frame.APP), Token: "", DeviceLevel: int64(frame.DeviceLevelMaster)}
-	if len(devices.upserted) != 1 || devices.upserted[0] != want {
-		t.Fatalf("upserted devices = %#v, want %#v", devices.upserted, []metadb.Device{want})
+	if len(devices.upserted) != 1 {
+		t.Fatalf("upserted devices = %#v, want one device", devices.upserted)
+	}
+	gotDevice := devices.upserted[0]
+	if gotDevice.UID != "u1" || gotDevice.DeviceFlag != int64(frame.APP) || gotDevice.Token != "" ||
+		gotDevice.DeviceLevel != int64(frame.DeviceLevelMaster) || gotDevice.CredentialVersion != 1 ||
+		gotDevice.CredentialStatus != metadb.DeviceCredentialStatusRevoked ||
+		gotDevice.LoginSessionID == "" || gotDevice.OperationID == "" || gotDevice.OperationDigest == "" ||
+		gotDevice.ExpiresAtUnixMS != 0 || gotDevice.TerminationCause != "SESSION_LOGGED_OUT" {
+		t.Fatalf("upserted device = %#v, want complete revoked credential", gotDevice)
 	}
 	if len(scheduled) != 1 || scheduled[0] != 2*time.Second {
 		t.Fatalf("scheduled = %#v, want one 2s close", scheduled)

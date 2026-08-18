@@ -92,12 +92,18 @@ type CommittedEnvelope = contract.CommittedEnvelope
 // Recipient identifies one UID selected for committed-message effects.
 type Recipient = contract.Recipient
 
-// OfflineRecipientsEvent reports durable recipients with no online route.
+// OfflineTarget identifies one recipient/device shape without an online route.
+type OfflineTarget struct {
+	UID        string
+	DeviceFlag uint8
+}
+
+// OfflineRecipientsEvent reports durable recipient/device shapes with no online route.
 type OfflineRecipientsEvent struct {
 	// Event is the committed message whose recipients were classified offline.
 	Event CommittedEnvelope
-	// UIDs are recipient user identifiers without online routes, in first-seen order.
-	UIDs []string
+	// Targets are canonically sorted recipient/device shapes without online routes.
+	Targets []OfflineTarget
 }
 
 // OfflineRecipientsObserver receives offline recipient candidates in one batch after presence resolution.
@@ -112,6 +118,8 @@ type OfflineRecipientEvent struct {
 	Event CommittedEnvelope
 	// UID is the recipient user identifier without an online route.
 	UID string
+	// DeviceFlag is the observed offline protocol device category.
+	DeviceFlag uint8
 }
 
 // OfflineRecipientObserver receives offline recipient candidates after presence resolution.

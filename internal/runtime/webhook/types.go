@@ -9,7 +9,7 @@ const (
 	// EventMsgNotify reports committed durable messages.
 	EventMsgNotify = "msg.notify"
 	// EventMsgOffline reports offline recipients for one committed message chunk.
-	EventMsgOffline = "msg.offline"
+	EventMsgOffline = "msg.offline.v2"
 	// EventUserOnlineStatus reports online/offline route status strings.
 	EventUserOnlineStatus = "user.onlinestatus"
 )
@@ -46,12 +46,18 @@ type Message struct {
 	SyncOnce bool
 }
 
-// OfflineMessage carries one committed message plus one bounded recipient UID chunk.
+// OfflineTarget identifies one canonical recipient/device-shape notification target.
+type OfflineTarget struct {
+	UID        string `json:"uid"`
+	DeviceFlag uint8  `json:"device_flag"`
+}
+
+// OfflineMessage carries one committed message plus one bounded target chunk.
 type OfflineMessage struct {
 	// Message is the committed message being reported offline.
 	Message Message
-	// ToUIDs is one bounded recipient UID batch for the offline message.
-	ToUIDs []string
+	// Targets is one bounded recipient/device-shape batch for the offline message.
+	Targets []OfflineTarget
 }
 
 // OnlineStatus records one legacy-compatible user online status string.

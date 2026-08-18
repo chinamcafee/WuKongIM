@@ -59,6 +59,17 @@ func inspectCommand(cmd command) (CommandInspection, error) {
 		return simpleInspection("upsert_conversation_states", map[string]any{
 			"states": conversationStatesPayload(typed.states()),
 		}), nil
+	case *upsertCMDDeviceCursorsCmd:
+		cursors := make([]map[string]any, 0, len(typed.cursors))
+		for _, cursor := range typed.cursors {
+			cursors = append(cursors, map[string]any{
+				"uid": cursor.UID, "device_flag": cursor.DeviceFlag,
+				"command_channel_id": cursor.ChannelID, "channel_type": cursor.ChannelType,
+				"read_seq": cursor.ReadSeq, "deleted_to_seq": cursor.DeletedToSeq,
+				"active_at": cursor.ActiveAt, "updated_at": cursor.UpdatedAt,
+			})
+		}
+		return simpleInspection("upsert_cmd_device_cursors", map[string]any{"cursors": cursors}), nil
 	case *touchConversationActiveAtCmd:
 		return simpleInspection("touch_conversation_active_at", map[string]any{
 			"patches": conversationActivePatchesPayload(typed.patches()),

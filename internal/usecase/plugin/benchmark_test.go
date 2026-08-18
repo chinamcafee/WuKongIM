@@ -458,13 +458,17 @@ func BenchmarkReceiveOfflineBatchCloudMediumFanout(b *testing.B) {
 	})
 	b.Run("batch", func(b *testing.B) {
 		app := newApp(b)
+		targets := make([]pluginevents.ReceiveOfflineTarget, len(uids))
+		for i, uid := range uids {
+			targets[i] = pluginevents.ReceiveOfflineTarget{UID: uid, DeviceFlag: 0}
+		}
 		event := pluginevents.ReceiveOfflineBatch{
 			MessageID:   1,
 			MessageSeq:  1,
 			ChannelID:   "room",
 			ChannelType: 2,
 			FromUID:     "sender",
-			UIDs:        uids,
+			Targets:     targets,
 			Payload:     payload,
 		}
 		b.ReportAllocs()
@@ -514,13 +518,17 @@ func BenchmarkReceiveOfflineBatchNoPluginCloudMediumFanout(b *testing.B) {
 	})
 	b.Run("batch", func(b *testing.B) {
 		app := newApp(b)
+		targets := make([]pluginevents.ReceiveOfflineTarget, len(uids))
+		for i, uid := range uids {
+			targets[i] = pluginevents.ReceiveOfflineTarget{UID: uid, DeviceFlag: 0}
+		}
 		event := pluginevents.ReceiveOfflineBatch{
 			MessageID:   1,
 			MessageSeq:  1,
 			ChannelID:   "room",
 			ChannelType: 2,
 			FromUID:     "sender",
-			UIDs:        uids,
+			Targets:     targets,
 			Payload:     make([]byte, 1024),
 		}
 		b.ReportAllocs()

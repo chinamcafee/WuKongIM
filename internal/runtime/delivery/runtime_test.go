@@ -541,6 +541,48 @@ func TestRuntimeTransientPlanNeverPublishesOfflineRecipients(t *testing.T) {
 	}
 }
 
+func TestRuntimePCOnlineDoesNotSuppressAPPDeviceOfflineTarget(t *testing.T) {
+	offline := &recordingOfflineRecipientsObserver{}
+	var written []onlinedelivery.Route
+	runtime := NewRuntime(RuntimeOptions{
+		LocalNodeID:                    1,
+		OfflineNotificationDeviceFlags: []uint8{0},
+		Presence: planPresenceResolverFunc(func(_ context.Context, _ []onlinedelivery.RecipientTargetBatch) []TargetPresenceResult {
+			return []TargetPresenceResult{{Routes: []onlinedelivery.Route{
+				{UID: "receiver", DeviceFlag: 2, OwnerNodeID: 1, SessionID: 20},
+				{UID: "sender", DeviceFlag: 2, OwnerNodeID: 1, SessionID: 21},
+			}}}
+		}),
+		SessionWriter: localSessionWriterFunc(func(_ context.Context, write LocalSessionWrite) SessionWriteResult {
+			written = append(written, write.Route)
+			return SessionWriteResult{Disposition: SessionWriteAccepted}
+		}),
+		OfflineRecipientsObserver: offline,
+	})
+
+	err := runtime.processPlan(context.Background(), onlinedelivery.RecipientDeliveryPlan{
+		Mode: onlinedelivery.ModeDurable,
+		Event: channelappendcontract.CommittedEnvelope{
+			MessageID: 13, MessageSeq: 8, FromUID: "sender",
+		},
+		Targets: []onlinedelivery.RecipientTargetBatch{{
+			Target: runtimeTargetForTest(1),
+			Recipients: []channelappendcontract.Recipient{
+				{UID: "receiver"}, {UID: "sender"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("processPlan() error = %v", err)
+	}
+	if got, want := offline.snapshotTargets(), []OfflineTarget{{UID: "receiver", DeviceFlag: 0}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("offline targets = %#v, want %#v; PC presence must not suppress APP push", got, want)
+	}
+	if len(written) != 2 || written[0].DeviceFlag != 2 || written[1].DeviceFlag != 2 {
+		t.Fatalf("online PC routes = %#v, want both realtime routes preserved", written)
+	}
+}
+
 func TestRuntimeSuppressesOnlyExactSenderSession(t *testing.T) {
 	routes := []onlinedelivery.Route{
 		{UID: "sender", OwnerNodeID: 1, SessionID: 10, DeviceID: "exact"},
@@ -1233,16 +1275,26 @@ func (m runtimeMeshPusher) PushOwner(ctx context.Context, push onlinedelivery.Ow
 }
 
 type recordingOfflineRecipientsObserver struct {
-	mu    sync.Mutex
-	calls int
-	uids  []string
+	mu      sync.Mutex
+	calls   int
+	uids    []string
+	targets []OfflineTarget
 }
 
 func (o *recordingOfflineRecipientsObserver) ObserveOfflineRecipients(_ context.Context, event OfflineRecipientsEvent) {
 	o.mu.Lock()
 	o.calls++
-	o.uids = append(o.uids, event.UIDs...)
+	o.targets = append(o.targets, event.Targets...)
+	for _, target := range event.Targets {
+		o.uids = append(o.uids, target.UID)
+	}
 	o.mu.Unlock()
+}
+
+func (o *recordingOfflineRecipientsObserver) snapshotTargets() []OfflineTarget {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]OfflineTarget(nil), o.targets...)
 }
 
 func (o *recordingOfflineRecipientsObserver) snapshot() []string {

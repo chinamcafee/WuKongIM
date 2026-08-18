@@ -423,9 +423,9 @@ func (w *Worker) invokeEvent(ctx context.Context, event hookEvent) error {
 			return errNilReceiveUsecase
 		}
 		var joined error
-		for _, uid := range event.receiveBatch.UIDs {
+		for _, target := range event.receiveBatch.Targets {
 			itemCtx, cancel := context.WithTimeout(ctx, w.timeout)
-			err := w.receiveUsecase.ReceiveOffline(itemCtx, event.receiveBatch.ForUID(uid))
+			err := w.receiveUsecase.ReceiveOffline(itemCtx, event.receiveBatch.ForTarget(target))
 			cancel()
 			if err != nil {
 				joined = errors.Join(joined, err)

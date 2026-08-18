@@ -32,6 +32,8 @@ var (
 	ErrUserStoreRequired = errors.New("internal/usecase/user: user store required")
 	// ErrDeviceStoreRequired reports that the device metadata store is missing.
 	ErrDeviceStoreRequired = errors.New("internal/usecase/user: device store required")
+	// ErrDeviceCredentialStoreRequired reports that replicated credential CAS is unavailable.
+	ErrDeviceCredentialStoreRequired = errors.New("internal/usecase/user: device credential store required")
 )
 
 // UserStore persists UID metadata.
@@ -43,6 +45,16 @@ type UserStore interface {
 // DeviceStore persists per-device token metadata.
 type DeviceStore interface {
 	UpsertDevice(ctx context.Context, device metadb.Device) error
+}
+
+// DeviceCredentialStore persists versioned credentials with a replicated CAS.
+type DeviceCredentialStore interface {
+	ApplyDeviceCredential(ctx context.Context, device metadb.Device) (metadb.DeviceCredentialMutationResult, error)
+}
+
+// CredentialFenceCoordinator advances authority admission and reconciles stale owner routes.
+type CredentialFenceCoordinator interface {
+	AdvanceCredentialFence(context.Context, presence.CredentialFence) (presence.CredentialFenceAdvanceResult, error)
 }
 
 // DeviceReader loads per-device token metadata.
@@ -76,6 +88,10 @@ type Options struct {
 	Devices DeviceStore
 	// DeviceReader loads stored device metadata for device-quit requests.
 	DeviceReader DeviceReader
+	// DeviceCredentials applies version-fenced device credential mutations.
+	DeviceCredentials DeviceCredentialStore
+	// CredentialFences reconciles Presence admission after durable credential CAS.
+	CredentialFences CredentialFenceCoordinator
 	// Online indexes owner-local gateway sessions.
 	Online *online.Registry
 	// Presence reads authoritative online routes for status queries.
@@ -92,15 +108,17 @@ type Options struct {
 
 // App coordinates legacy-compatible user operations.
 type App struct {
-	users        UserStore
-	devices      DeviceStore
-	deviceReader DeviceReader
-	online       *online.Registry
-	presence     PresenceDirectory
-	systemUIDs   SystemUIDStore
-	systemUID    string
-	afterFunc    func(time.Duration, func())
-	logger       wklog.Logger
+	users            UserStore
+	devices          DeviceStore
+	deviceReader     DeviceReader
+	credentialStore  DeviceCredentialStore
+	credentialFences CredentialFenceCoordinator
+	online           *online.Registry
+	presence         PresenceDirectory
+	systemUIDs       SystemUIDStore
+	systemUID        string
+	afterFunc        func(time.Duration, func())
+	logger           wklog.Logger
 
 	systemUIDCacheMu sync.RWMutex
 	systemUIDCache   map[string]struct{}
@@ -143,6 +161,11 @@ func New(opts Options) *App {
 			opts.DeviceReader = reader
 		}
 	}
+	if opts.DeviceCredentials == nil {
+		if store, ok := opts.Devices.(DeviceCredentialStore); ok {
+			opts.DeviceCredentials = store
+		}
+	}
 	if opts.SystemUID == "" {
 		opts.SystemUID = DefaultSystemUID
 	}
@@ -150,16 +173,18 @@ func New(opts Options) *App {
 		opts.Logger = wklog.NewNop()
 	}
 	return &App{
-		users:          opts.Users,
-		devices:        opts.Devices,
-		deviceReader:   opts.DeviceReader,
-		online:         opts.Online,
-		presence:       opts.Presence,
-		systemUIDs:     opts.SystemUIDs,
-		systemUID:      opts.SystemUID,
-		afterFunc:      opts.AfterFunc,
-		logger:         opts.Logger,
-		systemUIDCache: make(map[string]struct{}),
+		users:            opts.Users,
+		devices:          opts.Devices,
+		deviceReader:     opts.DeviceReader,
+		credentialStore:  opts.DeviceCredentials,
+		credentialFences: opts.CredentialFences,
+		online:           opts.Online,
+		presence:         opts.Presence,
+		systemUIDs:       opts.SystemUIDs,
+		systemUID:        opts.SystemUID,
+		afterFunc:        opts.AfterFunc,
+		logger:           opts.Logger,
+		systemUIDCache:   make(map[string]struct{}),
 	}
 }
 

@@ -17,6 +17,8 @@ type PresenceDirectoryAuthority struct {
 var _ accessnode.PresenceAuthority = (*PresenceDirectoryAuthority)(nil)
 var _ accessnode.PresenceBatchAuthority = (*PresenceDirectoryAuthority)(nil)
 var _ accessnode.PresenceTargetBatchAuthority = (*PresenceDirectoryAuthority)(nil)
+var _ accessnode.PresenceCredentialAuthority = (*PresenceDirectoryAuthority)(nil)
+var _ accessnode.PresenceCredentialActionAuthority = (*PresenceDirectoryAuthority)(nil)
 
 // NewPresenceDirectoryAuthority creates an authority adapter for directory.
 func NewPresenceDirectoryAuthority(directory *authoritypresence.Directory) *PresenceDirectoryAuthority {
@@ -31,7 +33,29 @@ func (a *PresenceDirectoryAuthority) RegisterRoute(ctx context.Context, target p
 	if a == nil || a.directory == nil {
 		return presenceusecase.RegisterResult{}, authoritypresence.ErrRouteNotReady
 	}
-	return a.directory.RegisterRoute(target, route)
+	return a.directory.RegisterRouteContext(ctx, target, route)
+}
+
+// AdvanceCredentialFence advances one UID/device admission fence and returns stale route actions.
+func (a *PresenceDirectoryAuthority) AdvanceCredentialFence(ctx context.Context, target presenceusecase.RouteTarget, fence presenceusecase.CredentialFence) (presenceusecase.CredentialFenceAdvanceResult, error) {
+	if err := contextError(ctx); err != nil {
+		return presenceusecase.CredentialFenceAdvanceResult{}, err
+	}
+	if a == nil || a.directory == nil {
+		return presenceusecase.CredentialFenceAdvanceResult{}, authoritypresence.ErrRouteNotReady
+	}
+	return a.directory.AdvanceCredentialFence(target, fence)
+}
+
+// AcknowledgeCredentialAction removes one owner action after exact execution evidence was observed.
+func (a *PresenceDirectoryAuthority) AcknowledgeCredentialAction(ctx context.Context, target presenceusecase.RouteTarget, action presenceusecase.RouteAction) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	if a == nil || a.directory == nil {
+		return authoritypresence.ErrRouteNotReady
+	}
+	return a.directory.AcknowledgeCredentialAction(target, action)
 }
 
 // CommitRoute commits one exact pending route token.
@@ -42,7 +66,7 @@ func (a *PresenceDirectoryAuthority) CommitRoute(ctx context.Context, target pre
 	if a == nil || a.directory == nil {
 		return authoritypresence.ErrRouteNotReady
 	}
-	return a.directory.CommitRoute(target, presenceusecase.PendingRouteToken(token))
+	return a.directory.CommitRouteContext(ctx, target, presenceusecase.PendingRouteToken(token))
 }
 
 // AbortRoute aborts one exact pending route token.
@@ -108,7 +132,7 @@ func (a *PresenceDirectoryAuthority) TouchRoutes(ctx context.Context, target pre
 	if a == nil || a.directory == nil {
 		return authoritypresence.ErrRouteNotReady
 	}
-	return a.directory.TouchRoutes(target, routes)
+	return a.directory.TouchRoutesContext(ctx, target, routes)
 }
 
 func presenceDirectoryErrorResults(count int, err error) []presenceusecase.EndpointLookupResult {

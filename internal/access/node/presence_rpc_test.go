@@ -568,6 +568,24 @@ func TestPresenceClientEncodesOwnerActionRPC(t *testing.T) {
 	}
 }
 
+func TestPresenceClientEncodesCredentialActionAckRPC(t *testing.T) {
+	node := &fakePresenceRPCNode{response: presenceRPCResponse{Status: rpcStatusOK}}
+	client := NewClient(node)
+	target := testPresenceTarget()
+	action := presence.RouteAction{UID: "u1", OwnerNodeID: 2, OwnerBootID: 23, SessionID: 101, Kind: "kick_then_close"}
+
+	if err := client.AcknowledgeCredentialAction(context.Background(), target, action); err != nil {
+		t.Fatalf("AcknowledgeCredentialAction() error = %v", err)
+	}
+	req, err := decodePresenceRPCRequest(node.payload)
+	if err != nil {
+		t.Fatalf("decodePresenceRPCRequest() error = %v", err)
+	}
+	if req.Op != presenceOpAckCredentialAction || !reflect.DeepEqual(req.Target, target) || !reflect.DeepEqual(req.Action, action) {
+		t.Fatalf("client request = %#v", req)
+	}
+}
+
 func TestPresenceClientRejectsUnknownStatus(t *testing.T) {
 	client := NewClient(&fakePresenceRPCNode{
 		response: presenceRPCResponse{Status: "mystery"},

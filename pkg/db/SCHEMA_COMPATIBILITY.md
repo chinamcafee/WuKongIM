@@ -39,6 +39,15 @@ When adding a field, allocate a new column ID and keep all old IDs unchanged.
 Prefer assigning the next highest column ID so `rowcodec.Writer` calls can stay
 in ascending order.
 
+The device-scoped command cursor allocation is permanent: Table ID `16`
+(`cmd_device_cursor`) stores `(uid, device_flag, command_channel_id,
+channel_type)` progress, while Table ID `7` remains reserved for the abandoned
+split CMD conversation design and must never be registered or reused. Slot FSM
+command type `53` is likewise stable. Rollouts must not propose command 53 to an
+old replica that cannot decode it; use a stop-the-world upgrade or a capability
+gate. Snapshot, inspect, transfer JSONL (`meta.cmd_device_cursors`), and restart
+tests must continue to preserve these rows exactly.
+
 ## Prefer Column Values For New Fields
 
 `pkg/db/internal/rowcodec` is the safest format for compatible field additions:

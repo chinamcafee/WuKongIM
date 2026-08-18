@@ -2,8 +2,10 @@ package cmdsync
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 	runtimechannelid "github.com/WuKongIM/WuKongIM/pkg/protocol/channelid"
@@ -142,7 +144,7 @@ func TestBatchSyncReturnsExplicitCursorsAndMore(t *testing.T) {
 	}
 	app := New(Options{States: store, Messages: store, DefaultLimit: 1, MaxLimit: 10})
 
-	got, err := app.BatchSync(context.Background(), BatchSyncQuery{UID: "u1", Limit: 1})
+	got, err := app.BatchSync(context.Background(), batchSyncQuery("u1", 0, 1))
 	if err != nil {
 		t.Fatalf("BatchSync(): %v", err)
 	}
@@ -152,6 +154,71 @@ func TestBatchSyncReturnsExplicitCursorsAndMore(t *testing.T) {
 	wantCursors := []AckCursor{{CommandChannelID: channelID, ChannelType: 2, ThroughSeq: 1}}
 	if !reflect.DeepEqual(got.AckCursors, wantCursors) {
 		t.Fatalf("ack cursors = %#v, want %#v", got.AckCursors, wantCursors)
+	}
+}
+
+func TestBatchSyncAndAckAreIsolatedByDeviceFlag(t *testing.T) {
+	store := newCmdSyncStore()
+	channelID := runtimechannelid.ToCommandChannel("g1")
+	store.deviceActive = map[uint8][]metadb.ConversationState{
+		0: {{UID: "u1", Kind: metadb.ConversationKindCMD, ChannelID: channelID, ChannelType: 2, ReadSeq: 1, ActiveAt: 100}},
+		2: {{UID: "u1", Kind: metadb.ConversationKindCMD, ChannelID: channelID, ChannelType: 2, ReadSeq: 0, ActiveAt: 100}},
+	}
+	store.messages[CommandChannelKey{ChannelID: channelID, ChannelType: 2}] = []SyncedMessage{
+		{MessageID: 1, MessageSeq: 1, ChannelID: channelID, ChannelType: 2},
+		{MessageID: 2, MessageSeq: 2, ChannelID: channelID, ChannelType: 2},
+	}
+	app := New(Options{States: store, Messages: store})
+
+	appBatch, err := app.BatchSync(context.Background(), batchSyncQuery("u1", 0, 10))
+	if err != nil {
+		t.Fatalf("APP BatchSync(): %v", err)
+	}
+	pcBatch, err := app.BatchSync(context.Background(), batchSyncQuery("u1", 2, 10))
+	if err != nil {
+		t.Fatalf("PC BatchSync(): %v", err)
+	}
+	if len(appBatch.Messages) != 1 || appBatch.Messages[0].MessageSeq != 2 {
+		t.Fatalf("APP messages = %#v, want only seq 2", appBatch.Messages)
+	}
+	if len(pcBatch.Messages) != 2 || pcBatch.Messages[0].MessageSeq != 1 {
+		t.Fatalf("PC messages = %#v, want independent seq 1..2", pcBatch.Messages)
+	}
+	if appBatch.BatchID == pcBatch.BatchID {
+		t.Fatalf("batch IDs must bind device flag: %s", appBatch.BatchID)
+	}
+	if err := app.BatchAck(context.Background(), BatchAckCommand{
+		UID: "u1", DeviceFlag: 0, LoginSessionID: "s1", CredentialVersion: 1,
+		BatchID: appBatch.BatchID, AckCursors: appBatch.AckCursors,
+	}); err != nil {
+		t.Fatalf("APP BatchAck(): %v", err)
+	}
+	if len(store.deviceUpserts) != 1 || store.deviceUpserts[0].DeviceFlag != 0 {
+		t.Fatalf("device upserts = %#v, want APP-only cursor", store.deviceUpserts)
+	}
+	if err := app.BatchAck(context.Background(), BatchAckCommand{
+		UID: "u1", DeviceFlag: 2, LoginSessionID: "s1", CredentialVersion: 1,
+		BatchID: appBatch.BatchID, AckCursors: appBatch.AckCursors,
+	}); !errors.Is(err, ErrBatchIDMismatch) {
+		t.Fatalf("cross-flag BatchAck() error = %v, want %v", err, ErrBatchIDMismatch)
+	}
+}
+
+func TestBatchSyncRejectsStaleCredentialPrincipalBeforeReadingMessages(t *testing.T) {
+	store := newCmdSyncStore()
+	store.device = metadb.Device{
+		UID: "u1", DeviceFlag: 0, CredentialStatus: metadb.DeviceCredentialStatusActive,
+		CredentialVersion: 2, LoginSessionID: "new-session",
+		ExpiresAtUnixMS: time.Now().Add(time.Hour).UnixMilli(),
+	}
+	app := New(Options{States: store, Messages: store})
+
+	_, err := app.BatchSync(context.Background(), batchSyncQuery("u1", 0, 10))
+	if !errors.Is(err, ErrPrincipalStale) {
+		t.Fatalf("BatchSync() error = %v, want %v", err, ErrPrincipalStale)
+	}
+	if len(store.messageCalls) != 0 {
+		t.Fatalf("stale principal reached message store: %#v", store.messageCalls)
 	}
 }
 
@@ -165,19 +232,20 @@ func TestBatchAckSurvivesAppRecreationAndIsMonotonic(t *testing.T) {
 		MessageID: 1, MessageSeq: 5, ChannelID: channelID, ChannelType: 2,
 	}}
 	firstApp := New(Options{States: store, Messages: store})
-	batch, err := firstApp.BatchSync(context.Background(), BatchSyncQuery{UID: "u1", Limit: 10})
+	batch, err := firstApp.BatchSync(context.Background(), batchSyncQuery("u1", 0, 10))
 	if err != nil {
 		t.Fatalf("BatchSync(): %v", err)
 	}
 
 	recreatedApp := New(Options{States: store, Messages: store})
 	if err := recreatedApp.BatchAck(context.Background(), BatchAckCommand{
-		UID: "u1", BatchID: batch.BatchID, AckCursors: batch.AckCursors,
+		UID: "u1", DeviceFlag: 0, LoginSessionID: "s1", CredentialVersion: 1,
+		BatchID: batch.BatchID, AckCursors: batch.AckCursors,
 	}); err != nil {
 		t.Fatalf("BatchAck() after app recreation: %v", err)
 	}
-	if len(store.upserts) != 1 || store.upserts[0].ChannelID != channelID || store.upserts[0].ReadSeq != 5 {
-		t.Fatalf("upserts = %#v, want command read seq 5", store.upserts)
+	if len(store.deviceUpserts) != 1 || store.deviceUpserts[0].ChannelID != channelID || store.deviceUpserts[0].ReadSeq != 5 || store.deviceUpserts[0].DeviceFlag != 0 {
+		t.Fatalf("device upserts = %#v, want APP command read seq 5", store.deviceUpserts)
 	}
 }
 
@@ -192,11 +260,11 @@ func TestBatchSyncReplayReturnsSameDeterministicBatch(t *testing.T) {
 	}}
 	app := New(Options{States: store, Messages: store})
 
-	first, err := app.BatchSync(context.Background(), BatchSyncQuery{UID: "u1", Limit: 10})
+	first, err := app.BatchSync(context.Background(), batchSyncQuery("u1", 0, 10))
 	if err != nil {
 		t.Fatalf("first BatchSync(): %v", err)
 	}
-	second, err := app.BatchSync(context.Background(), BatchSyncQuery{UID: "u1", Limit: 10})
+	second, err := app.BatchSync(context.Background(), batchSyncQuery("u1", 0, 10))
 	if err != nil {
 		t.Fatalf("second BatchSync(): %v", err)
 	}
@@ -218,29 +286,30 @@ func TestBatchAckReplayAndNewerThenOlderAckRemainSafe(t *testing.T) {
 		MessageID: 1, MessageSeq: 1, ChannelID: channelID, ChannelType: 2,
 	}}
 	app := New(Options{States: store, Messages: store})
-	oldBatch, err := app.BatchSync(context.Background(), BatchSyncQuery{UID: "u1", Limit: 10})
+	oldBatch, err := app.BatchSync(context.Background(), batchSyncQuery("u1", 0, 10))
 	if err != nil {
 		t.Fatalf("old BatchSync(): %v", err)
 	}
 	store.messages[key] = append(store.messages[key], SyncedMessage{
 		MessageID: 2, MessageSeq: 2, ChannelID: channelID, ChannelType: 2,
 	})
-	newBatch, err := app.BatchSync(context.Background(), BatchSyncQuery{UID: "u1", Limit: 10})
+	newBatch, err := app.BatchSync(context.Background(), batchSyncQuery("u1", 0, 10))
 	if err != nil {
 		t.Fatalf("new BatchSync(): %v", err)
 	}
 
 	for _, batch := range []BatchSyncResult{newBatch, newBatch, oldBatch} {
 		if err := app.BatchAck(context.Background(), BatchAckCommand{
-			UID: "u1", BatchID: batch.BatchID, AckCursors: batch.AckCursors,
+			UID: "u1", DeviceFlag: 0, LoginSessionID: "s1", CredentialVersion: 1,
+			BatchID: batch.BatchID, AckCursors: batch.AckCursors,
 		}); err != nil {
 			t.Fatalf("BatchAck(%s): %v", batch.BatchID, err)
 		}
 	}
 	if got := []uint64{
-		store.upserts[0].ReadSeq,
-		store.upserts[1].ReadSeq,
-		store.upserts[2].ReadSeq,
+		store.deviceUpserts[0].ReadSeq,
+		store.deviceUpserts[1].ReadSeq,
+		store.deviceUpserts[2].ReadSeq,
 	}; !reflect.DeepEqual(got, []uint64{2, 2, 1}) {
 		t.Fatalf("explicit ACK writes = %v, want newer/replay/older cursors; metadata max merge prevents regression", got)
 	}
@@ -254,15 +323,17 @@ func TestBatchAckRejectsTamperedOrDuplicateCursors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("syncRecordsFromAckCursors(): %v", err)
 	}
-	batchID := commandBatchID("u1", records)
+	batchID := commandBatchID("u1", 0, records)
 
 	if err := app.BatchAck(context.Background(), BatchAckCommand{
-		UID: "u1", BatchID: batchID, AckCursors: []AckCursor{{CommandChannelID: cursors[0].CommandChannelID, ChannelType: 2, ThroughSeq: 6}},
+		UID: "u1", DeviceFlag: 0, LoginSessionID: "s1", CredentialVersion: 1,
+		BatchID: batchID, AckCursors: []AckCursor{{CommandChannelID: cursors[0].CommandChannelID, ChannelType: 2, ThroughSeq: 6}},
 	}); err != ErrBatchIDMismatch {
 		t.Fatalf("tampered BatchAck() error = %v, want %v", err, ErrBatchIDMismatch)
 	}
 	if err := app.BatchAck(context.Background(), BatchAckCommand{
-		UID: "u1", BatchID: batchID, AckCursors: append(cursors, cursors[0]),
+		UID: "u1", DeviceFlag: 0, LoginSessionID: "s1", CredentialVersion: 1,
+		BatchID: batchID, AckCursors: append(cursors, cursors[0]),
 	}); err != ErrAckCursorInvalid {
 		t.Fatalf("duplicate BatchAck() error = %v, want %v", err, ErrAckCursorInvalid)
 	}
@@ -288,10 +359,14 @@ func TestSyncRejectsMissingDependencies(t *testing.T) {
 }
 
 type cmdSyncStore struct {
-	active       []metadb.ConversationState
-	upserts      []metadb.ConversationState
-	messages     map[CommandChannelKey][]SyncedMessage
-	messageCalls []messageLoadCall
+	active        []metadb.ConversationState
+	deviceActive  map[uint8][]metadb.ConversationState
+	upserts       []metadb.ConversationState
+	deviceUpserts []metadb.CMDDeviceCursor
+	device        metadb.Device
+	deviceErr     error
+	messages      map[CommandChannelKey][]SyncedMessage
+	messageCalls  []messageLoadCall
 }
 
 func newCmdSyncStore() *cmdSyncStore {
@@ -314,6 +389,41 @@ func (s *cmdSyncStore) ListConversationActiveView(_ context.Context, uid string,
 func (s *cmdSyncStore) UpsertConversationStates(_ context.Context, states []metadb.ConversationState) error {
 	s.upserts = append(s.upserts, states...)
 	return nil
+}
+
+func (s *cmdSyncStore) ListDeviceConversationActiveView(ctx context.Context, uid string, deviceFlag uint8, limit int) ([]metadb.ConversationState, error) {
+	if rows, ok := s.deviceActive[deviceFlag]; ok {
+		out := append([]metadb.ConversationState(nil), rows...)
+		if limit > 0 && len(out) > limit {
+			out = out[:limit]
+		}
+		return out, nil
+	}
+	return s.ListConversationActiveView(ctx, uid, limit)
+}
+
+func (s *cmdSyncStore) UpsertCMDDeviceCursors(_ context.Context, cursors []metadb.CMDDeviceCursor) error {
+	s.deviceUpserts = append(s.deviceUpserts, cursors...)
+	return nil
+}
+
+func (s *cmdSyncStore) GetDevice(_ context.Context, uid string, deviceFlag int64) (metadb.Device, error) {
+	if s.deviceErr != nil {
+		return metadb.Device{}, s.deviceErr
+	}
+	if s.device.CredentialVersion > 0 {
+		return s.device, nil
+	}
+	return metadb.Device{
+		UID: uid, DeviceFlag: deviceFlag, CredentialStatus: metadb.DeviceCredentialStatusActive,
+		CredentialVersion: 1, LoginSessionID: "s1", ExpiresAtUnixMS: time.Now().Add(time.Hour).UnixMilli(),
+	}, nil
+}
+
+func batchSyncQuery(uid string, deviceFlag uint8, limit int) BatchSyncQuery {
+	return BatchSyncQuery{
+		UID: uid, DeviceFlag: deviceFlag, LoginSessionID: "s1", CredentialVersion: 1, Limit: limit,
+	}
 }
 
 type messageLoadCall struct {

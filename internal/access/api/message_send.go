@@ -61,10 +61,8 @@ func (s *Server) registerMessageRoutes() {
 	}
 	s.engine.POST("/message/send", s.handleSendMessage)
 	s.engine.POST("/message/event", s.handleMessageEventAppend)
-	s.engine.POST("/message/sync", s.handleMessageSync)
-	s.engine.POST("/message/syncack", s.handleMessageSyncAck)
-	s.engine.POST("/v3/message/commands/sync", s.handleV3CommandSync)
-	s.engine.POST("/v3/message/commands/ack", s.handleV3CommandAck)
+	s.engine.POST("/v3/message/commands/sync", s.requireCommandHMAC(), s.handleV3CommandSync)
+	s.engine.POST("/v3/message/commands/ack", s.requireCommandHMAC(), s.handleV3CommandAck)
 	s.engine.POST("/channel/messagesync", s.handleChannelMessageSync)
 }
 

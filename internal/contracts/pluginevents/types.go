@@ -51,6 +51,8 @@ type ReceiveOffline struct {
 	FromUID string
 	// UID is the offline recipient user identifier.
 	UID string
+	// DeviceFlag is the offline recipient protocol device category.
+	DeviceFlag uint8
 	// ClientMsgNo is the client-provided idempotency key.
 	ClientMsgNo string
 	// ServerTimestampMS is the server commit timestamp in milliseconds.
@@ -72,6 +74,12 @@ func (e ReceiveOffline) Clone() ReceiveOffline {
 	return e
 }
 
+// ReceiveOfflineTarget is one recipient/device-shape plugin target.
+type ReceiveOfflineTarget struct {
+	UID        string
+	DeviceFlag uint8
+}
+
 // ReceiveOfflineBatch carries offline recipient candidates for one committed message into plugin hooks.
 type ReceiveOfflineBatch struct {
 	// MessageID is the durable server message identifier.
@@ -84,8 +92,8 @@ type ReceiveOfflineBatch struct {
 	ChannelType uint8
 	// FromUID is the sender user identifier.
 	FromUID string
-	// UIDs contains the offline recipient user identifiers in delivery order.
-	UIDs []string
+	// Targets contains canonical offline recipient/device shapes.
+	Targets []ReceiveOfflineTarget
 	// ClientMsgNo is the client-provided idempotency key.
 	ClientMsgNo string
 	// ServerTimestampMS is the server commit timestamp in milliseconds.
@@ -102,22 +110,23 @@ type ReceiveOfflineBatch struct {
 
 // Clone returns an independent batch copy safe for asynchronous plugin workers.
 func (e ReceiveOfflineBatch) Clone() ReceiveOfflineBatch {
-	e.UIDs = append([]string(nil), e.UIDs...)
+	e.Targets = append([]ReceiveOfflineTarget(nil), e.Targets...)
 	e.Payload = append([]byte(nil), e.Payload...)
 	e.MessageScopedUIDs = append([]string(nil), e.MessageScopedUIDs...)
 	return e
 }
 
-// ForUID projects one recipient into the scalar compatibility event.
+// ForTarget projects one recipient/device shape into the scalar event.
 // Payload and MessageScopedUIDs remain shared with the immutable owned batch.
-func (e ReceiveOfflineBatch) ForUID(uid string) ReceiveOffline {
+func (e ReceiveOfflineBatch) ForTarget(target ReceiveOfflineTarget) ReceiveOffline {
 	return ReceiveOffline{
 		MessageID:         e.MessageID,
 		MessageSeq:        e.MessageSeq,
 		ChannelID:         e.ChannelID,
 		ChannelType:       e.ChannelType,
 		FromUID:           e.FromUID,
-		UID:               uid,
+		UID:               target.UID,
+		DeviceFlag:        target.DeviceFlag,
 		ClientMsgNo:       e.ClientMsgNo,
 		ServerTimestampMS: e.ServerTimestampMS,
 		Payload:           e.Payload,

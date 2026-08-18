@@ -10,7 +10,7 @@ work must stay on the promoted access/usecase/runtime/infra/app boundaries.
 
 The promoted runtime proves the client `SEND -> SENDACK` write path through
 `pkg/cluster` and `pkg/channel`. It also exposes legacy-compatible channel,
-user, message, conversation, and CMD sync HTTP surfaces backed by cluster Slot
+user, message, and conversation HTTP surfaces plus an internal-only CMD sync surface backed by cluster Slot
 metadata and Channel runtime logs.
 
 Single-node deployment is still a single-node cluster. Do not add send,
@@ -21,14 +21,14 @@ storage, or routing branches that bypass cluster semantics.
 | Package | Responsibility |
 |---------|----------------|
 | `app` | Single composition root for config, dependency wiring, and lifecycle. |
-| `access/api` | Health, readiness, bench/v1 target HTTP surface, legacy `/route` address lookup, and legacy-compatible channel/user/message/conversation/CMD sync HTTP adapters. |
+| `access/api` | Health, readiness, bench/v1 target HTTP surface, legacy `/route` address lookup, legacy-compatible channel/user/message/conversation adapters, and signed internal CMD v3 adapters. |
 | `access/gateway` | Gateway event/frame adapter: presence activation/deactivation mapping, `SendPacket` mapping, sendack writing, and entry error mapping. |
 | `access/manager` | Manager HTTP adapter for diagnostics, management views, and authenticated backup/restore operations. |
 | `access/node` | Node RPC adapter for presence, conversation authority, delivery, channel append, scheduled backup, and staged restore calls between internal nodes. |
 | `log` | Zap/lumberjack-backed application logger for the internal composition root. |
 | `observability/diagnostics` | Bounded node-local diagnostics events, trace indexing, runtime tracking rules, and sendtrace context helpers. |
 | `usecase/channel` | Entry-agnostic channel metadata, subscriber, temporary subscriber, allowlist, and denylist orchestration. |
-| `usecase/cmdsync` | Entry-agnostic durable CMD offline sync and syncack over CMD-kind conversation projection rows. |
+| `usecase/cmdsync` | Entry-agnostic durable CMD offline sync and ACK over UID-level CMD discovery plus device-flag-scoped cursors. |
 | `usecase/conversation` | Entry-agnostic ordinary recent conversation list, sync, unread, and delete orchestration over normal-kind conversation projection rows. |
 | `usecase/delivery` | Temporary entry-agnostic gateway RECVACK/session-close feedback facade plus explicit rejection of old committed-event submissions. |
 | `usecase/management` | Entry-agnostic management read orchestration for manager adapters. |
@@ -96,24 +96,29 @@ ordinary conversation list/sync
   -> read latest non-CMD Channel runtime messages for visible rows
 
 CMD offline sync/ack
-  -> internal/access/api /v3/message/commands/sync or /v3/message/commands/ack
+  -> trusted Link-U proxy signs /v3/message/commands/sync or /v3/message/commands/ack
+  -> internal/access/api verifies HMAC/replay window and derives uid/device/session/version only from signed headers
   -> internal/usecase/cmdsync
   -> internal/infra/cluster CMDSyncStore
   -> paginate ListConversationActivePage(ConversationKindCMD, uid) to completion
+  -> overlay CMDDeviceCursor(uid, device_flag, command_channel_id, channel_type)
   -> read only SyncOnce or command-channel Channel runtime messages
-  -> explicit per-channel ACK writes monotonic ConversationKindCMD read cursors
+  -> explicit per-channel ACK writes monotonic device-scoped cursors
 ```
 
-Deprecated `/message/sync` and `/message/syncack` remain compatibility adapters
-over the same usecase but are not the v3-native client contract.
+Deprecated `/message/sync` and `/message/syncack` are not registered. Direct
+client access to WuKongIM command sync is disabled; only the signed internal v3
+contract is admitted, and its signed credential fence must match the current
+durable ACTIVE device row.
 
 `pkg/db/meta` owns one canonical conversation projection table keyed by
-`(uid, kind, channel_id, channel_type)`. Both ordinary and CMD rows are routed
+`(uid, kind, channel_id, channel_type)`. Both ordinary and CMD discovery rows are routed
 by the UID hash slot, including single-node cluster deployments. Ordinary
 conversation storage and listing do not infer semantics from the `____cmd`
 suffix; the suffix remains a legacy command-channel naming detail, while
 ordinary/CMD separation is carried by explicit `ConversationKind` and the
-durable Channel runtime `SyncOnce` marker.
+durable Channel runtime `SyncOnce` marker. Device consumption progress is kept
+in Table ID 16 and never mutates ordinary or UID-level CMD conversation state.
 
 ## Phase-1 Presence Flow
 

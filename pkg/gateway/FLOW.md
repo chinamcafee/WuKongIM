@@ -397,4 +397,5 @@ GOWORK=off go test ./internal -run TestInternalImportBoundaries -count=1
 - 不要在 transport event loop 上执行长耗时业务；CONNECT 认证和 SEND 热路径必须通过 `asyncRuntime` 进入有界 workqueue executor，SEND worker 在 shard 内微批处理。
 - 不要让出站写入刷新 idle timeout；idle 语义以客户端入站活跃为准。
 - 不要绕过 session encoded queue 直接并发写 conn，除认证 CONNACK 这类必须立即响应的握手帧外都走 `WriteFrame`。
+- Credential auth returns durable version/session/expiry metadata. Core registers an absolute expiry timer after auth values are installed; expiry atomically enters KICKING (blocking ordinary inbound work), writes the final DISCONNECT through the ordered transport completion primitive, reports enqueue and flush evidence separately, unregisters the session, and hard closes on completion or timeout. Every other close path stops the timer.
 - 新增 listener preset 时保持 `Name`、`Network`、`Address`、`Transport`、`Protocol` 字段完整，并补 `options_test`。

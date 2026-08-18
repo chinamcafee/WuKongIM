@@ -123,6 +123,9 @@ type sessionState struct {
 
 	closeOnce sync.Once
 	closedCh  chan struct{}
+	// credentialExpiryTimer enforces the durable credential deadline for an
+	// already-admitted connection. It is stopped on every close path.
+	credentialExpiryTimer *time.Timer
 
 	requestContext       context.Context
 	cancelRequestContext context.CancelFunc
@@ -773,6 +776,7 @@ func (s *Server) runAuthTask(task asyncAuthTask) {
 	for key, value := range result.SessionValues {
 		state.session.SetValue(key, value)
 	}
+	state.scheduleCredentialExpiry(credentialExpiryUnixMS(result.SessionValues[gatewaytypes.SessionValueCredentialExpiresAt]))
 
 	ctx = s.dispatcher.context(state, task.replyToken, state.closeReason(), nil)
 	activated := false
@@ -984,6 +988,32 @@ func (s *Server) writeImmediateFrame(state *sessionState, f frame.Frame) error {
 	}
 	s.observeFrameOut(state, f, len(encoded))
 	return s.writePayloadDirect(state, encoded)
+}
+
+func (s *Server) kickSession(state *sessionState, control frame.Frame, timeout time.Duration, kickErr error) (gatewaytypes.KickResult, error) {
+	var result gatewaytypes.KickResult
+	if state == nil || state.listener == nil || state.conn == nil || control == nil || !state.beginKicking() {
+		return result, session.ErrSessionClosed
+	}
+	encoded, err := state.listener.adapter.Encode(state.session, control, session.OutboundMeta{})
+	if err == nil {
+		s.observeFrameOut(state, control, len(encoded))
+		messageType := webSocketMessageTypeForState(state)
+		if writer, ok := state.conn.(transport.CompletionWriter); ok {
+			var completion transport.WriteCompletion
+			completion, err = writer.WriteAndWait(encoded, messageType, timeout)
+			result.FrameEnqueued = completion.Enqueued
+			result.TransportFlushed = completion.Flushed
+			state.close(gatewaytypes.CloseReasonPolicyViolation, kickErr)
+			result.HardClosed = true
+			return result, err
+		}
+		err = s.writePayloadDirect(state, encoded)
+		result.FrameEnqueued = err == nil
+	}
+	state.close(gatewaytypes.CloseReasonPolicyViolation, kickErr)
+	result.HardClosed = true
+	return result, err
 }
 
 func (s *Server) dispatchSessionOpen(state *sessionState) error {
@@ -1433,10 +1463,15 @@ func (st *sessionState) close(reason gatewaytypes.CloseReason, err error) {
 		st.metaMu.Lock()
 		st.closing = true
 		st.closeReasonValue = reason
+		expiryTimer := st.credentialExpiryTimer
+		st.credentialExpiryTimer = nil
 		if err != nil {
 			st.closeErrs = append(st.closeErrs, err)
 		}
 		st.metaMu.Unlock()
+		if expiryTimer != nil {
+			expiryTimer.Stop()
+		}
 		if st.cancelRequestContext != nil {
 			st.cancelRequestContext()
 		}
@@ -1458,6 +1493,62 @@ func (st *sessionState) close(reason gatewaytypes.CloseReason, err error) {
 		st.dispatchCloseNotificationIfReady()
 		close(st.closedCh)
 	})
+}
+
+func credentialExpiryUnixMS(value any) int64 {
+	switch expiry := value.(type) {
+	case int64:
+		return expiry
+	case uint64:
+		if expiry > uint64(^uint64(0)>>1) {
+			return 0
+		}
+		return int64(expiry)
+	case int:
+		return int64(expiry)
+	default:
+		return 0
+	}
+}
+
+func (st *sessionState) scheduleCredentialExpiry(expiresAtUnixMS int64) {
+	if st == nil || st.server == nil || expiresAtUnixMS <= 0 {
+		return
+	}
+	delay := time.Until(time.UnixMilli(expiresAtUnixMS))
+	if delay < 0 {
+		delay = 0
+	}
+
+	st.metaMu.Lock()
+	if st.closing {
+		st.metaMu.Unlock()
+		return
+	}
+	if st.credentialExpiryTimer != nil {
+		st.credentialExpiryTimer.Stop()
+	}
+	st.credentialExpiryTimer = time.AfterFunc(delay, func() {
+		_, _ = st.server.kickSession(st, &frame.DisconnectPacket{
+			ReasonCode: frame.ReasonConnectKick,
+			Reason:     "CREDENTIAL_EXPIRED",
+		}, 500*time.Millisecond, gatewaytypes.ErrCredentialExpired)
+	})
+	st.metaMu.Unlock()
+}
+
+func (st *sessionState) beginKicking() bool {
+	if st == nil {
+		return false
+	}
+	st.metaMu.Lock()
+	defer st.metaMu.Unlock()
+	if st.closing {
+		return false
+	}
+	st.closing = true
+	st.closeReasonValue = gatewaytypes.CloseReasonPolicyViolation
+	return true
 }
 
 func (s *Server) observeConnectionOpen(state *sessionState) {

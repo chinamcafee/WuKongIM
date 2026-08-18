@@ -1,6 +1,9 @@
 package transport
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 type Factory interface {
 	Name() string
@@ -42,6 +45,18 @@ const (
 type WebSocketMessageWriter interface {
 	// WriteWebSocketMessage writes immutable payload bytes with an explicit websocket message type.
 	WriteWebSocketMessage(data []byte, messageType WebSocketMessageType) error
+}
+
+// WriteCompletion reports independently whether the transport accepted a write
+// and whether its completion callback confirmed the bytes were flushed.
+type WriteCompletion struct {
+	Enqueued bool
+	Flushed  bool
+}
+
+// CompletionWriter writes one final ordered payload and waits for transport completion or timeout.
+type CompletionWriter interface {
+	WriteAndWait(data []byte, messageType WebSocketMessageType, timeout time.Duration) (WriteCompletion, error)
 }
 
 // ErrOutboundBytesExceeded indicates that transport-owned outbound buffering exceeded its configured limit.

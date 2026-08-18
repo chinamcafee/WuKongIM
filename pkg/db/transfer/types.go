@@ -30,6 +30,8 @@ const (
 	FileKindMetaUserChannelMemberships FileKind = "meta.user_channel_memberships"
 	// FileKindMetaConversations stores conversation projection rows.
 	FileKindMetaConversations FileKind = "meta.conversations"
+	// FileKindMetaCMDDeviceCursors stores per-device-class command-channel progress.
+	FileKindMetaCMDDeviceCursors FileKind = "meta.cmd_device_cursors"
 	// FileKindMetaChannelLatest stores latest channel message projection rows.
 	FileKindMetaChannelLatest FileKind = "meta.channel_latest"
 	// FileKindMessageChannels stores message channel index rows.
@@ -148,6 +150,22 @@ type DeviceRecord struct {
 	Token string `json:"token"`
 	// DeviceLevel describes the device trust or login level.
 	DeviceLevel int64 `json:"device_level"`
+	// CredentialVersion is the monotonic admission fence.
+	CredentialVersion Uint64 `json:"credential_version"`
+	// LoginSessionID binds the credential to one business session.
+	LoginSessionID string `json:"login_session_id"`
+	// OperationID identifies the idempotent mutation.
+	OperationID string `json:"operation_id"`
+	// OperationDigest detects equal-version payload conflicts.
+	OperationDigest string `json:"operation_digest"`
+	// CredentialStatus is ACTIVE or REVOKED.
+	CredentialStatus string `json:"credential_status"`
+	// ExpiresAtUnixMS is the absolute ACTIVE admission deadline.
+	ExpiresAtUnixMS int64 `json:"expires_at_unix_ms"`
+	// UpdatedAtUnixMS records the mutation timestamp.
+	UpdatedAtUnixMS int64 `json:"updated_at_unix_ms"`
+	// TerminationCause records the stable REVOKED reason.
+	TerminationCause string `json:"termination_cause"`
 }
 
 // ChannelRecord represents one imported channel metadata row.
@@ -222,6 +240,28 @@ type ConversationRecord struct {
 	UpdatedAt int64 `json:"updated_at"`
 	// SparseActive marks rows imported from sparse active conversation state.
 	SparseActive bool `json:"sparse_active"`
+}
+
+// CMDDeviceCursorRecord represents one device-scoped command-channel cursor.
+type CMDDeviceCursorRecord struct {
+	// HashSlot is the hash slot that owns this cursor row.
+	HashSlot uint16 `json:"hash_slot"`
+	// UID is the stable user identifier.
+	UID string `json:"uid"`
+	// DeviceFlag identifies the independently advancing device class.
+	DeviceFlag int64 `json:"device_flag"`
+	// CommandChannelID is the retained command channel identifier.
+	CommandChannelID string `json:"command_channel_id"`
+	// ChannelType is the numeric command channel type.
+	ChannelType int64 `json:"channel_type"`
+	// ReadSeq is the exact highest acknowledged command sequence.
+	ReadSeq Uint64 `json:"read_seq"`
+	// DeletedToSeq is the exact highest deleted command sequence.
+	DeletedToSeq Uint64 `json:"deleted_to_seq"`
+	// ActiveAt is the device-scoped command activity timestamp.
+	ActiveAt int64 `json:"active_at"`
+	// UpdatedAt is the device-scoped cursor update timestamp.
+	UpdatedAt int64 `json:"updated_at"`
 }
 
 // ChannelLatestRecord represents one imported latest-message projection row for a channel.

@@ -27,6 +27,7 @@ func TestMetaSchemaValidateAllTables(t *testing.T) {
 	messageEventStatePrimaryRegistered := false
 	messageEventCursorPrimaryRegistered := false
 	messageEventAppliedPrimaryRegistered := false
+	cmdDeviceCursorPrimaryRegistered := false
 	conversationPrimaryRegistered := false
 	conversationKindColumnRegistered := false
 	conversationActiveIndexRegistered := false
@@ -110,6 +111,12 @@ func TestMetaSchemaValidateAllTables(t *testing.T) {
 			len(table.Primary.Columns) == 4 {
 			messageEventAppliedPrimaryRegistered = true
 		}
+		if table.ID == TableIDCMDDeviceCursor &&
+			table.Primary.ID == cmdDeviceCursorPrimaryIndexID &&
+			table.Primary.Name == "pk_cmd_device_cursor" &&
+			len(table.Primary.Columns) == 4 {
+			cmdDeviceCursorPrimaryRegistered = true
+		}
 		if table.ID == TableIDConversation {
 			if table.Primary.ID == conversationPrimaryIndexID &&
 				table.Primary.Name == "pk_conversation" &&
@@ -167,6 +174,9 @@ func TestMetaSchemaValidateAllTables(t *testing.T) {
 	if !messageEventAppliedPrimaryRegistered {
 		t.Fatalf("message event applied table missing typed primary index %d", messageEventAppliedPrimaryIndexID)
 	}
+	if !cmdDeviceCursorPrimaryRegistered {
+		t.Fatalf("cmd device cursor table missing typed primary index")
+	}
 	if !conversationPrimaryRegistered {
 		t.Fatalf("conversation table missing kind-aware typed primary index")
 	}
@@ -194,6 +204,7 @@ func TestMetaSchemaValidateAllTables(t *testing.T) {
 		TableIDMessageEventState,
 		TableIDMessageEventCursor,
 		TableIDMessageEventApplied,
+		TableIDCMDDeviceCursor,
 	} {
 		if _, ok := seen[tableID]; !ok {
 			t.Fatalf("table id %d missing from Tables()", tableID)

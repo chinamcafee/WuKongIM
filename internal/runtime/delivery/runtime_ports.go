@@ -77,12 +77,18 @@ type LocalSessionWriter interface {
 	WriteSession(context.Context, LocalSessionWrite) SessionWriteResult
 }
 
-// OfflineRecipientsEvent reports durable recipients with no online route.
+// OfflineTarget identifies one recipient/device shape without an online route.
+type OfflineTarget struct {
+	UID        string
+	DeviceFlag uint8
+}
+
+// OfflineRecipientsEvent reports durable recipient/device shapes with no online route.
 type OfflineRecipientsEvent struct {
 	// Event is the durable message whose successfully resolved target had offline recipients.
 	Event channelappendcontract.CommittedEnvelope
-	// UIDs is one call-owned, deduplicated offline recipient batch.
-	UIDs []string
+	// Targets is one call-owned, canonically sorted and deduplicated offline batch.
+	Targets []OfflineTarget
 }
 
 // OfflineRecipientsObserver receives one durable-only offline recipient batch.

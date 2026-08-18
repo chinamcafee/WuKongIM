@@ -13,6 +13,15 @@ import (
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 )
 
+func transferTestDevice(uid string) metadb.Device {
+	return metadb.Device{
+		UID: uid, DeviceFlag: 1, Token: "device-token", DeviceLevel: 3,
+		CredentialVersion: 7, LoginSessionID: "session-7", OperationID: "operation-7",
+		OperationDigest: "digest-7", CredentialStatus: metadb.DeviceCredentialStatusActive,
+		ExpiresAtUnixMS: 2000000000000, UpdatedAtUnixMS: 1900000000000,
+	}
+}
+
 func TestExportBundleRoundTripsCurrentStores(t *testing.T) {
 	ctx := context.Background()
 	const hashSlotCount uint16 = 16
@@ -28,12 +37,7 @@ func TestExportBundleRoundTripsCurrentStores(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertUser(): %v", err)
 	}
-	if err := seedStore.Meta().HashSlot(userSlot).UpsertDevice(ctx, metadb.Device{
-		UID:         "u1",
-		DeviceFlag:  1,
-		Token:       "device-token",
-		DeviceLevel: 3,
-	}); err != nil {
+	if err := seedStore.Meta().HashSlot(userSlot).UpsertDevice(ctx, transferTestDevice("u1")); err != nil {
 		t.Fatalf("UpsertDevice(): %v", err)
 	}
 	if err := seedStore.Meta().HashSlot(channelSlot).UpsertChannel(ctx, metadb.Channel{
@@ -69,6 +73,13 @@ func TestExportBundleRoundTripsCurrentStores(t *testing.T) {
 		SparseActive: true,
 	}); err != nil {
 		t.Fatalf("UpsertConversationState(): %v", err)
+	}
+	wantCursor := metadb.CMDDeviceCursor{
+		UID: "u1", DeviceFlag: 1, ChannelID: "u1-cmd", ChannelType: 7,
+		ReadSeq: 4, DeletedToSeq: 3, ActiveAt: 2100, UpdatedAt: 2101,
+	}
+	if err := seedStore.Meta().HashSlot(userSlot).UpsertCMDDeviceCursor(ctx, wantCursor); err != nil {
+		t.Fatalf("UpsertCMDDeviceCursor(): %v", err)
 	}
 	if err := seedStore.Meta().HashSlot(channelSlot).UpsertChannelLatest(ctx, metadb.ChannelLatest{
 		ChannelID:      "g1",
@@ -145,6 +156,16 @@ func TestExportBundleRoundTripsCurrentStores(t *testing.T) {
 	}
 	if user.Token != "user-token" || user.DeviceLevel != 2 {
 		t.Fatalf("user = %+v, want exported user fields", user)
+	}
+	device, ok, err := target.Meta().HashSlot(userSlot).GetDevice(ctx, "u1", 1)
+	if err != nil || !ok || device != transferTestDevice("u1") {
+		t.Fatalf("GetDevice() = %#v, %v, %v, want full versioned credential", device, ok, err)
+	}
+	cursor, ok, err := target.Meta().HashSlot(userSlot).GetCMDDeviceCursor(ctx, metadb.CMDDeviceCursorKey{
+		UID: "u1", DeviceFlag: 1, ChannelID: "u1-cmd", ChannelType: 7,
+	})
+	if err != nil || !ok || cursor != wantCursor {
+		t.Fatalf("GetCMDDeviceCursor() = %#v, %v, %v, want %#v", cursor, ok, err, wantCursor)
 	}
 	channel, ok, err := target.Meta().HashSlot(channelSlot).GetChannel(ctx, "g1", 2)
 	if err != nil || !ok {

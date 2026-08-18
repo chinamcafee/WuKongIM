@@ -52,6 +52,8 @@ const (
 	cmdTypeAppendMessageEventsBatch             uint8 = 49
 	cmdTypeCreateChannel                        uint8 = 50
 	cmdTypePatchChannelBusinessFlags            uint8 = 51
+	cmdTypeApplyDeviceCredential                uint8 = 52
+	cmdTypeUpsertCMDDeviceCursors               uint8 = 53
 	cmdTypeBindPluginUser                       uint8 = 42
 	cmdTypeUnbindPluginUser                     uint8 = 43
 
@@ -62,10 +64,18 @@ const (
 	tagUserDeviceLevel uint8 = 4
 
 	// Device field tags.
-	tagDeviceUID   uint8 = 1
-	tagDeviceFlag  uint8 = 2
-	tagDeviceToken uint8 = 3
-	tagDeviceLevel uint8 = 4
+	tagDeviceUID               uint8 = 1
+	tagDeviceFlag              uint8 = 2
+	tagDeviceToken             uint8 = 3
+	tagDeviceLevel             uint8 = 4
+	tagDeviceCredentialVersion uint8 = 5
+	tagDeviceLoginSessionID    uint8 = 6
+	tagDeviceOperationID       uint8 = 7
+	tagDeviceOperationDigest   uint8 = 8
+	tagDeviceCredentialStatus  uint8 = 9
+	tagDeviceExpiresAtUnixMS   uint8 = 10
+	tagDeviceUpdatedAtUnixMS   uint8 = 11
+	tagDeviceTerminationCause  uint8 = 12
 
 	// Channel field tags.
 	tagChannelID            uint8 = 1
@@ -175,6 +185,17 @@ const (
 	// Conversation entry field tags shared by state, patch, and delete records.
 	tagConversationEntryKind uint8 = 12
 
+	// Device-scoped CMD cursor field tags.
+	tagCMDDeviceCursorCommandEntry uint8 = 1
+	tagCMDDeviceCursorUID          uint8 = 1
+	tagCMDDeviceCursorDeviceFlag   uint8 = 2
+	tagCMDDeviceCursorChannelID    uint8 = 3
+	tagCMDDeviceCursorChannelType  uint8 = 4
+	tagCMDDeviceCursorReadSeq      uint8 = 5
+	tagCMDDeviceCursorDeletedToSeq uint8 = 6
+	tagCMDDeviceCursorActiveAt     uint8 = 7
+	tagCMDDeviceCursorUpdatedAt    uint8 = 8
+
 	// Clear conversation active command field tags.
 	tagClearConversationActiveKind uint8 = 1
 	tagClearConversationActiveUID  uint8 = 2
@@ -259,6 +280,8 @@ var commandDecoders = map[uint8]commandDecoder{
 	cmdTypeAppendMessageEventsBatch:             decodeAppendMessageEventsBatch,
 	cmdTypeCreateChannel:                        decodeCreateChannel,
 	cmdTypePatchChannelBusinessFlags:            decodePatchChannelBusinessFlags,
+	cmdTypeApplyDeviceCredential:                decodeApplyDeviceCredential,
+	cmdTypeUpsertCMDDeviceCursors:               decodeUpsertCMDDeviceCursors,
 	cmdTypeBindPluginUser:                       decodeBindPluginUser,
 	cmdTypeUnbindPluginUser:                     decodeUnbindPluginUser,
 	cmdTypeApplyDelta:                           decodeApplyDelta,
@@ -638,6 +661,21 @@ type upsertConversationStatesCmd struct {
 	entries []conversationStateEntry
 }
 
+// --- UpsertCMDDeviceCursors ---
+
+type upsertCMDDeviceCursorsCmd struct {
+	cursors []metadb.CMDDeviceCursor
+}
+
+func (c *upsertCMDDeviceCursorsCmd) apply(wb *metadb.WriteBatch, hashSlot uint16) error {
+	for _, cursor := range c.cursors {
+		if err := wb.UpsertCMDDeviceCursor(hashSlot, cursor); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *upsertConversationStatesCmd) apply(wb *metadb.WriteBatch, hashSlot uint16) error {
 	for _, entry := range c.entries {
 		if err := wb.UpsertConversationState(entryHashSlot(entry.hashSlot, entry.hasHashSlot, hashSlot), entry.state); err != nil {
@@ -887,28 +925,7 @@ func encodeUserCommand(cmdType uint8, u metadb.User) []byte {
 
 // EncodeUpsertDeviceCommand encodes a Device into a binary command.
 func EncodeUpsertDeviceCommand(d metadb.Device) []byte {
-	uidLen := len(d.UID)
-	tokenLen := len(d.Token)
-	size := headerSize +
-		tlvOverhead + uidLen +
-		tlvOverhead + 8 +
-		tlvOverhead + tokenLen +
-		tlvOverhead + 8
-
-	buf := make([]byte, size)
-	off := 0
-
-	buf[off] = commandVersion
-	off++
-	buf[off] = cmdTypeUpsertDevice
-	off++
-
-	off = putStringField(buf, off, tagDeviceUID, d.UID)
-	off = putInt64Field(buf, off, tagDeviceFlag, d.DeviceFlag)
-	off = putStringField(buf, off, tagDeviceToken, d.Token)
-	_ = putInt64Field(buf, off, tagDeviceLevel, d.DeviceLevel)
-
-	return buf
+	return encodeDeviceCommand(cmdTypeUpsertDevice, d)
 }
 
 // EncodeUpsertChannelCommand encodes a Channel into a binary command.
@@ -1246,6 +1263,16 @@ func EncodeUpsertConversationStatesCommand(states []metadb.ConversationState) []
 	return buf
 }
 
+// EncodeUpsertCMDDeviceCursorsCommand encodes device-scoped command cursor upserts.
+func EncodeUpsertCMDDeviceCursorsCommand(cursors []metadb.CMDDeviceCursor) []byte {
+	buf := make([]byte, 0, headerSize+len(cursors)*72)
+	buf = append(buf, commandVersion, cmdTypeUpsertCMDDeviceCursors)
+	for _, cursor := range cursors {
+		buf = appendBytesTLVField(buf, tagCMDDeviceCursorCommandEntry, encodeCMDDeviceCursorEntry(cursor))
+	}
+	return buf
+}
+
 // EncodeUpsertConversationStatesCommandChecked validates and encodes state upserts.
 func EncodeUpsertConversationStatesCommandChecked(states []metadb.ConversationState) ([]byte, error) {
 	if len(states) == 0 {
@@ -1554,6 +1581,90 @@ func encodeConversationStateEntry(state metadb.ConversationState) []byte {
 	buf = appendBoolTLVField(buf, tagConversationStateEntrySparseActive, state.SparseActive)
 	buf = appendUint64TLVField(buf, tagConversationEntryKind, uint64(state.Kind))
 	return buf
+}
+
+func encodeCMDDeviceCursorEntry(cursor metadb.CMDDeviceCursor) []byte {
+	buf := make([]byte, 0, 96)
+	buf = appendStringTLVField(buf, tagCMDDeviceCursorUID, cursor.UID)
+	buf = appendInt64TLVField(buf, tagCMDDeviceCursorDeviceFlag, cursor.DeviceFlag)
+	buf = appendStringTLVField(buf, tagCMDDeviceCursorChannelID, cursor.ChannelID)
+	buf = appendInt64TLVField(buf, tagCMDDeviceCursorChannelType, cursor.ChannelType)
+	buf = appendUint64TLVField(buf, tagCMDDeviceCursorReadSeq, cursor.ReadSeq)
+	buf = appendUint64TLVField(buf, tagCMDDeviceCursorDeletedToSeq, cursor.DeletedToSeq)
+	buf = appendInt64TLVField(buf, tagCMDDeviceCursorActiveAt, cursor.ActiveAt)
+	return appendInt64TLVField(buf, tagCMDDeviceCursorUpdatedAt, cursor.UpdatedAt)
+}
+
+func decodeCMDDeviceCursorEntries(data []byte) ([]metadb.CMDDeviceCursor, error) {
+	var cursors []metadb.CMDDeviceCursor
+	for off := 0; off < len(data); {
+		tag, value, n, err := readTLV(data[off:])
+		if err != nil {
+			return nil, err
+		}
+		off += n
+		if tag != tagCMDDeviceCursorCommandEntry {
+			continue
+		}
+		cursor, err := decodeCMDDeviceCursorEntry(value)
+		if err != nil {
+			return nil, err
+		}
+		cursors = append(cursors, cursor)
+	}
+	return cursors, nil
+}
+
+func decodeCMDDeviceCursorEntry(data []byte) (metadb.CMDDeviceCursor, error) {
+	var cursor metadb.CMDDeviceCursor
+	var haveUID, haveFlag, haveChannelID, haveChannelType, haveReadSeq, haveDeletedToSeq, haveActiveAt, haveUpdatedAt bool
+	for off := 0; off < len(data); {
+		tag, value, n, err := readTLV(data[off:])
+		if err != nil {
+			return metadb.CMDDeviceCursor{}, err
+		}
+		off += n
+		switch tag {
+		case tagCMDDeviceCursorUID:
+			cursor.UID, haveUID = string(value), true
+		case tagCMDDeviceCursorDeviceFlag:
+			if len(value) != 8 {
+				return metadb.CMDDeviceCursor{}, fmt.Errorf("%w: bad cmd device cursor DeviceFlag length", metadb.ErrCorruptValue)
+			}
+			cursor.DeviceFlag, haveFlag = int64(binary.BigEndian.Uint64(value)), true
+		case tagCMDDeviceCursorChannelID:
+			cursor.ChannelID, haveChannelID = string(value), true
+		case tagCMDDeviceCursorChannelType:
+			if len(value) != 8 {
+				return metadb.CMDDeviceCursor{}, fmt.Errorf("%w: bad cmd device cursor ChannelType length", metadb.ErrCorruptValue)
+			}
+			cursor.ChannelType, haveChannelType = int64(binary.BigEndian.Uint64(value)), true
+		case tagCMDDeviceCursorReadSeq:
+			if len(value) != 8 {
+				return metadb.CMDDeviceCursor{}, fmt.Errorf("%w: bad cmd device cursor ReadSeq length", metadb.ErrCorruptValue)
+			}
+			cursor.ReadSeq, haveReadSeq = binary.BigEndian.Uint64(value), true
+		case tagCMDDeviceCursorDeletedToSeq:
+			if len(value) != 8 {
+				return metadb.CMDDeviceCursor{}, fmt.Errorf("%w: bad cmd device cursor DeletedToSeq length", metadb.ErrCorruptValue)
+			}
+			cursor.DeletedToSeq, haveDeletedToSeq = binary.BigEndian.Uint64(value), true
+		case tagCMDDeviceCursorActiveAt:
+			if len(value) != 8 {
+				return metadb.CMDDeviceCursor{}, fmt.Errorf("%w: bad cmd device cursor ActiveAt length", metadb.ErrCorruptValue)
+			}
+			cursor.ActiveAt, haveActiveAt = int64(binary.BigEndian.Uint64(value)), true
+		case tagCMDDeviceCursorUpdatedAt:
+			if len(value) != 8 {
+				return metadb.CMDDeviceCursor{}, fmt.Errorf("%w: bad cmd device cursor UpdatedAt length", metadb.ErrCorruptValue)
+			}
+			cursor.UpdatedAt, haveUpdatedAt = int64(binary.BigEndian.Uint64(value)), true
+		}
+	}
+	if !haveUID || !haveFlag || !haveChannelID || !haveChannelType || !haveReadSeq || !haveDeletedToSeq || !haveActiveAt || !haveUpdatedAt {
+		return metadb.CMDDeviceCursor{}, fmt.Errorf("%w: incomplete cmd device cursor record", metadb.ErrCorruptValue)
+	}
+	return cursor, nil
 }
 
 func encodeConversationStateBatchItem(item ConversationStateBatchItem) []byte {
@@ -2006,6 +2117,17 @@ func decodeUpsertConversationStates(data []byte) (command, error) {
 	return &upsertConversationStatesCmd{entries: entries}, nil
 }
 
+func decodeUpsertCMDDeviceCursors(data []byte) (command, error) {
+	cursors, err := decodeCMDDeviceCursorEntries(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(cursors) == 0 {
+		return nil, fmt.Errorf("%w: empty cmd device cursor batch", metadb.ErrInvalidArgument)
+	}
+	return &upsertCMDDeviceCursorsCmd{cursors: cursors}, nil
+}
+
 func decodeUpsertUserChannelMemberships(data []byte) (command, error) {
 	memberships, err := decodeUserChannelMembershipEntries(data, true)
 	if err != nil {
@@ -2338,6 +2460,31 @@ func decodeDevice(data []byte) (metadb.Device, error) {
 				return metadb.Device{}, fmt.Errorf("%w: bad DeviceLevel length", metadb.ErrCorruptValue)
 			}
 			d.DeviceLevel = int64(binary.BigEndian.Uint64(value))
+		case tagDeviceCredentialVersion:
+			if len(value) != 8 {
+				return metadb.Device{}, fmt.Errorf("%w: bad CredentialVersion length", metadb.ErrCorruptValue)
+			}
+			d.CredentialVersion = binary.BigEndian.Uint64(value)
+		case tagDeviceLoginSessionID:
+			d.LoginSessionID = string(value)
+		case tagDeviceOperationID:
+			d.OperationID = string(value)
+		case tagDeviceOperationDigest:
+			d.OperationDigest = string(value)
+		case tagDeviceCredentialStatus:
+			d.CredentialStatus = metadb.DeviceCredentialStatus(value)
+		case tagDeviceExpiresAtUnixMS:
+			if len(value) != 8 {
+				return metadb.Device{}, fmt.Errorf("%w: bad ExpiresAtUnixMS length", metadb.ErrCorruptValue)
+			}
+			d.ExpiresAtUnixMS = int64(binary.BigEndian.Uint64(value))
+		case tagDeviceUpdatedAtUnixMS:
+			if len(value) != 8 {
+				return metadb.Device{}, fmt.Errorf("%w: bad UpdatedAtUnixMS length", metadb.ErrCorruptValue)
+			}
+			d.UpdatedAtUnixMS = int64(binary.BigEndian.Uint64(value))
+		case tagDeviceTerminationCause:
+			d.TerminationCause = string(value)
 		default:
 			// Unknown tag — skip for forward compatibility.
 		}

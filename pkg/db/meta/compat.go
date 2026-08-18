@@ -829,6 +829,14 @@ func (s *ShardStore) GetConversationState(ctx context.Context, kind Conversation
 	return state, foundError(ok, err)
 }
 
+// GetCMDDeviceCursor returns one device-scoped command cursor.
+func (s *ShardStore) GetCMDDeviceCursor(ctx context.Context, key CMDDeviceCursorKey) (CMDDeviceCursor, bool, error) {
+	if err := s.validate(); err != nil {
+		return CMDDeviceCursor{}, false, err
+	}
+	return s.shard.GetCMDDeviceCursor(ctx, key)
+}
+
 func (s *ShardStore) UpsertConversationState(ctx context.Context, state ConversationState) error {
 	if err := s.validate(); err != nil {
 		return err
@@ -1434,6 +1442,57 @@ func (b *WriteBatch) UpsertDevice(hashSlot uint16, device Device) error {
 	return deviceTable.StageUpsert(b.batch, HashSlot(hashSlot), device)
 }
 
+// ApplyDeviceCredentialConditionally stages a version-fenced credential mutation.
+// The comparison runs while the hash-slot mutation lock is held by Commit.
+func (b *WriteBatch) ApplyDeviceCredentialConditionally(hashSlot uint16, device Device) (*DeviceCredentialMutationResult, error) {
+	if err := b.ensure(); err != nil {
+		return nil, err
+	}
+	if err := validateDevice(device); err != nil {
+		return nil, err
+	}
+	hs := HashSlot(hashSlot)
+	pk := KeyParts{String(device.UID), Int64Ordered(device.DeviceFlag)}
+	primaryKey, err := deviceTable.primaryRowKey(hs, pk)
+	if err != nil {
+		return nil, err
+	}
+	value, err := deviceTable.encodeValue(primaryKey, device)
+	if err != nil {
+		return nil, err
+	}
+	result := &DeviceCredentialMutationResult{}
+	b.batch.addOp(hs, func(ctx context.Context, state *batchCommitState, batch *engine.Batch) error {
+		current, exists, err := deviceTable.loadBatchRow(state, hs, pk, primaryKey)
+		if err != nil {
+			return err
+		}
+		if exists {
+			result.CurrentVersion = current.CredentialVersion
+			switch {
+			case device.CredentialVersion < current.CredentialVersion:
+				result.Outcome = DeviceCredentialOutcomeStaleVersion
+				return nil
+			case device.CredentialVersion == current.CredentialVersion:
+				if sameDeviceCredentialMutation(current, device) {
+					result.Outcome = DeviceCredentialOutcomeIdempotent
+				} else {
+					result.Outcome = DeviceCredentialOutcomeIdempotencyConflict
+				}
+				return nil
+			}
+		}
+		if err := batch.Set(primaryKey, value); err != nil {
+			return err
+		}
+		state.tableRows[string(primaryKey)] = tableRowOverlay{value: append([]byte(nil), value...), exists: true}
+		result.Outcome = DeviceCredentialOutcomeApplied
+		result.CurrentVersion = device.CredentialVersion
+		return nil
+	})
+	return result, nil
+}
+
 func (b *WriteBatch) UpsertChannel(hashSlot uint16, channel Channel) error {
 	if err := b.ensure(); err != nil {
 		return err
@@ -1726,6 +1785,14 @@ func (b *WriteBatch) UpsertConversationState(hashSlot uint16, state Conversation
 		return shard.stageConversationStateWithOverlay(st, batch, key, existing, exists, next)
 	})
 	return nil
+}
+
+// UpsertCMDDeviceCursor stages one device-scoped command cursor mutation.
+func (b *WriteBatch) UpsertCMDDeviceCursor(hashSlot uint16, cursor CMDDeviceCursor) error {
+	if err := b.ensure(); err != nil {
+		return err
+	}
+	return b.batch.UpsertCMDDeviceCursor(HashSlot(hashSlot), cursor)
 }
 
 func (b *WriteBatch) TouchConversationActiveAt(hashSlot uint16, patches []ConversationActivePatch) error {

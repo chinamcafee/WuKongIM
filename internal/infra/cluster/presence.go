@@ -748,19 +748,89 @@ func (c *PresenceAuthorityClient) TouchRoutesTo(ctx context.Context, target pres
 
 // ApplyRouteAction applies a conflict action on the node that owns the real session.
 func (c *PresenceAuthorityClient) ApplyRouteAction(ctx context.Context, action presence.RouteAction) error {
+	_, err := c.applyRouteActionDetailed(ctx, action)
+	return err
+}
+
+func (c *PresenceAuthorityClient) applyRouteActionDetailed(ctx context.Context, action presence.RouteAction) (presence.RouteActionResult, error) {
 	if c == nil || c.node == nil || action.OwnerNodeID == 0 {
-		return authoritypresence.ErrRouteNotReady
+		return presence.RouteActionResult{}, authoritypresence.ErrRouteNotReady
 	}
 	if action.OwnerNodeID == c.node.NodeID() {
 		if c.localOwner == nil {
-			return authoritypresence.ErrRouteNotReady
+			return presence.RouteActionResult{}, authoritypresence.ErrRouteNotReady
 		}
-		return c.localOwner.ApplyRouteAction(ctx, action)
+		if detailed, ok := c.localOwner.(accessnode.PresenceOwnerDetailed); ok {
+			return detailed.ApplyRouteActionDetailed(ctx, action)
+		}
+		err := c.localOwner.ApplyRouteAction(ctx, action)
+		if err != nil {
+			return presence.RouteActionResult{}, err
+		}
+		// The legacy owner contract defines nil as completed application. Production
+		// owners implement PresenceOwnerDetailed and report the individual stages.
+		return presence.RouteActionResult{LocalFenced: true, HardClosed: true}, nil
 	}
 	if c.remote == nil {
-		return authoritypresence.ErrRouteNotReady
+		return presence.RouteActionResult{}, authoritypresence.ErrRouteNotReady
 	}
-	return c.remote.ApplyRouteAction(ctx, action.OwnerNodeID, action)
+	return c.remote.ApplyRouteActionDetailed(ctx, action.OwnerNodeID, action)
+}
+
+// AdvanceCredentialFence advances authority admission and synchronously fences every returned owner route.
+func (c *PresenceAuthorityClient) AdvanceCredentialFence(ctx context.Context, fence presence.CredentialFence) (presence.CredentialFenceAdvanceResult, error) {
+	var result presence.CredentialFenceAdvanceResult
+	err := c.withFreshTarget(ctx, fence.UID, func(target presence.RouteTarget) error {
+		authority, err := c.authorityForTarget(target)
+		if err != nil {
+			return err
+		}
+		credentialAuthority, ok := authority.(accessnode.PresenceCredentialAuthority)
+		if !ok {
+			return authoritypresence.ErrRouteNotReady
+		}
+		actionAuthority, ok := authority.(accessnode.PresenceCredentialActionAuthority)
+		if !ok {
+			return authoritypresence.ErrRouteNotReady
+		}
+		result, err = credentialAuthority.AdvanceCredentialFence(ctx, target, fence)
+		if err != nil {
+			return err
+		}
+		pending := make([]presence.RouteAction, 0)
+		for _, action := range result.Actions {
+			actionResult, actionErr := c.applyRouteActionDetailed(ctx, action)
+			if actionResult.LocalFenced {
+				result.OwnerLocalFenced++
+			}
+			if actionResult.FrameEnqueued {
+				result.FrameEnqueued++
+			}
+			if actionResult.TransportFlushed {
+				result.TransportFlushed++
+			}
+			if actionResult.HardClosed {
+				result.HardClosed++
+			}
+			if actionResult.StaleNoop {
+				result.StaleNoop++
+			}
+			resolved := actionResult.StaleNoop || (actionResult.LocalFenced && actionResult.HardClosed)
+			if actionErr != nil || !resolved {
+				pending = append(pending, action)
+				continue
+			}
+			if err := actionAuthority.AcknowledgeCredentialAction(ctx, target, action); err != nil {
+				pending = append(pending, action)
+			}
+		}
+		result.Actions = pending
+		if len(pending) != 0 {
+			return authoritypresence.ErrRouteNotReady
+		}
+		return nil
+	})
+	return result, err
 }
 
 func (c *PresenceAuthorityClient) withFreshTarget(ctx context.Context, uid string, call func(presence.RouteTarget) error) error {

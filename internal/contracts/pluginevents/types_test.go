@@ -54,23 +54,23 @@ func TestReceiveOfflineBatchCloneCopiesMutableFields(t *testing.T) {
 		ChannelID:         "room",
 		ChannelType:       2,
 		FromUID:           "u1",
-		UIDs:              []string{"u2", "u3"},
+		Targets:           []ReceiveOfflineTarget{{UID: "u2", DeviceFlag: 0}, {UID: "u3", DeviceFlag: 2}},
 		ClientMsgNo:       "c1",
 		ServerTimestampMS: 1713859200123,
 		Payload:           []byte("hello"),
 		MessageScopedUIDs: []string{"u2"},
 	}
 	clone := event.Clone()
-	event.UIDs[0] = "changed"
+	event.Targets[0].UID = "changed"
 	event.Payload[0] = 'H'
 	event.MessageScopedUIDs[0] = "changed"
 
-	require.Equal(t, []string{"u2", "u3"}, clone.UIDs)
+	require.Equal(t, []ReceiveOfflineTarget{{UID: "u2", DeviceFlag: 0}, {UID: "u3", DeviceFlag: 2}}, clone.Targets)
 	require.Equal(t, []byte("hello"), clone.Payload)
 	require.Equal(t, []string{"u2"}, clone.MessageScopedUIDs)
 }
 
-func TestReceiveOfflineBatchForUIDPreservesSharedMessageFields(t *testing.T) {
+func TestReceiveOfflineBatchForTargetPreservesSharedMessageFields(t *testing.T) {
 	batch := ReceiveOfflineBatch{
 		MessageID:         10,
 		MessageSeq:        3,
@@ -92,11 +92,12 @@ func TestReceiveOfflineBatchForUIDPreservesSharedMessageFields(t *testing.T) {
 		ChannelType:       2,
 		FromUID:           "u1",
 		UID:               "u3",
+		DeviceFlag:        2,
 		ClientMsgNo:       "c1",
 		ServerTimestampMS: 1713859200123,
 		Payload:           []byte("hello"),
 		NoPersist:         true,
 		SyncOnce:          true,
 		MessageScopedUIDs: []string{"u2"},
-	}, batch.ForUID("u3"))
+	}, batch.ForTarget(ReceiveOfflineTarget{UID: "u3", DeviceFlag: 2}))
 }

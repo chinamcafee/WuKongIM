@@ -353,6 +353,7 @@ func (o pluginReceiveObserver) ObserveOfflineRecipient(ctx context.Context, even
 		ChannelType:       source.ChannelType,
 		FromUID:           source.FromUID,
 		UID:               event.UID,
+		DeviceFlag:        event.DeviceFlag,
 		ClientMsgNo:       source.ClientMsgNo,
 		ServerTimestampMS: source.ServerTimestampMS,
 		Payload:           append([]byte(nil), source.Payload...),
@@ -364,24 +365,30 @@ func (o pluginReceiveObserver) ObserveOfflineRecipient(ctx context.Context, even
 
 // ObserveOfflineRecipients converts one committed message recipient batch into one plugin task.
 func (o pluginReceiveObserver) ObserveOfflineRecipients(ctx context.Context, event channelappend.OfflineRecipientsEvent) {
-	if o.worker == nil || len(event.UIDs) == 0 {
+	if o.worker == nil || len(event.Targets) == 0 {
 		return
 	}
 	worker, ok := o.worker.(pluginReceiveBatchWorker)
 	if !ok {
-		for _, uid := range event.UIDs {
-			o.ObserveOfflineRecipient(ctx, channelappend.OfflineRecipientEvent{Event: event.Event, UID: uid})
+		for _, target := range event.Targets {
+			o.ObserveOfflineRecipient(ctx, channelappend.OfflineRecipientEvent{
+				Event: event.Event, UID: target.UID, DeviceFlag: target.DeviceFlag,
+			})
 		}
 		return
 	}
 	source := event.Event
+	targets := make([]pluginevents.ReceiveOfflineTarget, len(event.Targets))
+	for i, target := range event.Targets {
+		targets[i] = pluginevents.ReceiveOfflineTarget{UID: target.UID, DeviceFlag: target.DeviceFlag}
+	}
 	worker.EnqueueReceiveBatch(ctx, pluginevents.ReceiveOfflineBatch{
 		MessageID:         source.MessageID,
 		MessageSeq:        source.MessageSeq,
 		ChannelID:         source.ChannelID,
 		ChannelType:       source.ChannelType,
 		FromUID:           source.FromUID,
-		UIDs:              event.UIDs,
+		Targets:           targets,
 		ClientMsgNo:       source.ClientMsgNo,
 		ServerTimestampMS: source.ServerTimestampMS,
 		Payload:           source.Payload,

@@ -150,12 +150,7 @@ func seedVerifyNodeStore(t *testing.T, hashSlotCount uint16, seedOpts verifySeed
 	}); err != nil {
 		t.Fatalf("UpsertUser(): %v", err)
 	}
-	if err := store.Meta().HashSlot(userSlot).UpsertDevice(ctx, metadb.Device{
-		UID:         "u1",
-		DeviceFlag:  1,
-		Token:       "device-token",
-		DeviceLevel: 3,
-	}); err != nil {
+	if err := store.Meta().HashSlot(userSlot).UpsertDevice(ctx, transferTestDevice("u1")); err != nil {
 		t.Fatalf("UpsertDevice(): %v", err)
 	}
 	if err := store.Meta().HashSlot(channelSlot).UpsertChannel(ctx, metadb.Channel{

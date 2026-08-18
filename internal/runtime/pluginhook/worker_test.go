@@ -119,16 +119,16 @@ func TestWorkerEnqueueReceiveBatchInvokesBatchUsecaseAndClonesMutableFieldsOnce(
 	require.NoError(t, worker.Start(context.Background()))
 	defer worker.Stop(context.Background())
 
-	uids := []string{"u2", "u3"}
+	targets := []pluginevents.ReceiveOfflineTarget{{UID: "u2", DeviceFlag: 0}, {UID: "u3", DeviceFlag: 2}}
 	payload := []byte("hello")
 	scopedUIDs := []string{"bot"}
 	worker.EnqueueReceiveBatch(context.Background(), pluginevents.ReceiveOfflineBatch{
 		MessageID:         1,
-		UIDs:              uids,
+		Targets:           targets,
 		Payload:           payload,
 		MessageScopedUIDs: scopedUIDs,
 	})
-	uids[0] = "changed"
+	targets[0].UID = "changed"
 	payload[0] = 'x'
 	scopedUIDs[0] = "changed"
 
@@ -141,7 +141,7 @@ func TestWorkerEnqueueReceiveBatchInvokesBatchUsecaseAndClonesMutableFieldsOnce(
 	usecase.mu.Lock()
 	defer usecase.mu.Unlock()
 	require.Len(t, usecase.receiveBatchCalls, 1)
-	require.Equal(t, []string{"u2", "u3"}, usecase.receiveBatchCalls[0].UIDs)
+	require.Equal(t, []pluginevents.ReceiveOfflineTarget{{UID: "u2", DeviceFlag: 0}, {UID: "u3", DeviceFlag: 2}}, usecase.receiveBatchCalls[0].Targets)
 	require.Equal(t, []byte("hello"), usecase.receiveBatchCalls[0].Payload)
 	require.Equal(t, []string{"bot"}, usecase.receiveBatchCalls[0].MessageScopedUIDs)
 	require.Equal(t, []time.Duration{time.Second}, usecase.receiveBatchTimeouts)

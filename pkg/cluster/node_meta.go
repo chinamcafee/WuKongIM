@@ -16,8 +16,78 @@ import (
 const (
 	maxChannelLatestBatchItems          = 512
 	maxConversationBatchItems           = 512
+	maxCMDDeviceCursorBatchItems        = 512
 	maxConversationTouchSlotConcurrency = 4
 )
+
+// UpsertCMDDeviceCursorsBatch persists independent command cursors through the UID Slot owner.
+func (n *Node) UpsertCMDDeviceCursorsBatch(ctx context.Context, cursors []metadb.CMDDeviceCursor) error {
+	if err := ctxErr(ctx); err != nil {
+		return err
+	}
+	if n == nil {
+		return ErrNotStarted
+	}
+	byUID := make(map[string][]metadb.CMDDeviceCursor)
+	for _, cursor := range cursors {
+		if cursor.UID == "" {
+			return metadb.ErrInvalidArgument
+		}
+		byUID[cursor.UID] = append(byUID[cursor.UID], cursor)
+	}
+	uids := make([]string, 0, len(byUID))
+	for uid := range byUID {
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
+	for _, uid := range uids {
+		group := byUID[uid]
+		for start := 0; start < len(group); start += maxCMDDeviceCursorBatchItems {
+			end := start + maxCMDDeviceCursorBatchItems
+			if end > len(group) {
+				end = len(group)
+			}
+			if err := n.Propose(ctx, ProposeRequest{
+				Key: uid, Command: metafsm.EncodeUpsertCMDDeviceCursorsCommand(group[start:end]),
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// GetCMDDeviceCursorsBatch reads existing device-scoped command cursors.
+func (n *Node) GetCMDDeviceCursorsBatch(ctx context.Context, keys []metadb.CMDDeviceCursorKey) (map[metadb.CMDDeviceCursorKey]metadb.CMDDeviceCursor, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	if err := n.ensureForeground(); err != nil {
+		return nil, err
+	}
+	if n.defaultSlotMetaDB == nil {
+		return nil, ErrNotStarted
+	}
+	uids := make([]string, len(keys))
+	for i, key := range keys {
+		uids[i] = key.UID
+	}
+	routes, err := n.RouteKeys(uids)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[metadb.CMDDeviceCursorKey]metadb.CMDDeviceCursor, len(keys))
+	for i, key := range keys {
+		cursor, ok, err := n.defaultSlotMetaDB.ForHashSlot(routes[i].HashSlot).GetCMDDeviceCursor(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out[key] = cursor
+		}
+	}
+	return out, nil
+}
 
 // CreateUserMetadata persists durable UID metadata through Slot ownership.
 func (n *Node) CreateUserMetadata(ctx context.Context, user metadb.User) error {
@@ -63,6 +133,24 @@ func (n *Node) UpsertDeviceMetadata(ctx context.Context, device metadb.Device) e
 		Key:     device.UID,
 		Command: metafsm.EncodeUpsertDeviceCommand(device),
 	})
+}
+
+// ApplyDeviceCredentialMetadata applies one version-fenced credential mutation through Slot ownership.
+func (n *Node) ApplyDeviceCredentialMetadata(ctx context.Context, device metadb.Device) (metadb.DeviceCredentialMutationResult, error) {
+	if err := ctxErr(ctx); err != nil {
+		return metadb.DeviceCredentialMutationResult{}, err
+	}
+	if n == nil {
+		return metadb.DeviceCredentialMutationResult{}, ErrNotStarted
+	}
+	result, err := n.ProposeResult(ctx, ProposeRequest{
+		Key:     device.UID,
+		Command: metafsm.EncodeApplyDeviceCredentialCommand(device),
+	})
+	if err != nil {
+		return metadb.DeviceCredentialMutationResult{}, err
+	}
+	return metafsm.DecodeDeviceCredentialMutationResult(result)
 }
 
 // GetDeviceMetadata reads durable per-device token metadata from the current Slot route.

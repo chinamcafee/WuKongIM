@@ -8,8 +8,8 @@ import (
 )
 
 var (
-	presenceRPCRequestMagic  = [...]byte{'W', 'K', 'V', 'P', 2}
-	presenceRPCResponseMagic = [...]byte{'W', 'K', 'V', 'R', 2}
+	presenceRPCRequestMagic  = [...]byte{'W', 'K', 'V', 'P', 3}
+	presenceRPCResponseMagic = [...]byte{'W', 'K', 'V', 'R', 3}
 )
 
 const (
@@ -21,6 +21,8 @@ const (
 	presenceOpTouchRoutesID
 	presenceOpApplyRouteActionID
 	presenceOpEndpointsByTargetsID
+	presenceOpAdvanceCredentialFenceID
+	presenceOpAckCredentialActionID
 )
 
 const maxPresenceRPCCollectionLen = 4096
@@ -47,6 +49,8 @@ type presenceRPCRequest struct {
 	OwnerSeq uint64
 	// EndpointGroups carries exact-target UID batches for grouped endpoint lookups.
 	EndpointGroups []presence.EndpointLookupGroup
+	// CredentialFence carries durable admission state for advance requests.
+	CredentialFence presence.CredentialFence
 }
 
 // presenceRPCEndpointLookupResult is one group-aligned endpoint lookup wire result.
@@ -65,6 +69,10 @@ type presenceRPCResponse struct {
 	Register presence.RegisterResult
 	// Endpoints carries EndpointsByUID output when Status is ok.
 	Endpoints []presence.Route
+	// CredentialFenceAdvance carries stale route reconciliation work.
+	CredentialFenceAdvance presence.CredentialFenceAdvanceResult
+	// ActionResult carries owner-local execution evidence.
+	ActionResult presence.RouteActionResult
 }
 
 func encodePresenceRPCRequestBinary(req presenceRPCRequest) ([]byte, error) {
@@ -86,6 +94,7 @@ func encodePresenceRPCRequestBinary(req presenceRPCRequest) ([]byte, error) {
 	dst = appendString(dst, req.PendingToken)
 	dst = appendString(dst, req.UID)
 	dst = appendUvarint(dst, req.OwnerSeq)
+	dst = appendPresenceCredentialFence(dst, req.CredentialFence)
 	return dst, nil
 }
 
@@ -139,6 +148,9 @@ func decodePresenceRPCRequest(body []byte) (presenceRPCRequest, error) {
 	if req.OwnerSeq, offset, err = readUvarint(body, offset); err != nil {
 		return presenceRPCRequest{}, err
 	}
+	if req.CredentialFence, offset, err = readPresenceCredentialFence(body, offset); err != nil {
+		return presenceRPCRequest{}, err
+	}
 	if offset != len(body) {
 		return presenceRPCRequest{}, fmt.Errorf("internal/access/node: trailing presence request bytes")
 	}
@@ -151,6 +163,8 @@ func encodePresenceRPCResponseBinary(resp presenceRPCResponse) ([]byte, error) {
 	dst = appendString(dst, resp.Status)
 	dst = appendPresenceRegisterResult(dst, resp.Register)
 	dst = appendPresenceRoutes(dst, resp.Endpoints)
+	dst = appendPresenceCredentialFenceAdvance(dst, resp.CredentialFenceAdvance)
+	dst = appendPresenceRouteActionResult(dst, resp.ActionResult)
 	return dst, nil
 }
 
@@ -172,6 +186,12 @@ func decodePresenceRPCResponseBinary(body []byte) (presenceRPCResponse, error) {
 		return presenceRPCResponse{}, err
 	}
 	if resp.Endpoints, offset, err = readPresenceRoutes(body, offset); err != nil {
+		return presenceRPCResponse{}, err
+	}
+	if resp.CredentialFenceAdvance, offset, err = readPresenceCredentialFenceAdvance(body, offset); err != nil {
+		return presenceRPCResponse{}, err
+	}
+	if resp.ActionResult, offset, err = readPresenceRouteActionResult(body, offset); err != nil {
 		return presenceRPCResponse{}, err
 	}
 	if offset != len(body) {
@@ -264,6 +284,10 @@ func presenceOpID(op string) (byte, error) {
 		return presenceOpApplyRouteActionID, nil
 	case presenceOpEndpointsByTargets:
 		return presenceOpEndpointsByTargetsID, nil
+	case presenceOpAdvanceCredentialFence:
+		return presenceOpAdvanceCredentialFenceID, nil
+	case presenceOpAckCredentialAction:
+		return presenceOpAckCredentialActionID, nil
 	default:
 		return 0, fmt.Errorf("internal/access/node: unknown presence op %q", op)
 	}
@@ -287,6 +311,10 @@ func presenceOpFromID(op byte) (string, error) {
 		return presenceOpApplyRouteAction, nil
 	case presenceOpEndpointsByTargetsID:
 		return presenceOpEndpointsByTargets, nil
+	case presenceOpAdvanceCredentialFenceID:
+		return presenceOpAdvanceCredentialFence, nil
+	case presenceOpAckCredentialActionID:
+		return presenceOpAckCredentialAction, nil
 	default:
 		return "", fmt.Errorf("internal/access/node: unknown presence op id %d", op)
 	}
@@ -417,6 +445,9 @@ func appendPresenceRoute(dst []byte, route presence.Route) []byte {
 	dst = appendString(dst, route.Listener)
 	dst = appendVarint(dst, route.ConnectedUnix)
 	dst = appendVarint(dst, route.LastSeenUnix)
+	dst = appendUvarint(dst, route.CredentialVersion)
+	dst = appendString(dst, route.LoginSessionID)
+	dst = appendVarint(dst, route.ExpiresAtUnixMS)
 	return dst
 }
 
@@ -454,6 +485,15 @@ func readPresenceRoute(body []byte, offset int) (presence.Route, int, error) {
 		return presence.Route{}, offset, err
 	}
 	if route.LastSeenUnix, offset, err = readVarint(body, offset); err != nil {
+		return presence.Route{}, offset, err
+	}
+	if route.CredentialVersion, offset, err = readUvarint(body, offset); err != nil {
+		return presence.Route{}, offset, err
+	}
+	if route.LoginSessionID, offset, err = readString(body, offset); err != nil {
+		return presence.Route{}, offset, err
+	}
+	if route.ExpiresAtUnixMS, offset, err = readVarint(body, offset); err != nil {
 		return presence.Route{}, offset, err
 	}
 	return route, offset, nil
@@ -551,6 +591,9 @@ func appendPresenceAction(dst []byte, action presence.RouteAction) []byte {
 	dst = appendString(dst, action.Kind)
 	dst = appendString(dst, action.Reason)
 	dst = appendVarint(dst, action.DelayMS)
+	dst = appendUvarint(dst, action.ExpectedOwnerSeq)
+	dst = appendUvarint(dst, action.ExpectedCredentialVersion)
+	dst = appendString(dst, action.ExpectedLoginSessionID)
 	return dst
 }
 
@@ -601,7 +644,155 @@ func readPresenceAction(body []byte, offset int) (presence.RouteAction, int, err
 	if action.DelayMS, offset, err = readVarint(body, offset); err != nil {
 		return presence.RouteAction{}, offset, err
 	}
+	if action.ExpectedOwnerSeq, offset, err = readUvarint(body, offset); err != nil {
+		return presence.RouteAction{}, offset, err
+	}
+	if action.ExpectedCredentialVersion, offset, err = readUvarint(body, offset); err != nil {
+		return presence.RouteAction{}, offset, err
+	}
+	if action.ExpectedLoginSessionID, offset, err = readString(body, offset); err != nil {
+		return presence.RouteAction{}, offset, err
+	}
 	return action, offset, nil
+}
+
+func appendPresenceCredentialFence(dst []byte, fence presence.CredentialFence) []byte {
+	dst = appendString(dst, fence.UID)
+	dst = append(dst, fence.DeviceFlag)
+	dst = appendUvarint(dst, fence.CredentialVersion)
+	dst = appendString(dst, fence.LoginSessionID)
+	dst = appendString(dst, string(fence.Status))
+	dst = appendVarint(dst, fence.ExpiresAtUnixMS)
+	return appendString(dst, fence.MachineReason)
+}
+
+func readPresenceCredentialFence(body []byte, offset int) (presence.CredentialFence, int, error) {
+	var fence presence.CredentialFence
+	var status string
+	var err error
+	if fence.UID, offset, err = readString(body, offset); err != nil {
+		return fence, offset, err
+	}
+	if fence.DeviceFlag, offset, err = readByte(body, offset, "credential fence device flag"); err != nil {
+		return fence, offset, err
+	}
+	if fence.CredentialVersion, offset, err = readUvarint(body, offset); err != nil {
+		return fence, offset, err
+	}
+	if fence.LoginSessionID, offset, err = readString(body, offset); err != nil {
+		return fence, offset, err
+	}
+	if status, offset, err = readString(body, offset); err != nil {
+		return fence, offset, err
+	}
+	fence.Status = presence.CredentialStatus(status)
+	if fence.ExpiresAtUnixMS, offset, err = readVarint(body, offset); err != nil {
+		return fence, offset, err
+	}
+	if fence.MachineReason, offset, err = readString(body, offset); err != nil {
+		return fence, offset, err
+	}
+	return fence, offset, nil
+}
+
+func appendPresenceCredentialFenceAdvance(dst []byte, result presence.CredentialFenceAdvanceResult) []byte {
+	dst = appendUvarint(dst, result.CurrentVersion)
+	dst = appendUvarint(dst, uint64(result.ActiveFenced))
+	dst = appendUvarint(dst, uint64(result.PendingFenced))
+	dst = appendUvarint(dst, uint64(result.OwnerLocalFenced))
+	dst = appendUvarint(dst, uint64(result.FrameEnqueued))
+	dst = appendUvarint(dst, uint64(result.TransportFlushed))
+	dst = appendUvarint(dst, uint64(result.HardClosed))
+	dst = appendUvarint(dst, uint64(result.StaleNoop))
+	return appendPresenceActions(dst, result.Actions)
+}
+
+func readPresenceCredentialFenceAdvance(body []byte, offset int) (presence.CredentialFenceAdvanceResult, int, error) {
+	var result presence.CredentialFenceAdvanceResult
+	var value uint64
+	var err error
+	if result.CurrentVersion, offset, err = readUvarint(body, offset); err != nil {
+		return result, offset, err
+	}
+	if value, offset, err = readUvarint(body, offset); err != nil {
+		return result, offset, err
+	}
+	if value > uint64(^uint(0)>>1) {
+		return result, offset, fmt.Errorf("internal/access/node: active fenced count overflow")
+	}
+	result.ActiveFenced = int(value)
+	if value, offset, err = readUvarint(body, offset); err != nil {
+		return result, offset, err
+	}
+	if value > uint64(^uint(0)>>1) {
+		return result, offset, fmt.Errorf("internal/access/node: pending fenced count overflow")
+	}
+	result.PendingFenced = int(value)
+	if value, offset, err = readPresenceCount(body, offset, "owner local fenced"); err != nil {
+		return result, offset, err
+	}
+	result.OwnerLocalFenced = int(value)
+	if value, offset, err = readPresenceCount(body, offset, "frame enqueued"); err != nil {
+		return result, offset, err
+	}
+	result.FrameEnqueued = int(value)
+	if value, offset, err = readPresenceCount(body, offset, "transport flushed"); err != nil {
+		return result, offset, err
+	}
+	result.TransportFlushed = int(value)
+	if value, offset, err = readPresenceCount(body, offset, "hard closed"); err != nil {
+		return result, offset, err
+	}
+	result.HardClosed = int(value)
+	if value, offset, err = readPresenceCount(body, offset, "stale noop"); err != nil {
+		return result, offset, err
+	}
+	result.StaleNoop = int(value)
+	if result.Actions, offset, err = readPresenceActions(body, offset); err != nil {
+		return result, offset, err
+	}
+	return result, offset, nil
+}
+
+func readPresenceCount(body []byte, offset int, field string) (uint64, int, error) {
+	value, next, err := readUvarint(body, offset)
+	if err != nil {
+		return 0, offset, err
+	}
+	if value > uint64(^uint(0)>>1) {
+		return 0, offset, fmt.Errorf("internal/access/node: %s count overflow", field)
+	}
+	return value, next, nil
+}
+
+func appendPresenceRouteActionResult(dst []byte, result presence.RouteActionResult) []byte {
+	for _, value := range []bool{result.LocalFenced, result.FrameEnqueued, result.TransportFlushed, result.HardClosed, result.StaleNoop} {
+		if value {
+			dst = append(dst, 1)
+		} else {
+			dst = append(dst, 0)
+		}
+	}
+	return dst
+}
+
+func readPresenceRouteActionResult(body []byte, offset int) (presence.RouteActionResult, int, error) {
+	values := make([]bool, 5)
+	for i := range values {
+		value, next, err := readByte(body, offset, "presence route action result")
+		if err != nil {
+			return presence.RouteActionResult{}, offset, err
+		}
+		if value > 1 {
+			return presence.RouteActionResult{}, offset, fmt.Errorf("internal/access/node: invalid route action result boolean")
+		}
+		values[i] = value == 1
+		offset = next
+	}
+	return presence.RouteActionResult{
+		LocalFenced: values[0], FrameEnqueued: values[1], TransportFlushed: values[2],
+		HardClosed: values[3], StaleNoop: values[4],
+	}, offset, nil
 }
 
 func appendString(dst []byte, value string) []byte {

@@ -96,6 +96,54 @@ func TestStateMachineApplyUpsertsUserAndChannel(t *testing.T) {
 	}
 }
 
+func TestStateMachineApplyCMDDeviceCursorsKeepsDeviceFlagsIndependent(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	sm := mustNewStateMachine(t, db, 11)
+	appCursor := metadb.CMDDeviceCursor{
+		UID: "u1", DeviceFlag: 0, ChannelID: "u1-cmd", ChannelType: 7,
+		ReadSeq: 9, DeletedToSeq: 4, ActiveAt: 10, UpdatedAt: 11,
+	}
+	pcCursor := appCursor
+	pcCursor.DeviceFlag = 2
+	pcCursor.ReadSeq = 3
+	pcCursor.DeletedToSeq = 1
+
+	result, err := sm.Apply(ctx, multiraft.Command{
+		SlotID: 11, Index: 1, Term: 1, HashSlot: 11,
+		Data: EncodeUpsertCMDDeviceCursorsCommand([]metadb.CMDDeviceCursor{appCursor, pcCursor}),
+	})
+	if err != nil || string(result) != ApplyResultOK {
+		t.Fatalf("Apply(cmd device cursors) result=%q err=%v", result, err)
+	}
+
+	for _, want := range []metadb.CMDDeviceCursor{appCursor, pcCursor} {
+		got, ok, err := db.ForSlot(11).GetCMDDeviceCursor(ctx, metadb.CMDDeviceCursorKey{
+			UID: want.UID, DeviceFlag: want.DeviceFlag, ChannelID: want.ChannelID, ChannelType: want.ChannelType,
+		})
+		if err != nil || !ok || got != want {
+			t.Fatalf("GetCMDDeviceCursor(flag=%d) = %+v, %v, %v, want %+v", want.DeviceFlag, got, ok, err, want)
+		}
+	}
+
+	stale := appCursor
+	stale.ReadSeq = 1
+	stale.DeletedToSeq = 0
+	stale.UpdatedAt = 1
+	if _, err := sm.Apply(ctx, multiraft.Command{
+		SlotID: 11, Index: 2, Term: 1, HashSlot: 11,
+		Data: EncodeUpsertCMDDeviceCursorsCommand([]metadb.CMDDeviceCursor{stale}),
+	}); err != nil {
+		t.Fatalf("Apply(stale cmd cursor): %v", err)
+	}
+	got, ok, err := db.ForSlot(11).GetCMDDeviceCursor(ctx, metadb.CMDDeviceCursorKey{
+		UID: appCursor.UID, DeviceFlag: appCursor.DeviceFlag, ChannelID: appCursor.ChannelID, ChannelType: appCursor.ChannelType,
+	})
+	if err != nil || !ok || got != appCursor {
+		t.Fatalf("monotonic cursor = %+v, %v, %v, want %+v", got, ok, err, appCursor)
+	}
+}
+
 func TestStateMachineApplyUpsertsAndDeletesChannelRuntimeMeta(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
@@ -818,7 +866,7 @@ func TestStateMachineApplyCreateUserAndUpsertDevice(t *testing.T) {
 		SlotID: 11,
 		Index:  3,
 		Term:   1,
-		Data:   EncodeUpsertDeviceCommand(metadb.Device{UID: "u1", DeviceFlag: 1, Token: "app-token", DeviceLevel: 5}),
+		Data:   EncodeUpsertDeviceCommand(testCredentialDevice("u1", 1, "app-token", 5, 1)),
 	}); err != nil {
 		t.Fatalf("Apply(upsert device) error = %v", err)
 	}

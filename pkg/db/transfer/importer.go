@@ -47,6 +47,7 @@ func ImportBundle(ctx context.Context, root string, store *db.NodeStore, opts Im
 		FileKindMetaSubscribers,
 		FileKindMetaUserChannelMemberships,
 		FileKindMetaConversations,
+		FileKindMetaCMDDeviceCursors,
 		FileKindMetaChannelLatest,
 	} {
 		for _, entry := range entries[kind] {
@@ -167,10 +168,12 @@ func importMetaRecord(ctx context.Context, meta *metadb.MetaDB, kind FileKind, r
 	case FileKindMetaDevices:
 		row := record.(DeviceRecord)
 		return meta.HashSlot(row.HashSlot).UpsertDevice(ctx, metadb.Device{
-			UID:         row.UID,
-			DeviceFlag:  row.DeviceFlag,
-			Token:       row.Token,
-			DeviceLevel: row.DeviceLevel,
+			UID: row.UID, DeviceFlag: row.DeviceFlag, Token: row.Token, DeviceLevel: row.DeviceLevel,
+			CredentialVersion: uint64(row.CredentialVersion), LoginSessionID: row.LoginSessionID,
+			OperationID: row.OperationID, OperationDigest: row.OperationDigest,
+			CredentialStatus: metadb.DeviceCredentialStatus(row.CredentialStatus),
+			ExpiresAtUnixMS:  row.ExpiresAtUnixMS, UpdatedAtUnixMS: row.UpdatedAtUnixMS,
+			TerminationCause: row.TerminationCause,
 		})
 	case FileKindMetaChannels:
 		row := record.(ChannelRecord)
@@ -209,6 +212,18 @@ func importMetaRecord(ctx context.Context, meta *metadb.MetaDB, kind FileKind, r
 			ActiveAt:     row.ActiveAt,
 			UpdatedAt:    row.UpdatedAt,
 			SparseActive: row.SparseActive,
+		})
+	case FileKindMetaCMDDeviceCursors:
+		row := record.(CMDDeviceCursorRecord)
+		return meta.HashSlot(row.HashSlot).UpsertCMDDeviceCursor(ctx, metadb.CMDDeviceCursor{
+			UID:          row.UID,
+			DeviceFlag:   row.DeviceFlag,
+			ChannelID:    row.CommandChannelID,
+			ChannelType:  row.ChannelType,
+			ReadSeq:      uint64(row.ReadSeq),
+			DeletedToSeq: uint64(row.DeletedToSeq),
+			ActiveAt:     row.ActiveAt,
+			UpdatedAt:    row.UpdatedAt,
 		})
 	case FileKindMetaChannelLatest:
 		row := record.(ChannelLatestRecord)

@@ -105,3 +105,8 @@ adapters. The import-boundary test rejects imports of:
 - `pkg/cluster`
 - `internal/access`
 - `internal/app`
+
+Activation, touch, and action DTOs preserve credential version, business login
+session, absolute expiry, and expected owner fences end to end. Credential
+advance results keep authority counts and structured owner execution evidence
+separate so callers cannot equate a frame attempt with route correctness.

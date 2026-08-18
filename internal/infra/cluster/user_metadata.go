@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 
+	authoritypresence "github.com/WuKongIM/WuKongIM/internal/runtime/presence"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 )
 
@@ -14,6 +15,28 @@ type UserMetadataNode interface {
 	GetDeviceMetadata(context.Context, string, int64) (metadb.Device, error)
 }
 
+// LoadCredentialFence maps durable device metadata into Presence admission state.
+func (s *UserMetadataStore) LoadCredentialFence(ctx context.Context, uid string, deviceFlag uint8) (authoritypresence.CredentialFence, error) {
+	device, err := s.GetDevice(ctx, uid, int64(deviceFlag))
+	if err != nil {
+		return authoritypresence.CredentialFence{}, err
+	}
+	return credentialFenceFromDevice(device), nil
+}
+
+func credentialFenceFromDevice(device metadb.Device) authoritypresence.CredentialFence {
+	return authoritypresence.CredentialFence{
+		UID: device.UID, DeviceFlag: uint8(device.DeviceFlag), CredentialVersion: device.CredentialVersion,
+		LoginSessionID: device.LoginSessionID, Status: authoritypresence.CredentialStatus(device.CredentialStatus),
+		ExpiresAtUnixMS: device.ExpiresAtUnixMS, MachineReason: device.TerminationCause,
+	}
+}
+
+// DeviceCredentialNode exposes replicated conditional credential mutations.
+type DeviceCredentialNode interface {
+	ApplyDeviceCredentialMetadata(context.Context, metadb.Device) (metadb.DeviceCredentialMutationResult, error)
+}
+
 // UserMetadataScanNode exposes cluster user metadata page scans for manager lists.
 type UserMetadataScanNode interface {
 	ScanUsersSlotPage(context.Context, uint32, metadb.UserCursor, int) ([]metadb.User, metadb.UserCursor, bool, error)
@@ -21,14 +44,16 @@ type UserMetadataScanNode interface {
 
 // UserMetadataStore adapts cluster Slot metadata to the entry-agnostic user usecase.
 type UserMetadataStore struct {
-	node     UserMetadataNode
-	scanNode UserMetadataScanNode
+	node           UserMetadataNode
+	scanNode       UserMetadataScanNode
+	credentialNode DeviceCredentialNode
 }
 
 // NewUserMetadataStore creates a cluster-backed user metadata store.
 func NewUserMetadataStore(node UserMetadataNode) *UserMetadataStore {
 	scanNode, _ := node.(UserMetadataScanNode)
-	return &UserMetadataStore{node: node, scanNode: scanNode}
+	credentialNode, _ := node.(DeviceCredentialNode)
+	return &UserMetadataStore{node: node, scanNode: scanNode, credentialNode: credentialNode}
 }
 
 // CreateUser persists UID metadata through Slot ownership.
@@ -53,6 +78,14 @@ func (s *UserMetadataStore) UpsertDevice(ctx context.Context, device metadb.Devi
 		return metadb.ErrNotFound
 	}
 	return s.node.UpsertDeviceMetadata(ctx, device)
+}
+
+// ApplyDeviceCredential performs the replicated credential CAS on the UID Slot.
+func (s *UserMetadataStore) ApplyDeviceCredential(ctx context.Context, device metadb.Device) (metadb.DeviceCredentialMutationResult, error) {
+	if s == nil || s.credentialNode == nil {
+		return metadb.DeviceCredentialMutationResult{}, metadb.ErrNotFound
+	}
+	return s.credentialNode.ApplyDeviceCredentialMetadata(ctx, device)
 }
 
 // GetDevice reads per-device token metadata from the current Slot route.

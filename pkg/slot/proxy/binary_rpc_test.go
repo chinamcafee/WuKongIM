@@ -2,11 +2,22 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 	"github.com/stretchr/testify/require"
 )
+
+func proxyTestCredentialDevice(uid string, flag int64, token string, level int64, version uint64) metadb.Device {
+	return metadb.Device{
+		UID: uid, DeviceFlag: flag, Token: token, DeviceLevel: level,
+		CredentialVersion: version, LoginSessionID: fmt.Sprintf("session-%d", version),
+		OperationID: fmt.Sprintf("operation-%d", version), OperationDigest: fmt.Sprintf("digest-%d", version),
+		CredentialStatus: metadb.DeviceCredentialStatusActive,
+		ExpiresAtUnixMS:  2000000000000, UpdatedAtUnixMS: 1900000000000,
+	}
+}
 
 func TestIdentityRPCBinaryCodecRoundTrip(t *testing.T) {
 	req := identityRPCRequest{
@@ -28,7 +39,10 @@ func TestIdentityRPCBinaryCodecRoundTrip(t *testing.T) {
 		Status:   rpcStatusOK,
 		LeaderID: 2,
 		User:     &metadb.User{UID: "u1", Token: "token", DeviceFlag: 3, DeviceLevel: 1},
-		Device:   &metadb.Device{UID: "u1", DeviceFlag: 3, Token: "device-token", DeviceLevel: 1},
+		Device: func() *metadb.Device {
+			device := proxyTestCredentialDevice("u1", 3, "device-token", 1, 7)
+			return &device
+		}(),
 	}
 	respBody, err := encodeIdentityRPCResponse(resp)
 	require.NoError(t, err)

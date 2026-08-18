@@ -57,6 +57,23 @@ type Context struct {
 	RequestContext context.Context
 	// CloseSessionFn closes the owning gateway connection state when core builds this context.
 	CloseSessionFn func(CloseReason, error)
+	// KickSessionFn writes the final control frame, waits for bounded transport completion, then closes.
+	KickSessionFn func(frame.Frame, time.Duration, error) (KickResult, error)
+}
+
+// KickResult exposes each observable stage of a protocol kick independently.
+type KickResult struct {
+	FrameEnqueued    bool
+	TransportFlushed bool
+	HardClosed       bool
+}
+
+// KickSession performs an ordered final control-frame write before physical close.
+func (ctx *Context) KickSession(control frame.Frame, timeout time.Duration, reason error) (KickResult, error) {
+	if ctx == nil || ctx.KickSessionFn == nil {
+		return KickResult{}, session.ErrSessionClosed
+	}
+	return ctx.KickSessionFn(control, timeout, reason)
 }
 
 func (ctx *Context) WriteFrame(f frame.Frame) error {

@@ -702,6 +702,13 @@ ID. The receiving adapter validates every enum before reconstructing the typed
 repository error. Raw provider messages, request bodies, credentials, and
 credential ciphertext never cross this RPC.
 
+Presence RPC codec v3 carries credential version/session/expiry on routes,
+credential admission fence advances, exact expected route fences on actions,
+and structured owner evidence (`localFenced`, frame enqueue, transport flush,
+hard close, stale no-op). Authority fence advances and owner actions remain
+separate result axes. An exact authority acknowledgement removes successfully
+reconciled actions; remote timeouts never become a false complete result.
+
 Restore handlers require the local Controller mirror to show the same active
 restore and maintenance state before touching local files. Commands are fenced
 by job ID, backup ID, Hash Slot, and attempt.

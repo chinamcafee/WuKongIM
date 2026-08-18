@@ -48,6 +48,12 @@ large_group_subscriber_threshold = 500
 listen_addr = "127.0.0.1:5001"
 external_tcp_addr = "127.0.0.1:5100"
 external_ws_addr = "ws://127.0.0.1:5200"
+# Required for Link-U /internal/v3/device-credentials:* requests. Set a strong shared secret in production.
+internal_credential_hmac_secret = ""
+# Signed timestamps and nonces outside this window are rejected.
+internal_credential_replay_window = "5m"
+# Batch items are independently linearized; keep this bound small enough for request deadlines.
+internal_credential_max_batch_size = 100
 
 [manager]
 listen_addr = "127.0.0.1:5301"
@@ -194,6 +200,7 @@ workers = 16
 online_status_batch_max_items = 512
 online_status_batch_max_wait = "2s"
 offline_uid_batch_size = 512
+offline_notification_device_flags = [0]
 request_timeout = "5s"
 retry_max_attempts = 3
 outbox_dir = "./data/wukongim-single-node-data/webhook-outbox"

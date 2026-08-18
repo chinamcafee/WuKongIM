@@ -198,7 +198,7 @@ func TestRuntimeFocusEventsFiltersDisabledEvents(t *testing.T) {
 	}
 	rt.Offline(context.Background(), OfflineMessage{
 		Message: Message{MessageID: 1, MessageSeq: 1, ChannelID: "c1"},
-		ToUIDs:  []string{"u1"},
+		Targets: []OfflineTarget{{UID: "u1", DeviceFlag: 0}},
 	})
 	rt.OnlineStatus(context.Background(), OnlineStatus{Value: "u1-1"})
 	rt.Notify(context.Background(), Message{MessageID: 2, MessageSeq: 2})
@@ -239,7 +239,7 @@ func TestRuntimeAdmissionBeforeStartAndStopAreSafe(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 	rt.Notify(context.Background(), Message{MessageID: 1, MessageSeq: 1})
-	rt.Offline(context.Background(), OfflineMessage{Message: Message{MessageID: 1, MessageSeq: 1, ChannelID: "c1"}, ToUIDs: []string{"u1"}})
+	rt.Offline(context.Background(), OfflineMessage{Message: Message{MessageID: 1, MessageSeq: 1, ChannelID: "c1"}, Targets: []OfflineTarget{{UID: "u1", DeviceFlag: 0}}})
 	rt.OnlineStatus(context.Background(), OnlineStatus{Value: "u1-1"})
 	if err := rt.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop() before Start error = %v", err)
@@ -310,7 +310,7 @@ func TestRuntimeSendsOfflineAndOnlineStatusEvents(t *testing.T) {
 	}
 	rt.Offline(context.Background(), OfflineMessage{
 		Message: Message{MessageID: 1, MessageSeq: 1, ChannelID: "c1"},
-		ToUIDs:  []string{"u1", "u2"},
+		Targets: []OfflineTarget{{UID: "u1", DeviceFlag: 0}, {UID: "u2", DeviceFlag: 2}},
 	})
 	rt.OnlineStatus(context.Background(), OnlineStatus{Value: "u1-1"})
 	rt.OnlineStatus(context.Background(), OnlineStatus{Value: "u2-0"})

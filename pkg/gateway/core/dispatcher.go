@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"time"
 
 	gatewaytypes "github.com/WuKongIM/WuKongIM/pkg/gateway/types"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
@@ -82,6 +83,9 @@ func (d dispatcher) context(state *sessionState, replyToken string, reason gatew
 		RequestContext: requestContext,
 		CloseSessionFn: func(closeReason gatewaytypes.CloseReason, closeErr error) {
 			state.close(closeReason, closeErr)
+		},
+		KickSessionFn: func(control frame.Frame, timeout time.Duration, kickErr error) (gatewaytypes.KickResult, error) {
+			return state.server.kickSession(state, control, timeout, kickErr)
 		},
 	}
 }

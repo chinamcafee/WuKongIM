@@ -433,21 +433,35 @@ func TestStoreCreateUserAndUpsertDevice(t *testing.T) {
 	err = store.CreateUser(ctx, metadb.User{UID: "u1", Token: "overwrite-attempt"})
 	require.ErrorIs(t, err, metadb.ErrAlreadyExists)
 
-	require.NoError(t, store.UpsertDevice(ctx, metadb.Device{
-		UID:         "u1",
-		DeviceFlag:  2,
-		Token:       "web-token",
-		DeviceLevel: 1,
-	}))
+	device := proxyTestCredentialDevice("u1", 2, "web-token", 1, 1)
+	require.NoError(t, store.UpsertDevice(ctx, device))
 
 	gotDevice, err := store.GetDevice(ctx, "u1", 2)
 	require.NoError(t, err)
-	require.Equal(t, metadb.Device{
-		UID:         "u1",
-		DeviceFlag:  2,
-		Token:       "web-token",
-		DeviceLevel: 1,
-	}, gotDevice)
+	require.Equal(t, device, gotDevice)
+}
+
+func TestStoreApplyDeviceCredentialReturnsReplicatedCASOutcome(t *testing.T) {
+	ctx := context.Background()
+	bizDB := openTestDBAt(t, filepath.Join(t.TempDir(), "biz"))
+	_, store := newSingleNodeProxyTestStore(t, bizDB, 1)
+	v2 := proxyTestCredentialDevice("u-cas", 0, "token-v2", 1, 2)
+
+	result, err := store.ApplyDeviceCredential(ctx, v2)
+	require.NoError(t, err)
+	require.Equal(t, metadb.DeviceCredentialOutcomeApplied, result.Outcome)
+	require.Equal(t, uint64(2), result.CurrentVersion)
+
+	result, err = store.ApplyDeviceCredential(ctx, v2)
+	require.NoError(t, err)
+	require.Equal(t, metadb.DeviceCredentialOutcomeIdempotent, result.Outcome)
+
+	result, err = store.ApplyDeviceCredential(ctx, proxyTestCredentialDevice("u-cas", 0, "token-v1", 1, 1))
+	require.NoError(t, err)
+	require.Equal(t, metadb.DeviceCredentialOutcomeStaleVersion, result.Outcome)
+	stored, err := store.GetDevice(ctx, "u-cas", 0)
+	require.NoError(t, err)
+	require.Equal(t, v2, stored)
 }
 
 func TestStoreUpsertUserRoutesByHashSlotOnShardedCluster(t *testing.T) {
@@ -727,21 +741,12 @@ func TestStoreGetDeviceReadsAuthoritativeRemoteSlot(t *testing.T) {
 	nodes := startTwoNodeShardedStores(t)
 
 	uid := findUIDForSlot(t, nodes[0].cluster, 2, "remote-device")
-	require.NoError(t, nodes[1].db.ForHashSlot(mustHashSlotForKey(t, nodes[1].cluster, uid)).UpsertDevice(ctx, metadb.Device{
-		UID:         uid,
-		DeviceFlag:  5,
-		Token:       "device-token",
-		DeviceLevel: 1,
-	}))
+	device := proxyTestCredentialDevice(uid, 5, "device-token", 1, 3)
+	require.NoError(t, nodes[1].db.ForHashSlot(mustHashSlotForKey(t, nodes[1].cluster, uid)).UpsertDevice(ctx, device))
 
 	got, err := nodes[0].store.GetDevice(ctx, uid, 5)
 	require.NoError(t, err)
-	require.Equal(t, metadb.Device{
-		UID:         uid,
-		DeviceFlag:  5,
-		Token:       "device-token",
-		DeviceLevel: 1,
-	}, got)
+	require.Equal(t, device, got)
 }
 
 func TestStoreCreateUserReturnsAlreadyExistsForAuthoritativeRemoteSlot(t *testing.T) {

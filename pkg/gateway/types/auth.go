@@ -19,3 +19,11 @@ type AuthResult struct {
 	Connack       *frame.ConnackPacket
 	SessionValues map[string]any
 }
+
+// CredentialAuthResult carries durable device admission metadata into the session.
+type CredentialAuthResult struct {
+	DeviceLevel       frame.DeviceLevel
+	CredentialVersion uint64
+	LoginSessionID    string
+	ExpiresAtUnixMS   int64
+}

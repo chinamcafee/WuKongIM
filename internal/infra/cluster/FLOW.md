@@ -219,24 +219,23 @@ layers or later phases.
 ## CMD Sync Flow
 
 ```text
-cmdsync.Sync
-  -> ListConversationActivePage(ConversationKindCMD, uid, cursor) until done
-  -> ReadChannelCommitted(command channel/source SyncOnce channel, forward from read cursor)
+cmdsync.BatchSync(uid, device_flag)
+  -> ListConversationActivePage(ConversationKindCMD, uid, cursor) until done for discovery
+  -> GetCMDDeviceCursorsBatch(uid, device_flag, discovered command channels)
+  -> ReadChannelCommitted(command channel/source SyncOnce channel, forward from device cursor)
        -> page forward until enough SyncOnce/command-channel messages are found
   -> cmdsync.SyncedMessage
 
-cmdsync.SyncAck
-  -> UpsertConversationStatesBatch(kind forced to ConversationKindCMD)
-
-cmdsync.BatchSync / BatchAck
-  -> the same durable reads and writes with explicit per-channel ACK cursors
+cmdsync.BatchAck(uid, device_flag)
+  -> UpsertCMDDeviceCursorsBatch(explicit per-channel ACK cursors)
 ```
 
 `CMDSyncStore` is the single internal adapter for durable command-message
-sync. It reads CMD rows from the unified UID-owned conversation projection and
-advances read progress by writing CMD-kind `ConversationState` rows back through
-cluster Slot metadata. It does not create a second CMD-specific metadata
-table or a pending overlay. The active-index limit is a per-page bound, not a
+sync. It uses CMD rows from the unified UID-owned conversation projection only
+to discover command channels, then overlays independent APP/PC progress from
+`CMDDeviceCursor` Table ID 16. A missing cursor means sequence zero, so a newly
+admitted device receives all retained commands. ACK never changes ordinary or
+UID-level CMD `ConversationState`. The active-index limit is a per-page bound, not a
 total-channel cap: the adapter rejects a repeated cursor and continues until the
 authority reports `done`, so a channel outside the first page cannot starve.
 Channel log reads use Channel runtime committed forward
@@ -244,7 +243,7 @@ reads, filter out ordinary source-channel messages, and return cloned payloads
 to keep access/usecase layers from aliasing storage-owned memory.
 The v3 batch contract is stateless at this adapter boundary: its batch digest
 and cursor validation live in the usecase, and metadata's monotonic merge keeps
-late or repeated ACK writes from regressing `ReadSeq`.
+late or repeated ACK writes from regressing one device flag's `ReadSeq`.
 
 ## Management Message Flow
 
@@ -977,3 +976,10 @@ bounded presence error so pending token cleanup semantics stay explicit.
 
 Best-effort unregister calls are bounded by a short context timeout so gateway
 close and rollback paths do not block indefinitely on route lookup or node RPC.
+
+Credential fence advances resolve the current UID authority, atomically remove
+stale active/pending routes there, route each resulting action to its exact
+owner node, and aggregate owner-local/frame/flush/close evidence. Failed or
+unproven owner actions remain in the returned action set and surface as pending;
+successful or exact stale-noop actions are acknowledged to the authority before
+completion. Idempotent equal-version advances still rerun retained reconciliation.

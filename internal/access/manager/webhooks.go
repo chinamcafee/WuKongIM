@@ -73,6 +73,8 @@ type WebhookConfigSnapshot struct {
 	OnlineStatusBatchMaxWait string `json:"online_status_batch_max_wait"`
 	// OfflineUIDBatchSize limits offline recipient UIDs sent in one msg.offline request.
 	OfflineUIDBatchSize int `json:"offline_uid_batch_size"`
+	// OfflineNotificationDeviceFlags lists device shapes observed for offline notification.
+	OfflineNotificationDeviceFlags []int `json:"offline_notification_device_flags"`
 	// RequestTimeout is the formatted timeout for one outbound webhook request attempt.
 	RequestTimeout string `json:"request_timeout"`
 	// RetryMaxAttempts moves critical delivery to dead-letter and ends best-effort delivery after this many attempts.

@@ -52,6 +52,9 @@ func TestWebhookConfigRejectsInvalidValues(t *testing.T) {
 		{name: "negative workers", cfg: WebhookConfig{HTTPAddr: "http://127.0.0.1/hook", Workers: -1}},
 		{name: "negative online wait", cfg: WebhookConfig{HTTPAddr: "http://127.0.0.1/hook", OnlineBatchMaxWait: -1}},
 		{name: "negative retry", cfg: WebhookConfig{HTTPAddr: "http://127.0.0.1/hook", RetryMaxAttempts: -1}},
+		{name: "desktop offline notification flag", cfg: WebhookConfig{
+			HTTPAddr: "http://127.0.0.1/hook", OfflineNotificationDeviceFlags: []uint8{2},
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

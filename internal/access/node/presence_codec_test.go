@@ -82,6 +82,18 @@ func TestPresenceCodecRequestRoundTrip(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "ack credential action",
+			req: presenceRPCRequest{
+				Op:     presenceOpAckCredentialAction,
+				Target: target,
+				Action: presence.RouteAction{
+					UID: "u1", OwnerNodeID: 13, OwnerBootID: 23, SessionID: 101,
+					ExpectedOwnerSeq: 7, ExpectedCredentialVersion: 8, ExpectedLoginSessionID: "login-8",
+					Kind: "kick_then_close", Reason: "SESSION_REPLACED_SAME_DEVICE_CLASS",
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -400,25 +412,30 @@ func TestPresenceCodecGoldenTouchRoutesWireLayout(t *testing.T) {
 		t.Fatalf("encodePresenceRPCRequestBinary() error = %v", err)
 	}
 	want := []byte{
-		'W', 'K', 'V', 'P', 2,
+		'W', 'K', 'V', 'P', 3,
 		presenceOpTouchRoutesID,
 		7, 8, 9, 12, 13, 10, 11,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 		1,
 		2, 'u', '1', 1, 2, 3, 4, 2, 'd', '1', 1, 0, 3, 't', 'c', 'p', 0xc8, 0x01, 0xac, 0x02,
 		0, 0, 0, 0, 0, 0, 0,
 		0, 0, 0, 0,
 		0, 0, 0,
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		0, 0,
 	}
 	if !reflect.DeepEqual(body, want) {
-		t.Fatalf("touch route wire bytes = %#v, want %#v", body, want)
+		t.Fatalf("touch route wire bytes(len=%d) = %#v, want(len=%d) %#v", len(body), body, len(want), want)
 	}
 
 	respBody, err := encodePresenceRPCResponseBinary(presenceRPCResponse{Status: rpcStatusOK})
 	if err != nil {
 		t.Fatalf("encodePresenceRPCResponseBinary() error = %v", err)
 	}
-	wantResp := []byte{'W', 'K', 'V', 'R', 2, 2, 'o', 'k', 0, 0, 0}
+	wantResp := []byte{
+		'W', 'K', 'V', 'R', 3, 2, 'o', 'k',
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	}
 	if !reflect.DeepEqual(respBody, wantResp) {
 		t.Fatalf("response wire bytes = %#v, want %#v", respBody, wantResp)
 	}
@@ -443,11 +460,14 @@ func TestPresenceCodecGoldenTouchRoutesWireLayout(t *testing.T) {
 		t.Fatalf("encodePresenceRPCResponseBinary(endpoints) error = %v", err)
 	}
 	wantEndpointResp := []byte{
-		'W', 'K', 'V', 'R', 2,
+		'W', 'K', 'V', 'R', 3,
 		2, 'o', 'k',
 		0, 0,
 		1,
 		2, 'u', '1', 1, 2, 3, 4, 2, 'd', '1', 1, 0, 3, 't', 'c', 'p', 0xc8, 0x01, 0xac, 0x02,
+		0, 0, 0,
+		0, 0, 0, 0, 0, 0, 0, 0, 0,
+		0, 0, 0, 0, 0,
 	}
 	if !reflect.DeepEqual(endpointRespBody, wantEndpointResp) {
 		t.Fatalf("endpoint response wire bytes = %#v, want %#v", endpointRespBody, wantEndpointResp)
@@ -464,8 +484,8 @@ func TestPresenceCodecUsesTaskMagicHeaders(t *testing.T) {
 		t.Fatalf("encodePresenceRPCResponseBinary() error = %v", err)
 	}
 
-	wantReq := []byte{'W', 'K', 'V', 'P', 2}
-	wantResp := []byte{'W', 'K', 'V', 'R', 2}
+	wantReq := []byte{'W', 'K', 'V', 'P', 3}
+	wantResp := []byte{'W', 'K', 'V', 'R', 3}
 	if string(reqBody[:len(wantReq)]) != string(wantReq) {
 		t.Fatalf("request magic = %v, want %v", reqBody[:len(wantReq)], wantReq)
 	}

@@ -837,27 +837,68 @@ func (p activationTimeoutPresence) Touch(ctx context.Context, cmd presence.Touch
 }
 
 func (a presenceOwnerActions) ApplyRouteAction(ctx context.Context, action presence.RouteAction) error {
+	_, err := a.ApplyRouteActionDetailed(ctx, action)
+	return err
+}
+
+// ApplyRouteActionDetailed fences the exact owner-local route before any
+// transport work and reports each observable close stage independently.
+func (a presenceOwnerActions) ApplyRouteActionDetailed(ctx context.Context, action presence.RouteAction) (presence.RouteActionResult, error) {
+	var result presence.RouteActionResult
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return result, err
 	}
 	if a.local == nil {
-		return authoritypresence.ErrRouteNotReady
+		return result, authoritypresence.ErrRouteNotReady
 	}
 	session, ok := a.local.LocalSession(action.SessionID)
 	route := session.Route
-	if !ok || route.UID != action.UID || route.OwnerNodeID != action.OwnerNodeID || route.OwnerBootID != action.OwnerBootID {
-		return nil
+	if !ok || route.UID != action.UID || route.OwnerNodeID != action.OwnerNodeID || route.OwnerBootID != action.OwnerBootID ||
+		(action.ExpectedOwnerSeq != 0 && route.OwnerSeq != action.ExpectedOwnerSeq) ||
+		(action.ExpectedCredentialVersion != 0 && route.CredentialVersion != action.ExpectedCredentialVersion) ||
+		(action.ExpectedLoginSessionID != "" && route.LoginSessionID != action.ExpectedLoginSessionID) {
+		result.StaleNoop = true
+		return result, nil
 	}
+	if _, removed := a.local.MarkClosingAndUnregister(action.SessionID); !removed {
+		result.StaleNoop = true
+		return result, nil
+	}
+	result.LocalFenced = true
 	if session.Session != nil {
-		if err := session.Session.CloseSession(action.Reason); err != nil {
-			return err
+		if action.Kind == "kick_then_close" {
+			if kicker, ok := session.Session.(online.KickSessionHandle); ok {
+				kickResult, kickErr := kicker.KickSession(action.Reason, 250*time.Millisecond)
+				result.FrameEnqueued = kickResult.FrameEnqueued
+				result.TransportFlushed = kickResult.TransportFlushed
+				result.HardClosed = kickResult.HardClosed
+				if !result.HardClosed {
+					if kickErr != nil {
+						return result, kickErr
+					}
+					return result, authoritypresence.ErrRouteNotReady
+				}
+			} else {
+				closeErr := session.Session.CloseSession(action.Reason)
+				result.HardClosed = closeErr == nil
+				if closeErr != nil {
+					return result, closeErr
+				}
+			}
+		} else {
+			closeErr := session.Session.CloseSession(action.Reason)
+			result.HardClosed = closeErr == nil
+			if closeErr != nil {
+				return result, closeErr
+			}
 		}
+	} else {
+		result.HardClosed = true
 	}
-	a.local.MarkClosingAndUnregister(action.SessionID)
-	return nil
+	return result, nil
 }
 
 func newOwnerBootID() uint64 {

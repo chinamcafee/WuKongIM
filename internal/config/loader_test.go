@@ -129,6 +129,32 @@ func TestLoadAllowsEnvOnlyStartup(t *testing.T) {
 	}
 }
 
+func TestLoadInternalCredentialHMACConfiguration(t *testing.T) {
+	base := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"WK_NODE_ID=9",
+		"WK_NODE_DATA_DIR=" + t.TempDir() + "/node9",
+		"WK_CLUSTER_LISTEN_ADDR=127.0.0.1:7009",
+	}
+	valid := append(append([]string(nil), base...),
+		"WK_API_INTERNAL_CREDENTIAL_HMAC_SECRET=0123456789abcdef0123456789abcdef",
+		"WK_API_INTERNAL_CREDENTIAL_REPLAY_WINDOW=45s",
+		"WK_API_INTERNAL_CREDENTIAL_MAX_BATCH_SIZE=25",
+	)
+	cfg, err := Load(Options{Environ: valid})
+	if err != nil {
+		t.Fatalf("Load(valid internal credential config) error = %v", err)
+	}
+	if cfg.API.InternalCredentialReplayWindow != 45*time.Second || cfg.API.InternalCredentialMaxBatchSize != 25 {
+		t.Fatalf("internal credential config = %#v", cfg.API)
+	}
+
+	invalid := append(append([]string(nil), base...), "WK_API_INTERNAL_CREDENTIAL_HMAC_SECRET=too-short")
+	if _, err := Load(Options{Environ: invalid}); err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {
+		t.Fatalf("Load(short secret) error = %v, want minimum length rejection", err)
+	}
+}
+
 func TestLoadEnvOverridesTOML(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "wukongim.toml")

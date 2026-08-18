@@ -13,27 +13,36 @@ const webhookConfigSnapshotSource = "startup_config"
 func (a *App) WebhookConfigSnapshot(context.Context) (accessmanager.WebhookConfigSnapshot, error) {
 	cfg := a.cfg.Webhook
 	return accessmanager.WebhookConfigSnapshot{
-		Enabled:                   cfg.Enabled,
-		HTTPAddr:                  cfg.HTTPAddr,
-		FocusEvents:               cloneWebhookConfigStrings(cfg.FocusEvents),
-		SupportedEvents:           supportedWebhookEvents(),
-		QueueSize:                 cfg.QueueSize,
-		Workers:                   cfg.Workers,
-		OnlineStatusBatchMaxItems: cfg.OnlineBatchMaxItems,
-		OnlineStatusBatchMaxWait:  cfg.OnlineBatchMaxWait.String(),
-		OfflineUIDBatchSize:       cfg.OfflineUIDBatchSize,
-		RequestTimeout:            cfg.RequestTimeout.String(),
-		RetryMaxAttempts:          cfg.RetryMaxAttempts,
-		OutboxDir:                 cfg.OutboxDir,
-		OutboxMaxEntries:          cfg.OutboxMaxEntries,
-		OutboxMaxBytes:            cfg.OutboxMaxBytes,
-		OutboxDispatchBatchSize:   cfg.OutboxDispatchBatchSize,
-		OutboxRetryBaseDelay:      cfg.OutboxRetryBaseDelay.String(),
-		OutboxRetryMaxDelay:       cfg.OutboxRetryMaxDelay.String(),
-		OutboxDeliveredRetention:  cfg.OutboxDeliveredRetention.String(),
-		Source:                    webhookConfigSnapshotSource,
-		RequiresRestart:           true,
+		Enabled:                        cfg.Enabled,
+		HTTPAddr:                       cfg.HTTPAddr,
+		FocusEvents:                    cloneWebhookConfigStrings(cfg.FocusEvents),
+		SupportedEvents:                supportedWebhookEvents(),
+		QueueSize:                      cfg.QueueSize,
+		Workers:                        cfg.Workers,
+		OnlineStatusBatchMaxItems:      cfg.OnlineBatchMaxItems,
+		OnlineStatusBatchMaxWait:       cfg.OnlineBatchMaxWait.String(),
+		OfflineUIDBatchSize:            cfg.OfflineUIDBatchSize,
+		OfflineNotificationDeviceFlags: webhookConfigDeviceFlags(cfg.OfflineNotificationDeviceFlags),
+		RequestTimeout:                 cfg.RequestTimeout.String(),
+		RetryMaxAttempts:               cfg.RetryMaxAttempts,
+		OutboxDir:                      cfg.OutboxDir,
+		OutboxMaxEntries:               cfg.OutboxMaxEntries,
+		OutboxMaxBytes:                 cfg.OutboxMaxBytes,
+		OutboxDispatchBatchSize:        cfg.OutboxDispatchBatchSize,
+		OutboxRetryBaseDelay:           cfg.OutboxRetryBaseDelay.String(),
+		OutboxRetryMaxDelay:            cfg.OutboxRetryMaxDelay.String(),
+		OutboxDeliveredRetention:       cfg.OutboxDeliveredRetention.String(),
+		Source:                         webhookConfigSnapshotSource,
+		RequiresRestart:                true,
 	}, nil
+}
+
+func webhookConfigDeviceFlags(flags []uint8) []int {
+	out := make([]int, len(flags))
+	for index, flag := range flags {
+		out[index] = int(flag)
+	}
+	return out
 }
 
 // WebhookOutboxSnapshot returns node-local durable delivery health and a bounded dead-letter preview.

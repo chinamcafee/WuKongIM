@@ -669,19 +669,24 @@ func (a *App) wireUsers() {
 	if node, ok := a.cluster.(clusterinfra.UserMetadataNode); ok {
 		userStore := clusterinfra.NewUserMetadataStore(node)
 		a.gatewayTokenMetadata = userStore
+		if a.presenceDirectory != nil {
+			a.presenceDirectory.SetCredentialFenceLoader(userStore)
+		}
 		if a.users == nil {
 			var systemUIDs userusecase.SystemUIDStore
 			if channelNode, ok := a.cluster.(clusterinfra.ChannelMetadataNode); ok {
 				systemUIDs = clusterinfra.NewChannelMetadataStore(channelNode, nil)
 			}
 			a.users = userusecase.New(userusecase.Options{
-				Users:        userStore,
-				Devices:      userStore,
-				DeviceReader: userStore,
-				Online:       a.online,
-				Presence:     a.presence,
-				SystemUIDs:   systemUIDs,
-				Logger:       a.logger.Named("usecase.user"),
+				Users:             userStore,
+				Devices:           userStore,
+				DeviceReader:      userStore,
+				DeviceCredentials: userStore,
+				CredentialFences:  a.presenceAuthorityClient,
+				Online:            a.online,
+				Presence:          a.presence,
+				SystemUIDs:        systemUIDs,
+				Logger:            a.logger.Named("usecase.user"),
 			})
 		}
 	}
@@ -807,8 +812,10 @@ func (a *App) wireCMDSync() {
 		if node, ok := a.cluster.(clusterinfra.CMDSyncNode); ok {
 			store := clusterinfra.NewCMDSyncStore(node)
 			a.cmdSync = cmdsyncusecase.New(cmdsyncusecase.Options{
-				States:   store,
-				Messages: store,
+				States:       store,
+				DeviceStates: store,
+				Principals:   store,
+				Messages:     store,
 			})
 		}
 	}
@@ -840,32 +847,36 @@ func (a *App) wireAPI() {
 		legacyRouteExternal, legacyRouteIntranet := legacyRouteAddresses(a.cfg.API, a.cfg.Gateway.Listeners)
 		legacyRouteNodes := legacyRouteNodeAddresses(a.cfg.NodeID, a.cfg.Cluster.Control.Voters, legacyRouteExternal, legacyRouteIntranet)
 		a.api = accessapi.New(accessapi.Options{
-			ListenAddr:               a.cfg.API.ListenAddr,
-			Readyz:                   a.readyzReport,
-			Maintenance:              a.restoreMaintenance.Load,
-			BenchEnabled:             a.cfg.Bench.APIEnabled,
-			BenchToken:               a.cfg.Bench.APIToken,
-			BenchMaxBatchSize:        a.cfg.Bench.APIMaxBatchSize,
-			BenchMaxPayloadBytes:     a.cfg.Bench.APIMaxPayloadBytes,
-			Gateway:                  apiGatewayAddresses(a.cfg.API, a.cfg.Gateway.Listeners),
-			BenchRuntime:             a.benchRuntimeController(),
-			BenchPresence:            a.benchPresenceController(),
-			BenchData:                a.deliveryMeta,
-			Channels:                 a.channels,
-			Users:                    a.users,
-			Messages:                 a.apiMessages,
-			CMDSync:                  a.cmdSync,
-			Conversations:            a.conversations,
-			ConversationListObserver: a.conversationListObserver(),
-			ConversationSyncObserver: a.conversationSyncObserver(),
-			LegacyRouteExternal:      legacyRouteExternal,
-			LegacyRouteIntranet:      legacyRouteIntranet,
-			LegacyRouteNodes:         legacyRouteNodes,
-			MetricsHandler:           a.metricsHandler(),
-			DebugAPIEnabled:          a.cfg.Observability.DebugAPIEnabled,
-			DebugConfig:              a.debugConfigSnapshot,
-			DebugCluster:             a.debugClusterSnapshot,
-			Diagnostics:              a,
+			ListenAddr:                     a.cfg.API.ListenAddr,
+			Readyz:                         a.readyzReport,
+			Maintenance:                    a.restoreMaintenance.Load,
+			BenchEnabled:                   a.cfg.Bench.APIEnabled,
+			BenchToken:                     a.cfg.Bench.APIToken,
+			BenchMaxBatchSize:              a.cfg.Bench.APIMaxBatchSize,
+			BenchMaxPayloadBytes:           a.cfg.Bench.APIMaxPayloadBytes,
+			InternalCredentialHMACSecret:   a.cfg.API.InternalCredentialHMACSecret,
+			InternalCredentialReplayWindow: a.cfg.API.InternalCredentialReplayWindow,
+			InternalCredentialMaxBatchSize: a.cfg.API.InternalCredentialMaxBatchSize,
+			Gateway:                        apiGatewayAddresses(a.cfg.API, a.cfg.Gateway.Listeners),
+			BenchRuntime:                   a.benchRuntimeController(),
+			BenchPresence:                  a.benchPresenceController(),
+			BenchData:                      a.deliveryMeta,
+			Channels:                       a.channels,
+			Users:                          a.users,
+			DeviceCredentials:              a.users,
+			Messages:                       a.apiMessages,
+			CMDSync:                        a.cmdSync,
+			Conversations:                  a.conversations,
+			ConversationListObserver:       a.conversationListObserver(),
+			ConversationSyncObserver:       a.conversationSyncObserver(),
+			LegacyRouteExternal:            legacyRouteExternal,
+			LegacyRouteIntranet:            legacyRouteIntranet,
+			LegacyRouteNodes:               legacyRouteNodes,
+			MetricsHandler:                 a.metricsHandler(),
+			DebugAPIEnabled:                a.cfg.Observability.DebugAPIEnabled,
+			DebugConfig:                    a.debugConfigSnapshot,
+			DebugCluster:                   a.debugClusterSnapshot,
+			Diagnostics:                    a,
 			GoroutineSnapshot: func() any {
 				return a.goroutines.Snapshot()
 			},
@@ -1234,7 +1245,7 @@ func (a *App) wireGateway(nodeID uint64) error {
 				return fmt.Errorf("%w: gateway token metadata reader required", ErrInvalidConfig)
 			}
 			authOptions.TokenAuthOn = true
-			authOptions.VerifyToken = newGatewayTokenVerifier(
+			authOptions.VerifyCredential = newGatewayCredentialVerifier(
 				a.gatewayTokenMetadata, a.cfg.Gateway.TokenAuthTimeout)
 		}
 		gw, err := gateway.New(gateway.Options{

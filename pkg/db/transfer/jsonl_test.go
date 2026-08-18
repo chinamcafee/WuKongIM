@@ -61,6 +61,21 @@ func TestReadJSONLRejectsUnknownConversationKind(t *testing.T) {
 	}
 }
 
+func TestReadJSONLDecodesCMDDeviceCursorExactUint64(t *testing.T) {
+	input := strings.NewReader("{\"hash_slot\":1,\"uid\":\"u1\",\"device_flag\":2,\"command_channel_id\":\"u1-cmd\",\"channel_type\":7,\"read_seq\":\"18446744073709551615\",\"deleted_to_seq\":3}\n")
+	var got CMDDeviceCursorRecord
+	err := readJSONL(context.Background(), input, FileKindMetaCMDDeviceCursors, func(record any) error {
+		got = record.(CMDDeviceCursorRecord)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("readJSONL() error = %v", err)
+	}
+	if got.DeviceFlag != 2 || got.CommandChannelID != "u1-cmd" || uint64(got.ReadSeq) != ^uint64(0) {
+		t.Fatalf("record = %+v, want PC cursor at max uint64", got)
+	}
+}
+
 func TestReadJSONLRejectsBadPayloadBase64(t *testing.T) {
 	input := strings.NewReader("{\"channel_key\":\"g1:2\",\"message_seq\":1,\"message_id\":1,\"payload_b64\":\"@@\"}\n")
 	err := readJSONL(context.Background(), input, FileKindMessageMessages, func(any) error { return nil })

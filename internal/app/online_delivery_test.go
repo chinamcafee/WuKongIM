@@ -28,8 +28,8 @@ func TestOnlineDeliveryOfflineObserverPreservesOrdinaryCommitEligibility(t *test
 			observer := onlineDeliveryOfflineObserver{next: next}
 
 			observer.ObserveOfflineRecipients(context.Background(), runtimedelivery.OfflineRecipientsEvent{
-				Event: tt.event,
-				UIDs:  []string{"u1"},
+				Event:   tt.event,
+				Targets: []runtimedelivery.OfflineTarget{{UID: "u1", DeviceFlag: 0}},
 			})
 
 			if len(next.events) != tt.want {
