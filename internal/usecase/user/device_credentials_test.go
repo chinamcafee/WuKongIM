@@ -59,6 +59,9 @@ func TestApplyDeviceCredentialUsesMasterCASAndStructuredRouteEvidence(t *testing
 	if len(fences.fences) != 1 || fences.fences[0].CredentialVersion != 7 || fences.fences[0].LoginSessionID != "session-7" {
 		t.Fatalf("advanced fences = %#v, want version 7/session-7", fences.fences)
 	}
+	if fences.fences[0].MachineReason != "SESSION_REPLACED_SAME_DEVICE_CLASS" {
+		t.Fatalf("machine reason = %q, want terminal login takeover", fences.fences[0].MachineReason)
+	}
 	if result.CredentialOutcome != metadb.DeviceCredentialOutcomeApplied || result.RouteOutcome != CredentialRouteOutcomeComplete ||
 		result.AuthorityFencedRoutes != 2 || result.AuthorityPendingRoutes != 1 ||
 		result.OwnerLocalFencedRoutes != 3 || result.FrameEnqueuedRoutes != 2 || result.TransportFlushedRoutes != 1 {
@@ -85,6 +88,9 @@ func TestIdempotentCredentialMutationStillReconcilesAndReportsPending(t *testing
 
 	if len(fences.fences) != 1 {
 		t.Fatalf("fence calls = %d, want idempotent mutation to reconcile", len(fences.fences))
+	}
+	if fences.fences[0].MachineReason != "CREDENTIAL_ROTATED" {
+		t.Fatalf("machine reason = %q, want recoverable credential rotation", fences.fences[0].MachineReason)
 	}
 	if result.CredentialOutcome != metadb.DeviceCredentialOutcomeIdempotent ||
 		result.RouteOutcome != CredentialRouteOutcomePending || result.PendingRoutes != 1 ||
@@ -124,9 +130,26 @@ func TestApplyDeviceCredentialRejectsCallerControlledPolicy(t *testing.T) {
 		OperationID: "operation", OperationKind: "LOGIN_TAKEOVER", ReplacementCause: "SAME_DEVICE_FAMILY_LOGIN",
 	}
 	tests := []ApplyDeviceCredentialCommand{
-		func() ApplyDeviceCredentialCommand { value := base; value.DeviceFlag = 1; return value }(),
-		func() ApplyDeviceCredentialCommand { value := base; value.OperationKind = "CALLER_POLICY"; return value }(),
-		func() ApplyDeviceCredentialCommand { value := base; value.ReplacementCause = "SESSION_ADMIN_KICKED"; return value }(),
+		func() ApplyDeviceCredentialCommand {
+			value := base
+			value.DeviceFlag = protocolmeta.DeviceFlagSystem
+			return value
+		}(),
+		func() ApplyDeviceCredentialCommand {
+			value := base
+			value.DeviceFlag = protocolmeta.DeviceFlag(255)
+			return value
+		}(),
+		func() ApplyDeviceCredentialCommand {
+			value := base
+			value.OperationKind = "CALLER_POLICY"
+			return value
+		}(),
+		func() ApplyDeviceCredentialCommand {
+			value := base
+			value.ReplacementCause = "SESSION_ADMIN_KICKED"
+			return value
+		}(),
 	}
 	for _, command := range tests {
 		result := app.ApplyDeviceCredentials(context.Background(), []ApplyDeviceCredentialCommand{command})[0]
@@ -136,5 +159,28 @@ func TestApplyDeviceCredentialRejectsCallerControlledPolicy(t *testing.T) {
 	}
 	if len(store.devices) != 0 {
 		t.Fatalf("invalid commands reached store: %#v", store.devices)
+	}
+}
+
+func TestApplyDeviceCredentialAcceptsFutureTerminalFamilyFlag(t *testing.T) {
+	store := &recordingCredentialStore{result: metadb.DeviceCredentialMutationResult{
+		Outcome: metadb.DeviceCredentialOutcomeApplied, CurrentVersion: 3,
+	}}
+	fences := &recordingCredentialFences{result: presence.CredentialFenceAdvanceResult{CurrentVersion: 3}}
+	app := New(Options{DeviceCredentials: store, CredentialFences: fences})
+
+	result := app.ApplyDeviceCredentials(context.Background(), []ApplyDeviceCredentialCommand{{
+		UID: "u-future", DeviceFlag: protocolmeta.DeviceFlag(7), Token: "future-token",
+		CredentialVersion: 3, LoginSessionID: "future-session",
+		ExpiresAtUnixMS: time.Now().Add(time.Hour).UnixMilli(), OperationID: "future-operation",
+		OperationKind: "SESSION_RECONCILE", ReplacementCause: "SESSION_RECONCILE",
+	}})[0]
+
+	if result.ErrorCode != "" || result.RouteOutcome != CredentialRouteOutcomeComplete || len(store.devices) != 1 {
+		t.Fatalf("result/store = %#v/%#v, want extensible device flag accepted", result, store.devices)
+	}
+	if len(fences.fences) != 1 || fences.fences[0].DeviceFlag != 7 ||
+		fences.fences[0].MachineReason != "CREDENTIAL_RECONCILED" {
+		t.Fatalf("fences = %#v, want future flag reconcile", fences.fences)
 	}
 }

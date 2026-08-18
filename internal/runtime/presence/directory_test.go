@@ -95,6 +95,27 @@ func TestDirectoryCredentialFenceAdvanceRemovesOldFlagOnly(t *testing.T) {
 	}
 }
 
+func TestDirectoryCredentialRotationClosesWithoutTerminalKick(t *testing.T) {
+	dir := NewDirectory(DirectoryOptions{LocalNodeID: 1, ShardCount: 1})
+	target := RouteTarget{HashSlot: 1, SlotID: 1, LeaderNodeID: 1, LeaderTerm: 1, ConfigEpoch: 1}
+	dir.BecomeAuthority(target)
+	expires := time.Now().Add(time.Hour).UnixMilli()
+	old := Route{UID: "u1", OwnerNodeID: 1, OwnerBootID: 1, OwnerSeq: 1, SessionID: 10,
+		DeviceFlag: 0, CredentialVersion: 1, LoginSessionID: "mobile-1", ExpiresAtUnixMS: expires}
+	if _, err := dir.RegisterRoute(target, old); err != nil {
+		t.Fatalf("RegisterRoute() error = %v", err)
+	}
+	result, err := dir.AdvanceCredentialFence(target, CredentialFence{
+		UID: "u1", DeviceFlag: 0, CredentialVersion: 2, LoginSessionID: "mobile-1",
+		Status: CredentialStatusActive, ExpiresAtUnixMS: time.Now().Add(2 * time.Hour).UnixMilli(),
+		MachineReason: "CREDENTIAL_ROTATED",
+	})
+	if err != nil || len(result.Actions) != 1 || result.Actions[0].Kind != "close" ||
+		result.Actions[0].Reason != "CREDENTIAL_ROTATED" {
+		t.Fatalf("AdvanceCredentialFence() = %#v, %v, want recoverable close", result, err)
+	}
+}
+
 func TestDirectoryCredentialFenceActionRetainedUntilAcknowledged(t *testing.T) {
 	dir := NewDirectory(DirectoryOptions{LocalNodeID: 1, ShardCount: 1})
 	target := RouteTarget{HashSlot: 1, SlotID: 1, LeaderNodeID: 1, LeaderTerm: 1, ConfigEpoch: 1}

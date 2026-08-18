@@ -812,11 +812,15 @@ func actionForCredentialFence(fence CredentialFence, route Route) RouteAction {
 	if reason == "" {
 		reason = "SESSION_REPLACED_SAME_DEVICE_CLASS"
 	}
+	kind := "kick_then_close"
+	if reason == "CREDENTIAL_ROTATED" || reason == "CREDENTIAL_RECONCILED" {
+		kind = "close"
+	}
 	return RouteAction{
 		UID: route.UID, OwnerNodeID: route.OwnerNodeID, OwnerBootID: route.OwnerBootID,
 		SessionID: route.SessionID, ExpectedOwnerSeq: route.OwnerSeq,
 		ExpectedCredentialVersion: route.CredentialVersion, ExpectedLoginSessionID: route.LoginSessionID,
-		Kind: "kick_then_close", Reason: reason,
+		Kind: kind, Reason: reason,
 	}
 }
 

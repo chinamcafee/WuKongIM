@@ -113,7 +113,7 @@ func (a *App) applyDeviceCredential(ctx context.Context, command ApplyDeviceCred
 		UpdatedAtUnixMS: nowMS,
 	}
 	device.OperationDigest = credentialOperationDigest(device, command.OperationKind, command.ReplacementCause)
-	return a.persistDeviceCredential(ctx, base, device)
+	return a.persistDeviceCredential(ctx, base, device, credentialMachineReasonForApply(command))
 }
 
 func (a *App) revokeDeviceCredential(ctx context.Context, command RevokeDeviceCredentialCommand) DeviceCredentialResult {
@@ -130,10 +130,10 @@ func (a *App) revokeDeviceCredential(ctx context.Context, command RevokeDeviceCr
 		TerminationCause: command.TerminationCause,
 	}
 	device.OperationDigest = credentialOperationDigest(device, "REVOKE", command.TerminationCause)
-	return a.persistDeviceCredential(ctx, base, device)
+	return a.persistDeviceCredential(ctx, base, device, credentialMachineReasonForTermination(command.TerminationCause))
 }
 
-func (a *App) persistDeviceCredential(ctx context.Context, result DeviceCredentialResult, device metadb.Device) DeviceCredentialResult {
+func (a *App) persistDeviceCredential(ctx context.Context, result DeviceCredentialResult, device metadb.Device, machineReason string) DeviceCredentialResult {
 	if a == nil || a.credentialStore == nil {
 		result.ErrorCode = "CREDENTIAL_STORE_UNAVAILABLE"
 		return result
@@ -156,7 +156,7 @@ func (a *App) persistDeviceCredential(ctx context.Context, result DeviceCredenti
 	fence := presence.CredentialFence{
 		UID: device.UID, DeviceFlag: uint8(device.DeviceFlag), CredentialVersion: device.CredentialVersion,
 		LoginSessionID: device.LoginSessionID, Status: presence.CredentialStatus(device.CredentialStatus),
-		ExpiresAtUnixMS: device.ExpiresAtUnixMS, MachineReason: credentialMachineReason(device),
+		ExpiresAtUnixMS: device.ExpiresAtUnixMS, MachineReason: machineReason,
 	}
 	advance, err := a.credentialFences.AdvanceCredentialFence(ctx, fence)
 	result.FenceVersion = advance.CurrentVersion
@@ -179,11 +179,19 @@ func (a *App) persistDeviceCredential(ctx context.Context, result DeviceCredenti
 	return result
 }
 
-func credentialMachineReason(device metadb.Device) string {
-	if device.CredentialStatus == metadb.DeviceCredentialStatusActive {
+func credentialMachineReasonForApply(command ApplyDeviceCredentialCommand) string {
+	switch command.OperationKind {
+	case "TOKEN_REFRESH":
+		return "CREDENTIAL_ROTATED"
+	case "SESSION_RECONCILE":
+		return "CREDENTIAL_RECONCILED"
+	default:
 		return "SESSION_REPLACED_SAME_DEVICE_CLASS"
 	}
-	switch device.TerminationCause {
+}
+
+func credentialMachineReasonForTermination(cause string) string {
+	switch cause {
 	case "SESSION_LOGGED_OUT":
 		return "SESSION_LOGGED_OUT"
 	case "SESSION_EXPIRED":
@@ -240,7 +248,9 @@ func validateCredentialIdentity(uid string, flag protocolmeta.DeviceFlag, versio
 	if strings.TrimSpace(uid) == "" || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(operationID) == "" || version == 0 {
 		return metadb.ErrInvalidArgument
 	}
-	if flag != protocolmeta.DeviceFlagApp && flag != protocolmeta.DeviceFlagPC {
+	// 终端族由上游 HMAC 内部接口和版本化凭据权威决定；WuKongIM 只保留协议系统 flag
+	// 与 255 哨兵，允许未来共存端使用其他 uint8 deviceFlag，无需修改 IM 主干。
+	if flag == protocolmeta.DeviceFlagSystem || flag == protocolmeta.DeviceFlag(^uint8(0)) {
 		return metadb.ErrInvalidArgument
 	}
 	return nil

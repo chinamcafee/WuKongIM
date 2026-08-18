@@ -283,7 +283,14 @@ func (a *App) kickLocalDevice(uid string, flag protocolmeta.DeviceFlag, delay ti
 
 func deviceQuitFlags(flag int) []protocolmeta.DeviceFlag {
 	if flag == -1 {
-		return []protocolmeta.DeviceFlag{protocolmeta.DeviceFlagApp, protocolmeta.DeviceFlagWeb, protocolmeta.DeviceFlagPC}
+		flags := make([]protocolmeta.DeviceFlag, 0, 254)
+		for candidate := 0; candidate <= 254; candidate++ {
+			value := protocolmeta.DeviceFlag(candidate)
+			if value != protocolmeta.DeviceFlagSystem {
+				flags = append(flags, value)
+			}
+		}
+		return flags
 	}
 	return []protocolmeta.DeviceFlag{protocolmeta.DeviceFlag(flag)}
 }
