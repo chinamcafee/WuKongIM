@@ -35,6 +35,8 @@ func inspectCommand(cmd command) (CommandInspection, error) {
 		return userInspection("create_user", typed.user), nil
 	case *upsertDeviceCmd:
 		return deviceInspection("upsert_device", typed.device), nil
+	case *applyDeviceCredentialCmd:
+		return deviceCredentialInspection(typed.device), nil
 	case *upsertChannelCmd:
 		return channelInspection("upsert_channel", typed.channel), nil
 	case *deleteChannelCmd:
@@ -170,6 +172,22 @@ func deviceInspection(commandType string, device metadb.Device) CommandInspectio
 		"device_flag":  device.DeviceFlag,
 		"token":        redactedSecret,
 		"device_level": device.DeviceLevel,
+	})
+}
+
+func deviceCredentialInspection(device metadb.Device) CommandInspection {
+	return simpleInspection("apply_device_credential", map[string]any{
+		"uid":                device.UID,
+		"device_flag":        device.DeviceFlag,
+		"token":              redactedSecret,
+		"credential_version": device.CredentialVersion,
+		"login_session_id":   device.LoginSessionID,
+		"operation_id":       device.OperationID,
+		"operation_digest":   redactedSecret,
+		"credential_status":  string(device.CredentialStatus),
+		"expires_at_unix_ms": device.ExpiresAtUnixMS,
+		"updated_at_unix_ms": device.UpdatedAtUnixMS,
+		"termination_cause":  device.TerminationCause,
 	})
 }
 

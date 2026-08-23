@@ -53,9 +53,10 @@ large_group_subscriber_threshold = 500
 
 [api]
 listen_addr = "127.0.0.1:5001"
-external_tcp_addr = "192.168.10.109:5100"
-external_ws_addr = "ws://192.168.10.109:5200"
+external_tcp_addr = "192.168.10.110:5100"
+external_ws_addr = "ws://192.168.10.110:5200"
 external_wss_addr = ""
+internal_credential_hmac_secret = "dev-only-wukongim-internal-credential-hmac-secret"
 
 [manager]
 listen_addr = "127.0.0.1:5300"

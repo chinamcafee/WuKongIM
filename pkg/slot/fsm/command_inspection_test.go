@@ -1,6 +1,7 @@
 package fsm
 
 import (
+	"fmt"
 	"testing"
 
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
@@ -27,6 +28,21 @@ func TestDecodeCommandInspectionRedactsUserToken(t *testing.T) {
 			"device_level": int64(7),
 		},
 	}, got)
+}
+
+func TestDecodeCommandInspectionRedactsDeviceCredentialSecrets(t *testing.T) {
+	got, err := DecodeCommandInspection(EncodeApplyDeviceCredentialCommand(metadb.Device{
+		UID: "u1", DeviceFlag: 0, Token: "secret-token", DeviceLevel: 1,
+		CredentialVersion: 8, LoginSessionID: "session-8", OperationID: "operation-8",
+		OperationDigest: "secret-digest", CredentialStatus: metadb.DeviceCredentialStatusActive,
+		ExpiresAtUnixMS: 2000000000000, UpdatedAtUnixMS: 1900000000000,
+	}))
+	require.NoError(t, err)
+	require.Equal(t, "apply_device_credential", got.Type)
+	require.Equal(t, "***", got.Payload["token"])
+	require.Equal(t, "***", got.Payload["operation_digest"])
+	require.NotContains(t, fmt.Sprint(got.Payload), "secret-token")
+	require.NotContains(t, fmt.Sprint(got.Payload), "secret-digest")
 }
 
 func TestDecodeCommandInspectionIncludesChannelStatusFlags(t *testing.T) {

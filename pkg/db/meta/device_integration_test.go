@@ -134,3 +134,52 @@ func TestDeviceCredentialVersionsAreIndependentForMobileAndDesktopFlags(t *testi
 		t.Fatalf("desktop = %#v, %v, want v5 unchanged", desktop, err)
 	}
 }
+
+func TestDeviceCredentialConditionalMutationUpgradesLegacyDeviceRow(t *testing.T) {
+	store := openTestMetaStore(t)
+	defer store.close(t)
+
+	const hashSlot HashSlot = 7
+	primaryKey, err := deviceTable.primaryRowKey(hashSlot, KeyParts{String("legacy-u1"), Int64Ordered(0)})
+	if err != nil {
+		t.Fatalf("primaryRowKey(): %v", err)
+	}
+	legacyValue := appendValueString(nil, "legacy-token")
+	legacyValue = appendValueInt64(legacyValue, 1)
+	raw := store.engine.NewBatch()
+	defer raw.Close()
+	if err := raw.Set(primaryKey, legacyValue); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+	if err := raw.Commit(true); err != nil {
+		t.Fatalf("commit legacy row: %v", err)
+	}
+
+	legacy, ok, err := store.db.HashSlot(hashSlot).GetDevice(context.Background(), "legacy-u1", 0)
+	if err != nil || !ok || legacy.Token != "legacy-token" || legacy.CredentialVersion != 0 {
+		t.Fatalf("legacy GetDevice() = (%+v, %v, %v), want compatible version-zero row", legacy, ok, err)
+	}
+
+	revoked := Device{
+		UID: "legacy-u1", DeviceFlag: 0, DeviceLevel: 1,
+		CredentialVersion: 8, LoginSessionID: "session-8", OperationID: "operation-8",
+		OperationDigest: "digest-8", CredentialStatus: DeviceCredentialStatusRevoked,
+		UpdatedAtUnixMS: 1900000000000, TerminationCause: "SESSION_REPLACED",
+	}
+	batch := (&DB{meta: store.db, engine: store.engine}).NewWriteBatch()
+	defer batch.Close()
+	result, err := batch.ApplyDeviceCredentialConditionally(hashSlot, revoked)
+	if err != nil {
+		t.Fatalf("ApplyDeviceCredentialConditionally(): %v", err)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatalf("Commit(): %v", err)
+	}
+	if result.Outcome != DeviceCredentialOutcomeApplied || result.CurrentVersion != 8 {
+		t.Fatalf("result = %#v, want APPLIED/8", result)
+	}
+	got, ok, err := store.db.HashSlot(hashSlot).GetDevice(context.Background(), "legacy-u1", 0)
+	if err != nil || !ok || got != revoked {
+		t.Fatalf("upgraded GetDevice() = (%+v, %v, %v), want %+v", got, ok, err, revoked)
+	}
+}

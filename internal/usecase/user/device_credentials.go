@@ -11,6 +11,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/contracts/protocolmeta"
 	"github.com/WuKongIM/WuKongIM/internal/usecase/presence"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
+	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 )
 
 const (
@@ -140,6 +141,13 @@ func (a *App) persistDeviceCredential(ctx context.Context, result DeviceCredenti
 	}
 	mutation, err := a.credentialStore.ApplyDeviceCredential(ctx, device)
 	if err != nil {
+		a.logger.Warn("device credential durable mutation failed",
+			wklog.Event("user.device_credential.persist.failed"),
+			wklog.String("uid", device.UID),
+			wklog.Int("deviceFlag", int(device.DeviceFlag)),
+			wklog.Uint64("credentialVersion", device.CredentialVersion),
+			wklog.Error(err),
+		)
 		result.ErrorCode = "RETRYABLE_ERROR"
 		return result
 	}
@@ -166,6 +174,13 @@ func (a *App) persistDeviceCredential(ctx context.Context, result DeviceCredenti
 	result.FrameEnqueuedRoutes = advance.FrameEnqueued
 	result.TransportFlushedRoutes = advance.TransportFlushed
 	if err != nil {
+		a.logger.Warn("device credential presence fence reconciliation failed",
+			wklog.Event("user.device_credential.fence.failed"),
+			wklog.String("uid", device.UID),
+			wklog.Int("deviceFlag", int(device.DeviceFlag)),
+			wklog.Uint64("credentialVersion", device.CredentialVersion),
+			wklog.Error(err),
+		)
 		result.PendingRoutes = len(advance.Actions)
 		result.ErrorCode = "ROUTE_RECONCILE_PENDING"
 		return result

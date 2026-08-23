@@ -135,9 +135,20 @@ func encodeDeviceValue(device Device) []byte {
 }
 
 func decodeDeviceValue(uid string, deviceFlag int64, value []byte) (Device, error) {
-	marker, rest, err := readValueString(value)
-	if err != nil || marker != deviceValueCodecMarker {
-		return Device{}, dberrors.ErrCorruptValue
+	markerOrLegacyToken, rest, err := readValueString(value)
+	if err != nil {
+		return Device{}, err
+	}
+	if markerOrLegacyToken != deviceValueCodecMarker {
+		deviceLevel, trailing, legacyErr := readValueInt64(rest)
+		if legacyErr != nil || len(trailing) != 0 {
+			return Device{}, dberrors.ErrCorruptValue
+		}
+		// V2 and earlier stored only token + device level. Return a version-zero
+		// compatibility row so the first replicated credential CAS can replace it.
+		return Device{
+			UID: uid, DeviceFlag: deviceFlag, Token: markerOrLegacyToken, DeviceLevel: deviceLevel,
+		}, nil
 	}
 	token, rest, err := readValueString(rest)
 	if err != nil {
