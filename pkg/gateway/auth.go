@@ -66,11 +66,7 @@ func NewWKProtoAuthenticator(opts WKProtoAuthOptions) Authenticator {
 		}
 		if opts.RequiredProtocolVersion != 0 && connect.Version != opts.RequiredProtocolVersion {
 			return &AuthResult{
-				Connack: &frame.ConnackPacket{
-					Framer:        frame.Framer{HasServerVersion: true},
-					ReasonCode:    frame.ReasonProtocolUpgradeRequired,
-					ServerVersion: opts.RequiredProtocolVersion,
-				},
+				Connack: connackForConnect(connect, opts.RequiredProtocolVersion, frame.ReasonProtocolUpgradeRequired),
 			}, nil
 		}
 
@@ -81,7 +77,7 @@ func NewWKProtoAuthenticator(opts WKProtoAuthOptions) Authenticator {
 		if opts.TokenAuthOn && !isVisitor(opts.IsVisitor, connect.UID) {
 			if connect.Token == "" || (opts.VerifyCredential == nil && opts.VerifyToken == nil) {
 				return &AuthResult{
-					Connack: &frame.ConnackPacket{ReasonCode: frame.ReasonAuthFail},
+					Connack: connackForConnect(connect, opts.RequiredProtocolVersion, frame.ReasonAuthFail),
 				}, nil
 			}
 
@@ -102,7 +98,7 @@ func NewWKProtoAuthenticator(opts WKProtoAuthOptions) Authenticator {
 			}
 			if err != nil {
 				return &AuthResult{
-					Connack: &frame.ConnackPacket{ReasonCode: frame.ReasonAuthFail},
+					Connack: connackForConnect(connect, opts.RequiredProtocolVersion, frame.ReasonAuthFail),
 				}, nil
 			}
 		}
@@ -115,25 +111,15 @@ func NewWKProtoAuthenticator(opts WKProtoAuthOptions) Authenticator {
 					reason = frame.ReasonAuthFail
 				}
 				return &AuthResult{
-					Connack: &frame.ConnackPacket{ReasonCode: reason},
+					Connack: connackForConnect(connect, opts.RequiredProtocolVersion, reason),
 				}, nil
 			}
 		}
 
-		serverVersion := connect.Version
-		if opts.RequiredProtocolVersion != 0 {
-			serverVersion = opts.RequiredProtocolVersion
-		} else if serverVersion == 0 || serverVersion > frame.LatestVersion {
-			serverVersion = frame.LatestVersion
-		}
-
-		connack := &frame.ConnackPacket{
-			ReasonCode:    frame.ReasonSuccess,
-			TimeDiff:      nowFn().UnixMilli() - connect.ClientTimestamp,
-			ServerVersion: serverVersion,
-			NodeId:        opts.NodeID,
-		}
-		connack.HasServerVersion = connect.Version > 3 || opts.RequiredProtocolVersion != 0
+		connack := connackForConnect(connect, opts.RequiredProtocolVersion, frame.ReasonSuccess)
+		connack.TimeDiff = nowFn().UnixMilli() - connect.ClientTimestamp
+		connack.NodeId = opts.NodeID
+		serverVersion := connack.ServerVersion
 
 		sessionValues := map[string]any{
 			SessionValueUID:             connect.UID,
@@ -150,19 +136,19 @@ func NewWKProtoAuthenticator(opts WKProtoAuthOptions) Authenticator {
 		if encryptionEnabled {
 			if connect.ClientKey == "" {
 				return &AuthResult{
-					Connack: &frame.ConnackPacket{ReasonCode: frame.ReasonClientKeyIsEmpty},
+					Connack: connackForConnect(connect, opts.RequiredProtocolVersion, frame.ReasonClientKeyIsEmpty),
 				}, nil
 			}
 			sessionKeys, serverKey, err := wkprotoenc.NegotiateServerSession(connect.ClientKey)
 			if err != nil {
 				return &AuthResult{
-					Connack: &frame.ConnackPacket{ReasonCode: frame.ReasonAuthFail},
+					Connack: connackForConnect(connect, opts.RequiredProtocolVersion, frame.ReasonAuthFail),
 				}, nil
 			}
 			sessionCrypto, err := wkprotoenc.NewSessionCrypto(sessionKeys)
 			if err != nil {
 				return &AuthResult{
-					Connack: &frame.ConnackPacket{ReasonCode: frame.ReasonAuthFail},
+					Connack: connackForConnect(connect, opts.RequiredProtocolVersion, frame.ReasonAuthFail),
 				}, nil
 			}
 			connack.ServerKey = serverKey
@@ -178,6 +164,27 @@ func NewWKProtoAuthenticator(opts WKProtoAuthOptions) Authenticator {
 			SessionValues: sessionValues,
 		}, nil
 	})
+}
+
+// connackForConnect preserves the negotiated protocol envelope on every
+// response, including authentication failures. V4+ clients need the version
+// flag to decode the reason code instead of mistaking a valid failure for a
+// legacy CONNACK payload.
+func connackForConnect(connect *frame.ConnectPacket, requiredVersion uint8, reason frame.ReasonCode) *frame.ConnackPacket {
+	connack := &frame.ConnackPacket{ReasonCode: reason}
+	if connect == nil {
+		return connack
+	}
+
+	serverVersion := connect.Version
+	if requiredVersion != 0 {
+		serverVersion = requiredVersion
+	} else if serverVersion == 0 || serverVersion > frame.LatestVersion {
+		serverVersion = frame.LatestVersion
+	}
+	connack.ServerVersion = serverVersion
+	connack.HasServerVersion = connect.Version > 3 || requiredVersion != 0
+	return connack
 }
 
 func isVisitor(fn func(uid string) bool, uid string) bool {

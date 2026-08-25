@@ -39,6 +39,43 @@ func TestAuthenticatorRequiresLatestProtocolVersion(t *testing.T) {
 	}
 }
 
+func TestAuthenticatorKeepsVersionEnvelopeOnV6AuthFailure(t *testing.T) {
+	auth := gateway.NewWKProtoAuthenticator(gateway.WKProtoAuthOptions{
+		TokenAuthOn:             true,
+		DisableEncryption:       true,
+		RequiredProtocolVersion: frame.LatestVersion,
+	})
+
+	result, err := auth.Authenticate(nil, &frame.ConnectPacket{
+		Version: frame.LatestVersion,
+		UID:     "u1",
+	})
+	if err != nil {
+		t.Fatalf("Authenticate() error = %v", err)
+	}
+	if got, want := result.Connack.ReasonCode, frame.ReasonAuthFail; got != want {
+		t.Fatalf("ReasonCode = %v, want %v", got, want)
+	}
+	if !result.Connack.HasServerVersion || result.Connack.ServerVersion != frame.LatestVersion {
+		t.Fatalf("failure connack = %#v, want v%d envelope", result.Connack, frame.LatestVersion)
+	}
+}
+
+func TestAuthenticatorKeepsLegacyFailureEnvelopeForV3Client(t *testing.T) {
+	auth := gateway.NewWKProtoAuthenticator(gateway.WKProtoAuthOptions{
+		TokenAuthOn:       true,
+		DisableEncryption: true,
+	})
+
+	result, err := auth.Authenticate(nil, &frame.ConnectPacket{Version: 3, UID: "u1"})
+	if err != nil {
+		t.Fatalf("Authenticate() error = %v", err)
+	}
+	if result.Connack.HasServerVersion {
+		t.Fatalf("legacy failure connack = %#v, want no version flag", result.Connack)
+	}
+}
+
 func TestAuthenticatorStoresDeviceIDSessionValue(t *testing.T) {
 	auth := gateway.NewWKProtoAuthenticator(gateway.WKProtoAuthOptions{DisableEncryption: true})
 
