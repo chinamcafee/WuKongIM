@@ -11,6 +11,7 @@ This domain covers black-box message and conversation behavior for
 
 | Scenario | Purpose | Run |
 | --- | --- | --- |
+| `preparation_cmd` | Verify silent preparation payloads, device-bound v3 sync/ACK, deduplication and restart recovery on a single-node cluster. | `GOWORK=off go test -tags=e2e ./test/e2e/message/preparation_cmd -count=1 -timeout 2m -p=1` |
 | `single_node_send` | Prove `cmd/wukongim` can complete one single-node cluster WKProto `SEND -> SENDACK` closure and expose sender/receiver rows through `/conversation/list`. | `GOWORK=off go test -tags=e2e ./test/e2e/message/single_node_send -count=1` |
 | `gateway_token_auth` | Prove `/user/token` is the authoritative fail-closed WKProto CONNECT credential on single-node and routed three-node clusters, including token rotation and device-flag isolation. | `GOWORK=off go test -tags=e2e ./test/e2e/message/gateway_token_auth -count=1 -timeout 3m -p=1` |
 | `linku_v3_contract` | Lock the Link-U v3 HTTP response families, WKProto v6 behavior, lossless sequence fields, token auth, readiness, and durable Webhook Outbox on single- and three-node clusters. | `GOWORK=off go test -tags=e2e ./test/e2e/message/linku_v3_contract -count=1 -timeout 4m -p=1` |
