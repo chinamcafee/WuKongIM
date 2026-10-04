@@ -1112,7 +1112,10 @@ func TestClientTimedOutAttemptLateAckCannotStealRetry(t *testing.T) {
 	})
 	defer server.close()
 
-	client, err := NewClient(ClientConfig{Addr: server.addr, OperationTimeout: time.Second, AckTimeout: 5 * time.Millisecond})
+	// The server withholds the first ACK until the retry arrives, so the first
+	// attempt necessarily times out. This tests ACK ownership, not a five-ms
+	// network SLA; leave a bounded scheduling budget for the successful retry.
+	client, err := NewClient(ClientConfig{Addr: server.addr, OperationTimeout: time.Second, AckTimeout: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}

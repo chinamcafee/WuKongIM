@@ -1,0 +1,1 @@
+ok  	github.com/WuKongIM/WuKongIM/internal/bench/wkproto	22.338s

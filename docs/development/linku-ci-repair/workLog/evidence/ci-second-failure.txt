@@ -1,0 +1,8 @@
+GitHub run 37222008609, commit 3132b70c588f3bd6f30556eee198d13e9833c578
+Go unit (internal), job 111494088585:
+--- FAIL: TestClientTimedOutAttemptLateAckCannotStealRetry (0.02s)
+client_test.go:1137: retry ReadFrame() error = client: sendack timeout
+A subsequent server ACK write reported broken pipe after client cleanup.
+Source: https://github.com/chinamcafee/WuKongIM/actions/runs/37222008609/job/111494088585
+The original embedded asset failure no longer occurred.
+Go three-node real disk (macOS), job 111494088191: completed/success.
