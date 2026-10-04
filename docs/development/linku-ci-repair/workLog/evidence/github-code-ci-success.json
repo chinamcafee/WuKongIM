@@ -1,0 +1,75 @@
+{
+  "verified_at_utc": "2026-10-04T18:01:43.464641+00:00",
+  "run_id": 37222423931,
+  "head_sha": "b4e8943757b7d2bf891686b3c5989fded22325dd",
+  "status": "completed",
+  "conclusion": "success",
+  "html_url": "https://github.com/chinamcafee/WuKongIM/actions/runs/37222423931",
+  "jobs": [
+    {
+      "id": 111495291975,
+      "name": "Go quality",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/chinamcafee/WuKongIM/actions/runs/37222423931/job/111495291975"
+    },
+    {
+      "id": 111495292028,
+      "name": "Go three-node real disk (macOS)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/chinamcafee/WuKongIM/actions/runs/37222423931/job/111495292028"
+    },
+    {
+      "id": 111495292083,
+      "name": "Demo",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/chinamcafee/WuKongIM/actions/runs/37222423931/job/111495292083"
+    },
+    {
+      "id": 111495292107,
+      "name": "Go unit (pkg)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/chinamcafee/WuKongIM/actions/runs/37222423931/job/111495292107"
+    },
+    {
+      "id": 111495292110,
+      "name": "Go unit (scripts-docker)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/chinamcafee/WuKongIM/actions/runs/37222423931/job/111495292110"
+    },
+    {
+      "id": 111495292129,
+      "name": "Web",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/chinamcafee/WuKongIM/actions/runs/37222423931/job/111495292129"
+    },
+    {
+      "id": 111495292134,
+      "name": "Go unit (internal)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/chinamcafee/WuKongIM/actions/runs/37222423931/job/111495292134"
+    },
+    {
+      "id": 111495292138,
+      "name": "Link-U v3 contract gate",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/chinamcafee/WuKongIM/actions/runs/37222423931/job/111495292138"
+    },
+    {
+      "id": 111495292164,
+      "name": "Go unit (cmd)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/chinamcafee/WuKongIM/actions/runs/37222423931/job/111495292164"
+    }
+  ],
+  "production_go_changes_since_abefbd351": [],
+  "workflow_yaml_changes_since_abefbd351": []
+}
