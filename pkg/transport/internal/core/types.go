@@ -43,11 +43,14 @@ const (
 	FrameKindRPCRequest
 	FrameKindRPCResponse
 	FrameKindControl
+	// Budgeted requests and cancellation use negotiated wire version 2.
+	FrameKindRPCBudgetRequest
+	FrameKindRPCCancel
 )
 
 // Valid reports whether the frame kind is known to this transport version.
 func (k FrameKind) Valid() bool {
-	return k >= FrameKindData && k <= FrameKindControl
+	return k >= FrameKindData && k <= FrameKindRPCCancel
 }
 
 // Discovery resolves node IDs to dialable network addresses.
@@ -63,8 +66,19 @@ type Observer interface {
 	ObserveTransport(event Event)
 }
 
+// DurationSamples contains one-in-32 latency samples collected before observer delivery.
+// Counters remain exact even when the bounded sample reservoir overflows.
+type DurationSamples struct {
+	Values [32]time.Duration
+	Len    int
+}
+
 // Event describes a transport lifecycle, scheduling, or service observation.
 type Event struct {
+	// Count is the number of counter events represented; zero means one legacy event.
+	Count uint64
+	// Samples is non-nil for aggregated duration events, including empty samples.
+	Samples *DurationSamples
 	// Name identifies the observed transport event.
 	Name string
 	// NodeID is the peer or local node associated with the event.
@@ -81,6 +95,9 @@ type Event struct {
 	Kind FrameKind
 	// Result classifies the event outcome.
 	Result string
+	// Revision orders absolute state from the physical source. Zero denotes an
+	// unversioned event whose arrival order remains authoritative.
+	Revision uint64
 	// Items is the queued item count or current count associated with the event.
 	Items int
 	// Capacity is the queued item capacity associated with the event.
@@ -99,6 +116,18 @@ type Event struct {
 	PoolWaiting int
 	// Duration is the elapsed time associated with the event.
 	Duration time.Duration
+}
+
+var transportStateRevision atomic.Uint64
+
+// NextStateRevision returns a process-monotonic revision for absolute
+// transport state captured under its physical owner lock.
+func NextStateRevision() uint64 {
+	for {
+		if revision := transportStateRevision.Add(1); revision != 0 {
+			return revision
+		}
+	}
 }
 
 // Stats is a point-in-time snapshot of transport counters.
@@ -168,10 +197,20 @@ type ServiceOptions struct {
 	Concurrency int
 	// QueueSize is the maximum queued item count for this service; it must be positive.
 	QueueSize int
-	// MaxQueueBytes is the maximum queued payload bytes for this service; it must be positive.
+	// MaxQueueBytes bounds queued backing bytes for this service; it must be positive.
 	MaxQueueBytes int64
-	// Timeout bounds handler execution for this service; zero disables per-request handler timeout.
+	// MaxRetainedBytes bounds queued plus executing request backing bytes. Zero
+	// defaults to twice MaxQueueBytes. Charges remain until payload release.
+	MaxRetainedBytes int64
+	// Timeout bounds the handler context; handlers must cooperate with cancellation.
+	// Zero disables this execution deadline. Ownership remains charged until return.
 	Timeout time.Duration
+	// QueueTimeout bounds time from service admission to executor dispatch. Zero
+	// disables this service-level limit; a propagated caller deadline still applies.
+	QueueTimeout time.Duration
+	// CancelRunning permits a caller deadline, cancellation or disconnect to stop
+	// an executing handler. Keep false for mutations that must finish once started.
+	CancelRunning bool
 	// MaxPayload bounds accepted payload bytes for this service; zero means use the transport frame limit.
 	MaxPayload int
 }
@@ -186,6 +225,12 @@ func (o ServiceOptions) Validate() error {
 	}
 	if o.MaxQueueBytes <= 0 {
 		return fmt.Errorf("%w: service max queue bytes must be positive", ErrInvalidConfig)
+	}
+	if o.MaxRetainedBytes < 0 {
+		return fmt.Errorf("%w: service max retained bytes must be non-negative", ErrInvalidConfig)
+	}
+	if o.QueueTimeout < 0 {
+		return fmt.Errorf("%w: service queue timeout must be non-negative", ErrInvalidConfig)
 	}
 	if o.Timeout < 0 {
 		return fmt.Errorf("%w: service timeout must be non-negative", ErrInvalidConfig)
@@ -211,11 +256,32 @@ func (e RemoteError) Error() string {
 	return fmt.Sprintf("%s: %s", e.Code, e.Message)
 }
 
+// Unwrap preserves explicitly typed transport failures without classifying text.
+func (e RemoteError) Unwrap() error {
+	switch e.Code {
+	case RemoteErrorCodeTimeout:
+		return ErrTimeout
+	case RemoteErrorCodeCanceled:
+		return ErrCanceled
+	case RemoteErrorCodeBusy:
+		return ErrBusy
+	case RemoteErrorCodeStopped:
+		return ErrStopped
+	default:
+		return nil
+	}
+}
+
 const (
 	// RemoteErrorCodeGeneric identifies an unclassified remote handler error.
 	RemoteErrorCodeGeneric = "remote_error"
 	// RemoteErrorCodeServiceNotFound identifies an RPC service absent on the remote node.
 	RemoteErrorCodeServiceNotFound = "service_not_found"
+	// These codes preserve retry/cancellation identity across an RPC boundary.
+	RemoteErrorCodeTimeout  = "timeout"
+	RemoteErrorCodeCanceled = "canceled"
+	RemoteErrorCodeBusy     = "busy"
+	RemoteErrorCodeStopped  = "stopped"
 )
 
 var (
@@ -233,9 +299,11 @@ var (
 )
 
 type ownedState struct {
-	data     []byte
-	release  func([]byte)
-	released atomic.Bool
+	// retainedBytes includes pool capacity hidden from the payload slice.
+	retainedBytes int
+	data          []byte
+	release       func([]byte)
+	released      atomic.Bool
 }
 
 // OwnedBuffer carries payload bytes plus explicit release ownership.
@@ -249,12 +317,35 @@ func NewOwnedBuffer(data []byte, release func([]byte)) OwnedBuffer {
 	if release == nil {
 		return OwnedBuffer{data: data}
 	}
-	return OwnedBuffer{state: &ownedState{data: data, release: release}}
+	return NewOwnedBufferWithCost(data, cap(data), release)
+}
+
+// NewOwnedBufferWithCost records the backing allocation retained by a pooled buffer.
+// The cost cannot be smaller than the visible capacity. Payload capacity may be
+// capped independently to prevent callers from writing beyond their owned bytes.
+func NewOwnedBufferWithCost(data []byte, retainedBytes int, release func([]byte)) OwnedBuffer {
+	if retainedBytes < cap(data) {
+		retainedBytes = cap(data)
+	}
+	return OwnedBuffer{state: &ownedState{data: data, retainedBytes: retainedBytes, release: release}}
+}
+
+// RetainedBytes returns the backing-byte admission cost, excluding object headers.
+// Callers wrapping a subslice must retain ownership of its backing allocation.
+func (b OwnedBuffer) RetainedBytes() int {
+	if b.state == nil {
+		return cap(b.data)
+	}
+	if b.state.released.Load() {
+		return 0
+	}
+	return b.state.retainedBytes
 }
 
 // CopyOwnedBuffer copies bytes into a new owned buffer.
 func CopyOwnedBuffer(data []byte) OwnedBuffer {
-	copied := append([]byte(nil), data...)
+	copied := make([]byte, len(data))
+	copy(copied, data)
 	return NewOwnedBuffer(copied, nil)
 }
 

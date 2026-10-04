@@ -1,112 +1,143 @@
 ---
 title: Linux
-description: Build the WuKongIM binary and supervise a node with explicit configuration, persistent directories, and systemd.
+description: Choose a package manager, initialize a single-node cluster, and verify readiness and Manager access.
 ---
 
-The Linux path fits teams that want direct control over hosts, filesystems, networking, and service lifecycle. The systemd unit below is an operator-owned reference template, not a repository release package.
+Install a single-node cluster with APT or DNF, then start it with systemd. Current preview: `WK_CURRENT_RELEASE_TAG` · amd64/x86_64.
 
-## 1. Build and record the artifact
+<Callout type="warn" title="Preview is a prerelease channel">
+  Validate it outside production before serving production traffic.
+</Callout>
 
-The repository currently requires Go `1.25.11`:
+<details>
+  <summary>Supported distributions and architecture</summary>
 
-```bash
-git rev-parse HEAD
-go version
-GOWORK=off go build -trimpath -o ./bin/wukongim ./cmd/wukongim
-sha256sum ./bin/wukongim
+The preview repository supports amd64/x86_64. It is verified on Ubuntu 24.04, Debian 13, Rocky Linux 9, and AlmaLinux 9; RHEL 9 can use the same EL9 repository.
+
+</details>
+
+<div className="tutorial-diagram">
+
+```mermaid
+flowchart TD
+  install["①Choose OS and install"] --> init["②Initialize config<br/>Save admin password"]
+  init --> ready["③Verify readiness<br/>Then admit traffic"]
 ```
 
-Build in an isolated environment and record the commit SHA, Go version, and SHA-256 in the release record. Do not build independently from a moving branch on every production node.
+</div>
 
-## 2. Install the account, binary, and configuration
+## 1. Install
 
-```bash
-sudo useradd --system \
-  --home-dir /var/lib/wukongim \
-  --shell /usr/sbin/nologin \
-  wukongim
+Choose your distribution and expand its commands.
 
-sudo install -m 0755 ./bin/wukongim /usr/local/bin/wukongim
-sudo install -d -o root -g wukongim -m 0750 /etc/wukongim
-sudo install -o root -g wukongim -m 0640 \
-  ./wukongim.toml.example \
-  /etc/wukongim/wukongim.toml
-```
+### Debian / Ubuntu
 
-Edit `/etc/wukongim/wukongim.toml`:
-
-- set `node.data_dir = "/var/lib/wukongim"`;
-- set `log.dir = "/var/log/wukongim"`;
-- set `plugin.socket_path = "/run/wukongim/plugin.sock"`;
-- give the node a unique `node.id` and reachable cluster address;
-- replace the join token, Manager JWT secret, users, and every example credential;
-- set `api.external_tcp_addr`, `external_ws_addr`, or `external_wss_addr` to client-reachable addresses;
-- disable benchmark and debug APIs by default in production.
-
-The loader rejects unknown TOML keys and unknown `WK_*` environment variables. An explicit `-config` avoids lookup changes caused by the systemd working directory.
-
-## 3. Create the systemd unit
-
-Write `/etc/systemd/system/wukongim.service`:
-
-```ini
-[Unit]
-Description=WuKongIM cluster node
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=simple
-User=wukongim
-Group=wukongim
-ExecStart=/usr/local/bin/wukongim -config /etc/wukongim/wukongim.toml
-Restart=on-failure
-RestartSec=5s
-TimeoutStopSec=30s
-KillSignal=SIGTERM
-LimitNOFILE=1048576
-StateDirectory=wukongim
-LogsDirectory=wukongim
-RuntimeDirectory=wukongim
-StateDirectoryMode=0750
-LogsDirectoryMode=0750
-RuntimeDirectoryMode=0750
-NoNewPrivileges=true
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-```
-
-`StateDirectory`, `LogsDirectory`, and `RuntimeDirectory` create `/var/lib/wukongim`, `/var/log/wukongim`, and `/run/wukongim`. If data lives on a separate mounted disk, complete the mount and permissions before starting the service.
-
-## 4. Start and verify
+<details>
+  <summary>APT installation commands</summary>
 
 ```bash
-sudo systemctl daemon-reload
+curl -fsSL https://packages.githubim.com/repo | sudo sh
+sudo apt update
+sudo apt install -y wukongim
+```
+
+</details>
+
+### RHEL / Rocky / AlmaLinux 9
+
+<details>
+  <summary>DNF installation commands</summary>
+
+```bash
+curl -fsSL https://packages.githubim.com/repo | sudo sh
+sudo dnf -y --disablerepo='*' --enablerepo=wukongim-preview makecache --refresh
+sudo dnf install -y wukongim
+```
+
+</details>
+
+**Expected:** `wukongim` and `wkcli` have matching `version`, `commit`, and `build_source`; the service has not started yet.
+
+<details>
+  <summary>Verify binary identities and installation paths</summary>
+
+The same package installs the server and the unified operator CLI. Their `version`, `commit`, and `build_source` fields must match. See [wkcli](/en/server/tools/wkcli) for command usage. If `wkcli` is missing or its identity differs, check `command -v wkcli` for an older binary on `PATH` and update to the matching package.
+
+```bash
+wukongim version --output json
+wkcli version --output json
+```
+
+The package creates the service account, systemd service, `/etc/wukongim`, `/var/lib/wukongim`, and `/var/log/wukongim`. It does not create a configuration or start the service.
+
+</details>
+
+## 2. Initialize the configuration
+
+Run `sudo wukongim init`, **save the password shown only once**, then validate the config. Listeners use loopback by default; configure the firewall, TLS, and ingress before exposing them.
+
+**Expected:** `/etc/wukongim/wukongim.toml` exists and configuration validation succeeds.
+
+<details>
+  <summary>Initialize, validate, automate, and forward Demo ports</summary>
+
+```bash
+sudo wukongim init
+# For automation:
+sudo wukongim init \
+  --admin-password-stdin < /secure/path/manager-password
+```
+
+Save the administrator password, which is shown only once. Existing automation may keep using `wukongim config init --config /etc/wukongim/wukongim.toml`. Then validate the configuration:
+
+```bash
+sudo wukongim config validate --config /etc/wukongim/wukongim.toml
+```
+
+Services bind to loopback by default. Configure the firewall, TLS, and ingress policy before exposing them.
+
+Initialization binds WebSocket to `127.0.0.1:5200`, which `/route` preserves as a concrete listener address. Forward `5001`, `5200`, and `5301` as shown in [Quick Start](/en/guide/quick-start/single-node-cluster) to use the Demo without `api.external_ws_addr`. If the listener is changed to a wildcard, default external routing can complete its host from the request. Remapped external ports, separate domains, and TLS proxies still require explicit published addresses; see the [Docker address rules](/en/server/deployment/docker).
+
+</details>
+
+## 3. Start and verify
+
+Start the systemd service and check `/readyz`. **Admit traffic only after `200` with `ready: true`**; inspect service logs if the check fails.
+
+<details>
+  <summary>Start, check readiness, and inspect logs</summary>
+
+```bash
 sudo systemctl enable --now wukongim
-sudo systemctl status wukongim
-sudo journalctl -u wukongim -n 100 --no-pager
-
 curl --fail http://127.0.0.1:5001/readyz
 ```
 
-On `SIGTERM`, the process performs a graceful shutdown using the configured cluster stop budget; the reference unit provides a 30-second external ceiling. If `/healthz` succeeds while `/readyz` returns `503`, do not add the node to the load balancer. Inspect the response `reason` and service logs first.
+Add the node to traffic only after `/readyz` succeeds. If startup fails, inspect the logs:
 
-## Network and permissions
+```bash
+sudo journalctl -u wukongim -n 100 --no-pager
+```
 
-| Surface | Default policy |
-| --- | --- |
-| API / Gateway | Expose only to product services, client ingress, or controlled load balancers |
-| Manager | Management network with strong authentication; never direct public exposure |
-| `/metrics` | Monitoring collection network only |
-| Debug / benchmark / diagnostics | Disabled in production or limited to a temporary diagnostic window |
-| Node transport | Cluster nodes only |
+</details>
 
-WuKongIM does not replace production TLS termination or the external authentication boundary for product HTTP APIs. Use a reverse proxy, load balancer, or service mesh for certificates and access policy.
+**Open Manager:** create an SSH tunnel from your computer, then visit [127.0.0.1:5301](http://127.0.0.1:5301). Sign in as `admin` with the saved password. Keep `auth_on = true`; port `5301` needs no public access.
 
-## Upgrade boundary
+<details>
+  <summary>SSH tunnel and shared administration</summary>
 
-Do not overwrite a running binary. Validate the target commit and configuration outside production, stage the new binary, then remove one node at a time from traffic, stop it, replace the binary atomically, start it, and wait for `/readyz`. The complete rolling-upgrade, data-compatibility, and rollback matrix remains part of the planned upgrade documentation.
+The default Manager address is [http://127.0.0.1:5301](http://127.0.0.1:5301). Sign in as `admin` with the password saved during initialization and keep `auth_on = true`. For remote access, run the following on your computer, keep the terminal open, and open the same browser address:
 
-For multi-node configuration, continue to [Multi-node Cluster](/en/server/deployment/multi-node).
+```bash
+ssh -N -L 127.0.0.1:5301:127.0.0.1:5301 <user>@<server-ip>
+```
+
+Port `5301` does not need a public firewall rule. For shared administration, use a management network or VPN with an HTTPS proxy; see [Manager](/en/server/operations/manager).
+
+</details>
+
+<Cards>
+  <Card title="Configure client addresses" description="Connect through domains, TLS, or remapped ports." href="/en/server/configuration/networking" />
+  <Card title="Deploy multiple nodes" description="Start with three servers for replication and recovery." href="/en/server/deployment/multi-node" />
+</Cards>
+
+For multiple nodes, continue to [Multi-node Cluster](/en/server/deployment/multi-node). Before upgrading, read [Upgrade & Migration](/en/server/operations/upgrade-and-migration).

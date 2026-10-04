@@ -150,3 +150,26 @@ func cloneBytes(in []byte) []byte {
 	copy(out, in)
 	return out
 }
+
+// ListMessageEventStatesBySequence adapts the cluster's durable sequence page
+// without applying visibility policy or depending on an HTTP request type.
+func (s *MessageEventStore) ListMessageEventStatesBySequence(ctx context.Context, key message.MessageEventMessageKey, after uint64, eventKey string, limit int) ([]message.MessageEventState, error) {
+	if s == nil || s.node == nil {
+		return nil, message.ErrMessageEventStoreRequired
+	}
+	node, ok := s.node.(interface {
+		ListMessageEventStatesBySequence(context.Context, metadb.MessageEventSequenceQuery) ([]metadb.MessageEventState, error)
+	})
+	if !ok {
+		return nil, message.ErrMessageEventStoreRequired
+	}
+	states, err := node.ListMessageEventStatesBySequence(ctx, metadb.MessageEventSequenceQuery{ChannelID: key.ChannelID, ChannelType: key.ChannelType, ClientMsgNo: key.ClientMsgNo, AfterSeq: after, EventKey: eventKey, Limit: limit})
+	if err != nil {
+		return nil, mapMessageEventError(err)
+	}
+	out := make([]message.MessageEventState, len(states))
+	for i, s := range states {
+		out[i] = messageEventStateFromMeta(s)
+	}
+	return out, nil
+}

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	benchworkload "github.com/WuKongIM/WuKongIM/internal/bench/workload"
 	"github.com/WuKongIM/WuKongIM/pkg/bench/model"
@@ -134,6 +135,73 @@ type Assignment struct {
 	Scenario model.Scenario `json:"scenario,omitempty"`
 }
 
+// TrafficStatus is the fixed, low-cardinality measured-phase lifecycle
+// projection used by periodic status sampling and terminal reconciliation.
+type TrafficStatus struct {
+	// Planned is the number of logical messages offered by the measured scheduler.
+	Planned uint64 `json:"planned"`
+	// Dispatched is the number of planned logical messages admitted to the workload.
+	Dispatched uint64 `json:"dispatched"`
+	// LogicalSent is the number of distinct logical SEND identities admitted.
+	LogicalSent uint64 `json:"logical_sent"`
+	// SendAttempts counts all physical SEND attempts, including retries.
+	SendAttempts uint64 `json:"send_attempts"`
+	// SendACKs counts logical messages with a successful terminal SENDACK.
+	SendACKs uint64 `json:"sendacks"`
+	// WarmupSendACKs counts successful terminal SENDACKs from the strict warmup
+	// phase. It is separate from the measured-only SendACKs denominator.
+	WarmupSendACKs uint64 `json:"warmup_sendacks"`
+	// TerminalErrors counts logical messages with a terminal SEND failure.
+	TerminalErrors uint64 `json:"terminal_errors"`
+	// CorrectnessErrors counts identity, correlation, delivery, or payload failures.
+	CorrectnessErrors uint64 `json:"correctness_errors"`
+	// Remaining is admitted logical work without a terminal outcome.
+	Remaining uint64 `json:"remaining"`
+	// RetryAttempts counts physical attempts after the first logical attempt.
+	RetryAttempts uint64 `json:"retry_attempts"`
+	// RetryExhausted counts logical messages that consumed the retry budget.
+	RetryExhausted uint64 `json:"retry_exhausted"`
+	// StableClientMsgNo reports whether all retry attempts reused their logical identity.
+	StableClientMsgNo bool `json:"stable_client_msg_no"`
+	// RetryEvidenceComplete reports whether the attempt lifecycle reconciles exactly.
+	RetryEvidenceComplete bool `json:"retry_evidence_complete"`
+	// MaximumRetriesPerMessage is the configured bound after the first attempt.
+	MaximumRetriesPerMessage uint8 `json:"max_retries"`
+}
+
+// LifecycleStatus is a bounded point-in-time worker lifecycle observation.
+type LifecycleStatus struct {
+	// TerminalPreClose marks an immutable lifecycle cut captured after drain
+	// convergence and before assignment-scoped sessions were closed. When true,
+	// ActiveConnections is provenance evidence, not the worker's current state.
+	TerminalPreClose bool `json:"terminal_pre_close"`
+	// ActiveConnections is the current connected session count, not cumulative connects.
+	ActiveConnections int `json:"active_connections"`
+	// ReconnectedUsers is the cumulative reconnect churn for this assignment.
+	ReconnectedUsers uint64 `json:"reconnected_users"`
+	// Traffic contains exact worker-wide SEND lifecycle counters.
+	Traffic TrafficStatus `json:"traffic"`
+	// ReceiveDrain contains the bounded worker/client receive convergence proof.
+	ReceiveDrain model.ReceiveDrainSnapshot `json:"receive_drain"`
+	// ReceiveDrainSHA256 binds this exact receive proof to an external terminal
+	// product cut without exposing any connection identity.
+	ReceiveDrainSHA256 string `json:"receive_drain_sha256"`
+	// TerminalCutRequired reports that cooldown must wait for an external
+	// pre-close evidence acknowledgement before sessions may be released.
+	TerminalCutRequired bool `json:"terminal_cut_required,omitempty"`
+	// TerminalCutReady reports that admitted and receive work converged while
+	// the exact assignment's sessions remain open.
+	TerminalCutReady bool `json:"terminal_cut_ready,omitempty"`
+	// TerminalCutReadyAt is the server clock instant at which the runner first
+	// exposed the external barrier.
+	TerminalCutReadyAt time.Time `json:"terminal_cut_ready_at,omitempty"`
+	// TerminalCutDeadlineAt is the immutable outer cooldown deadline. External
+	// observers must leave enough time to publish their exact acknowledgement.
+	TerminalCutDeadlineAt time.Time `json:"terminal_cut_deadline_at,omitempty"`
+	// TerminalCut is the immutable exact-generation external evidence binding.
+	TerminalCut *TerminalCutBinding `json:"terminal_cut,omitempty"`
+}
+
 // Status is a JSON-friendly snapshot of the worker control state.
 type Status struct {
 	// Phase is the worker's current lifecycle phase.
@@ -148,6 +216,10 @@ type Status struct {
 	LastErrorCode FailureReasonCode `json:"last_error_code,omitempty"`
 	// LastErrorOperation identifies a safe low-cardinality workload operation when known.
 	LastErrorOperation FailureOperationCode `json:"last_error_operation,omitempty"`
+	// ObservedAt is the server-side UTC time of a live /v1/status observation.
+	ObservedAt time.Time `json:"observed_at,omitempty"`
+	// Lifecycle is the bounded live workload projection when the runner supports it.
+	Lifecycle *LifecycleStatus `json:"lifecycle,omitempty"`
 	// Assignment is the active or most recently stopped assignment.
 	Assignment Assignment `json:"assignment"`
 }
@@ -165,18 +237,38 @@ type statusJSON struct {
 	LastError          string                   `json:"last_error,omitempty"`
 	LastErrorCode      FailureReasonCode        `json:"last_error_code,omitempty"`
 	LastErrorOperation FailureOperationCode     `json:"last_error_operation,omitempty"`
+	ObservedAt         *time.Time               `json:"observed_at,omitempty"`
+	Lifecycle          *LifecycleStatus         `json:"lifecycle,omitempty"`
 	Assignment         statusAssignmentIdentity `json:"assignment"`
 }
 
 // MarshalJSON keeps the worker control response independent from assignment plan size.
 func (s Status) MarshalJSON() ([]byte, error) {
+	var observedAt *time.Time
+	if !s.ObservedAt.IsZero() {
+		observedAt = &s.ObservedAt
+	}
+	reason := s.LastErrorCode
+	if !reason.Valid() {
+		reason = ""
+	}
+	lastError := ""
+	if strings.TrimSpace(s.LastError) != "" {
+		lastError = safeFailureMessage(reason)
+	}
+	operation := s.LastErrorOperation
+	if !operation.Valid() {
+		operation = ""
+	}
 	return json.Marshal(statusJSON{
 		Phase:              s.Phase,
 		ActivePhase:        s.ActivePhase,
 		CompletedPhase:     s.CompletedPhase,
-		LastError:          s.LastError,
-		LastErrorCode:      s.LastErrorCode,
-		LastErrorOperation: s.LastErrorOperation,
+		LastError:          lastError,
+		LastErrorCode:      reason,
+		LastErrorOperation: operation,
+		ObservedAt:         observedAt,
+		Lifecycle:          s.Lifecycle,
 		Assignment: statusAssignmentIdentity{
 			RunID:        s.Assignment.RunID,
 			AssignmentID: s.Assignment.AssignmentID,
@@ -185,8 +277,8 @@ func (s Status) MarshalJSON() ([]byte, error) {
 	})
 }
 
-// State stores the active worker assignment and monotonic phase.
-type State struct {
+// assignmentState stores the active worker assignment and monotonic phase.
+type assignmentState struct {
 	mu                 sync.Mutex
 	workDir            string
 	phase              Phase
@@ -197,14 +289,14 @@ type State struct {
 	assignment         Assignment
 }
 
-// NewState creates empty worker assignment state. When workDir is non-empty,
+// newAssignmentState creates empty worker assignment state. When workDir is non-empty,
 // accepted assignments are persisted to current-run.json.
-func NewState(workDir string) *State {
-	return &State{workDir: workDir, phase: PhaseIdle}
+func newAssignmentState(workDir string) *assignmentState {
+	return &assignmentState{workDir: workDir, phase: PhaseIdle}
 }
 
 // Assign stores a run assignment unless another non-equivalent assignment is active.
-func (s *State) Assign(a Assignment) error {
+func (s *assignmentState) Assign(a Assignment) error {
 	a.RunID = strings.TrimSpace(a.RunID)
 	a.AssignmentID = strings.TrimSpace(a.AssignmentID)
 	a.WorkerID = strings.TrimSpace(a.WorkerID)
@@ -255,25 +347,8 @@ func assignmentsEqual(a, b Assignment) bool {
 	return string(aJSON) == string(bJSON)
 }
 
-// Transition advances the worker to the next expected phase or accepts an idempotent retry.
-func (s *State) Transition(next Phase) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.transitionLocked(next)
-}
-
-// TransitionForAssignment advances the phase only if the exact assignment generation matches.
-func (s *State) TransitionForAssignment(runID, assignmentID string, next Phase) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !assignmentIdentityMatches(s.assignment, runID, assignmentID) {
-		return assignmentIdentityConflict(s.assignment, runID, assignmentID)
-	}
-	return s.transitionLocked(next)
-}
-
 // BeginPhaseForAssignment starts a phase hook if it is not already running or complete.
-func (s *State) BeginPhaseForAssignment(runID, assignmentID string, next Phase) (Status, bool, error) {
+func (s *assignmentState) BeginPhaseForAssignment(runID, assignmentID string, next Phase) (Status, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !assignmentIdentityMatches(s.assignment, runID, assignmentID) {
@@ -299,7 +374,7 @@ func (s *State) BeginPhaseForAssignment(runID, assignmentID string, next Phase) 
 }
 
 // CompletePhaseForAssignment records the terminal result of an asynchronous phase hook.
-func (s *State) CompletePhaseForAssignment(runID, assignmentID string, phase Phase, phaseErr error) error {
+func (s *assignmentState) CompletePhaseForAssignment(runID, assignmentID string, phase Phase, phaseErr error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !assignmentIdentityMatches(s.assignment, runID, assignmentID) {
@@ -310,8 +385,8 @@ func (s *State) CompletePhaseForAssignment(runID, assignmentID string, phase Pha
 	}
 	s.active = ""
 	if phaseErr != nil {
-		s.lastError = phaseErr.Error()
 		s.lastErrorCode = failureReasonForError(phaseErr)
+		s.lastError = safeFailureMessage(s.lastErrorCode)
 		s.lastErrorOperation = failureOperationForError(phaseErr)
 		return nil
 	}
@@ -321,7 +396,7 @@ func (s *State) CompletePhaseForAssignment(runID, assignmentID string, phase Pha
 	return s.transitionLocked(phase)
 }
 
-func (s *State) transitionLocked(next Phase) error {
+func (s *assignmentState) transitionLocked(next Phase) error {
 	if s.phase == next {
 		return nil
 	}
@@ -332,23 +407,8 @@ func (s *State) transitionLocked(next Phase) error {
 	return nil
 }
 
-// Stop marks the current assignment as stopped. Idle workers cannot be stopped.
-func (s *State) Stop() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.assignment.RunID == "" || s.phase == PhaseIdle {
-		return fmt.Errorf("%w: %s to %s", ErrInvalidPhaseTransition, s.phase, PhaseStopped)
-	}
-	s.phase = PhaseStopped
-	s.active = ""
-	s.lastError = ""
-	s.lastErrorCode = ""
-	s.lastErrorOperation = ""
-	return nil
-}
-
 // StopForAssignment marks only the exact active assignment generation stopped.
-func (s *State) StopForAssignment(runID, assignmentID string) error {
+func (s *assignmentState) StopForAssignment(runID, assignmentID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !assignmentIdentityMatches(s.assignment, runID, assignmentID) {
@@ -381,13 +441,13 @@ func assignmentIdentityConflict(active Assignment, runID, assignmentID string) e
 }
 
 // Status returns a copy of the current worker control state.
-func (s *State) Status() Status {
+func (s *assignmentState) Status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.statusLocked()
 }
 
-func (s *State) statusLocked() Status {
+func (s *assignmentState) statusLocked() Status {
 	return Status{
 		Phase:              s.phase,
 		ActivePhase:        s.active,
@@ -412,6 +472,24 @@ func failureReasonForError(err error) FailureReasonCode {
 		return FailureReasonTargetUnavailable
 	}
 	return FailureReasonPhaseHookFailed
+}
+
+// safeFailureMessage maps the closed reason code to retained control-plane
+// text. Raw workload and transport errors remain available only through the
+// in-process error chain and never enter status or HTTP JSON.
+func safeFailureMessage(reason FailureReasonCode) string {
+	switch reason {
+	case FailureReasonPhaseHookFailed:
+		return "worker phase hook failed"
+	case FailureReasonTCPSourceUnavailable:
+		return "tcp source unavailable"
+	case FailureReasonTCPSourcePoolExhausted:
+		return "tcp source pool exhausted"
+	case FailureReasonTargetUnavailable:
+		return "target unavailable"
+	default:
+		return "worker operation failed"
+	}
 }
 
 // failureOperationForError maps typed session failures to a fixed operation code.
@@ -446,19 +524,25 @@ func failureOperationForError(err error) FailureOperationCode {
 	}
 }
 
-func (s *State) persistAssignment(a Assignment) error {
+func (s *assignmentState) persistAssignment(a Assignment) error {
 	if s.workDir == "" {
 		return nil
 	}
 	if err := os.MkdirAll(s.workDir, 0o755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(a, "", "  ")
+	// The live assignment needs the benchmark API credential, but the durable
+	// recovery hint must never become a second credential store. Persist a
+	// value copy with the secret cleared and keep the in-memory assignment
+	// unchanged for the active runner.
+	persisted := a
+	persisted.Target.BenchAPI.Token = ""
+	data, err := json.MarshalIndent(persisted, "", "  ")
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
-	return os.WriteFile(filepath.Join(s.workDir, "current-run.json"), data, 0o644)
+	return os.WriteFile(filepath.Join(s.workDir, "current-run.json"), data, 0o600)
 }
 
 func canTransition(current, next Phase) bool {

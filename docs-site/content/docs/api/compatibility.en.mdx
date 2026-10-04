@@ -1,0 +1,28 @@
+---
+title: API Versions & Compatibility
+description: Separate complete source contracts, narrow profiles, and end-to-end verification scope.
+---
+
+API pages describe contracts for the current build. An unchanged URL does not make different server, SDK, or contract versions automatically compatible.
+
+## Current snapshot
+
+<CompatibilitySnapshot locale="en" />
+
+The snapshot's verification status covers only this basic integration flow:
+
+| Operation | Verified behavior |
+| --- | --- |
+| `POST /user/token` | Create a development identity |
+| `GET /route` | Discover WebSocket ingress |
+| `POST /channel/messagesync` | Recover committed messages after reconnect |
+
+The complete [WuKongIM HTTP API OpenAPI](/contracts/product-http.openapi.json) covers all 44 current registrations; Operations and Webhooks have separate contracts. Three narrow profiles remain available for controlled adoption, but the end-to-end status above covers only the three basic-integration operations. Source alignment, Schema checks, and protocol pages do not expand that runtime evidence.
+
+## Version rules
+
+- Revalidate the application flow after changing the server, SDK, or contract.
+- Treat an unverified combination as unknown, not compatible by default.
+- Use the complete contract for the current source surface and a narrow profile for a specific adoption scope.
+
+Compatibility does not make an API safe for public exposure. Keep WuKongIM HTTP API behind a trusted network or authenticated proxy; see the [Interface Inventory](/en/api/interface-inventory) for private and experimental boundaries.

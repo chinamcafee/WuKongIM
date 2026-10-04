@@ -15,6 +15,7 @@ const (
 	channelAppendResultChannelBusy        = "channel_busy"
 	channelAppendResultRouteNotReady      = "route_not_ready"
 	channelAppendResultStaleRoute         = "stale_route"
+	channelAppendResultStaleCompletion    = "stale_completion"
 	channelAppendResultNotAuthority       = "not_authority"
 	channelAppendResultNotLeader          = "not_leader"
 	channelAppendResultChannelNotFound    = "channel_not_found"
@@ -96,6 +97,26 @@ func observeEffect(observer AppendObserver, event EffectObservation) {
 		event.Result = channelAppendResultOther
 	}
 	effectObserver.ObserveChannelAppendEffect(event)
+}
+
+func observeIdempotencyRecovery(observer AppendObserver, event IdempotencyRecoveryObservation) {
+	recoveryObserver, ok := observer.(IdempotencyRecoveryObserver)
+	if !ok || recoveryObserver == nil {
+		return
+	}
+	if event.RecoveredItems < 0 {
+		event.RecoveredItems = 0
+	}
+	if event.UnresolvedItems < 0 {
+		event.UnresolvedItems = 0
+	}
+	if event.LookupErrorItems < 0 {
+		event.LookupErrorItems = 0
+	}
+	if event.RecoveredItems == 0 && event.UnresolvedItems == 0 && event.LookupErrorItems == 0 {
+		return
+	}
+	recoveryObserver.ObserveChannelAppendIdempotencyRecovery(event)
 }
 
 func observePostCommitFailure(observer AppendObserver, event PostCommitFailureObservation) {

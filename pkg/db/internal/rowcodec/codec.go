@@ -121,6 +121,8 @@ func (w *Writer) begin(columnID uint16, typ Type) error {
 
 // Scanner decodes a family payload one column at a time.
 type Scanner struct {
+	// borrow avoids intermediate column copies while accessors still own results.
+	borrow   bool
 	data     []byte
 	columnID uint16
 	typ      Type
@@ -135,6 +137,13 @@ type Scanner struct {
 // NewScanner returns a scanner over payload.
 func NewScanner(payload []byte) *Scanner {
 	return &Scanner{data: payload}
+}
+
+// NewBorrowedScanner borrows the input through the entire synchronous scan.
+// The caller must not mutate payload while scanning. String and Bytes still
+// return owned values that survive input reuse and subsequent Next calls.
+func NewBorrowedScanner(payload []byte) *Scanner {
+	return &Scanner{data: payload, borrow: true}
 }
 
 // Next advances to the next column.
@@ -215,6 +224,16 @@ func (s *Scanner) Bytes() ([]byte, error) {
 	return append([]byte(nil), s.bytes...), nil
 }
 
+// BorrowedBytes exposes the current bytes only for synchronous decoding. The
+// caller must not mutate or retain the view beyond the next scanner operation
+// or reuse of the scanner input. Use Bytes when the result must own its storage.
+func (s *Scanner) BorrowedBytes() ([]byte, error) {
+	if err := s.require(TypeBytes); err != nil {
+		return nil, err
+	}
+	return s.bytes, nil
+}
+
 // Int64 returns the current value as an int64.
 func (s *Scanner) Int64() (int64, error) {
 	if err := s.require(TypeInt64); err != nil {
@@ -259,7 +278,11 @@ func (s *Scanner) readValue() bool {
 			s.err = fmt.Errorf("%w: bytes payload truncated", dberrors.ErrCorruptValue)
 			return false
 		}
-		s.bytes = append([]byte(nil), rest[:length]...)
+		if s.borrow {
+			s.bytes = rest[:length]
+		} else {
+			s.bytes = append([]byte(nil), rest[:length]...)
+		}
 		s.data = rest[length:]
 		return true
 	case TypeInt64, TypeUint64:

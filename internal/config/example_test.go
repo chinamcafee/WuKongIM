@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	managementusecase "github.com/WuKongIM/WuKongIM/internal/usecase/management"
 )
 
 func TestRootTOMLExampleLoads(t *testing.T) {
@@ -20,14 +22,12 @@ func TestRootTOMLExampleLoads(t *testing.T) {
 	if cfg.Cluster.Slots.HashSlotCount != 256 {
 		t.Fatalf("HashSlotCount = %d, want 256", cfg.Cluster.Slots.HashSlotCount)
 	}
-	if cfg.Cluster.Slots.InitialSlotCount != 10 {
-		t.Fatalf("InitialSlotCount = %d, want 10", cfg.Cluster.Slots.InitialSlotCount)
+	if cfg.Cluster.Slots.InitialSlotCount != 12 {
+		t.Fatalf("InitialSlotCount = %d, want 12", cfg.Cluster.Slots.InitialSlotCount)
 	}
-	if cfg.Cluster.Channel.RPCWorkers != 160 || cfg.Cluster.Channel.RPCBatchMaxItems != 16 {
-		t.Fatalf("Channel RPC workers/batch = %d/%d, want 160/16", cfg.Cluster.Channel.RPCWorkers, cfg.Cluster.Channel.RPCBatchMaxItems)
-	}
-	if cfg.Cluster.Storage.CommitShards != 4 {
-		t.Fatalf("CommitShards = %d, want 4", cfg.Cluster.Storage.CommitShards)
+	assertQualified2000QPSRuntimeProfile(t, cfg.StartupConfigSnapshot)
+	if cfg.Cluster.Storage.CommitShards != 1 {
+		t.Fatalf("CommitShards = %d, want 1", cfg.Cluster.Storage.CommitShards)
 	}
 }
 
@@ -38,11 +38,9 @@ func TestScriptThreeNodeClusterUsesQPSValidatedRPCDefaults(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Load(%s) error = %v", path, err)
 		}
-		if cfg.Cluster.Channel.RPCWorkers != 160 || cfg.Cluster.Channel.RPCBatchMaxItems != 16 {
-			t.Fatalf("%s Channel RPC workers/batch = %d/%d, want 160/16", path, cfg.Cluster.Channel.RPCWorkers, cfg.Cluster.Channel.RPCBatchMaxItems)
-		}
-		if cfg.Cluster.Storage.CommitShards != 4 {
-			t.Fatalf("%s CommitShards = %d, want 4", path, cfg.Cluster.Storage.CommitShards)
+		assertQualified2000QPSRuntimeProfile(t, cfg.StartupConfigSnapshot)
+		if cfg.Cluster.Storage.CommitShards != 1 {
+			t.Fatalf("%s CommitShards = %d, want 1", path, cfg.Cluster.Storage.CommitShards)
 		}
 	}
 }
@@ -55,24 +53,24 @@ func TestCommandTOMLExampleLoads(t *testing.T) {
 	if cfg.Cluster.Control.ClusterID != "wukongim-single" {
 		t.Fatalf("ClusterID = %q, want wukongim-single", cfg.Cluster.Control.ClusterID)
 	}
-	if cfg.Cluster.Slots.InitialSlotCount != 10 || cfg.Cluster.Slots.HashSlotCount != 256 {
-		t.Fatalf("cmd topology = logical Slot Groups %d / physical hash slots %d, want 10 / 256", cfg.Cluster.Slots.InitialSlotCount, cfg.Cluster.Slots.HashSlotCount)
+	if cfg.Cluster.Slots.InitialSlotCount != 12 || cfg.Cluster.Slots.HashSlotCount != 256 {
+		t.Fatalf("cmd topology = logical Slot Groups %d / physical hash slots %d, want 12 / 256", cfg.Cluster.Slots.InitialSlotCount, cfg.Cluster.Slots.HashSlotCount)
 	}
-	if cfg.Cluster.Channel.RPCBatchMaxItems != 16 {
-		t.Fatalf("RPCBatchMaxItems = %d, want 16", cfg.Cluster.Channel.RPCBatchMaxItems)
-	}
+	assertQualified2000QPSRuntimeProfile(t, cfg.StartupConfigSnapshot)
 }
 
-func TestScriptSingleNodeClusterUsesTenLogicalAndDefaultPhysicalSlots(t *testing.T) {
-	cfg, err := Load(Options{Args: []string{"-config", filepath.Join("..", "..", "scripts", "wukongim", "wukongim.toml")}, Environ: cleanEnv()})
+func TestScriptSingleNodeClusterUsesTwelveLogicalAndDefaultPhysicalSlots(t *testing.T) {
+	path := filepath.Join("..", "..", "scripts", "wukongim", "wukongim.toml")
+	cfg, err := Load(Options{Args: []string{"-config", path}, Environ: cleanEnv()})
 	if err != nil {
 		t.Fatalf("Load(script example) error = %v", err)
 	}
-	if cfg.Cluster.Slots.InitialSlotCount != 10 || cfg.Cluster.Slots.HashSlotCount != 256 {
-		t.Fatalf("script topology = logical Slot Groups %d / physical hash slots %d, want 10 / 256", cfg.Cluster.Slots.InitialSlotCount, cfg.Cluster.Slots.HashSlotCount)
+	if cfg.Cluster.Slots.InitialSlotCount != 12 || cfg.Cluster.Slots.HashSlotCount != 256 {
+		t.Fatalf("script topology = logical Slot Groups %d / physical hash slots %d, want 12 / 256", cfg.Cluster.Slots.InitialSlotCount, cfg.Cluster.Slots.HashSlotCount)
 	}
-	if cfg.Cluster.Channel.RPCBatchMaxItems != 16 {
-		t.Fatalf("RPCBatchMaxItems = %d, want 16", cfg.Cluster.Channel.RPCBatchMaxItems)
+	assertQualified2000QPSRuntimeProfile(t, cfg.StartupConfigSnapshot)
+	if cfg.Cluster.Storage.CommitShards != 1 {
+		t.Fatalf("%s CommitShards = %d, want 1", path, cfg.Cluster.Storage.CommitShards)
 	}
 }
 
@@ -91,7 +89,7 @@ func TestV2WKYAMLEquivalentTOMLLoads(t *testing.T) {
 	if cfg.Cluster.Slots.ReplicaCount != 1 || cfg.Cluster.Channel.ReplicaCount != 1 || cfg.Cluster.Slots.HashSlotCount != 256 {
 		t.Fatalf("replica config = slots:%d channels:%d hash_slots:%d", cfg.Cluster.Slots.ReplicaCount, cfg.Cluster.Channel.ReplicaCount, cfg.Cluster.Slots.HashSlotCount)
 	}
-	if cfg.API.ListenAddr != "127.0.0.1:5001" || cfg.API.ExternalTCPAddr != "192.168.10.109:5100" || cfg.API.ExternalWSAddr != "ws://192.168.10.109:5200" {
+	if cfg.API.ListenAddr != "127.0.0.1:5001" || cfg.API.ExternalTCPAddr != "192.168.10.110:5100" || cfg.API.ExternalWSAddr != "ws://192.168.10.110:5200" {
 		t.Fatalf("API config = %#v", cfg.API)
 	}
 	if cfg.Manager.ListenAddr != "127.0.0.1:5300" || !cfg.Manager.AuthOn || len(cfg.Manager.Users) != 1 {
@@ -134,6 +132,47 @@ func TestSingleNodeClusterPrometheusExamplesUseDedicatedDefaultPort(t *testing.T
 	}
 }
 
+func TestGatewayExamplesUseQualifiedAsyncSendBatchLimit(t *testing.T) {
+	files := []string{filepath.Join("..", "..", "wukongim.toml.example")}
+	for _, pattern := range []string{
+		filepath.Join("..", "..", "cmd", "wukongim", "*.toml.example"),
+		filepath.Join("..", "..", "scripts", "wukongim", "*.toml"),
+	} {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			t.Fatalf("Glob(%s) error = %v", pattern, err)
+		}
+		files = append(files, matches...)
+	}
+
+	foundGateway := 0
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("ReadFile(%s) error = %v", file, err)
+		}
+		if !strings.Contains(string(content), "[gateway]") {
+			continue
+		}
+		foundGateway++
+		want := "# Maximum SEND frames coalesced into one asynchronous gateway dispatch batch.\n" +
+			"# The 128-record limit is qualified for sustained high-QPS workloads.\n" +
+			"default_session_async_send_batch_max_records = 128"
+		if strings.Contains(filepath.ToSlash(file), "scripts/wukongim/wukongim-node") {
+			want = "# Maximum SEND frames coalesced into one asynchronous gateway dispatch batch.\n" +
+				"# The reviewed chat-lifecycle profile keeps one SEND per dispatch because each\n" +
+				"# sender already allows only one in-flight SENDACK operation.\n" +
+				"default_session_async_send_batch_max_records = 1"
+		}
+		if !strings.Contains(string(content), want) {
+			t.Errorf("%s must document the qualified gateway async SEND batch limit", file)
+		}
+	}
+	if foundGateway == 0 {
+		t.Fatal("no shipped [gateway] examples found")
+	}
+}
+
 func TestPresenceExamplesDocumentTouchMaxRoutesPerFlush(t *testing.T) {
 	files := []string{filepath.Join("..", "..", "wukongim.toml.example")}
 	for _, pattern := range []string{
@@ -169,6 +208,25 @@ func TestPresenceExamplesDocumentTouchMaxRoutesPerFlush(t *testing.T) {
 	}
 }
 
+func TestMessageExamplesDocumentSystemUID(t *testing.T) {
+	files := []string{
+		filepath.Join("..", "..", "wukongim.toml.example"),
+		filepath.Join("..", "..", "cmd", "wukongim", "wukongim.toml.example"),
+	}
+	want := "# System account UID used when a trusted message sender is omitted.\n" +
+		"# Omitted or empty values use the built-in ____system account.\n" +
+		"system_uid = \"____system\""
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("ReadFile(%s) error = %v", file, err)
+		}
+		if !strings.Contains(string(content), want) {
+			t.Errorf("%s must document message.system_uid with the required adjacent English comments", file)
+		}
+	}
+}
+
 func TestDeliveryExamplesDocumentRecipientWorkerConcurrency(t *testing.T) {
 	files := []string{filepath.Join("..", "..", "wukongim.toml.example")}
 	for _, pattern := range []string{
@@ -182,9 +240,10 @@ func TestDeliveryExamplesDocumentRecipientWorkerConcurrency(t *testing.T) {
 		files = append(files, matches...)
 	}
 
-	want := "# Maximum recipient-authority delivery batches processed concurrently by this node.\n" +
+	want := "# Maximum number of distinct Channels with delivery plans executing concurrently on this node.\n" +
+		"# Plans for one Channel stay FIFO; ready Channels share workers without hash-shard blocking.\n" +
 		"# This is independent from channel_append.recipient_authority_dispatch_concurrency.\n" +
-		"recipient_worker_concurrency = 100"
+		"recipient_worker_concurrency = 320"
 	foundDelivery := 0
 	for _, file := range files {
 		content, err := os.ReadFile(file)
@@ -201,5 +260,42 @@ func TestDeliveryExamplesDocumentRecipientWorkerConcurrency(t *testing.T) {
 	}
 	if foundDelivery == 0 {
 		t.Fatal("no shipped [delivery] examples found")
+	}
+}
+
+func TestDockerThreeNodeClusterUsesQualified2000QPSRuntimeProfile(t *testing.T) {
+	for node := 1; node <= 3; node++ {
+		path := filepath.Join("..", "..", "docker", "conf", fmt.Sprintf("node%d.toml", node))
+		cfg, err := Load(Options{Args: []string{"-config", path}, Environ: cleanEnv()})
+		if err != nil {
+			t.Fatalf("Load(%s) error = %v", path, err)
+		}
+		assertQualified2000QPSRuntimeProfile(t, cfg.StartupConfigSnapshot)
+	}
+}
+
+func assertQualified2000QPSRuntimeProfile(t *testing.T, snapshot managementusecase.NodeConfigSnapshot) {
+	t.Helper()
+	wants := map[string]string{
+		"WK_CLUSTER_CHANNEL_STORE_APPEND_WORKERS":      "128",
+		"WK_CLUSTER_CHANNEL_STORE_APPLY_WORKERS":       "8",
+		"WK_CLUSTER_CHANNEL_RPC_WORKERS":               "96",
+		"WK_CLUSTER_CHANNEL_RPC_BATCH_MAX_ITEMS":       "8",
+		"WK_GATEWAY_GNET_MULTICORE":                    "true",
+		"WK_GATEWAY_TOKEN_AUTH_ON":                     "true",
+		"WK_GATEWAY_GNET_NUM_EVENT_LOOP":               "4",
+		"WK_GATEWAY_RUNTIME_ASYNC_SEND_WORKERS":        "1000",
+		"WK_GATEWAY_RUNTIME_ASYNC_SEND_QUEUE_CAPACITY": "131072",
+		"WK_DELIVERY_RECIPIENT_WORKER_CONCURRENCY":     "320",
+	}
+	for key, want := range wants {
+		item, ok := snapshotItem(snapshot, key)
+		if !ok {
+			t.Errorf("startup snapshot missing %s", key)
+			continue
+		}
+		if item.Value != want {
+			t.Errorf("startup snapshot %s = %s, want %s", key, item.Value, want)
+		}
 	}
 }

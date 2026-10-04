@@ -2,7 +2,6 @@ package meta
 
 import (
 	"context"
-	"encoding/binary"
 	"sort"
 
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/dberrors"
@@ -692,12 +691,4 @@ func decodeConversationValueFields(value []byte) (uint64, uint64, int64, int64, 
 		return 0, 0, 0, 0, nil, err
 	}
 	return readSeq, deletedToSeq, activeAt, updatedAt, rest, nil
-}
-
-func readKeyInt64Ordered(src []byte) (int64, []byte, error) {
-	if len(src) < 8 {
-		return 0, nil, dberrors.ErrCorruptValue
-	}
-	ordered := binary.BigEndian.Uint64(src[:8])
-	return int64(ordered ^ (uint64(1) << 63)), src[8:], nil
 }

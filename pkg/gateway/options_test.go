@@ -100,18 +100,18 @@ func TestDefaultSessionOptions(t *testing.T) {
 	if opts.AsyncSendBatchMaxWait != time.Millisecond {
 		t.Fatalf("expected default async SEND batch wait 1ms, got %s", opts.AsyncSendBatchMaxWait)
 	}
-	if opts.AsyncSendBatchMaxRecords != 512 {
-		t.Fatalf("expected default async SEND batch records 512, got %d", opts.AsyncSendBatchMaxRecords)
+	if opts.AsyncSendBatchMaxRecords != 128 {
+		t.Fatalf("expected default async SEND batch records 128, got %d", opts.AsyncSendBatchMaxRecords)
 	}
 }
 
 func TestDefaultRuntimeOptions(t *testing.T) {
 	opts := gateway.DefaultRuntimeOptions()
-	if opts.AsyncSendWorkers <= 0 {
-		t.Fatalf("AsyncSendWorkers = %d, want > 0", opts.AsyncSendWorkers)
+	if opts.AsyncSendWorkers != 1000 {
+		t.Fatalf("AsyncSendWorkers = %d, want 1000", opts.AsyncSendWorkers)
 	}
-	if opts.AsyncSendQueueCapacity <= 0 {
-		t.Fatalf("AsyncSendQueueCapacity = %d, want > 0", opts.AsyncSendQueueCapacity)
+	if opts.AsyncSendQueueCapacity != 128*1024 {
+		t.Fatalf("AsyncSendQueueCapacity = %d, want %d", opts.AsyncSendQueueCapacity, 128*1024)
 	}
 	if opts.AsyncAuthWorkers <= 0 {
 		t.Fatalf("AsyncAuthWorkers = %d, want > 0", opts.AsyncAuthWorkers)
@@ -166,6 +166,35 @@ func TestNormalizeRuntimeOptionsUsesDefaultsForInvalidValues(t *testing.T) {
 	def := gateway.DefaultRuntimeOptions()
 	if opts != def {
 		t.Fatalf("normalized runtime options = %+v, want %+v", opts, def)
+	}
+}
+
+func TestNormalizeSessionOptionsPreservesLimitsAndDisablesBatchWait(t *testing.T) {
+	closeOnHandlerError := false
+	opts := gateway.NormalizeSessionOptions(gateway.SessionOptions{
+		MaxInboundBytes:          8 * 1024,
+		MaxOutboundBytes:         16 * 1024,
+		IdleTimeout:              30 * time.Second,
+		AsyncSendBatchMaxWait:    -1,
+		AsyncSendBatchMaxRecords: 32,
+		AsyncSendBatchMaxBytes:   64 * 1024,
+		CloseOnHandlerError:      &closeOnHandlerError,
+	})
+
+	if opts.MaxInboundBytes != 8*1024 || opts.MaxOutboundBytes != 16*1024 {
+		t.Fatalf("normalized byte limits = %d/%d", opts.MaxInboundBytes, opts.MaxOutboundBytes)
+	}
+	if opts.IdleTimeout != 30*time.Second {
+		t.Fatalf("IdleTimeout = %s, want 30s", opts.IdleTimeout)
+	}
+	if opts.AsyncSendBatchMaxWait != 0 {
+		t.Fatalf("AsyncSendBatchMaxWait = %s, want disabled", opts.AsyncSendBatchMaxWait)
+	}
+	if opts.AsyncSendBatchMaxRecords != 32 || opts.AsyncSendBatchMaxBytes != 64*1024 {
+		t.Fatalf("normalized batch bounds = %d records/%d bytes", opts.AsyncSendBatchMaxRecords, opts.AsyncSendBatchMaxBytes)
+	}
+	if opts.CloseOnHandlerError == nil || *opts.CloseOnHandlerError {
+		t.Fatal("explicit CloseOnHandlerError=false was not preserved")
 	}
 }
 

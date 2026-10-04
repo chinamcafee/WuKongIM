@@ -3,7 +3,7 @@ package channelappend
 import (
 	"context"
 	"errors"
-	"strconv"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -237,15 +237,14 @@ func TestInboxCoalesceReturnsOnWindowExpiry(t *testing.T) {
 func TestInboxCoalesceMergesSingleItemSubmissions(t *testing.T) {
 	appender := &recordingBatchAppenderForCoalesceTest{}
 	group := New(Options{
-		LocalNodeID:                1,
-		AuthorityShardCount:        1,
-		EffectPoolSize:             4,
-		AdmissionCapacityPerShard:  4096,
-		Appender:                   appender,
-		MessageID:                  newBenchmarkMessageIDs(1),
-		InboxCoalesceWindow:        20 * time.Millisecond,
-		InboxCoalesceMaxItems:      8,
-		ConversationActiveAdmitter: nil,
+		LocalNodeID:               1,
+		AuthorityShardCount:       1,
+		EffectPoolSize:            4,
+		AdmissionCapacityPerShard: 4096,
+		Appender:                  appender,
+		MessageID:                 newBenchmarkMessageIDs(1),
+		InboxCoalesceWindow:       20 * time.Millisecond,
+		InboxCoalesceMaxItems:     8,
 	})
 	if err := group.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -263,7 +262,7 @@ func TestInboxCoalesceMergesSingleItemSubmissions(t *testing.T) {
 	futures := make([]*Future, submissions)
 	for i := 0; i < submissions; i++ {
 		item := benchmarkSendItem("coalesce-merge")
-		item.Command.ClientMsgNo += "-" + strconv.Itoa(i)
+		item.Command.ClientMsgNo = fmt.Sprintf("coalesce-merge-%d", i)
 		future, err := group.SubmitLocal(context.Background(), target, []SendBatchItem{item})
 		if err != nil {
 			t.Fatalf("submit %d error = %v", i, err)
@@ -369,13 +368,13 @@ func (a *recordingBatchAppenderForCoalesceTest) sizes() []int {
 
 func TestAdvancePostCommitReusesEffectWithoutBleed(t *testing.T) {
 	group := New(Options{
-		LocalNodeID:                1,
-		AuthorityShardCount:        1,
-		EffectPoolSize:             4,
-		AdmissionCapacityPerShard:  4096,
-		Appender:                   &orderedAppender{},
-		MessageID:                  newBenchmarkMessageIDs(1),
-		ConversationActiveAdmitter: benchmarkNoopActiveAdmitter{},
+		LocalNodeID:               1,
+		AuthorityShardCount:       1,
+		EffectPoolSize:            4,
+		AdmissionCapacityPerShard: 4096,
+		Appender:                  &orderedAppender{},
+		MessageID:                 newBenchmarkMessageIDs(1),
+		PersistAfterEnqueuer:      &benchmarkPersistAfterEnqueuer{},
 	})
 	if err := group.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)

@@ -22,7 +22,6 @@ func TestConversationListMapsRequestToUsecaseAndReturnsPage(t *testing.T) {
 				ActiveAt:     1234,
 				ReadSeq:      3,
 				DeletedToSeq: 2,
-				SparseActive: true,
 				UpdatedAt:    1235,
 				Unread:       4,
 				LastMessage: &conversationusecase.LastMessage{
@@ -41,7 +40,10 @@ func TestConversationListMapsRequestToUsecaseAndReturnsPage(t *testing.T) {
 				ChannelID:   "g1",
 				ChannelType: int64(frame.ChannelTypeGroup),
 			},
-			HasMore: true,
+			HasMore:  true,
+			Done:     false,
+			Deletes:  []conversationusecase.ConversationKey{{ChannelID: "g-deleted", ChannelType: int64(frame.ChannelTypeGroup)}},
+			Coverage: 2001, TombstonesRetainedSince: 1000, ResetRequired: true,
 		},
 	}
 	srv := New(Options{Conversations: conversations})
@@ -50,7 +52,8 @@ func TestConversationListMapsRequestToUsecaseAndReturnsPage(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/conversation/list", bytes.NewBufferString(`{
 		"uid":"u1",
 		"limit":20,
-		"cursor":{"active_at":2000,"channel_id":"g0","channel_type":2}
+		"completed_coverage":900,
+		"cursor":"AQAAAAAAAAfQAAAAAAAAAAIAAmcw"
 	}`))
 	req.Header.Set("Content-Type", "application/json")
 
@@ -66,7 +69,6 @@ func TestConversationListMapsRequestToUsecaseAndReturnsPage(t *testing.T) {
 			"active_at":1234,
 			"read_seq":3,
 			"deleted_to_seq":2,
-			"sparse_active":true,
 			"unread":4,
 			"last_message":{
 				"header":{"no_persist":0,"red_dot":1,"sync_once":0},
@@ -79,8 +81,12 @@ func TestConversationListMapsRequestToUsecaseAndReturnsPage(t *testing.T) {
 				"payload":"aGVsbG8="
 			}
 		}],
-		"next_cursor":{"active_at":1234,"channel_id":"g1","channel_type":2},
-		"more":1
+		"deletes":[{"channel_id":"g-deleted","channel_type":2}],
+		"next_cursor":"AQAAAAAAAATSAAAAAAAAAAIAAmcx",
+		"done":false,
+		"coverage":2001,
+		"tombstones_retained_since":1000,
+		"reset_required":true
 	}`) {
 		t.Fatalf("body = %q, want conversation list page", rec.Body.String())
 	}
@@ -90,7 +96,7 @@ func TestConversationListMapsRequestToUsecaseAndReturnsPage(t *testing.T) {
 		t.Fatalf("conversation list requests = %#v, want one", conversations.requests)
 	}
 	got := conversations.requests[0]
-	if got.UID != "u1" || got.Limit != 20 ||
+	if got.UID != "u1" || got.Limit != 20 || got.CompletedCoverage != 900 ||
 		got.Cursor.ActiveAt != 2000 ||
 		got.Cursor.ChannelID != "g0" || got.Cursor.ChannelType != int64(frame.ChannelTypeGroup) {
 		t.Fatalf("list request = %#v, want mapped cursor request", got)
@@ -108,6 +114,7 @@ func TestConversationListOmitsMissingLastMessage(t *testing.T) {
 				DeletedToSeq: 5,
 				UpdatedAt:    3001,
 			}},
+			Done: true,
 		},
 	}
 	srv := New(Options{Conversations: conversations})
@@ -128,11 +135,14 @@ func TestConversationListOmitsMissingLastMessage(t *testing.T) {
 			"active_at":3000,
 			"read_seq":5,
 			"deleted_to_seq":5,
-			"sparse_active":false,
 			"unread":0,
 			"last_message":null
 		}],
-		"more":0
+		"deletes":[],
+		"done":true,
+		"coverage":0,
+		"tombstones_retained_since":0,
+		"reset_required":false
 	}`) {
 		t.Fatalf("body = %q, want row without last_message", rec.Body.String())
 	}
@@ -162,6 +172,7 @@ func TestConversationListReturnsPeerIDForPersonChannel(t *testing.T) {
 					MessageSeq: 8,
 				},
 			}},
+			Done: true,
 		},
 	}
 	srv := New(Options{Conversations: conversations})
@@ -182,7 +193,6 @@ func TestConversationListReturnsPeerIDForPersonChannel(t *testing.T) {
 			"active_at":2000,
 			"read_seq":0,
 			"deleted_to_seq":0,
-			"sparse_active":false,
 			"unread":0,
 			"last_message":{
 				"header":{"no_persist":0,"red_dot":0,"sync_once":0},
@@ -195,9 +205,22 @@ func TestConversationListReturnsPeerIDForPersonChannel(t *testing.T) {
 				"payload":null
 			}
 		}],
-		"more":0
+		"deletes":[],
+		"done":true,
+		"coverage":0,
+		"tombstones_retained_since":0,
+		"reset_required":false
 	}`) {
 		t.Fatalf("body = %q, want person peer channel id", rec.Body.String())
+	}
+}
+
+func TestConversationRetryRouteRemoved(t *testing.T) {
+	srv := New(Options{Conversations: &recordingConversationUsecase{}})
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/conversation/retry", bytes.NewBufferString(`{"uid":"alice"}`)))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -211,7 +234,7 @@ func TestConversationListReturnsCompatibleErrors(t *testing.T) {
 		{name: "invalid json", conversations: &recordingConversationUsecase{}, body: `{"uid":`, want: `{"msg":"数据格式有误！","status":400}`},
 		{name: "missing uid", conversations: &recordingConversationUsecase{}, body: `{"limit":10}`, want: `{"msg":"uid不能为空！","status":400}`},
 		{name: "missing usecase", body: `{"uid":"u1"}`, want: `{"msg":"conversation usecase not configured","status":400}`},
-		{name: "usecase error", conversations: &recordingConversationUsecase{err: errors.New("conversation list failed")}, body: `{"uid":"u1"}`, want: `{"msg":"conversation list failed","status":400}`},
+		{name: "usecase error", conversations: &recordingConversationUsecase{err: errors.New("conversation list failed")}, body: `{"uid":"u1"}`, want: `{"msg":"conversation list failed","status":500}`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			srv := New(Options{Conversations: tt.conversations})
@@ -222,7 +245,11 @@ func TestConversationListReturnsCompatibleErrors(t *testing.T) {
 
 			srv.Handler().ServeHTTP(rec, req)
 
-			if rec.Code != http.StatusBadRequest {
+			wantStatus := http.StatusBadRequest
+			if tt.name == "usecase error" {
+				wantStatus = http.StatusInternalServerError
+			}
+			if rec.Code != wantStatus {
 				t.Fatalf("status = %d body = %s, want 400", rec.Code, rec.Body.String())
 			}
 			if !jsonEqual(rec.Body.String(), tt.want) {
@@ -235,11 +262,14 @@ func TestConversationListReturnsCompatibleErrors(t *testing.T) {
 func TestConversationListObserverRecordsPageShapeAndLatency(t *testing.T) {
 	conversations := &recordingConversationUsecase{
 		result: conversationusecase.ListResult{
+			ScannedCandidates: 5,
 			Items: []conversationusecase.Conversation{
-				{ChannelID: "g1", ChannelType: int64(frame.ChannelTypeGroup), SparseActive: true, LastMessage: &conversationusecase.LastMessage{MessageID: 1}},
+				{ChannelID: "g1", ChannelType: int64(frame.ChannelTypeGroup), LastMessage: &conversationusecase.LastMessage{MessageID: 1}},
 				{ChannelID: "g2", ChannelType: int64(frame.ChannelTypeGroup)},
 			},
+			Deletes: []conversationusecase.ConversationKey{{ChannelID: "gone", ChannelType: 2}},
 			HasMore: true,
+			Done:    false,
 		},
 	}
 	observer := &recordingConversationListObserver{}
@@ -258,14 +288,37 @@ func TestConversationListObserverRecordsPageShapeAndLatency(t *testing.T) {
 		t.Fatalf("observer events = %#v, want one", observer.events)
 	}
 	got := observer.events[0]
-	if got.Result != "ok" || got.ReturnedItems != 2 || got.SparseItems != 1 || got.LastMessageLoads != 2 ||
-		got.LastMessageErrors != 0 || got.ActiveIndexStaleSkips != 0 || !got.More {
+	if got.Result != "ok" || got.ScannedCandidates != 5 || got.ReturnedItems != 2 ||
+		got.Deletes != 1 || got.Unresolved != 0 || got.Done {
 		t.Fatalf("observer event = %#v, want page shape", got)
 	}
 	if got.Duration <= 0 {
 		t.Fatalf("observer duration = %v, want positive latency", got.Duration)
 	}
 }
+
+func BenchmarkConversationListResponse200LargePayload(b *testing.B) {
+	payload := bytes.Repeat([]byte("x"), 32767)
+	result := conversationusecase.ListResult{Items: make([]conversationusecase.Conversation, 200), Done: true}
+	for i := range result.Items {
+		result.Items[i] = conversationusecase.Conversation{
+			ChannelID: "benchmark-group", ChannelType: int64(frame.ChannelTypeGroup),
+			LastMessage: &conversationusecase.LastMessage{MessageID: uint64(i + 1), MessageSeq: uint64(i + 1), Payload: payload},
+		}
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload) * len(result.Items)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		encoded, err := json.Marshal(newConversationListResponse("u1", result))
+		if err != nil {
+			b.Fatal(err)
+		}
+		conversationListBenchmarkSink = encoded
+	}
+}
+
+var conversationListBenchmarkSink []byte
 
 func assertJSONFieldAbsent(t *testing.T, body []byte, field string) {
 	t.Helper()
@@ -282,12 +335,10 @@ type recordingConversationUsecase struct {
 	requests              []conversationusecase.ListRequest
 	result                conversationusecase.ListResult
 	err                   error
-	syncQueries           []conversationusecase.SyncQuery
-	syncResult            conversationusecase.SyncResult
-	syncErr               error
 	clearUnreadCommands   []conversationusecase.ClearUnreadCommand
 	setUnreadCommands     []conversationusecase.SetUnreadCommand
 	deleteCommands        []conversationusecase.DeleteConversationCommand
+	activateCommands      []conversationusecase.ActivateConversationCommand
 	clearUnreadErr        error
 	setUnreadErr          error
 	deleteConversationErr error
@@ -296,11 +347,6 @@ type recordingConversationUsecase struct {
 func (r *recordingConversationUsecase) List(_ context.Context, req conversationusecase.ListRequest) (conversationusecase.ListResult, error) {
 	r.requests = append(r.requests, req)
 	return r.result, r.err
-}
-
-func (r *recordingConversationUsecase) Sync(_ context.Context, req conversationusecase.SyncQuery) (conversationusecase.SyncResult, error) {
-	r.syncQueries = append(r.syncQueries, req)
-	return r.syncResult, r.syncErr
 }
 
 func (r *recordingConversationUsecase) ClearUnread(_ context.Context, cmd conversationusecase.ClearUnreadCommand) error {
@@ -316,6 +362,11 @@ func (r *recordingConversationUsecase) SetUnread(_ context.Context, cmd conversa
 func (r *recordingConversationUsecase) DeleteConversation(_ context.Context, cmd conversationusecase.DeleteConversationCommand) error {
 	r.deleteCommands = append(r.deleteCommands, cmd)
 	return r.deleteConversationErr
+}
+
+func (r *recordingConversationUsecase) ActivateConversation(_ context.Context, cmd conversationusecase.ActivateConversationCommand) error {
+	r.activateCommands = append(r.activateCommands, cmd)
+	return nil
 }
 
 type recordingConversationListObserver struct {

@@ -1,7 +1,15 @@
+import { easySdkReleases } from './easy-sdk-version';
+import {
+  productHTTPOpenAPIReferenceGroups,
+  productHTTPOpenAPIReferenceOperations,
+  type ProductHTTPOpenAPIMethod,
+} from './product-http-openapi';
+
 export const locales = ['zh', 'en'] as const;
 
 export type Locale = (typeof locales)[number];
 export type PublicationStatus = 'published' | 'planned';
+export type NavigationHTTPMethod = Uppercase<ProductHTTPOpenAPIMethod>;
 
 export interface LocalizedText {
   zh: string;
@@ -9,15 +17,22 @@ export interface LocalizedText {
 }
 
 export interface NavigationPage {
+  /** Relative route path below its parent; nested pages use slash-separated segments. */
   slug: string;
   label: LocalizedText;
   description: LocalizedText;
   status: PublicationStatus;
+  /** HTTP method shown beside one OpenAPI operation in the sidebar. */
+  method?: NavigationHTTPMethod;
 }
 
 export interface NavigationGroup extends NavigationPage {
-  children: NavigationPage[];
+  children: NavigationNode[];
+  /** Keeps direct child routes at the domain root while grouping them in the sidebar. */
+  childrenAtDomainRoot?: boolean;
 }
+
+export type NavigationNode = NavigationPage | NavigationGroup;
 
 export interface DocumentationDomain extends Omit<NavigationPage, 'slug'> {
   key: 'guide' | 'server' | 'sdk' | 'api';
@@ -98,7 +113,7 @@ function navigationGroup(
   enLabel: string,
   zhDescription: string,
   enDescription: string,
-  children: NavigationPage[],
+  children: NavigationNode[],
 ): NavigationGroup {
   return {
     ...navigationPage(status, slug, zhLabel, enLabel, zhDescription, enDescription),
@@ -112,7 +127,7 @@ function plannedGroup(
   enLabel: string,
   zhDescription: string,
   enDescription: string,
-  children: NavigationPage[],
+  children: NavigationNode[],
 ): NavigationGroup {
   return navigationGroup(
     'planned',
@@ -131,7 +146,7 @@ function publishedGroup(
   enLabel: string,
   zhDescription: string,
   enDescription: string,
-  children: NavigationPage[],
+  children: NavigationNode[],
 ): NavigationGroup {
   return navigationGroup(
     'published',
@@ -144,49 +159,393 @@ function publishedGroup(
   );
 }
 
-function platformGroup(
+interface FullSDKAdvancedPage {
+  slug: string;
+  label: LocalizedText;
+  description: LocalizedText;
+}
+
+interface FullSDKPlatform {
+  slug: 'android' | 'ios' | 'javascript' | 'flutter' | 'harmonyos';
+  label: string;
+  packageName: string;
+  version: string;
+  language: string;
+  advanced: FullSDKAdvancedPage[];
+}
+
+function advancedPage(
   slug: string,
-  label: string,
-  zhPlatformDescription: string,
-  enPlatformDescription: string,
-): NavigationGroup {
-  return plannedGroup(slug, label, label, zhPlatformDescription, enPlatformDescription, [
-    plannedPage(
-      'installation',
-      '安装与配置',
-      'Installation',
-      `${label} SDK 的依赖、权限和构建配置。`,
-      `Dependencies, permissions, and build configuration for the ${label} SDK.`,
+  zhLabel: string,
+  enLabel: string,
+  zhDescription: string,
+  enDescription: string,
+): FullSDKAdvancedPage {
+  return {
+    slug,
+    label: text(zhLabel, enLabel),
+    description: text(zhDescription, enDescription),
+  };
+}
+
+function publishedFullSDKPlatformGroup(platform: FullSDKPlatform): NavigationGroup {
+  const identity = `${platform.packageName} ${platform.version}`;
+  return publishedGroup(
+    platform.slug,
+    platform.label,
+    platform.label,
+    `从快速开始到常用管理器，使用 ${identity} 完成清晰、可查找的 ${platform.label} 接入。`,
+    `Integrate ${identity} on ${platform.label} through a clear quickstart and task-based manager guides.`,
+    [
+      publishedPage(
+        'quickstart',
+        '快速开始',
+        'Quickstart',
+        `安装 ${identity}，连接一个用户，并用 ${platform.language} 完成第一条在线文本消息。`,
+        `Install ${identity}, connect one user, and exchange the first online text message in ${platform.language}.`,
+      ),
+      publishedPage(
+        'connection',
+        '连接管理',
+        'Connection',
+        '配置 UID、Token 与连接地址，监听连接状态，并正确处理断开和退出。',
+        'Configure the UID, token, and endpoint; observe connection state; and disconnect or log out correctly.',
+      ),
+      publishedPage(
+        'messages',
+        '消息管理',
+        'Messages',
+        '发送、接收和查询消息，并理解发送中、发送成功与发送失败。',
+        'Send, receive, and query messages while understanding sending, success, and failure states.',
+      ),
+      publishedPage(
+        'conversations',
+        '会话管理',
+        'Conversations',
+        '读取聊天列表、监听会话变化，并管理未读数。',
+        'Read the chat list, observe conversation changes, and manage unread counts.',
+      ),
+      publishedPage(
+        'channels',
+        '频道管理',
+        'Channels',
+        '获取单聊或群聊资料，监听资料变化，并连接业务数据源。',
+        'Load direct or group chat profiles, observe changes, and connect product data providers.',
+      ),
+      publishedGroup(
+        'advanced',
+        '高级功能',
+        'Advanced',
+        '按当前平台确实提供的 API 学习自定义消息、媒体和离线能力。',
+        'Use only the custom-content, media, and offline APIs actually provided by this platform.',
+        platform.advanced.map((item) =>
+          publishedPage(
+            item.slug,
+            item.label.zh,
+            item.label.en,
+            item.description.zh,
+            item.description.en,
+          ),
+        ),
+      ),
+      publishedPage(
+        'api-reference',
+        'API 参考',
+        'API Reference',
+        '按管理器查找常用入口、监听器、Provider、模型和状态。',
+        'Find common manager entry points, listeners, providers, models, and states.',
+      ),
+    ],
+  );
+}
+
+function publishedAndroidSDKGroup(): NavigationGroup {
+  return publishedFullSDKPlatformGroup({
+    slug: 'android',
+    label: 'Android',
+    packageName: 'WuKongIMAndroidSDK',
+    version: '1.5.5',
+    language: 'Java',
+    advanced: [
+      advancedPage(
+        'custom-messages',
+        '自定义消息',
+        'Custom Messages',
+        '定义、注册并发送自己的业务消息类型。',
+        'Define, register, and send product-specific message content.',
+      ),
+      advancedPage(
+        'media-and-history',
+        '媒体与历史消息',
+        'Media & History',
+        '接入媒体上传，并在本地消息不足时补齐历史消息。',
+        'Connect media upload and fill message history when local data is incomplete.',
+      ),
+    ],
+  });
+}
+
+function publishedIOSSDKGroup(): NavigationGroup {
+  return publishedFullSDKPlatformGroup({
+    slug: 'ios',
+    label: 'iOS',
+    packageName: 'WuKongIMSDK',
+    version: '1.1.1',
+    language: 'Objective-C',
+    advanced: [
+      advancedPage(
+        'custom-messages',
+        '自定义消息',
+        'Custom Messages',
+        '继承消息正文、注册类型并发送自己的业务消息。',
+        'Subclass message content, register its type, and send product-specific messages.',
+      ),
+      advancedPage(
+        'media-and-history',
+        '媒体与历史消息',
+        'Media & History',
+        '接入图片和语音上传，并在本地消息不足时同步历史消息。',
+        'Connect image and voice upload and synchronize history when local messages are incomplete.',
+      ),
+    ],
+  });
+}
+
+function publishedJavaScriptSDKGroup(): NavigationGroup {
+  return publishedFullSDKPlatformGroup({
+    slug: 'javascript',
+    label: 'JavaScript / Web',
+    packageName: 'wukongimjssdk',
+    version: '1.3.5',
+    language: 'TypeScript',
+    advanced: [
+      advancedPage(
+        'custom-messages',
+        '自定义消息',
+        'Custom Messages',
+        '定义、注册并发送浏览器业务需要的消息正文。',
+        'Define, register, and send message content required by the browser product.',
+      ),
+      advancedPage(
+        'offline-and-uniapp',
+        '离线恢复与 UniApp 迁移',
+        'Offline Recovery & UniApp Migration',
+        '接入离线消息同步，并把旧 UniApp SDK 迁移到 JavaScript SDK。',
+        'Connect offline synchronization and migrate the retired UniApp SDK to the JavaScript SDK.',
+      ),
+    ],
+  });
+}
+
+function publishedFlutterSDKGroup(): NavigationGroup {
+  return publishedFullSDKPlatformGroup({
+    slug: 'flutter',
+    label: 'Flutter',
+    packageName: 'wukongimfluttersdk',
+    version: '1.7.9',
+    language: 'Dart',
+    advanced: [
+      advancedPage(
+        'custom-messages',
+        '自定义消息',
+        'Custom Messages',
+        '定义、注册并发送 Flutter 业务消息类型。',
+        'Define, register, and send product-specific Flutter message content.',
+      ),
+      advancedPage(
+        'media-and-history',
+        '媒体与历史消息',
+        'Media & History',
+        '接入媒体上传，并在本地消息不足时补齐历史消息。',
+        'Connect media upload and fill message history when local data is incomplete.',
+      ),
+    ],
+  });
+}
+
+function publishedHarmonyOSSDKGroup(): NavigationGroup {
+  return publishedFullSDKPlatformGroup({
+    slug: 'harmonyos',
+    label: 'HarmonyOS',
+    packageName: '@wukong/wkim',
+    version: '1.1.7',
+    language: 'ArkTS',
+    advanced: [
+      advancedPage(
+        'custom-messages',
+        '自定义消息',
+        'Custom Messages',
+        '定义、注册并发送 HarmonyOS 业务消息类型。',
+        'Define, register, and send product-specific HarmonyOS message content.',
+      ),
+      advancedPage(
+        'media-and-history',
+        '媒体与历史消息',
+        'Media & History',
+        '接入图片或语音消息，并在本地数据不足时补齐历史消息。',
+        'Connect image or voice messages and fill history when local data is incomplete.',
+      ),
+    ],
+  });
+}
+
+function publishedEasySDKGroup(): NavigationGroup {
+  return publishedGroup(
+    'easy',
+    'WuKongEasySDK',
+    'WuKongEasySDK',
+    '选择 iOS、Android、Flutter、Web、C#、C++、Rust 或 Python 快速接入，使用固定版本的 SDK完成在线双向消息。',
+    'Choose an iOS, Android, Flutter, Web, C#, C++, Rust, or Python quickstart with pinned SDK versions for online bidirectional messaging.',
+    [
+      publishedPage(
+        'examples',
+        '运行官方示例',
+        'Run Official Examples',
+        '准备开发集群和两个账号，运行八个平台的示例并检查双向收发与退出清理。',
+        'Prepare a development cluster and two accounts, run examples for eight platforms, and check messaging and cleanup.',
+      ),
+      publishedPage(
+        'ios/getting-started',
+        'iOS 快速接入',
+        'iOS quickstart',
+        `精确安装 v${easySdkReleases.ios.version}，完成单聊收发、监听清理和 Alice/Bob 双向消息。`,
+        `Install exactly v${easySdkReleases.ios.version} for person messaging, listener cleanup, and Alice/Bob messaging.`,
+      ),
+      publishedPage(
+        'android/getting-started',
+        'Android 快速接入',
+        'Android quickstart',
+        `精确安装 v${easySdkReleases.android.version}，处理单例、单聊收发、清理和 Alice/Bob 双向消息。`,
+        `Install exactly v${easySdkReleases.android.version} for singleton ownership, person messaging, cleanup, and Alice/Bob messaging.`,
+      ),
+      publishedPage(
+        'flutter/getting-started',
+        'Flutter 快速接入',
+        'Flutter quickstart',
+        `精确安装并运行已验证的 v${easySdkReleases.flutter.version} example，完成单聊收发、dispose 清理和 Alice/Bob 验收。`,
+        `Install and run the verified v${easySdkReleases.flutter.version} example for person messaging, dispose cleanup, and Alice/Bob acceptance.`,
+      ),
+      publishedPage(
+        'javascript/getting-started',
+        'Web 快速接入',
+        'Web quickstart',
+        `精确安装 easyjssdk v${easySdkReleases.javascript.version}，在浏览器中通过业务后端完成 Alice/Bob 在线消息。`,
+        `Install exactly easyjssdk v${easySdkReleases.javascript.version} for Alice/Bob browser messaging with credentials from your backend.`,
+      ),
+      publishedPage(
+        'agent-streaming',
+        'Agent 流式回复',
+        'Agent Streaming Replies',
+        '使用 EasySDK 与真实模型实现逐段回复、取消、失败和离线恢复。',
+        'Build incremental replies with EasySDK and a real model, including cancellation, failures, and offline recovery.',
+      ),
+      publishedPage(
+        'rust/getting-started',
+        'Rust 快速接入',
+        'Rust quickstart',
+        `安装 WuKongEasySDK-Rust ${easySdkReleases.rust.version} 正式包，使用 Tokio 完成在线消息、有限重连和清理。`,
+        `Install WuKongEasySDK-Rust ${easySdkReleases.rust.version} for Tokio online messaging, bounded reconnect, and cleanup.`,
+      ),
+      publishedPage(
+        'csharp/getting-started',
+        'C# 快速接入',
+        'C# quickstart',
+        `安装 NuGet ${easySdkReleases.csharp.version} 正式包接入 .NET 8，完成异步连接、消息收发、重连和释放。`,
+        `Install NuGet ${easySdkReleases.csharp.version} with .NET 8 for async connections, messaging, reconnect, and cleanup.`,
+      ),
+      publishedPage(
+        'cpp/getting-started',
+        'C++ 快速接入',
+        'C++ quickstart',
+        '通过预编译包或 vcpkg 引入 SDK，以 C++17 和 CMake 完成在线收发与线程管理。',
+        'Use prebuilt archives or vcpkg with C++17 and CMake for messaging and thread management.',
+      ),
+      publishedPage(
+        'python/getting-started',
+        'Python 快速接入',
+        'Python quickstart',
+        `安装 PyPI ${easySdkReleases.python.version} 正式包，用 asyncio 完成在线收发、重连和异步资源清理。`,
+        `Install PyPI ${easySdkReleases.python.version} and use asyncio for online messaging, reconnect, and async cleanup.`,
+      ),
+    ],
+  );
+}
+
+function publishedWuKongIMSDKGroup(): NavigationGroup {
+  return {
+    ...publishedGroup(
+      'wukongim',
+      'WuKongIMSDK',
+      'WuKongIMSDK',
+      '完整版客户端 SDK：管理连接、消息、本地会话、未读数与离线数据。',
+      'Full client SDKs that manage connections, messages, local conversations, unread counts, and offline data.',
+      [
+        publishedPage(
+          'wukongim/concepts',
+          '核心概念',
+          'Core Concepts',
+          '用简单语言理解 UID、Token、频道、消息状态、会话和 Provider。',
+          'Understand UIDs, tokens, Channels, message states, Conversations, and providers in plain language.',
+        ),
+        publishedAndroidSDKGroup(),
+        publishedIOSSDKGroup(),
+        publishedJavaScriptSDKGroup(),
+        publishedFlutterSDKGroup(),
+        publishedHarmonyOSSDKGroup(),
+        publishedPage(
+          'wukongim/upgrade',
+          '升级 SDK',
+          'Upgrade SDKs',
+          '用一套简洁流程升级依赖、检查数据兼容并准备回滚。',
+          'Upgrade dependencies, check data compatibility, and prepare rollback with one concise workflow.',
+        ),
+      ],
     ),
-    plannedPage(
-      'quickstart',
-      '快速接入',
-      'Quickstart',
-      `在 ${label} 应用中完成首次连接和消息收发。`,
-      `Connect and exchange the first messages with the ${label} SDK.`,
-    ),
-    plannedPage(
-      'platform-capabilities',
-      '平台专属能力',
-      'Platform Capabilities',
-      `${label} 平台的生命周期、后台运行和推送等差异。`,
-      `Lifecycle, background execution, push, and other ${label}-specific behavior.`,
-    ),
-    plannedPage(
-      'api-reference',
-      'API 参考',
-      'API Reference',
-      `${label} SDK 的类、方法、事件、参数和错误定义。`,
-      `Classes, methods, events, parameters, and errors for the ${label} SDK.`,
-    ),
-    plannedPage(
-      'upgrade',
-      '升级指南',
-      'Upgrade Guide',
-      `${label} SDK 的破坏性变更、迁移步骤和发布记录。`,
-      `Breaking changes, migration steps, and release history for the ${label} SDK.`,
-    ),
-  ]);
+    childrenAtDomainRoot: true,
+  };
+}
+
+function publishedProductHTTPGroup(): NavigationGroup {
+  return publishedGroup(
+    'product-http',
+    'WuKongIM HTTP API',
+    'WuKongIM HTTP API',
+    `浏览当前源码注册的全部 ${productHTTPOpenAPIReferenceOperations.length} 条 WuKongIM HTTP API 操作。`,
+    `Browse all ${productHTTPOpenAPIReferenceOperations.length} WuKongIM HTTP API operations registered by the current source.`,
+    [
+      ...productHTTPOpenAPIReferenceGroups.map((group) =>
+        publishedGroup(
+          group.slug,
+          group.title.zh,
+          group.title.en,
+          group.description.zh,
+          group.description.en,
+          group.operations.map((operation) => ({
+            ...publishedPage(
+              operation.slug,
+              operation.title.zh,
+              operation.title.en,
+              operation.description.zh,
+              operation.description.en,
+            ),
+            method: operation.method === 'get' ? 'GET' : 'POST',
+          })),
+        ),
+      ),
+      publishedPage(
+        'errors',
+        '错误响应',
+        'Error Responses',
+        '解释 HTTP 状态、业务状态和 Reason Code 的关系。',
+        'Relates HTTP status, business status, and protocol reason codes.',
+      ),
+    ],
+  );
+}
+
+/** Distinguishes folders from leaf pages in the recursive navigation tree. */
+export function isNavigationGroup(node: NavigationNode): node is NavigationGroup {
+  return 'children' in node;
 }
 
 export const domains: DocumentationDomain[] = [
@@ -204,29 +563,22 @@ export const domains: DocumentationDomain[] = [
         'product-overview',
         '产品概览',
         'Product Overview',
-        '建立产品定位、能力边界和适用场景的整体认识。',
-        'Understand the product position, capability boundaries, and use cases.',
+        '判断 WuKongIM 是什么、是否适合你的产品，以及下一步如何验证。',
+        'Decide what WuKongIM is, whether it fits your product, and how to validate it.',
         [
-          publishedPage(
-            'what-is-wukongim',
-            'WuKongIM 是什么',
-            'What is WuKongIM?',
-            '介绍频道式消息模型、集群语义，以及它与网关和消息队列的区别。',
-            'Introduces the channel model, cluster semantics, and how WuKongIM differs from gateways and queues.',
-          ),
           publishedPage(
             'capabilities',
             '核心能力',
             'Core Capabilities',
-            '概览高并发消息、超大群、持久化、多设备、故障转移和扩容能力。',
-            'Surveys high-throughput messaging, large groups, persistence, multi-device, failover, and scaling.',
+            '从产品结果理解实时接入、可靠消息、多设备、集群和运维能力。',
+            'Explains real-time access, reliable messaging, multi-device, cluster, and operations outcomes.',
           ),
           publishedPage(
             'use-cases',
             '适用场景',
             'Use Cases',
-            '说明聊天、推送、客服、直播、IoT、信令和 AI 通信等用途。',
-            'Explains chat, push, support, live interaction, IoT, signaling, and AI communication use cases.',
+            '判断聊天、通知、客服及扩展场景如何使用 WuKongIM。',
+            'Maps chat, notifications, customer service, and extended scenarios to WuKongIM.',
           ),
         ],
       ),
@@ -234,22 +586,22 @@ export const domains: DocumentationDomain[] = [
         'quick-start',
         '快速开始',
         'Quick Start',
-        '沿最短路径启动集群、发送消息并验证结果。',
-        'Follow the shortest path to start a cluster, send a message, and verify the result.',
+        '用 Docker 启动单节点集群，通过 Demo 验证消息，再选择 SDK。',
+        'Start a single-node cluster with Docker, exchange messages in the Demo, then choose an SDK.',
         [
           publishedPage(
             'prerequisites',
             '环境准备',
             'Prerequisites',
-            '列出 Git、Go、端口、本地目录和测试工具要求。',
-            'Lists Git, Go, ports, local directories, and test tool requirements.',
+            '准备 Docker、浏览器与本机端口；Linux 安装作为可选路径。',
+            'Prepare Docker, a browser, and local ports, with Linux installation as an alternative.',
           ),
           publishedPage(
             'single-node-cluster',
-            '启动单节点集群',
-            'Start a Single-node Cluster',
-            '启动单节点集群并验证就绪状态与 Manager。',
-            'Starts a single-node cluster and verifies readiness and Manager access.',
+            'Linux 安装（可选）',
+            'Linux Installation (Optional)',
+            '安装软件包并通过 systemd 启动单节点集群。',
+            'Installs the package and starts a single-node cluster with systemd.',
           ),
           publishedPage(
             'first-message',
@@ -260,10 +612,10 @@ export const domains: DocumentationDomain[] = [
           ),
           publishedPage(
             'chat-demo',
-            '运行聊天演示',
-            'Run the Chat Demo',
-            '使用内置聊天演示验证两个测试用户之间的通信。',
-            'Uses the embedded chat demo to verify communication between two test users.',
+            '体验四个 Demo',
+            'Try the Four Demos',
+            '一键启动聊天、流式回复、客服与 Agent，按场景体验。',
+            'Launches chat, streaming, support, and Agent Demos together.',
           ),
           publishedPage(
             'next-steps',
@@ -278,43 +630,43 @@ export const domains: DocumentationDomain[] = [
         'core-concepts',
         '核心概念',
         'Core Concepts',
-        '建立应用开发所需的统一业务术语。',
-        'Establishes the shared product vocabulary needed by application developers.',
+        '用消息、频道、用户、设备和会话理解 WuKongIM 如何组织即时通信。',
+        'Explains how WuKongIM organizes communication through messages, channels, users, devices, and conversations.',
         [
-          publishedPage(
-            'cluster-and-nodes',
-            '集群与节点',
-            'Clusters & Nodes',
-            '解释所有部署都是集群，以及节点、Slot、副本和 Leader 的关系。',
-            'Explains cluster-only deployment semantics and the relationship among nodes, slots, replicas, and leaders.',
-          ),
           publishedPage(
             'messages',
             '消息',
-            'Messages',
-            '解释消息标识、序号、顺序、持久化、去重和离线生命周期。',
-            'Explains identifiers, sequence, ordering, persistence, deduplication, and offline lifecycle.',
+            'Message',
+            '消息是什么、如何找到接收范围，以及发送成功、送达和已读的区别。',
+            'Explains what a message is, how it finds recipients, and why sent, delivered, and read are different outcomes.',
           ),
           publishedPage(
             'channels',
             '频道',
-            'Channels',
-            '解释频道作为消息路由和存储核心单位的职责。',
-            'Explains channels as the core unit for message routing and storage.',
+            'Channel',
+            '频道如何表示单聊、群聊等消息目标，并组织参与者和消息历史。',
+            'Explains how a Channel represents direct and group targets and organizes participants and message history.',
           ),
           publishedPage(
-            'users-and-devices',
-            '用户与设备',
-            'Users & Devices',
-            '区分用户、设备、连接、登录状态和多端在线。',
-            'Distinguishes users, devices, connections, login state, and multi-device presence.',
+            'users',
+            '用户',
+            'User',
+            '用户如何通过稳定 UID 接入，以及 WuKongIM 与业务账号系统的职责边界。',
+            'Explains how a stable UID enters WuKongIM and what remains the responsibility of the product account system.',
+          ),
+          publishedPage(
+            'devices',
+            '设备',
+            'Device',
+            '设备、连接与多端在线的区别，以及哪些状态会跨设备共享。',
+            'Separates devices from connections and explains multi-endpoint presence and shared state.',
           ),
           publishedPage(
             'conversations',
             '会话',
-            'Conversations',
-            '解释会话列表、最近消息、未读数和状态同步。',
-            'Explains conversation lists, latest messages, unread counts, and state synchronization.',
+            'Conversation',
+            '会话如何把频道呈现为聊天列表，并管理未读和个人可见状态。',
+            'Explains how a Conversation presents a Channel in a chat list with unread and personal visibility state.',
           ),
         ],
       ),
@@ -360,6 +712,13 @@ export const domains: DocumentationDomain[] = [
             '说明插件的适用问题、生命周期和安全边界。',
             'Explains suitable plugin use cases, lifecycle, and security boundaries.',
           ),
+          publishedPage(
+            'acceptance',
+            '上线检查',
+            'Release Checks',
+            '发布前检查身份、连接、消息、离线恢复、安全、容量和回滚。',
+            'Checks identity, connection, messaging, offline recovery, security, capacity, and rollback before release.',
+          ),
         ],
       ),
       publishedGroup(
@@ -383,19 +742,26 @@ export const domains: DocumentationDomain[] = [
             '实现群成员维护和群消息，并说明十万级成员约束。',
             'Implements group membership and messaging with constraints for 100,000-member groups.',
           ),
-          plannedPage(
+          publishedPage(
             'push',
             '消息推送',
             'Message Push',
             '实现通知、系统消息、离线设备处理和失败恢复。',
             'Implements notifications, system messages, offline-device handling, and recovery.',
           ),
-          plannedPage(
+          publishedPage(
             'ai-and-iot',
             'AI 与 IoT 通信',
             'AI & IoT Communication',
             '展示流式 AI 回复、设备上报和服务端指令。',
             'Demonstrates streaming AI replies, device telemetry, and server commands.',
+          ),
+          publishedPage(
+            'mqtt',
+            'MQTT 快速开始',
+            'MQTT Quickstart',
+            '用 Node.js 和 MQTT.js 完成认证、订阅和双向消息验证。',
+            'Authenticates, subscribes and verifies a two-way exchange using Node.js and MQTT.js.',
           ),
         ],
       ),
@@ -415,50 +781,29 @@ export const domains: DocumentationDomain[] = [
         'deployment',
         '部署',
         'Deployment',
-        '选择并实施适合环境的服务端部署方式。',
-        'Choose and implement the server deployment method appropriate for the environment.',
+        '从 Docker、Linux 或多节点路径完成服务端部署。',
+        'Deploy the server through the Docker, Linux, or multi-node path.',
         [
-          publishedPage(
-            'choosing',
-            '部署方式选择',
-            'Choose a Deployment',
-            '比较 Docker、Linux 二进制和 Kubernetes 的适用边界。',
-            'Compares the suitability of Docker, Linux binaries, and Kubernetes.',
-          ),
           publishedPage(
             'docker',
             'Docker 部署',
             'Docker',
-            '使用镜像部署单节点集群或多节点集群。',
-            'Deploys single-node clusters or multi-node clusters from container images.',
+            '使用固定的官方镜像、显式配置和持久卷运行节点。',
+            'Runs a node with a pinned official image, explicit configuration, and persistent storage.',
           ),
           publishedPage(
             'linux',
             'Linux 部署',
             'Linux',
-            '使用二进制、配置文件和 systemd 运行服务。',
-            'Runs the server with a binary, configuration file, and systemd.',
-          ),
-          plannedPage(
-            'kubernetes',
-            'Kubernetes 部署（Beta）',
-            'Kubernetes (Beta)',
-            '说明持久化、服务发现、资源规划和 Beta 边界。',
-            'Covers persistence, discovery, resource planning, and Beta limitations.',
+            '从签名 APT/DNF Preview 软件源安装，并用安全配置和 systemd 运行服务。',
+            'Installs from the signed APT/DNF preview repository and runs the service with secure configuration and systemd.',
           ),
           publishedPage(
             'multi-node',
             '多节点集群',
             'Multi-node Cluster',
-            '规划并引导多节点集群完成启动和就绪检查。',
-            'Plans and bootstraps a multi-node cluster through readiness verification.',
-          ),
-          publishedPage(
-            'production-checklist',
-            '生产检查清单',
-            'Production Checklist',
-            '汇总资源、磁盘、安全、监控、备份和容量检查。',
-            'Checks resources, disks, security, monitoring, backups, and capacity.',
+            '规划成员、副本、故障域并验证集群就绪。',
+            'Plans membership, replicas, failure domains, and cluster readiness.',
           ),
         ],
       ),
@@ -469,6 +814,13 @@ export const domains: DocumentationDomain[] = [
         '解释配置来源、覆盖规则和各领域配置。',
         'Explains configuration sources, override rules, and domain settings.',
         [
+          publishedPage(
+            'common-configurations',
+            '常用配置',
+            'Common Configurations',
+            '以表格解释高频配置项及其关键边界。',
+            'Explains frequently used settings and their key boundaries in a table.',
+          ),
           publishedPage(
             'cluster',
             '节点与集群',
@@ -508,8 +860,8 @@ export const domains: DocumentationDomain[] = [
             'reference',
             '配置参考',
             'Configuration Reference',
-            '列出 TOML 键、类型、环境变量、脱敏边界和约束。',
-            'Lists TOML keys, types, environment variables, redaction boundaries, and constraints.',
+            '逐项说明全部公开 TOML、环境变量、关键默认值、约束和迁移方式。',
+            'Explains every public TOML field, environment override, key default, constraint, and migration.',
           ),
         ],
       ),
@@ -517,50 +869,64 @@ export const domains: DocumentationDomain[] = [
         'operations',
         '运维',
         'Operations',
-        '管理、观察和安全变更生产集群。',
-        'Manage, observe, and safely change production clusters.',
+        '从日常检查开始，安全地监控、备份、扩缩容和升级集群。',
+        'Start with daily checks, then monitor, back up, scale, and upgrade the cluster safely.',
         [
           publishedPage(
             'manager',
             'Manager 管理后台',
             'Manager',
-            '介绍后台权限、集群状态、业务查询和运维操作。',
-            'Introduces permissions, cluster state, business queries, and operations.',
+            '登录管理后台，看懂主要页面并安全执行操作。',
+            'Sign in, understand the main pages, and perform administrative actions safely.',
           ),
           publishedPage(
             'health-and-monitoring',
             '健康检查与监控',
             'Health & Monitoring',
-            '解释就绪状态、核心指标、Prometheus、Grafana 和告警。',
-            'Explains readiness, key metrics, Prometheus, Grafana, and alerts.',
+            '判断进程是否存活、节点能否接流量，以及何时需要告警。',
+            'Tell whether the process is alive, the node can accept traffic, and an alert is needed.',
           ),
           publishedPage(
             'scaling',
             '扩容与缩容',
             'Scaling',
-            '说明节点加入、平衡、安全缩容和 Leader 迁移。',
-            'Covers node joins, balancing, safe scale-in, and leader transfer.',
+            '逐步增加节点，或安全排空并移除节点。',
+            'Add a node step by step, or safely drain and remove one.',
           ),
           publishedPage(
             'backup-and-restore',
             '备份与恢复',
             'Backup & Restore',
-            '说明备份计划、验证、恢复和灾难演练。',
-            'Covers backup schedules, verification, restoration, and recovery drills.',
+            '创建、测试和验证备份，并在维护窗口中恢复。',
+            'Create, test, and verify backups, then restore during maintenance.',
           ),
           publishedPage(
             'upgrade-and-migration',
             '升级与迁移',
             'Upgrade & Migration',
-            '说明兼容性、滚动升级、回滚和 v2 到 v3 迁移。',
-            'Covers compatibility, rolling upgrades, rollback, and v2-to-v3 migration.',
+            '根据发布说明选择滚动升级或停机升级。',
+            'Use release notes to choose a rolling or stopped upgrade.',
+          ),
+          publishedPage(
+            'v2-to-v3-migration',
+            'v2 → v3 离线迁移',
+            'v2 → v3 Offline Migration',
+            '跟着单节点集群实例完成备份、迁移、启动和验收。',
+            'Follow a single-node cluster example through backup, migration, startup, and acceptance.',
+          ),
+          publishedPage(
+            'v2-to-v3-migration-reference',
+            'v2 → v3 迁移参考',
+            'v2 → v3 Migration Reference',
+            '按需查阅多节点计划、插件、兼容性策略与故障处理。',
+            'Look up multi-node plans, plugins, compatibility policies, and troubleshooting.',
           ),
           publishedPage(
             'troubleshooting',
             '故障排查',
             'Troubleshooting',
-            '按现象、指标、日志和诊断工具定位问题。',
-            'Diagnoses issues through symptoms, metrics, logs, and diagnostic tools.',
+            '从故障现象开始，用低风险检查逐步定位问题。',
+            'Start from the symptom and narrow the problem with low-risk checks.',
           ),
         ],
       ),
@@ -580,15 +946,15 @@ export const domains: DocumentationDomain[] = [
           ),
           publishedPage(
             'wkdb',
-            'wkdb',
-            'wkdb',
+            'wkcli db',
+            'wkcli db',
             '执行本地只读存储诊断和离线导入导出。',
             'Performs node-local read-only storage diagnostics and offline import/export.',
           ),
           publishedPage(
             'wkbench',
-            'wkbench',
-            'wkbench',
+            'wkcli bench',
+            'wkcli bench',
             '执行黑盒压力测试、容量评估和回归验证。',
             'Runs black-box load tests, capacity evaluations, and regression checks.',
           ),
@@ -659,241 +1025,81 @@ export const domains: DocumentationDomain[] = [
     label: text('SDK', 'SDK'),
     description: text(
       '在不同客户端平台接入 WuKongIM。',
-      'Integrate WuKongIM across supported client platforms.',
+      'Integrate WuKongIM across client platforms.',
     ),
     status: 'published',
-    pages: [
-      plannedPage(
-        'choose-sdk',
-        '选择 SDK',
-        'Choose an SDK',
-        '根据应用平台、框架和运行环境选择客户端 SDK。',
-        'Choose a client SDK by platform, framework, and runtime.',
-      ),
-      plannedPage(
-        'compatibility',
-        '版本与兼容性',
-        'Versions & Compatibility',
-        '汇总 SDK 版本、服务端兼容范围、系统要求和维护状态。',
-        'Lists SDK versions, server compatibility, system requirements, and maintenance status.',
-      ),
-    ],
-    groups: [
-      plannedGroup(
-        'common-guides',
-        '公共指南',
-        'Common Guides',
-        '统一说明所有客户端 SDK 共有的接入行为。',
-        'Explains integration behavior shared by all client SDKs.',
-        [
-          plannedPage(
-            'identity-and-token',
-            '身份与 Token',
-            'Identity & Token',
-            '说明用户、设备、Token 获取和失效处理。',
-            'Explains users, devices, token acquisition, and invalidation.',
-          ),
-          plannedPage(
-            'initialization-and-connection',
-            '初始化与连接',
-            'Initialization & Connection',
-            '说明 SDK 初始化、连接状态、生命周期和退出。',
-            'Covers SDK initialization, connection state, lifecycle, and logout.',
-          ),
-          plannedPage(
-            'messaging',
-            '消息收发',
-            'Messaging',
-            '解释发送、接收、确认、消息状态和错误处理。',
-            'Explains send, receive, acknowledgement, message state, and error handling.',
-          ),
-          plannedPage(
-            'custom-messages',
-            '自定义消息',
-            'Custom Messages',
-            '定义自定义消息的编码、注册、兼容和降级。',
-            'Defines encoding, registration, compatibility, and fallback for custom messages.',
-          ),
-          plannedPage(
-            'conversations-and-unread',
-            '会话与未读数',
-            'Conversations & Unread Counts',
-            '说明会话、最近消息、未读数和已读状态。',
-            'Explains conversations, latest messages, unread counts, and read state.',
-          ),
-          plannedPage(
-            'offline-and-push',
-            '离线消息与推送',
-            'Offline Messages & Push',
-            '区分离线同步和系统推送，并说明协作方式。',
-            'Distinguishes offline synchronization from system push and explains how they cooperate.',
-          ),
-          plannedPage(
-            'multi-device',
-            '多设备同步',
-            'Multi-device Sync',
-            '说明多端登录、消息同步和设备状态一致性。',
-            'Explains multi-device login, message sync, and device-state consistency.',
-          ),
-          plannedPage(
-            'reconnect-and-errors',
-            '重连与异常处理',
-            'Reconnect & Errors',
-            '说明断线、网络切换、超时、重试和常见错误。',
-            'Covers disconnects, network changes, timeouts, retries, and common errors.',
-          ),
-        ],
-      ),
-      platformGroup(
-        'android',
-        'Android',
-        'Android SDK 的支持范围、系统要求和接入入口。',
-        'Support scope, system requirements, and entry points for the Android SDK.',
-      ),
-      platformGroup(
-        'ios',
-        'iOS',
-        'iOS SDK 的支持范围、系统要求和接入入口。',
-        'Support scope, system requirements, and entry points for the iOS SDK.',
-      ),
-      platformGroup(
-        'javascript',
-        'JavaScript / Web',
-        'JavaScript SDK 的浏览器支持范围和接入入口。',
-        'Browser support and entry points for the JavaScript SDK.',
-      ),
-      platformGroup(
-        'flutter',
-        'Flutter',
-        'Flutter SDK 的支持范围、系统要求和接入入口。',
-        'Support scope, system requirements, and entry points for the Flutter SDK.',
-      ),
-      platformGroup(
-        'uniapp',
-        'UniApp',
-        'UniApp SDK 的支持范围、平台差异和接入入口。',
-        'Support scope, platform differences, and entry points for the UniApp SDK.',
-      ),
-      platformGroup(
-        'harmonyos',
-        'HarmonyOS',
-        'HarmonyOS SDK 的支持范围、系统要求和接入入口。',
-        'Support scope, system requirements, and entry points for the HarmonyOS SDK.',
-      ),
-    ],
+    pages: [],
+    groups: [publishedWuKongIMSDKGroup(), publishedEasySDKGroup()],
   },
   {
     key: 'api',
     label: text('API 与协议', 'API & Protocols'),
     description: text(
-      '查阅 HTTP API、Webhook 和客户端协议。',
-      'Reference HTTP APIs, webhooks, and client protocols.',
+      '查阅源码校准的 HTTP、Webhook、客户端协议与私有接口边界。',
+      'Reference source-aligned HTTP, webhook, client-protocol, and private-interface boundaries.',
     ),
     status: 'published',
     pages: [
-      plannedPage(
+      publishedPage(
         'conventions',
         '通用约定',
         'Conventions',
-        '定义 Base URL、JSON、时间、ID、分页、幂等和响应结构。',
-        'Defines base URLs, JSON, time, identifiers, pagination, idempotency, and response envelopes.',
+        'WuKongIM HTTP API 的地址、格式、标识和重试规则。',
+        'WuKongIM HTTP API addressing, formats, identifiers, and retry rules.',
       ),
-      plannedPage(
+      publishedPage(
         'authentication',
         '认证与安全',
         'Authentication & Security',
-        '说明 API 凭证、Token、请求保护和生产安全要求。',
-        'Explains API credentials, tokens, request protection, and production security.',
+        'WuKongIM HTTP API 与 Gateway 的鉴权边界。',
+        'Authentication boundaries for WuKongIM HTTP API and Gateway.',
       ),
-      plannedPage(
+      publishedPage(
         'compatibility',
         '版本与兼容性',
         'Versions & Compatibility',
-        '说明 API、客户端协议与服务端版本的兼容规则。',
-        'Defines compatibility among APIs, client protocols, and server versions.',
+        '查看构建快照和接口覆盖状态。',
+        'View the build snapshot and API coverage status.',
+      ),
+      publishedPage(
+        'interface-inventory',
+        '接口清单与信任边界',
+        'Interface Inventory & Trust Boundaries',
+        '盘点 Manager、Node transport、MCP、插件与 Agent 私有合同。',
+        'Inventories Manager, node transport, MCP, plugin, and agent-private contracts.',
       ),
     ],
     groups: [
-      plannedGroup(
-        'product-http',
-        '产品 HTTP API',
-        'Product HTTP API',
-        '面向稳定产品能力的规范驱动 HTTP 参考。',
-        'Specification-driven HTTP reference for stable product capabilities.',
-        [
-          plannedPage(
-            'users',
-            '用户',
-            'Users',
-            'Token、设备退出、在线状态和系统用户接口。',
-            'Token, device logout, online status, and system-user endpoints.',
-          ),
-          plannedPage(
-            'channels',
-            '频道',
-            'Channels',
-            '频道、订阅者、黑名单、白名单和临时频道接口。',
-            'Channel, subscriber, blacklist, whitelist, and temporary-channel endpoints.',
-          ),
-          plannedPage(
-            'messages',
-            '消息',
-            'Messages',
-            '消息发送、同步、确认和消息事件接口。',
-            'Message send, sync, acknowledgement, and event endpoints.',
-          ),
-          plannedPage(
-            'conversations',
-            '会话',
-            'Conversations',
-            '会话列表、同步、未读数和删除接口。',
-            'Conversation list, sync, unread-count, and deletion endpoints.',
-          ),
-          plannedPage(
-            'routing',
-            '路由发现',
-            'Route Discovery',
-            '获取目标节点 TCP 和 WebSocket 接入地址。',
-            'Discovers TCP and WebSocket addresses for the target node.',
-          ),
-          plannedPage(
-            'errors',
-            '错误响应',
-            'Error Responses',
-            '解释 HTTP 状态、业务状态和 Reason Code 的关系。',
-            'Relates HTTP status, business status, and protocol reason codes.',
-          ),
-        ],
-      ),
-      plannedGroup(
+      publishedProductHTTPGroup(),
+      publishedGroup(
         'operations-http',
         '运维 HTTP API',
         'Operations HTTP API',
-        '发布稳定且受支持的运维接口。',
-        'Publishes stable and supported operations endpoints.',
+        '发布四个运维观测接口，并逐项标明稳定性。',
+        'Publishes four operations observation endpoints with per-operation stability.',
         [
-          plannedPage(
+          publishedPage(
             'health-and-readiness',
             '健康与就绪',
             'Health & Readiness',
             '说明健康检查、就绪检查和负载均衡使用方式。',
             'Covers health checks, readiness checks, and load-balancer usage.',
           ),
-          plannedPage(
+          publishedPage(
             'metrics',
             'Metrics',
             'Metrics',
             '说明 Prometheus 指标入口、访问控制和抓取建议。',
             'Explains the Prometheus endpoint, access control, and scrape guidance.',
           ),
-          plannedPage(
+          publishedPage(
             'read-only',
             '只读运维接口',
             'Read-only Operations',
-            '记录正式支持的节点状态和资源快照查询。',
-            'Documents supported node-state and resource-snapshot queries.',
+            '记录节点本地 Top 快照以及条件启用的 Debug、Bench 清单。',
+            'Documents node-local Top snapshots and conditional Debug and Bench inventories.',
           ),
-          plannedPage(
+          publishedPage(
             'stability',
             '接口稳定性',
             'API Stability',
@@ -902,28 +1108,28 @@ export const domains: DocumentationDomain[] = [
           ),
         ],
       ),
-      plannedGroup(
+      publishedGroup(
         'webhooks',
         'Webhook',
         'Webhooks',
         '说明服务端向业务系统投递事件的契约。',
         'Defines how the server delivers events to business systems.',
         [
-          plannedPage(
+          publishedPage(
             'events',
             '事件类型',
             'Event Types',
             '列出消息、在线状态和其他受支持事件。',
             'Lists messages, presence, and other supported events.',
           ),
-          plannedPage(
+          publishedPage(
             'payloads',
             '请求结构',
             'Payloads',
-            '定义通用信封、事件负载和示例。',
-            'Defines the common envelope, event payloads, and examples.',
+            '定义三种事件负载，并明确请求体没有通用信封。',
+            'Defines the three event payloads and the absence of a common envelope.',
           ),
-          plannedPage(
+          publishedPage(
             'reliability-and-security',
             '安全与可靠性',
             'Security & Reliability',
@@ -932,109 +1138,160 @@ export const domains: DocumentationDomain[] = [
           ),
         ],
       ),
-      plannedGroup(
+      publishedGroup(
         'client-protocols',
         '客户端协议',
         'Client Protocols',
-        '说明 TCP 二进制协议与 WebSocket JSON-RPC。',
-        'Documents the TCP binary protocol and WebSocket JSON-RPC.',
+        '说明 WKProto、JSON-RPC 和 MQTT 开发预览的接入契约。',
+        'Documents WKProto, JSON-RPC and MQTT development-preview entry contracts.',
         [
-          plannedPage(
+          publishedPage(
             'connection-lifecycle',
             '连接生命周期',
             'Connection Lifecycle',
-            '说明 Connect、认证、心跳、断开和重连。',
-            'Covers connect, authentication, heartbeat, disconnect, and reconnect.',
+            '说明 CONNECT 认证、CONNACK、心跳、关闭和恢复边界。',
+            'Covers CONNECT authentication, CONNACK, heartbeat, close, and recovery boundaries.',
           ),
-          plannedPage(
+          publishedPage(
+            'packet-types',
+            '数据包类型',
+            'Packet Types',
+            '列出当前 Frame Type、方向、支持范围和版本差异。',
+            'Lists current Frame Types, directions, support scope, and version differences.',
+          ),
+          publishedPage(
             'tcp-binary',
             'TCP 二进制协议',
             'TCP Binary Protocol',
             '定义帧格式、编码、标志位和包边界。',
             'Defines frame format, encoding, flags, and packet boundaries.',
           ),
-          plannedPage(
+          publishedPage(
             'json-rpc',
             'WebSocket JSON-RPC',
             'WebSocket JSON-RPC',
             '定义方法、参数、结果、通知和请求关联。',
             'Defines methods, parameters, results, notifications, and request correlation.',
           ),
-          plannedPage(
-            'packet-types',
-            '数据包类型',
-            'Packet Types',
-            '说明 Connect、Send、Recv、Ack 和 Ping/Pong 字段。',
-            'Documents Connect, Send, Recv, Ack, and Ping/Pong fields.',
-          ),
-          plannedPage(
+          publishedPage(
             'encryption',
             '加密与安全',
             'Encryption & Security',
             '说明握手密钥、负载保护和协议安全约束。',
             'Covers handshake keys, payload protection, and protocol security constraints.',
           ),
+          publishedGroup(
+            'mqtt',
+            'MQTT',
+            'MQTT',
+            'MQTT 5 TCP 开发预览：认证、消息、会话、遗嘱和互通。',
+            'MQTT 5 TCP development preview: authentication, messages, sessions, Wills and interop.',
+            [
+              publishedPage(
+                'authentication-and-topics',
+                '认证与 Topic',
+                'Authentication and Topics',
+                '配置 UID、Token、设备标识与精确 Topic。',
+                'Configures UIDs, tokens, device flags and exact topics.',
+              ),
+              publishedPage(
+                'messages',
+                '消息契约',
+                'Message Contract',
+                '说明原始 payload、幂等、消息属性与提交确认。',
+                'Defines raw payloads, idempotency, message properties and commit acknowledgements.',
+              ),
+              publishedPage(
+                'sessions-and-qos',
+                '持久会话与 QoS',
+                'Persistent Sessions and QoS',
+                '核对会话恢复、QoS、重复和背压。',
+                'Checks session recovery, QoS, duplicates and backpressure.',
+              ),
+              publishedPage(
+                'will',
+                '遗嘱消息',
+                'Will Messages',
+                '说明 Will 配置、触发、取消和当前授权。',
+                'Explains Will setup, triggering, cancellation and current authorization.',
+              ),
+              publishedPage(
+                'interop',
+                'HTTP / SDK 互通',
+                'HTTP / SDK Interoperability',
+                '共用 IM 消息，区分 Topic 与 payload 的编码。',
+                'Shares IM messages and distinguishes topic from payload encoding.',
+              ),
+              publishedPage(
+                'operations-and-troubleshooting',
+                '部署与排障',
+                'Operations and Troubleshooting',
+                '核对集群配置、逻辑配额和公开诊断信号。',
+                'Checks cluster configuration, logical quotas and public diagnostic signals.',
+              ),
+            ],
+          ),
         ],
       ),
-      plannedGroup(
+      publishedGroup(
         'dictionaries',
         '公共数据字典',
         'Shared Dictionaries',
-        '集中定义跨 API 和协议复用的常量。',
-        'Centralizes constants shared across APIs and protocols.',
+        '发布源码校准的 Channel、设备、消息标志与 Reason Code 字典。',
+        'Publishes source-aligned Channel, device, message-flag, and Reason Code dictionaries.',
         [
-          plannedPage(
+          publishedPage(
             'channel-types',
             'Channel Type',
             'Channel Type',
-            '定义单聊、群聊和其他频道类型。',
-            'Defines direct, group, and other channel types.',
+            '列出当前 1–12 Channel Type，并标注基础、专用和旧类型边界。',
+            'Lists current Channel Types 1–12 with baseline, specialized, and legacy boundaries.',
           ),
-          plannedPage(
+          publishedPage(
             'device-flags',
             'Device Flag',
             'Device Flag',
-            '定义 App、Web、System 等设备标识。',
-            'Defines App, Web, System, and other device identifiers.',
+            '列出 APP、WEB、PC、SYSTEM 与 Device Level 冲突策略。',
+            'Lists APP, WEB, PC, SYSTEM, and Device Level conflict policies.',
           ),
-          plannedPage(
+          publishedPage(
             'message-flags',
             'Message Flags',
             'Message Flags',
-            '定义持久化、红点、回执和流式消息标志。',
-            'Defines persistence, red-dot, receipt, and streaming-message flags.',
+            '列出固定 Header 与 Setting 位，并解释持久化、红点、命令、回执和流语义。',
+            'Lists fixed-header and Setting bits for persistence, red dots, commands, receipts, and streams.',
           ),
-          plannedPage(
+          publishedPage(
             'reason-codes',
             'Reason Code',
             'Reason Code',
-            '定义成功、鉴权失败、重试和拒绝等原因码。',
-            'Defines success, authentication failure, retry, refusal, and other reason codes.',
+            '完整列出当前 0–29 协议枚举并标注使用阶段、重试和可达性。',
+            'Lists the complete current 0–29 protocol enum with stage, retry, and reachability guidance.',
           ),
         ],
       ),
-      plannedGroup(
+      publishedGroup(
         'specifications',
         '规范下载',
         'Specifications',
         '提供校准后、可机器读取的接口与协议规范。',
         'Provides aligned, machine-readable API and protocol specifications.',
         [
-          plannedPage(
+          publishedPage(
             'openapi',
             'OpenAPI',
             'OpenAPI',
             '在线浏览并下载校准后的 v3 HTTP API 规范。',
             'Browse and download the aligned v3 HTTP API specification.',
           ),
-          plannedPage(
+          publishedPage(
             'json-rpc-schema',
             'JSON-RPC Schema',
             'JSON-RPC Schema',
             '浏览并下载 WebSocket JSON-RPC Schema。',
             'Browse and download the WebSocket JSON-RPC schema.',
           ),
-          plannedPage(
+          publishedPage(
             'protocol-changelog',
             '协议变更记录',
             'Protocol Changelog',
@@ -1071,21 +1328,51 @@ function entryFromPage(
   };
 }
 
+/** Converts one validated relative navigation path into Next.js route segments. */
+export function navigationPathSegments(slug: string): string[] {
+  const segments = slug.split('/');
+  if (segments.some((segment) => segment.length === 0 || segment === '.' || segment === '..')) {
+    throw new Error(`invalid navigation path: ${slug}`);
+  }
+  return segments;
+}
+
+/** Resolves the route base for a group's children independently from sidebar nesting. */
+export function navigationChildParentSlugs(
+  group: NavigationGroup,
+  groupSlugs: string[],
+): string[] {
+  return group.childrenAtDomainRoot ? [] : groupSlugs;
+}
+
 /** Returns every domain, folder index, and leaf page in display order. */
 export function getAllNavigationEntries(locale: Locale): NavigationEntry[] {
   return domains.flatMap((domain) => {
     const entries = [entryFromPage(locale, domain, domain, [], 'domain')];
 
-    for (const page of domain.pages) {
-      entries.push(entryFromPage(locale, domain, page, [page.slug], 'page'));
-    }
-
-    for (const group of domain.groups) {
-      entries.push(entryFromPage(locale, domain, group, [group.slug], 'group'));
-      for (const page of group.children) {
-        entries.push(entryFromPage(locale, domain, page, [group.slug, page.slug], 'page'));
+    function appendNodes(nodes: NavigationNode[], parentSlugs: string[]) {
+      for (const node of nodes) {
+        const slugs = [...parentSlugs, ...navigationPathSegments(node.slug)];
+        entries.push(
+          entryFromPage(
+            locale,
+            domain,
+            node,
+            slugs,
+            isNavigationGroup(node) ? 'group' : 'page',
+          ),
+        );
+        if (isNavigationGroup(node)) {
+          appendNodes(node.children, navigationChildParentSlugs(node, slugs));
+        }
       }
     }
+
+    for (const page of domain.pages) {
+      entries.push(entryFromPage(locale, domain, page, navigationPathSegments(page.slug), 'page'));
+    }
+
+    appendNodes(domain.groups, []);
 
     return entries;
   });

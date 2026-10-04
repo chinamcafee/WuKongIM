@@ -1,0 +1,58 @@
+---
+title: WuKongIM HTTP API
+description: Reference 49 HTTP contract entries, including two disabled historical CMD endpoints.
+---
+
+WuKongIM HTTP API provides basic integration and trusted-management operations. The complete OpenAPI contract matches 47 runtime registrations and two disabled historical CMD compatibility entries.
+Each operation page explains the type, requiredness, default, range, and runtime compatibility behavior of every query parameter and JSON field.
+
+OpenAPI: [complete contract](/contracts/product-http.openapi.json) · narrow profiles: [basic integration](/contracts/javascript-web-quickstart.openapi.json) · [message sending](/contracts/product-http-messaging.openapi.json) · [Channel and Conversation](/contracts/product-http-management.openapi.json)
+
+<Callout type="error" title="Trusted backends only">
+  WuKongIM HTTP API has no general business authentication. Restrict network reachability and provide authentication, authorization, limits, and audit at an API Gateway, service mesh, or product backend.
+</Callout>
+
+## Choose by task
+
+| Task | Recommended entry | Completion check |
+| --- | --- | --- |
+| Issue a connection identity | `/user/token` → `/route` → SDK CONNECT | After the token write, CONNACK still decides connection success |
+| Send from a backend | `/message/send` | Inspect `reason` after HTTP 200 |
+| Recover after disconnect | `/channel/messagesync` or its batch form | Advance by `message_seq`; inspect each batch-item `error` |
+| Reconcile group membership | `/channel`, subscriber add/remove | Persist the product desired version; verify and replay desired state after failure |
+| Synchronize the Conversation directory | `/conversation/list` | Echo the cursor until `done=true` |
+
+The complete contract is authoritative for 47 runtime entries and two disabled historical CMD compatibility entries. The three narrow profiles are reviewed task projections with runnable examples. Generated pages merge those examples and expose caller, node scope, non-atomic writes, and post-200 business checks in an “Operation boundary” callout.
+
+## Channel observability boundary
+
+| State | WuKongIM HTTP API readback |
+| --- | --- |
+| Allowlist | `GET /channel/whitelist`, a legacy unbounded full list |
+| Ordinary subscribers | None |
+| Denylist | None |
+| Temporary subscribers | None |
+
+When WuKongIM HTTP API has no symmetric readback, do not treat one 200 response as reconciliation proof. Keep the product database as the desired-state source and use the protected, bounded Manager query when strict verification is required.
+
+## What deprecated means
+
+`deprecated` marks a compatibility entry that still exists but should not be the default for a new integration: replace `/channel/info` with `/channel`, list set with remove-all plus bounded add, and `/conversation/sync` with `/conversation/list`. Batch routing, online status, Channel disband/removal, full allowlist read, and command-message sync/bind compatibility entries currently have no one-to-one replacement in WuKongIM HTTP API; use them only after reading their operation boundaries. Node-local system-UID cache routes are for directed operations and cannot replace durable mutations.
+
+## API directory
+
+<Cards>
+  <Card title="User Token" description="POST /user/token stores device-token metadata." href="/en/api/product-http/users" />
+  <Card title="Route Discovery" description="GET /route returns client TCP and WebSocket ingress." href="/en/api/product-http/routing" />
+  <Card title="Message Sync" description="POST /channel/messagesync recovers committed messages." href="/en/api/product-http/messages" />
+  <Card title="Message Sending" description="POST /message/send submits ordinary persistent messages." href="/en/api/product-http/message-send" />
+  <Card title="Channels" description="Manage Channels, subscribers, and allow or deny lists." href="/en/api/product-http/channels" />
+  <Card title="Conversations" description="List, retry, unread, hide, and activate Conversations." href="/en/api/product-http/conversations" />
+  <Card title="Error Responses" description="HTTP status, error bodies, and retry guidance." href="/en/api/product-http/errors" />
+</Cards>
+
+## Basic integration contract
+
+<GoldenPathContract locale="en" />
+
+The snapshot above proves only the example scope of the three golden-path operations; it is not end-to-end acceptance for the complete contract. Realtime client send and receive still use the SDK and Gateway.

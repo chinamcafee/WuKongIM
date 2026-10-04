@@ -1,17 +1,22 @@
 ---
-title: SDK
-description: Integrate WuKongIM across supported client platforms.
+title: Choose an SDK
+description: Quickly choose between the full WuKongIMSDK and the lightweight WuKongEasySDK.
 ---
 
-SDK documentation centralizes cross-platform workflows and platform-specific integration details.
-
-## Start here
+WuKongIM provides two client SDK families. Choose by how much client-side state the SDK should manage, then open the matching guide.
 
 <Cards>
-  <Card title="Choose an SDK" description="Choose a client by platform, framework, and runtime." href="/en/sdk/choose-sdk" />
-  <Card title="Versions & compatibility" description="Verify SDK, operating system, and server versions." href="/en/sdk/compatibility" />
-  <Card title="Common guides" description="Learn identity, connection, messaging, conversations, and error handling." href="/en/sdk/common-guides" />
-  <Card title="Android" description="Review the planned Android SDK structure." href="/en/sdk/android" />
-  <Card title="iOS" description="Review the planned iOS SDK structure." href="/en/sdk/ios" />
-  <Card title="JavaScript / Web" description="Review the planned browser SDK structure." href="/en/sdk/javascript" />
+  <Card title="WuKongIMSDK" description="Full SDKs for connections, messages, local chats, unread counts, and offline data." href="/en/sdk/wukongim" />
+  <Card title="WuKongEasySDK" description="Lightweight SDKs with fewer APIs for online connections and messaging." href="/en/sdk/easy" />
 </Cards>
+
+## Which one should I use?
+
+| Your requirement | Recommended |
+| --- | --- |
+| The SDK should maintain local messages and the chat list | WuKongIMSDK |
+| You need unread counts, history, and offline recovery | WuKongIMSDK |
+| You only need an online connection plus send and receive | WuKongEasySDK |
+| You want the smallest possible integration surface | WuKongEasySDK |
+
+For a complete chat product, start with [WuKongIMSDK](/en/sdk/wukongim). To add lightweight realtime communication to an existing product, start with [WuKongEasySDK](/en/sdk/easy).

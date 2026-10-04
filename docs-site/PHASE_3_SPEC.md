@@ -25,11 +25,11 @@ planned.
   business relationships, moderation, and webhook side effects.
 - Clients use `/route` to discover configured gateway addresses and use a
   client SDK or protocol implementation for the long-lived connection.
-- The current app gateway performs CONNECT negotiation and encryption, but its
-  composition does not enable stored-token verification. `/user/token` stores
-  compatible device-token metadata; documentation must not present the current
-  default build as a complete production authentication boundary.
-- Product HTTP routes, including `/user/token` and `/message/send`, require a
+- The current app gateway performs CONNECT negotiation and encryption and, by
+  default, verifies the token stored by `/user/token` for the same UID and
+  device category. Documentation must not present this exact-match check as a
+  complete production credential lifecycle.
+- WuKongIM HTTP API routes, including `/user/token` and `/message/send`, require a
   trusted network or an authenticated reverse proxy in production.
 - `/message/send` accepts a base64 payload and returns `message_id`,
   `message_seq`, and a protocol `reason`. On the default persistent-message

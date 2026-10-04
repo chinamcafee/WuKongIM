@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
+	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 	"github.com/WuKongIM/WuKongIM/pkg/hashslot"
 )
 
@@ -49,6 +50,9 @@ func ValidateBundle(ctx context.Context, root string, opts ImportOptions) (Impor
 			return stats, err
 		}
 	}
+	if err := validator.finishSubscriberSequences(); err != nil {
+		return stats, err
+	}
 	if err := validateMessageEntries(ctx, root, messageChannelEntries, messageEntries, &stats); err != nil {
 		return stats, err
 	}
@@ -70,16 +74,34 @@ type bundleValidator struct {
 
 	haveSubscriberOrder bool
 	subscriberOrder     subscriberOrder
+	subscriberMax       map[uint16]uint64
+	subscriberSequences map[uint16]uint64
 }
 
 func newBundleValidator(hashSlotCount uint16) *bundleValidator {
 	return &bundleValidator{
-		hashSlotCount: hashSlotCount,
+		hashSlotCount:       hashSlotCount,
+		subscriberMax:       make(map[uint16]uint64),
+		subscriberSequences: make(map[uint16]uint64),
 	}
 }
 
 func (v *bundleValidator) Visit(kind FileKind, record any) error {
 	switch kind {
+	case FileKindMetaSubscriberSequences:
+		row := record.(SubscriberSequenceRecord)
+		if row.HashSlot >= v.hashSlotCount || row.Sequence < 2 || v.subscriberSequences[row.HashSlot] != 0 {
+			return fmt.Errorf("%w: invalid or duplicate subscriber sequence", ErrValidation)
+		}
+		v.subscriberSequences[row.HashSlot] = uint64(row.Sequence)
+		return nil
+	case FileKindMetaMessageUpdates:
+		row := record.(MessageUpdateRecord)
+		key, err := metadb.ValidateMessageUpdateImport(row.MessageUpdateImport)
+		if err != nil {
+			return err
+		}
+		return v.validateHashSlot("message_updates", key.ChannelID, row.HashSlot)
 	case FileKindMetaUsers:
 		row := record.(UserRecord)
 		return v.validateHashSlot("users", row.UID, row.HashSlot)
@@ -88,11 +110,20 @@ func (v *bundleValidator) Visit(kind FileKind, record any) error {
 		return v.validateHashSlot("devices", row.UID, row.HashSlot)
 	case FileKindMetaChannels:
 		row := record.(ChannelRecord)
+		if row.DirectoryProjectionState > uint8(metadb.DirectoryProjectionReady) {
+			return fmt.Errorf("%w: channels invalid directory_projection_state %d", ErrValidation, row.DirectoryProjectionState)
+		}
+		if (row.DirectoryProjectionState == uint8(metadb.DirectoryProjectionNone)) != (row.DirectoryProjectionGeneration == 0) {
+			return fmt.Errorf("%w: channels inconsistent directory projection generation", ErrValidation)
+		}
 		return v.validateHashSlot("channels", row.ChannelID, row.HashSlot)
 	case FileKindMetaSubscribers:
 		row := record.(SubscriberRecord)
 		if err := v.validateHashSlot("subscribers", row.ChannelID, row.HashSlot); err != nil {
 			return err
+		}
+		if uint64(row.Incarnation) > v.subscriberMax[row.HashSlot] {
+			v.subscriberMax[row.HashSlot] = uint64(row.Incarnation)
 		}
 		return v.validateSubscriberOrder(row)
 	case FileKindMetaUserChannelMemberships:
@@ -104,9 +135,18 @@ func (v *bundleValidator) Visit(kind FileKind, record any) error {
 	case FileKindMetaCMDDeviceCursors:
 		row := record.(CMDDeviceCursorRecord)
 		return v.validateHashSlot("cmd_device_cursors", row.UID, row.HashSlot)
+	case FileKindMetaUserCMDChannelMemberships:
+		row := record.(UserCMDChannelMembershipRecord)
+		return v.validateHashSlot("user_cmd_channel_memberships", row.UID, row.HashSlot)
 	case FileKindMetaChannelLatest:
 		row := record.(ChannelLatestRecord)
 		return v.validateHashSlot("channel_latest", row.ChannelID, row.HashSlot)
+	case FileKindMetaPersonDirectoryTasks:
+		row := record.(PersonDirectoryTaskRecord)
+		if row.Generation == 0 {
+			return fmt.Errorf("%w: person_directory_tasks generation is zero", ErrValidation)
+		}
+		return v.validateHashSlot("person_directory_tasks", row.ChannelID, row.HashSlot)
 	default:
 		return fmt.Errorf("%w: unknown kind %q", ErrValidation, kind)
 	}

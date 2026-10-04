@@ -29,3 +29,23 @@ func TestFromCommandChannel(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "u2@u1", channelID)
 }
+
+func TestConfiguredCommandCodecsAreIndependent(t *testing.T) {
+	for _, suffix := range []string{"__commands", "__events"} {
+		t.Run(suffix, func(t *testing.T) {
+			t.Parallel()
+			codec := CommandCodec{Suffix: suffix}
+			id := codec.ToCommandChannel("u1@u2")
+			require.Equal(t, "u1@u2"+suffix, id)
+			require.Equal(t, id, codec.ToCommandChannel(id))
+			source, ok := codec.FromCommandChannel(id)
+			require.True(t, ok)
+			require.Equal(t, "u1@u2", source)
+			require.False(t, codec.IsCommandChannel("g1____cmd"))
+			scoped, err := codec.RequestSubscriberChannelFor([]string{"u1", "u2"})
+			require.NoError(t, err)
+			require.Equal(t, scoped.SourceChannelID+suffix, scoped.CommandChannelID)
+			require.Equal(t, "g1____cmd", ToCommandChannel("g1"))
+		})
+	}
+}

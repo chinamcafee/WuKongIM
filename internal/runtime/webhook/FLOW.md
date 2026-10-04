@@ -1,60 +1,35 @@
-# internal/runtime/webhook Flow
+---
+scope: package
+summary: Performs durable critical webhook delivery with stable IDs, retry, dead letters and optional batching; presence status is bounded best effort.
+---
 
-`internal/runtime/webhook` owns node-local HTTP webhook delivery. Critical
-post-commit events (`msg.notify` and `msg.offline`) use a sync-WAL Pebble outbox;
-the presence-only `user.onlinestatus` event remains a bounded best-effort memory
-queue because Link-U does not derive durable business state from it.
+# Webhook Runtime Flow
 
-## Critical Event Flow
+## Responsibility
 
-```text
-durable message commit / bounded offline-recipient chunk
-  -> map to the v3 webhook body
-  -> derive stable X-WK-Webhook-ID from event + message identity + recipients
-  -> sync the active outbox record before admission returns
-  -> bounded workers claim due records
-  -> POST with stable ID and one-based attempt headers
-  -> any HTTP 2xx: atomically replace the active record with a retained dedupe marker
-  -> timeout / transport / non-2xx: persist exponential retry using the same ID
-  -> max attempts: atomically move the record to dead-letter
-```
+Notify and offline callbacks enter a synchronous WAL outbox with bounded bytes and entries. Backpressure preserves critical events. HTTP completion never changes SENDACK or message durability. Presence status uses a bounded best-effort batch pool.
 
-Duplicate source admission is a successful no-op while the identity is pending,
-dead, or retained as delivered. Process restart reopens Pebble and dispatches due
-active records. Capacity is bounded by record count and logical bytes; saturation
-backpressures critical admission instead of dropping it. Successful ID markers are
-pruned only after `outbox_delivered_retention`.
+## Boundaries
 
-Operators inspect node-local state with `GET /manager/webhooks/outbox` and may
-requeue an explicit set of 1–100 dead-letter IDs with
-`POST /manager/webhooks/outbox/replay`. Replay requires `cluster.webhook:w` when
-Manager auth is enabled and never accepts an unbounded “replay all” request.
+The runtime receives already-decided events; it does not own subscriber scans, personal send policy, presence or Channel ordering. Endpoint and JSON compatibility are runtime responsibilities.
 
-`msg.offline`
-  -> canonical Online Delivery classifies offline recipients after presence
-  -> batch observer passes bounded UID chunks to the app adapter
-  -> webhook runtime syncs each `OfflineMessage` chunk into the durable outbox
-  -> bounded outbox workers send one JSON object to `{HTTPAddr}?event=msg.offline`
+## Main Flows
 
-Both critical message payloads expose the committed message's durable
-`ServerTimestampMS` as `server_timestamp_ms`. The mapper copies the Unix
-millisecond value without truncation. It does not emit the former second-level
-`timestamp` field, and consumers must not synthesize an occurrence time from
-delivery time or another fallback.
+1. Notify/offline admission durably stores each original event ID and body; restart recovers pending records.
+2. Workers claim due records, send with bounded timeouts and mark each delivered or failed. Exponential retry ends in retained dead letters; explicit replay keeps IDs.
+3. Optional notify batching groups claimed records after a bounded coalescing wait. The default is one item, preserving existing HTTP ID/body contracts. Batch items add stable `event_id`; the request ID binds that exact group. Regrouping can change the group ID, so consumers deduplicate by item ID when enabling batching.
+4. Online status stays best effort and retains its legacy JSON shape. Offline notifications preserve the device push policy and existing schema.
 
-## Best-Effort Presence Flow
+## Invariants and Failure Semantics
 
-`user.onlinestatus` is mapped to the legacy-compatible status string, admitted to
-a bounded batch pool, retried a finite number of times, and then discarded with a
-bounded observation. It never enters the critical outbox.
+- Critical delivery is at least once. A successful HTTP response followed by a crash before its marker can be retried; consumers must deduplicate stable source IDs.
+- Admission, outbox size, claimed groups and concurrent requests remain bounded.
+- Shutdown releases interrupted claims and keeps undelivered work for restart.
 
-## Observability and Security
+## Read First
 
-Prometheus exposes delivery totals and latency plus outbox backlog, oldest age,
-logical bytes, live retry attempts, and dead-letter count. Runtime observations
-use bounded event/result labels. `HTTPAddr` may contain Basic Auth userinfo; sender
-errors never include the configured URL, credentials, response body, payload, or
-chat content.
+- [Runtime](runtime.go), [outbox](outbox.go), [mapper](mapper.go), [sender](sender.go)
 
-Webhook delivery remains post-commit and cannot rewrite an already successful
-SENDACK. Large offline fanout must continue to enter as bounded recipient chunks.
+## Update Triggers
+
+Update when durability, event IDs, batching, retry, replay, offline policy or shutdown semantics change.

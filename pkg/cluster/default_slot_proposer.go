@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	clusterchannels "github.com/WuKongIM/WuKongIM/pkg/cluster/channels"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/propose"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 	metafsm "github.com/WuKongIM/WuKongIM/pkg/slot/fsm"
@@ -31,6 +32,10 @@ type defaultSlotProposer struct {
 	// acquireAdmission linearizes ordinary Slot proposal admission against the
 	// one-way source fence. The returned release must cover the runtime enqueue.
 	acquireAdmission func() (release func(), err error)
+	// contentEpoch reads the non-restored Controller epoch while admission is held.
+	contentEpoch func(context.Context) (uint64, error)
+	// metaCreateObserver receives one result at this authoritative proposal boundary.
+	metaCreateObserver clusterchannels.MetaCreateObserver
 }
 
 // IsLocalLeader reports whether the local default Slot runtime leads slotID.
@@ -64,6 +69,14 @@ func (p defaultSlotProposer) propose(ctx context.Context, slotID uint32, payload
 	if err != nil {
 		return nil, err
 	}
+	metaCreate := metafsm.IsCreateChannelRuntimeMetaCommand(command)
+	metaCreateCount := 0
+	if metaCreate {
+		metaCreateCount, err = metafsm.CreateChannelRuntimeMetaBatchCommandSize(command)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if observer := propose.StageObserverFromContext(ctx); observer != nil {
 		ctx = multiraft.WithProposalStageObserver(ctx, defaultSlotProposalStageObserver{observer: observer})
 	}
@@ -80,6 +93,23 @@ func (p defaultSlotProposer) propose(ctx context.Context, slotID uint32, payload
 			release = func() {}
 		}
 	}
+	if expected, edit, decodeErr := metafsm.MessageUpdateCommandEpoch(command); edit {
+		if decodeErr != nil {
+			release()
+			return nil, decodeErr
+		}
+		if p.contentEpoch != nil {
+			epoch, epochErr := p.contentEpoch(ctx)
+			if epochErr != nil {
+				release()
+				return nil, epochErr
+			}
+			if expected != epoch {
+				release()
+				return []byte(`{"Status":"content_epoch_conflict"}`), nil
+			}
+		}
+	}
 	started := time.Now()
 	future, err := p.runtime.Propose(ctx, multiraft.SlotID(slotID), multiraftPayload(hashSlot, command))
 	release()
@@ -87,21 +117,94 @@ func (p defaultSlotProposer) propose(ctx context.Context, slotID uint32, payload
 	if err != nil {
 		return nil, mapMultiraftProposeError(err)
 	}
+	completionObserved := false
+	if metaCreate && p.metaCreateObserver != nil {
+		if completionFuture, ok := future.(multiraft.CompletionFuture); ok {
+			completionObserved = completionFuture.ObserveCompletion(defaultSlotMetaCreateCompletionObserver{
+				slotID:        slotID,
+				expectedCount: metaCreateCount,
+				observer:      p.metaCreateObserver,
+			})
+		}
+	}
 	started = time.Now()
 	result, err := future.Wait(ctx)
 	propose.ObserveStage(ctx, defaultSlotStageMetaCreateWait, err, time.Since(started))
 	if err == nil {
 		if applyErr := mapSlotApplyResult(command, result.Data); applyErr != nil {
+			if !completionObserved {
+				p.observeMetaCreateBatch(slotID, metaCreateCount, clusterchannels.MetaCreateError)
+			}
 			return nil, applyErr
 		}
 	}
 	if err != nil {
+		if !completionObserved && (ctx.Err() == nil || !errors.Is(err, ctx.Err())) {
+			p.observeMetaCreateBatch(slotID, metaCreateCount, clusterchannels.MetaCreateError)
+		}
 		return nil, mapMultiraftProposeError(err)
+	}
+	if metaCreate && !completionObserved {
+		defaultSlotMetaCreateCompletionObserver{
+			slotID: slotID, expectedCount: metaCreateCount, observer: p.metaCreateObserver,
+		}.ObserveFutureCompletion(result, nil)
+	}
+	if metaCreate {
+		results, decodeErr := metafsm.DecodeCreateChannelRuntimeMetaBatchResult(result.Data)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		if len(results) != metaCreateCount {
+			return nil, metadb.ErrCorruptValue
+		}
 	}
 	if !wantResult {
 		return nil, nil
 	}
 	return append([]byte(nil), result.Data...), nil
+}
+
+type defaultSlotMetaCreateCompletionObserver struct {
+	slotID        uint32
+	expectedCount int
+	observer      clusterchannels.MetaCreateObserver
+}
+
+func (o defaultSlotMetaCreateCompletionObserver) ObserveFutureCompletion(result multiraft.Result, err error) {
+	if o.observer == nil {
+		return
+	}
+	if err != nil {
+		o.observeRepeated(clusterchannels.MetaCreateError)
+		return
+	}
+	results, decodeErr := metafsm.DecodeCreateChannelRuntimeMetaBatchResult(result.Data)
+	if decodeErr != nil || len(results) != o.expectedCount {
+		o.observeRepeated(clusterchannels.MetaCreateError)
+		return
+	}
+	for _, result := range results {
+		observed := clusterchannels.MetaCreateAlreadyExisting
+		if result.Created {
+			observed = clusterchannels.MetaCreateCreated
+		}
+		o.observer.ObserveChannelMetaCreate(o.slotID, observed)
+	}
+}
+
+func (o defaultSlotMetaCreateCompletionObserver) observeRepeated(result clusterchannels.MetaCreateResult) {
+	for i := 0; i < o.expectedCount; i++ {
+		o.observer.ObserveChannelMetaCreate(o.slotID, result)
+	}
+}
+
+func (p defaultSlotProposer) observeMetaCreateBatch(slotID uint32, count int, result clusterchannels.MetaCreateResult) {
+	if p.metaCreateObserver == nil {
+		return
+	}
+	for i := 0; i < count; i++ {
+		p.metaCreateObserver.ObserveChannelMetaCreate(slotID, result)
+	}
 }
 
 // multiraftPayload converts cluster's propose envelope into Multi-Raft's hash-slot envelope.

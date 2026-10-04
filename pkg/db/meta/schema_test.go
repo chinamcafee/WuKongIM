@@ -195,7 +195,6 @@ func TestMetaSchemaValidateAllTables(t *testing.T) {
 		TableIDChannel,
 		TableIDSubscriber,
 		TableIDChannelRuntimeMeta,
-		TableIDConversation,
 		TableIDPluginBinding,
 		TableIDChannelMigration,
 		TableIDHashSlotMigration,
@@ -210,7 +209,7 @@ func TestMetaSchemaValidateAllTables(t *testing.T) {
 			t.Fatalf("table id %d missing from Tables()", tableID)
 		}
 	}
-	if _, ok := seen[TableIDCMDConversation]; ok {
-		t.Fatalf("reserved cmd conversation table id %d must not be registered", TableIDCMDConversation)
+	if _, ok := seen[TableIDConversation]; !ok {
+		t.Fatal("Link-U legacy conversation table must remain registered")
 	}
 }

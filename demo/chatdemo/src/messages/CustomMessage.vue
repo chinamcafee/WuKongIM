@@ -1,19 +1,21 @@
 
 
 <script setup lang="ts">
+import { t } from '../i18n'
+import { computed } from 'vue'
 
 
 const props = defineProps<{
     message: any
 }>()
 
-const order = props.message.content
+const order = computed(() => props.message.content)
 
 </script>
 
 <template>
     <div class="order">
-        <div class="orderNo">订单号：{{order.orderNo}}</div>
+        <div class="orderNo">{{ t('orderNumber', { number: order.orderNo }) }}</div>
         <div class="orderMiddle">
             <div class="orderImg">
                 <img :src="order.imgUrl" alt="" style="width: 40px;height: 40px;">
@@ -24,7 +26,7 @@ const order = props.message.content
                     </div>
                     <div class="orderPriceBox">
                         <div class="orderPrice">${{order.price}}</div>
-                        <div class="orderNum">共{{order.num}}件</div>
+                        <div class="orderNum">{{ t('orderQuantity', { count: order.num }) }}</div>
                     </div>
             </div>
         </div>
@@ -58,6 +60,7 @@ const order = props.message.content
 .orderPriceBox {
     display: flex;
     justify-content: space-between;
+    gap: 12px;
 }
 
 .orderTitle {

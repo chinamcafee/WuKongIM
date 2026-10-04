@@ -1,0 +1,28 @@
+---
+title: API 版本与兼容性
+description: 区分完整源码合同、窄 Profile 与端到端验证范围。
+---
+
+API 页面描述当前构建对应的合同。URL 不变不代表不同服务端、SDK 或合同版本自动兼容。
+
+## 当前快照
+
+<CompatibilitySnapshot locale="zh" />
+
+快照中的验证状态只覆盖以下基础接入流程：
+
+| 接口 | 验证内容 |
+| --- | --- |
+| `POST /user/token` | 创建开发身份 |
+| `GET /route` | 发现 WebSocket 入口 |
+| `POST /channel/messagesync` | 重连后恢复已提交消息 |
+
+完整 [WuKongIM HTTP API OpenAPI](/contracts/product-http.openapi.json) 覆盖当前 44 条注册，Operations 与 Webhook 各有独立合同。三份窄 Profile 继续用于受控采用，但上方端到端状态只覆盖基础接入三条操作。源码对齐、Schema 校验和协议页都不会扩大该运行时验收结论。
+
+## 版本规则
+
+- 升级服务端、SDK 或合同后，应重新验证应用接入流程。
+- 未验证的组合应视为未知兼容性，而不是默认兼容。
+- 以完整合同判断当前源码 Surface，以窄 Profile 判断特定接入的采用范围。
+
+兼容不等于可直接公网暴露。WuKongIM HTTP API 仍须放在受信网络或已鉴权代理之后；私有与实验性接口见[接口清单](/zh/api/interface-inventory)。

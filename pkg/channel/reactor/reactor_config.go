@@ -2,6 +2,9 @@ package reactor
 
 import "time"
 
+// NormalizeConfig applies the same pure defaults as reactor construction for startup inspection.
+func NormalizeConfig(cfg ReactorConfig) ReactorConfig { return defaultReactorConfig(cfg) }
+
 func defaultReactorConfig(cfg ReactorConfig) ReactorConfig {
 	if cfg.MaxChannels > 0 {
 		cfg.MaxChannelsEnabled = true

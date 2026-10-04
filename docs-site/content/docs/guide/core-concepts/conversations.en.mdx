@@ -1,66 +1,56 @@
 ---
-title: Conversations
-description: Understand UID-owned recent-conversation projections, ordering, unread counts, delete boundaries, and their relationship to message logs.
+title: Conversation
+description: Use one diagram to distinguish a shared Channel from a personal chat list, then understand unread, hide, and sync.
 ---
 
-A Conversation is a recent-interaction view for one UID. It helps clients display the conversation list, latest message, read position, and unread count, but it is not the Channel message log and does not own message commit order.
+A Conversation is **one row in one user's chat list**. It points to a Channel and shows the latest message, unread count, and personal state. Messages are stored in the Channel.
 
-## Projection and log
+## Why conversations matter
 
-```text
-Channel-owned committed messages
-          |
-          +-> newest visible message reads
-          |
-          +-> post-commit recipient activity
-                    |
-                    v
-          UID-owned ConversationState
+Conversations help users find chats, spot new messages, hide a chat, or clear unread. During offline recovery, clients first sync the conversation list, then fetch missing messages for each Channel.
+
+## Relationship to other concepts
+
+<div className="tutorial-diagram">
+
+```mermaid
+flowchart TD
+  channel["Weekend Trip<br/>shared Channel messages"] --> alice["Alice<br/>0 unread"]
+  channel --> bob["Bob<br/>5 unread"]
 ```
 
-Channel owns message payload and sequence. ConversationState stores one user's view under UID, kind, Channel ID, and Channel type. Ordinary and CMD-sync conversations share one kind-aware metadata table but remain different kinds.
+</div>
 
-## Important fields
+These are example states for two members: **one Channel, different personal read positions and visibility ranges**. Devices sharing a UID sync conversation state while retaining their own local UI state.
 
-| Field | Meaning |
+## Distinguish Channel and Conversation
+
+| Channel | Conversation |
 | --- | --- |
-| `active_at` | Recent-activity ordering anchor; list order is not recomputed from latest-message time |
-| `read_seq` | User read position, affecting only that user's unread view |
-| `deleted_to_seq` | Delete-visibility floor; messages at or below it do not reappear |
-| `message_seq` | Message fence observed by the projection, preventing stale activity from crossing a delete barrier |
-| `sparse_active` | Marks a sparse active projection without changing active-index position semantics |
+| Shared communication space and ordered history | The current user's personal view of a Channel |
+| Identified by `channel_id + channel_type` | Also requires the current UID |
+| Stores committed messages | Refers to the latest message and presents unread and visibility state |
 
-Conceptually, unread is:
+## Common actions
 
-```text
-unread = max(last_visible_message_seq - max(read_seq, deleted_to_seq), 0)
-```
+| Action | Result |
+| --- | --- |
+| Clear unread | Advances the current UID's unread baseline; sends no peer-read receipt |
+| Hide or delete | Hides your current view; does not leave the group or delete others' messages. A later message above the hidden range can make it appear again |
+| Leave or remove a member | Changes Channel membership |
+| Sync devices | Other devices with the same UID can see conversation and unread updates on their next sync |
 
-In the compatibility sync path, a user's own sent message does not become unread for that same user.
+The client owns pinning, drafts, grouping, and final UI ordering.
 
-## List and sync are different
+<details>
+  <summary>Integration: list fields, ordering, and sync cursors</summary>
 
-### Conversation list
+A Conversation normally includes Channel ID and type, latest message, unread count, and read and visibility boundaries. These determine which chat opens, which preview appears, and the unread baseline.
 
-List pages the UID-owned active index by `(active_at desc, channel_id, channel_type)` and batch-reads the newest visible ordinary message from each Channel. A projection without a visible message may still be returned with `LastMessage=nil` and unread 0.
+The server orders the active conversation directory by `activated_at`: the time of explicit Channel activation, **not latest-message time**. An inactive empty Channel with no visible messages is omitted. The client chooses final ordering after receiving latest-message data.
 
-### Compatibility sync
+**The conversation list and each Channel's message list have separate sync positions.** One cursor cannot replace both. WuKongIM builds the view from the user's Channel relationship, committed messages, and personal visibility state.
 
-Sync merges a bounded active working set with client-known Channel overlays, reads latest messages, filters delete floors and excluded types, and then orders the final window by latest-message time. A client overlay is not a request to scan the full conversation directory.
+</details>
 
-## Read and delete
-
-- Clear unread advances `read_seq` to the newest visible message or compatible request position.
-- Set unread derives `read_seq` from the newest message; it does not copy messages.
-- Delete conversation writes a monotonic `deleted_to_seq` barrier and clears active state; it does not delete the Channel log.
-- New activity above the barrier can reactivate the Conversation. Old projections and retries cannot cross that barrier.
-
-## Cache and persistence
-
-The UID Authority coalesces high-frequency activity in a bounded active cache and flushes to Slot periodically, under pressure, or during hash-slot handoff. Admission does not wait for durable flush. Cache pressure rejects explicitly rather than growing without bound or silently dropping dirty state. Version and delete fences prevent a concurrent flush from rolling newer state backward.
-
-<Callout type="info" title="Commit boundary">
-  A Conversation update is a post-commit user view. Projection failure cannot roll back an already committed Channel message. Applications should treat “the message exists” and “the conversation view is updated” as separate observations.
-</Callout>
-
-Continue with [Messages](/en/guide/core-concepts/messages), [Users & Devices](/en/guide/core-concepts/users-and-devices), and [Messaging Integration](/en/guide/integration/messaging).
+Continue with [Message](/en/guide/core-concepts/messages), then choose a [full SDK platform](/en/sdk/wukongim) for conversation APIs. For server construction and paging, see [message-flow architecture](/en/server/architecture/message-flow).

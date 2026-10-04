@@ -8,13 +8,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	accessapi "github.com/WuKongIM/WuKongIM/internal/access/api"
 	gatewayadapter "github.com/WuKongIM/WuKongIM/internal/access/gateway"
 	clusterinfra "github.com/WuKongIM/WuKongIM/internal/infra/cluster"
 	obsdiagnostics "github.com/WuKongIM/WuKongIM/internal/observability/diagnostics"
-	"github.com/WuKongIM/WuKongIM/internal/runtime/conversationactive"
 	authoritypresence "github.com/WuKongIM/WuKongIM/internal/runtime/presence"
 	managementusecase "github.com/WuKongIM/WuKongIM/internal/usecase/management"
 	messageusecase "github.com/WuKongIM/WuKongIM/internal/usecase/message"
@@ -28,10 +28,10 @@ import (
 	clustertasks "github.com/WuKongIM/WuKongIM/pkg/cluster/tasks"
 	controller "github.com/WuKongIM/WuKongIM/pkg/controller"
 	messagedb "github.com/WuKongIM/WuKongIM/pkg/db/message"
-	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 	accessgateway "github.com/WuKongIM/WuKongIM/pkg/gateway"
 	obsmetrics "github.com/WuKongIM/WuKongIM/pkg/metrics"
 	"github.com/WuKongIM/WuKongIM/pkg/slot/multiraft"
+	slotproxy "github.com/WuKongIM/WuKongIM/pkg/slot/proxy"
 	"github.com/WuKongIM/WuKongIM/pkg/transport"
 )
 
@@ -88,13 +88,25 @@ type transportMetricsObserver struct {
 	metrics *obsmetrics.Registry
 	mu      sync.Mutex
 
-	pendingRPCBySource     map[uint64]int
-	schedulerQueueBySource map[transportSchedulerQueueSource]obsmetrics.RuntimePressureQueueObservation
+	pendingRPCBySource         map[uint64]int
+	pendingRPCRevisionBySource map[uint64]uint64
+	schedulerQueueBySource     map[transportSchedulerQueueSource]obsmetrics.RuntimePressureQueueObservation
+	schedulerRevisionBySource  map[transportSchedulerQueueSource]uint64
 }
 
 type transportSchedulerQueueSource struct {
 	sourceID uint64
 	priority string
+}
+
+var transportMetricsStateRevision atomic.Uint64
+
+func nextTransportMetricsStateRevision() uint64 {
+	for {
+		if revision := transportMetricsStateRevision.Add(1); revision != 0 {
+			return revision
+		}
+	}
 }
 
 type controllerRaftMetricsObserver struct {
@@ -129,14 +141,6 @@ type conversationListMetricsObserver struct {
 	metrics *obsmetrics.Registry
 }
 
-type conversationSyncMetricsObserver struct {
-	metrics *obsmetrics.Registry
-}
-
-type conversationAuthorityMetricsObserver struct {
-	metrics *obsmetrics.Registry
-}
-
 type presenceMetricsObserver struct {
 	metrics *obsmetrics.Registry
 }
@@ -150,6 +154,7 @@ type multiSlotReplicaMoveObserver []cluster.SlotReplicaMoveObserver
 type multiPreferredLeaderObserver []cluster.PreferredLeaderObserver
 type multiCommitCoordinatorObserver []messagedb.CommitCoordinatorObserver
 type multiMessageEventObserver []cluster.MessageEventObserver
+type multiMembershipMutationObserver []cluster.MembershipMutationObserver
 type multiGatewayObserver []accessgateway.Observer
 type multiSendackObserver []gatewayadapter.SendackObserver
 
@@ -210,12 +215,19 @@ func (o gatewayMetricsObserver) OnFrameHandled(event accessgateway.FrameHandleEv
 	o.metrics.Gateway.FrameHandled(event.FrameType, event.Duration)
 }
 
+func (o gatewayMetricsObserver) OnTransportWrite(event accessgateway.TransportWriteEvent) {
+	if o.metrics == nil {
+		return
+	}
+	o.metrics.Gateway.TransportWrite(event.FrameType, event.Duration, event.Err)
+}
+
 func (o gatewayMetricsObserver) OnAsyncSendQueue(event accessgateway.AsyncSendQueueEvent) {
 	if o.metrics == nil {
 		return
 	}
-	o.metrics.Gateway.SetAsyncSendQueue(event.Depth, event.Capacity)
-	o.metrics.RuntimePressure.SetQueue("gateway", "async_send", "send", "none", obsmetrics.RuntimePressureQueueObservation{
+	o.metrics.Gateway.SetAsyncSendQueueRevisioned(event.Revision, event.Depth, event.Capacity)
+	o.metrics.RuntimePressure.SetQueueRevisioned("gateway", "async_send", "send", "none", event.Revision, obsmetrics.RuntimePressureQueueObservation{
 		Depth:    event.Depth,
 		Capacity: event.Capacity,
 	})
@@ -274,7 +286,7 @@ func (o gatewayMetricsObserver) OnTransportPressure(event accessgateway.Transpor
 	}
 	pool := fallbackRuntimePressureLabel(event.Name, "gnet")
 	queue := fallbackRuntimePressureLabel(event.Queue, "transport")
-	o.metrics.RuntimePressure.SetQueue("gateway", pool, queue, "none", obsmetrics.RuntimePressureQueueObservation{
+	o.metrics.RuntimePressure.SetQueueRevisioned("gateway", pool, queue, "none", event.Revision, obsmetrics.RuntimePressureQueueObservation{
 		Depth:         event.Depth,
 		Capacity:      event.Capacity,
 		Bytes:         event.Bytes,
@@ -325,6 +337,14 @@ func (o multiGatewayObserver) OnFrameOut(event accessgateway.FrameEvent) {
 func (o multiGatewayObserver) OnFrameHandled(event accessgateway.FrameHandleEvent) {
 	for _, observer := range o {
 		observer.OnFrameHandled(event)
+	}
+}
+
+func (o multiGatewayObserver) OnTransportWrite(event accessgateway.TransportWriteEvent) {
+	for _, observer := range o {
+		if optional, ok := observer.(accessgateway.TransportWriteObserver); ok {
+			optional.OnTransportWrite(event)
+		}
 	}
 }
 
@@ -445,102 +465,7 @@ func (o conversationListMetricsObserver) ObserveConversationList(event accessapi
 	if o.metrics == nil || o.metrics.Conversation == nil {
 		return
 	}
-	o.metrics.Conversation.ObserveList(event.Result, event.More, event.Duration, event.ReturnedItems, event.SparseItems, event.LastMessageLoads, event.LastMessageErrors, event.ActiveIndexStaleSkips)
-}
-
-func (o conversationSyncMetricsObserver) ObserveConversationSync(event accessapi.ConversationSyncObservation) {
-	if o.metrics == nil || o.metrics.Conversation == nil {
-		return
-	}
-	o.metrics.Conversation.ObserveSync(event.Result, event.OnlyUnread, event.WithRecents, event.Duration, event.ReturnedItems, event.OverlayItems, event.RecentLoadDuration)
-}
-
-func (o conversationAuthorityMetricsObserver) ObserveConversationAuthorityAdmit(event conversationAuthorityAdmitEvent) {
-	if o.metrics == nil || o.metrics.Conversation == nil {
-		return
-	}
-	o.metrics.Conversation.ObserveAuthorityAdmit(event.Result)
-}
-
-func (o conversationAuthorityMetricsObserver) ObserveConversationAuthorityCachePressure(event conversationAuthorityCachePressureEvent) {
-	if o.metrics == nil || o.metrics.Conversation == nil {
-		return
-	}
-	o.metrics.Conversation.ObserveAuthorityCachePressure(event.Phase, event.Result)
-}
-
-func (o conversationAuthorityMetricsObserver) ObserveConversationAuthorityList(event conversationAuthorityListEvent) {
-	if o.metrics == nil || o.metrics.Conversation == nil {
-		return
-	}
-	o.metrics.Conversation.ObserveAuthorityList(event.Result)
-}
-
-func (o conversationAuthorityMetricsObserver) ObserveConversationAuthorityHandoff(event conversationAuthorityHandoffEvent) {
-	if o.metrics == nil || o.metrics.Conversation == nil {
-		return
-	}
-	o.metrics.Conversation.ObserveAuthorityHandoff(event.Result)
-}
-
-func (o conversationAuthorityMetricsObserver) ObserveConversationActiveCache(event conversationactive.CacheObservation) {
-	if o.metrics == nil || o.metrics.Conversation == nil {
-		return
-	}
-	o.metrics.Conversation.SetActiveCache(obsmetrics.ConversationActiveCacheSample{
-		Revision:         event.Revision,
-		Rows:             event.Rows,
-		DirtyRows:        event.DirtyRows,
-		DirtyQueueRows:   event.DirtyQueueRows,
-		DirtyAgeBuckets:  event.DirtyAgeBuckets,
-		OldestDirtyAge:   event.OldestDirtyAge,
-		PressureDraining: event.PressureDraining,
-		NormalRows:       event.RowsByKind[metadb.ConversationKindNormal],
-		NormalDirtyRows:  event.DirtyRowsByKind[metadb.ConversationKindNormal],
-		CMDRows:          event.RowsByKind[metadb.ConversationKindCMD],
-		CMDDirtyRows:     event.DirtyRowsByKind[metadb.ConversationKindCMD],
-	})
-}
-
-func (o conversationAuthorityMetricsObserver) ObserveConversationActiveMutation(event conversationactive.MutationObservation) {
-	if o.metrics == nil || o.metrics.Conversation == nil {
-		return
-	}
-	o.metrics.Conversation.ObserveActiveMutation(event.BecameDirty, event.DirtyUpdated, event.CooldownSuppressed, event.Unchanged)
-	o.metrics.Conversation.ObserveActiveMutationLock(event.Result, event.LockWaitDuration, event.LockHoldDuration, event.CacheObservationDuration)
-}
-
-func (o conversationAuthorityMetricsObserver) ObserveConversationActiveFlush(event conversationactive.FlushObservation) {
-	if o.metrics == nil || o.metrics.Conversation == nil {
-		return
-	}
-	o.metrics.Conversation.ObserveActiveFlush(obsmetrics.ConversationActiveFlushSample{
-		Result:                event.Result,
-		FailureStage:          event.FailureStage,
-		Selected:              event.Selected,
-		Persisted:             event.Persisted,
-		Skipped:               event.Skipped,
-		DeleteFenced:          event.DeleteFenced,
-		Cleared:               event.Cleared,
-		VersionConflicts:      event.VersionConflicts,
-		Superseded:            event.Superseded,
-		Requeued:              event.Requeued,
-		LaneWaitDuration:      event.LaneWaitDuration,
-		SelectDuration:        event.SelectDuration,
-		FilterDuration:        event.FilterDuration,
-		PersistDuration:       event.PersistDuration,
-		ClearDuration:         event.ClearDuration,
-		ClearLockWaitDuration: event.ClearLockWaitDuration,
-		ClearApplyDuration:    event.ClearApplyDuration,
-		Duration:              event.Duration,
-	})
-}
-
-func (o conversationAuthorityMetricsObserver) ObserveConversationActivePressure(event conversationactive.PressureObservation) {
-	if o.metrics == nil || o.metrics.Conversation == nil {
-		return
-	}
-	o.metrics.Conversation.ObserveActivePressure(event.Event, event.WakeupWaitDuration)
+	o.metrics.Conversation.ObserveDirectoryList(event.Result, event.Done, event.Duration, event.ScannedCandidates, event.ReturnedItems, event.Deletes, event.Unresolved)
 }
 
 func (o presenceMetricsObserver) ObservePresenceExpiry(result authoritypresence.ExpireResult, duration time.Duration) {
@@ -573,17 +498,6 @@ func (o presenceMetricsObserver) ObservePresenceTouchFlush(event presenceTouchFl
 		event.TargetGroups,
 		event.BudgetReached,
 	)
-}
-
-func conversationKindMetricLabel(kind metadb.ConversationKind) string {
-	switch kind {
-	case metadb.ConversationKindNormal:
-		return "normal"
-	case metadb.ConversationKindCMD:
-		return "cmd"
-	default:
-		return "other"
-	}
 }
 
 func (o channelMetricsObserver) SetReactorMailboxDepth(reactorID int, priority string, depth int) {
@@ -632,6 +546,7 @@ func (o channelMetricsObserver) SetWorkerQueueCapacity(pool string, capacity int
 	if o.metrics == nil {
 		return
 	}
+	o.metrics.ChannelRuntime.SetWorkerQueueCapacity(pool, capacity)
 	o.metrics.RuntimePressure.SetQueueCapacity(channelRuntimePressureComponent, pool, "worker", "none", capacity)
 }
 
@@ -647,6 +562,13 @@ func (o channelMetricsObserver) ObserveWorkerAdmission(pool string, result strin
 		return
 	}
 	o.metrics.RuntimePressure.ObserveAdmission(channelRuntimePressureComponent, pool, "worker", "none", result)
+}
+
+func (o channelMetricsObserver) ObserveWorkerAdmissionKind(pool string, kind worker.TaskKind, result string) {
+	if o.metrics == nil {
+		return
+	}
+	o.metrics.ChannelRuntime.ObserveWorkerAdmission(pool, channelWorkerKindLabel(kind), result)
 }
 
 func (o channelMetricsObserver) ObserveWorkerWait(pool string, kind worker.TaskKind, d time.Duration) {
@@ -705,6 +627,20 @@ func (o channelMetricsObserver) SetChannelRuntimeCount(reactorID int, role ch.Ro
 		return
 	}
 	o.metrics.ChannelRuntime.SetChannelRuntimeCount(reactorID, channelRoleLabel(role), count)
+}
+
+func (o channelMetricsObserver) ObserveRuntimeLoad(role ch.Role) {
+	if o.metrics == nil {
+		return
+	}
+	o.metrics.ChannelRuntime.ObserveRuntimeLoad(channelRoleLabel(role))
+}
+
+func (o channelMetricsObserver) ObserveRuntimeEviction(role ch.Role, reason reactor.RuntimeEvictionReason) {
+	if o.metrics == nil {
+		return
+	}
+	o.metrics.ChannelRuntime.ObserveRuntimeEviction(channelRoleLabel(role), channelRuntimeEvictionReasonLabel(reason))
 }
 
 func (o channelMetricsObserver) ObserveChannelActivationRejected(reason string) {
@@ -822,6 +758,34 @@ func (o channelMetricsObserver) ObserveChannelMetaCache(result string) {
 	o.metrics.ChannelRuntime.ObserveMetaCache(result)
 }
 
+func (o channelMetricsObserver) ObserveChannelMetaCreate(slotID uint32, result clusterchannels.MetaCreateResult) {
+	if o.metrics == nil {
+		return
+	}
+	o.metrics.ChannelRuntime.ObserveMetaCreate(slotID, string(result))
+}
+
+func (o channelMetricsObserver) SetChannelMetaCreateQueueDepth(slotID uint32, depth int) {
+	if o.metrics == nil {
+		return
+	}
+	o.metrics.ChannelRuntime.SetMetaCreateQueueDepth(slotID, depth)
+}
+
+func (o channelMetricsObserver) ObserveChannelMetaCreateCoalesced(slotID uint32) {
+	if o.metrics == nil {
+		return
+	}
+	o.metrics.ChannelRuntime.ObserveMetaCreateCoalesced(slotID)
+}
+
+func (o channelMetricsObserver) ObserveChannelMetaCreateBatch(slotID uint32, result string, items int) {
+	if o.metrics == nil {
+		return
+	}
+	o.metrics.ChannelRuntime.ObserveMetaCreateBatch(slotID, result, items)
+}
+
 func (o channelMetricsObserver) ObserveAppendBatch(records int, bytes int, wait time.Duration) {
 	if o.metrics == nil {
 		return
@@ -841,6 +805,13 @@ func (o channelMetricsObserver) ObserveChannelAppendStage(stage string, result s
 		return
 	}
 	o.metrics.ChannelRuntime.ObserveAppendStage(stage, result, d)
+}
+
+func (o channelMetricsObserver) ObserveConversationHydrationBatch(result string, items, remoteCalls, localReads int, duration time.Duration) {
+	if o.metrics == nil || o.metrics.Conversation == nil {
+		return
+	}
+	o.metrics.Conversation.ObserveHydrationBatch(result, duration, items, remoteCalls, localReads)
 }
 
 func (o channelMetricsObserver) ObserveAppendWaitStage(stage string, mode ch.CommitMode, result string, d time.Duration) {
@@ -948,6 +919,14 @@ func (o slotMetricsObserver) ObserveSlotProposal(slotID multiraft.SlotID, d time
 		return
 	}
 	o.metrics.Slot.ObserveProposal(uint32(slotID), d)
+}
+
+// ObserveSlotReadBarrier records one Slot read barrier wait.
+func (o slotMetricsObserver) ObserveSlotReadBarrier(result string, d time.Duration) {
+	if o.metrics == nil {
+		return
+	}
+	o.metrics.Slot.ObserveReadBarrier(result, d)
 }
 
 func (o slotMetricsObserver) ObserveSlotProposalAdmission(_ multiraft.SlotID, class multiraft.ProposalClass, result string) {
@@ -1091,45 +1070,63 @@ func (o *transportMetricsObserver) ObserveTransport(event transport.Event) {
 	switch event.Name {
 	case "sent_bytes":
 		o.metrics.Transport.ObserveSentBytes(transportFrameKindLabel(event.Kind), event.Bytes)
+		o.metrics.Transport.ObserveLanePayloadBytes("send", transportPriorityLabel(event.Priority), event.Bytes)
 	case "received_bytes":
 		o.metrics.Transport.ObserveReceivedBytes(transportFrameKindLabel(event.Kind), event.Bytes)
+		o.metrics.Transport.ObserveLanePayloadBytes("receive", transportPriorityLabel(event.Priority), event.Bytes)
 	case "write_batch":
-		o.metrics.Transport.ObserveWriteBatch(event.Items, event.Bytes, event.Capacity)
+		o.metrics.Transport.ObserveWriteBatches(transportEventCount(event), event.Items, event.Bytes, event.Capacity)
 	case "pending_rpc":
-		o.metrics.RuntimePressure.SetPoolInflight(transportRuntimePressureComponent, "rpc", o.transportPendingRPCInflight(event))
+		inflight, revision := o.transportPendingRPCInflight(event)
+		o.metrics.RuntimePressure.SetPoolInflightRevisioned(transportRuntimePressureComponent, "rpc", revision, inflight)
 	case "peer_pool":
-		inflight := event.Inflight
-		if inflight == 0 {
-			inflight = event.Items
-		}
 		o.metrics.RuntimePressure.SetPoolWorkers(transportRuntimePressureComponent, "peer_pool", event.Capacity)
-		o.metrics.RuntimePressure.SetPoolInflight(transportRuntimePressureComponent, "peer_pool", inflight)
+		// Peer pool items are persistent node-to-node connections, not unfinished
+		// work. Publishing them as runtime inflight makes a healthy live cluster
+		// structurally unable to prove terminal queue convergence.
+		o.metrics.Transport.SetPoolConnections(map[string]int{"aggregate": event.Items}, nil)
 	case "scheduler_queue":
 		priority := transportPriorityLabel(event.Priority)
-		o.metrics.RuntimePressure.SetQueue(transportRuntimePressureComponent, "scheduler", "scheduler", priority, o.transportSchedulerQueue(priority, event))
+		queue, revision := o.transportSchedulerQueue(priority, event)
+		o.metrics.RuntimePressure.SetQueueRevisioned(transportRuntimePressureComponent, "scheduler", "scheduler", priority, revision, queue)
+	case "service_retained":
+		o.metrics.RuntimePressure.SetQueueRevisioned(transportRuntimePressureComponent, "service", transportServiceEventLabel(event)+" retained", "none", event.Revision, transportQueueObservation(event))
 	case "service_queue":
-		o.metrics.RuntimePressure.SetQueue(transportRuntimePressureComponent, "service", transportServiceEventLabel(event), transportPriorityLabel(event.Priority), transportQueueObservation(event))
+		o.metrics.RuntimePressure.SetQueueRevisioned(transportRuntimePressureComponent, "service", transportServiceEventLabel(event), transportPriorityLabel(event.Priority), event.Revision, transportQueueObservation(event))
 	case "scheduler_admission":
-		o.metrics.RuntimePressure.ObserveAdmission(transportRuntimePressureComponent, "scheduler", "scheduler", transportPriorityLabel(event.Priority), event.Result)
+		o.metrics.RuntimePressure.ObserveAdmissions(transportRuntimePressureComponent, "scheduler", "scheduler", transportPriorityLabel(event.Priority), event.Result, transportEventCount(event))
 	case "service_admission":
-		o.metrics.RuntimePressure.ObserveAdmission(transportRuntimePressureComponent, "service", transportServiceEventLabel(event), transportPriorityLabel(event.Priority), event.Result)
+		o.metrics.RuntimePressure.ObserveAdmissions(transportRuntimePressureComponent, "service", transportServiceEventLabel(event), transportPriorityLabel(event.Priority), event.Result, transportEventCount(event))
 	case "scheduler_wait":
-		o.metrics.RuntimePressure.ObserveQueueWait(transportRuntimePressureComponent, "scheduler", "scheduler", transportPriorityLabel(event.Priority), event.Result, event.Duration)
+		for _, duration := range transportEventDurations(event) {
+			o.metrics.RuntimePressure.ObserveQueueWait(transportRuntimePressureComponent, "scheduler", "scheduler", transportPriorityLabel(event.Priority), event.Result, duration)
+		}
+	case "service_wait":
+		for _, duration := range transportEventDurations(event) {
+			o.metrics.RuntimePressure.ObserveQueueWait(transportRuntimePressureComponent, "service", transportServiceEventLabel(event), "none", event.Result, duration)
+		}
 	case "service_task":
 		queue := transportServiceEventLabel(event)
-		o.metrics.RuntimePressure.ObserveTaskDuration(transportRuntimePressureComponent, "service", queue, event.Result, event.Duration)
-		o.metrics.Transport.ObserveRPC(queue, transportRPCResultLabel(event.Result), event.Duration)
+		durations := transportEventDurations(event)
+		for _, duration := range durations {
+			o.metrics.RuntimePressure.ObserveTaskDuration(transportRuntimePressureComponent, "service", queue, event.Result, duration)
+		}
+		o.metrics.Transport.ObserveRPCBatch(queue, transportRPCResultLabel(event.Result), transportEventCount(event), durations)
+	case "client_rpc":
+		o.metrics.Transport.ObserveRPCClientBatch(strconv.FormatUint(uint64(event.NodeID), 10), transportServiceEventLabel(event), transportRPCResultLabel(event.Result), transportEventCount(event), transportEventDurations(event))
+	case "observer_dropped":
+		o.metrics.Transport.ObserveDropped(event.Count)
 	case "service_inflight":
 		pool := transportServiceEventLabel(event)
 		if event.Capacity > 0 {
 			o.metrics.RuntimePressure.SetPoolWorkers(transportRuntimePressureComponent, pool, event.Capacity)
 		}
-		o.metrics.RuntimePressure.SetPoolInflight(transportRuntimePressureComponent, pool, event.Inflight)
+		o.metrics.RuntimePressure.SetPoolInflightRevisioned(transportRuntimePressureComponent, pool, event.Revision, event.Inflight)
 		if event.PoolCapacity > 0 {
 			o.metrics.AntsPool.SetUsage(transportRuntimePressureComponent, "service_executor", event.PoolRunning, event.PoolCapacity, event.PoolWaiting)
 		}
 	case "controller_raft_queue":
-		o.metrics.RuntimePressure.SetQueue(transportRuntimePressureComponent, "controller_raft", "send", transportPriorityLabel(event.Priority), transportQueueObservation(event))
+		o.metrics.RuntimePressure.SetQueueRevisioned(transportRuntimePressureComponent, "controller_raft", "send", transportPriorityLabel(event.Priority), event.Revision, transportQueueObservation(event))
 	case "controller_raft_admission":
 		o.metrics.RuntimePressure.ObserveAdmission(transportRuntimePressureComponent, "controller_raft", "send", transportPriorityLabel(event.Priority), event.Result)
 	case "controller_raft_task":
@@ -1137,38 +1134,56 @@ func (o *transportMetricsObserver) ObserveTransport(event transport.Event) {
 	}
 }
 
-func (o *transportMetricsObserver) transportPendingRPCInflight(event transport.Event) int {
+func (o *transportMetricsObserver) transportPendingRPCInflight(event transport.Event) (int, uint64) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
 	if o.pendingRPCBySource == nil {
 		o.pendingRPCBySource = make(map[uint64]int)
 	}
-	if event.Inflight <= 0 {
-		delete(o.pendingRPCBySource, event.SourceID)
-	} else {
-		o.pendingRPCBySource[event.SourceID] = event.Inflight
+	if o.pendingRPCRevisionBySource == nil {
+		o.pendingRPCRevisionBySource = make(map[uint64]uint64)
+	}
+	lastRevision := o.pendingRPCRevisionBySource[event.SourceID]
+	if event.Revision == 0 || lastRevision == 0 || event.Revision > lastRevision {
+		if event.Revision > 0 {
+			o.pendingRPCRevisionBySource[event.SourceID] = event.Revision
+		}
+		if event.Inflight <= 0 {
+			delete(o.pendingRPCBySource, event.SourceID)
+		} else {
+			o.pendingRPCBySource[event.SourceID] = event.Inflight
+		}
 	}
 	var total int
 	for _, inflight := range o.pendingRPCBySource {
 		total += inflight
 	}
-	return total
+	return total, nextTransportMetricsStateRevision()
 }
 
-func (o *transportMetricsObserver) transportSchedulerQueue(priority string, event transport.Event) obsmetrics.RuntimePressureQueueObservation {
+func (o *transportMetricsObserver) transportSchedulerQueue(priority string, event transport.Event) (obsmetrics.RuntimePressureQueueObservation, uint64) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
 	if o.schedulerQueueBySource == nil {
 		o.schedulerQueueBySource = make(map[transportSchedulerQueueSource]obsmetrics.RuntimePressureQueueObservation)
 	}
+	if o.schedulerRevisionBySource == nil {
+		o.schedulerRevisionBySource = make(map[transportSchedulerQueueSource]uint64)
+	}
 	key := transportSchedulerQueueSource{sourceID: event.SourceID, priority: priority}
-	switch event.Result {
-	case "closed", "stopped":
-		delete(o.schedulerQueueBySource, key)
-	default:
-		o.schedulerQueueBySource[key] = transportQueueObservation(event)
+	lastRevision := o.schedulerRevisionBySource[key]
+	if event.Revision == 0 || lastRevision == 0 || event.Revision > lastRevision {
+		if event.Revision > 0 {
+			o.schedulerRevisionBySource[key] = event.Revision
+		}
+		switch event.Result {
+		case "closed", "stopped":
+			delete(o.schedulerQueueBySource, key)
+		default:
+			o.schedulerQueueBySource[key] = transportQueueObservation(event)
+		}
 	}
 
 	var total obsmetrics.RuntimePressureQueueObservation
@@ -1181,7 +1196,7 @@ func (o *transportMetricsObserver) transportSchedulerQueue(priority string, even
 		total.Bytes += observation.Bytes
 		total.BytesCapacity += observation.BytesCapacity
 	}
-	return total
+	return total, nextTransportMetricsStateRevision()
 }
 
 func (o controllerRaftMetricsObserver) SetStepQueueDepth(depth int, capacity int) {
@@ -1538,6 +1553,17 @@ func (o messageEventMetricsObserver) SetMessageEventStreamCache(event cluster.Me
 	})
 }
 
+type membershipMutationMetricsObserver struct {
+	metrics *obsmetrics.Registry
+}
+
+func (o membershipMutationMetricsObserver) ObserveMembershipMutation(event cluster.MembershipMutationObservation) {
+	if o.metrics == nil {
+		return
+	}
+	o.metrics.Conversation.ObserveMembershipMutation(event.Directory, event.Operation, event.Rows)
+}
+
 func (o deliveryMetricsObserver) ObserveRecipientAuthorityResolve(event clusterinfra.RecipientAuthorityResolveObservation) {
 	if o.metrics == nil {
 		return
@@ -1642,6 +1668,16 @@ func combineMessageEventObservers(first, second cluster.MessageEventObserver) cl
 	return multiMessageEventObserver{first, second}
 }
 
+func combineMembershipMutationObservers(first, second cluster.MembershipMutationObserver) cluster.MembershipMutationObserver {
+	if first == nil {
+		return second
+	}
+	if second == nil {
+		return first
+	}
+	return multiMembershipMutationObserver{first, second}
+}
+
 func deliveryNodeLabel(nodeID uint64) string {
 	return strconv.FormatUint(nodeID, 10)
 }
@@ -1658,6 +1694,20 @@ func channelReactorPoolLabel(reactorID int) string {
 		return "reactor_unknown"
 	}
 	return "reactor_" + strconv.Itoa(reactorID)
+}
+
+func transportEventCount(event transport.Event) uint64 {
+	if event.Count == 0 {
+		return 1
+	}
+	return event.Count
+}
+
+func transportEventDurations(event transport.Event) []time.Duration {
+	if event.Samples != nil {
+		return event.Samples.Values[:event.Samples.Len]
+	}
+	return []time.Duration{event.Duration}
 }
 
 func transportQueueObservation(event transport.Event) obsmetrics.RuntimePressureQueueObservation {
@@ -1708,11 +1758,11 @@ func transportFrameKindLabel(kind transport.FrameKind) string {
 		return "data"
 	case transport.FrameKindNotify:
 		return "notify"
-	case transport.FrameKindRPCRequest:
+	case transport.FrameKindRPCRequest, transport.FrameKindRPCBudgetRequest:
 		return "rpc_request"
 	case transport.FrameKindRPCResponse:
 		return "rpc_response"
-	case transport.FrameKindControl:
+	case transport.FrameKindControl, transport.FrameKindRPCCancel:
 		return "control"
 	default:
 		return "unknown"
@@ -1785,6 +1835,15 @@ func (o multiChannelObserver) ObserveWorkerAdmission(pool string, result string)
 	}
 }
 
+func (o multiChannelObserver) ObserveWorkerAdmissionKind(pool string, kind worker.TaskKind, result string) {
+	for _, observer := range o {
+		admissionObserver, ok := observer.(worker.KindAdmissionObserver)
+		if ok {
+			admissionObserver.ObserveWorkerAdmissionKind(pool, kind, result)
+		}
+	}
+}
+
 func (o multiChannelObserver) ObserveWorkerWait(pool string, kind worker.TaskKind, d time.Duration) {
 	for _, observer := range o {
 		waitObserver, ok := observer.(worker.WaitObserver)
@@ -1853,6 +1912,24 @@ func (o multiChannelObserver) SetChannelRuntimeReactorCount(count int) {
 		topologyObserver, ok := observer.(reactor.RuntimeTopologyObserver)
 		if ok {
 			topologyObserver.SetChannelRuntimeReactorCount(count)
+		}
+	}
+}
+
+func (o multiChannelObserver) ObserveRuntimeLoad(role ch.Role) {
+	for _, observer := range o {
+		lifecycleObserver, ok := observer.(reactor.RuntimeLifecycleMetricsObserver)
+		if ok {
+			lifecycleObserver.ObserveRuntimeLoad(role)
+		}
+	}
+}
+
+func (o multiChannelObserver) ObserveRuntimeEviction(role ch.Role, reason reactor.RuntimeEvictionReason) {
+	for _, observer := range o {
+		lifecycleObserver, ok := observer.(reactor.RuntimeLifecycleMetricsObserver)
+		if ok {
+			lifecycleObserver.ObserveRuntimeEviction(role, reason)
 		}
 	}
 }
@@ -2042,6 +2119,42 @@ func (o multiChannelObserver) ObserveChannelMetaCache(result string) {
 	}
 }
 
+func (o multiChannelObserver) ObserveChannelMetaCreate(slotID uint32, result clusterchannels.MetaCreateResult) {
+	for _, observer := range o {
+		metaCreateObserver, ok := observer.(clusterchannels.MetaCreateObserver)
+		if ok {
+			metaCreateObserver.ObserveChannelMetaCreate(slotID, result)
+		}
+	}
+}
+
+func (o multiChannelObserver) SetChannelMetaCreateQueueDepth(slotID uint32, depth int) {
+	for _, observer := range o {
+		batchObserver, ok := observer.(clusterchannels.MetaCreateBatchObserver)
+		if ok {
+			batchObserver.SetChannelMetaCreateQueueDepth(slotID, depth)
+		}
+	}
+}
+
+func (o multiChannelObserver) ObserveChannelMetaCreateCoalesced(slotID uint32) {
+	for _, observer := range o {
+		batchObserver, ok := observer.(clusterchannels.MetaCreateBatchObserver)
+		if ok {
+			batchObserver.ObserveChannelMetaCreateCoalesced(slotID)
+		}
+	}
+}
+
+func (o multiChannelObserver) ObserveChannelMetaCreateBatch(slotID uint32, result string, items int) {
+	for _, observer := range o {
+		batchObserver, ok := observer.(clusterchannels.MetaCreateBatchObserver)
+		if ok {
+			batchObserver.ObserveChannelMetaCreateBatch(slotID, result, items)
+		}
+	}
+}
+
 func (o multiChannelObserver) ObserveAppendBatch(records int, bytes int, wait time.Duration) {
 	for _, observer := range o {
 		observer.ObserveAppendBatch(records, bytes, wait)
@@ -2060,6 +2173,16 @@ func (o multiChannelObserver) ObserveChannelAppendStage(stage string, result str
 		if ok {
 			appendStageObserver.ObserveChannelAppendStage(stage, result, d)
 		}
+	}
+}
+
+func (o multiChannelObserver) ObserveConversationHydrationBatch(result string, items, remoteCalls, localReads int, duration time.Duration) {
+	for _, observer := range o {
+		hydrationObserver, ok := observer.(clusterchannels.ConversationHydrationObserver)
+		if !ok {
+			continue
+		}
+		hydrationObserver.ObserveConversationHydrationBatch(result, items, remoteCalls, localReads, duration)
 	}
 }
 
@@ -2122,6 +2245,15 @@ func (o multiSlotObserver) ObserveSlotProposal(slotID multiraft.SlotID, d time.D
 		proposalObserver, ok := observer.(multiraft.ProposalObserver)
 		if ok {
 			proposalObserver.ObserveSlotProposal(slotID, d)
+		}
+	}
+}
+
+// ObserveSlotReadBarrier fans one read barrier wait out to capable children.
+func (o multiSlotObserver) ObserveSlotReadBarrier(result string, d time.Duration) {
+	for _, observer := range o {
+		if readObserver, ok := observer.(multiraft.ReadBarrierObserver); ok {
+			readObserver.ObserveSlotReadBarrier(result, d)
 		}
 	}
 }
@@ -2309,6 +2441,14 @@ func (o multiMessageEventObserver) SetMessageEventStreamCache(event cluster.Mess
 	}
 }
 
+func (o multiMembershipMutationObserver) ObserveMembershipMutation(event cluster.MembershipMutationObservation) {
+	for _, observer := range o {
+		if observer != nil {
+			observer.ObserveMembershipMutation(event)
+		}
+	}
+}
+
 func channelCommitModeLabel(mode ch.CommitMode) string {
 	switch mode {
 	case ch.CommitModeLocal:
@@ -2337,6 +2477,10 @@ func channelWorkerKindLabel(kind worker.TaskKind) string {
 		return "func"
 	case worker.TaskStoreAppend:
 		return "store_append"
+	case worker.TaskQuorumInstall:
+		return "quorum_install"
+	case worker.TaskQuorumCommit:
+		return "quorum_commit"
 	case worker.TaskStoreApply:
 		return "store_apply"
 	case worker.TaskStoreReadLog:
@@ -2368,6 +2512,17 @@ func channelRoleLabel(role ch.Role) string {
 		return "leader"
 	case ch.RoleFollower:
 		return "follower"
+	default:
+		return "unknown"
+	}
+}
+
+func channelRuntimeEvictionReasonLabel(reason reactor.RuntimeEvictionReason) string {
+	switch reason {
+	case reactor.RuntimeEvictionReasonIdle:
+		return "idle"
+	case reactor.RuntimeEvictionReasonBench:
+		return "bench"
 	default:
 		return "unknown"
 	}
@@ -2466,13 +2621,11 @@ var _ accessgateway.AsyncAuthObserver = gatewayMetricsObserver{}
 var _ accessgateway.AsyncSendAdmissionObserver = gatewayMetricsObserver{}
 var _ accessgateway.TransportPressureObserver = gatewayMetricsObserver{}
 var _ gatewayadapter.SendackObserver = gatewayMetricsObserver{}
-var _ accessapi.ConversationSyncObserver = conversationSyncMetricsObserver{}
-var _ conversationAuthorityObserver = conversationAuthorityMetricsObserver{}
-var _ conversationactive.Observer = conversationAuthorityMetricsObserver{}
 var _ reactor.Observer = channelMetricsObserver{}
 var _ reactor.MailboxPressureObserver = channelMetricsObserver{}
 var _ reactor.AppendQueuePressureObserver = channelMetricsObserver{}
 var _ reactor.RuntimeObserver = channelMetricsObserver{}
+var _ reactor.RuntimeLifecycleMetricsObserver = channelMetricsObserver{}
 var _ reactor.ReplicationObserver = channelMetricsObserver{}
 var _ reactor.ReplicationStageObserver = channelMetricsObserver{}
 var _ reactor.PullBatchObserver = channelMetricsObserver{}
@@ -2488,8 +2641,10 @@ var _ worker.TaskObserver = channelMetricsObserver{}
 var _ worker.AntsPoolObserver = channelMetricsObserver{}
 var _ clusterchannels.MetaCacheObserver = channelMetricsObserver{}
 var _ clusterchannels.AppendStageObserver = channelMetricsObserver{}
+var _ clusterchannels.MetaCreateObserver = channelMetricsObserver{}
 var _ multiraft.SchedulerObserver = slotMetricsObserver{}
 var _ multiraft.ProposalObserver = slotMetricsObserver{}
+var _ multiraft.ReadBarrierObserver = slotMetricsObserver{}
 var _ multiraft.ProposalAdmissionObserver = slotMetricsObserver{}
 var _ multiraft.ApplyStateObserver = slotMetricsObserver{}
 var _ cluster.PreferredLeaderObserver = slotMetricsObserver{}
@@ -2503,6 +2658,7 @@ var _ reactor.MailboxPressureObserver = multiChannelObserver{}
 var _ worker.AntsPoolObserver = multiChannelObserver{}
 var _ reactor.AppendQueuePressureObserver = multiChannelObserver{}
 var _ reactor.RuntimeObserver = multiChannelObserver{}
+var _ reactor.RuntimeLifecycleMetricsObserver = multiChannelObserver{}
 var _ reactor.ReplicationObserver = multiChannelObserver{}
 var _ reactor.ReplicationStageObserver = multiChannelObserver{}
 var _ reactor.PullBatchObserver = multiChannelObserver{}
@@ -2519,8 +2675,10 @@ var _ worker.WaitObserver = multiChannelObserver{}
 var _ worker.TaskObserver = multiChannelObserver{}
 var _ clusterchannels.MetaCacheObserver = multiChannelObserver{}
 var _ clusterchannels.AppendStageObserver = multiChannelObserver{}
+var _ clusterchannels.MetaCreateObserver = multiChannelObserver{}
 var _ multiraft.SchedulerObserver = multiSlotObserver{}
 var _ multiraft.ProposalObserver = multiSlotObserver{}
+var _ multiraft.ReadBarrierObserver = multiSlotObserver{}
 var _ multiraft.ProposalAdmissionObserver = multiSlotObserver{}
 var _ multiraft.ApplyStateObserver = multiSlotObserver{}
 var _ cluster.PreferredLeaderObserver = multiPreferredLeaderObserver{}
@@ -2535,3 +2693,125 @@ var _ messagedb.CommitCoordinatorQueueObserver = multiCommitCoordinatorObserver{
 var _ messagedb.CommitCoordinatorRequestObserver = multiCommitCoordinatorObserver{}
 var _ clusterinfra.RecipientAuthorityResolveObserver = deliveryMetricsObserver{}
 var _ clusterinfra.PresenceEndpointLookupObserver = presenceMetricsObserver{}
+var _ cluster.MembershipMutationObserver = membershipMutationMetricsObserver{}
+var _ cluster.MembershipMutationObserver = multiMembershipMutationObserver{}
+
+// ObservePersistedReadAdmission preserves bounded serving-node read pressure.
+func (o channelMetricsObserver) ObservePersistedReadAdmission(kind string, accepted bool, inUse, limit int) {
+	if o.metrics != nil {
+		o.metrics.Conversation.ObservePersistedReadAdmission(kind, accepted, inUse, limit)
+	}
+}
+func (o channelMetricsObserver) ObservePersistedReadCompletion(kind, result string, items int, duration time.Duration) {
+	if o.metrics != nil {
+		o.metrics.Conversation.ObservePersistedReadCompletion(kind, result, items, duration)
+	}
+}
+func (o multiChannelObserver) ObservePersistedReadAdmission(kind string, accepted bool, inUse, limit int) {
+	for _, observer := range o {
+		if v, ok := observer.(clusterchannels.PersistedReadObserver); ok {
+			v.ObservePersistedReadAdmission(kind, accepted, inUse, limit)
+		}
+	}
+}
+func (o multiChannelObserver) ObservePersistedReadCompletion(kind, result string, items int, duration time.Duration) {
+	for _, observer := range o {
+		if v, ok := observer.(clusterchannels.PersistedReadObserver); ok {
+			v.ObservePersistedReadCompletion(kind, result, items, duration)
+		}
+	}
+}
+
+// ObserveConversationReadStage keeps origin and HTTP populations separate.
+func (o conversationListMetricsObserver) ObserveConversationReadStage(scope, stage, result string, duration time.Duration) {
+	if o.metrics != nil {
+		o.metrics.Conversation.ObserveReadStage(scope, stage, result, duration)
+	}
+}
+func (o channelMetricsObserver) ObserveConversationReadStage(scope, stage, result string, duration time.Duration) {
+	if o.metrics != nil {
+		o.metrics.Conversation.ObserveReadStage(scope, stage, result, duration)
+	}
+}
+func (o channelMetricsObserver) ObserveMessageUpdateReadStage(stage, result string, duration time.Duration) {
+	if o.metrics != nil {
+		o.metrics.Conversation.ObserveReadStage("edit_slot", stage, result, duration)
+	}
+}
+func (o multiChannelObserver) ObserveConversationReadStage(scope, stage, result string, duration time.Duration) {
+	for _, child := range o {
+		if observer, ok := child.(cluster.ConversationReadStageObserver); ok && observer.ConversationReadStageObservationEnabled() {
+			observer.ObserveConversationReadStage(scope, stage, result, duration)
+		}
+	}
+}
+func (o multiChannelObserver) ObserveMessageUpdateReadStage(stage, result string, duration time.Duration) {
+	for _, child := range o {
+		if observer, ok := child.(slotproxy.MessageUpdateReadObserver); ok && observer.MessageUpdateReadObservationEnabled() {
+			observer.ObserveMessageUpdateReadStage(stage, result, duration)
+		}
+	}
+}
+
+func (o conversationListMetricsObserver) ConversationReadStageObservationEnabled() bool {
+	return o.metrics != nil && o.metrics.Conversation != nil
+}
+func (o channelMetricsObserver) ConversationReadStageObservationEnabled() bool {
+	return o.metrics != nil && o.metrics.Conversation != nil
+}
+func (o channelMetricsObserver) MessageUpdateReadObservationEnabled() bool {
+	return o.metrics != nil && o.metrics.Conversation != nil
+}
+func (o multiChannelObserver) ConversationReadStageObservationEnabled() bool {
+	for _, child := range o {
+		if observer, ok := child.(cluster.ConversationReadStageObserver); ok && observer.ConversationReadStageObservationEnabled() {
+			return true
+		}
+	}
+	return false
+}
+func (o multiChannelObserver) MessageUpdateReadObservationEnabled() bool {
+	for _, child := range o {
+		if observer, ok := child.(slotproxy.MessageUpdateReadObserver); ok && observer.MessageUpdateReadObservationEnabled() {
+			return true
+		}
+	}
+	return false
+}
+
+func (o channelMetricsObserver) ObserveSendPermissionCount(kind string, n int) {
+	if o.metrics != nil {
+		o.metrics.Message.ObserveSendPermissionCount(kind, n)
+	}
+}
+func (o channelMetricsObserver) ObserveSendPermissionStage(stage, result string, d time.Duration) {
+	if o.metrics != nil {
+		o.metrics.Message.ObserveSendPermissionStage(stage, result, d)
+	}
+}
+func (o channelMetricsObserver) ObserveSendPermissionInflight(delta int) {
+	if o.metrics != nil {
+		o.metrics.Message.ObserveSendPermissionInflight(delta)
+	}
+}
+func (o multiChannelObserver) ObserveSendPermissionCount(kind string, n int) {
+	for _, child := range o {
+		if v, ok := child.(slotproxy.SendPermissionObserver); ok {
+			v.ObserveSendPermissionCount(kind, n)
+		}
+	}
+}
+func (o multiChannelObserver) ObserveSendPermissionStage(stage, result string, d time.Duration) {
+	for _, child := range o {
+		if v, ok := child.(slotproxy.SendPermissionObserver); ok {
+			v.ObserveSendPermissionStage(stage, result, d)
+		}
+	}
+}
+func (o multiChannelObserver) ObserveSendPermissionInflight(delta int) {
+	for _, child := range o {
+		if v, ok := child.(slotproxy.SendPermissionObserver); ok {
+			v.ObserveSendPermissionInflight(delta)
+		}
+	}
+}

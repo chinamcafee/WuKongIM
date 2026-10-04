@@ -1,0 +1,37 @@
+---
+title: Webhook Event Types
+description: Synchronous before-send admission and asynchronous notification triggers.
+---
+
+The asynchronous notification runtime emits these three events. `focus_events` filters these exact names; an empty list enables all of them.
+
+| Event | Trigger boundary | Body / default batch |
+| --- | --- | --- |
+| `msg.notify` | after quorum-durable commit of an ordinary message | message array; 1 item by default; opt-in batching waits up to 500ms |
+| `msg.offline.v2` | when an eligible durable message has recipients without an online route | one flattened object; up to 512 device targets per chunk |
+| `user.onlinestatus` | when a UID owner's local active session comes online or its last local session goes offline | status-string array; up to 512 items or 2s |
+
+`msg.before_send` is independently enabled synchronous admission; its response allows, replaces, or rejects the send. Queue and retry semantics below apply only to the three asynchronous notifications. See [Before-send business callback](/en/guide/integration/webhooks#before-send-business-callback) for configuration, requests, and failure policies.
+
+## `msg.notify`
+
+Use this event for audit, indexing, or asynchronous product notification. It runs after durable commit. A webhook failure neither rolls the message back nor changes a successful SENDACK into a failure.
+
+## `msg.offline.v2`
+
+A commit is eligible for offline-candidate calculation only when all of these are true:
+
+- `message_seq > 0`;
+- `sync_once` is false;
+- the message has no `message_scoped_uids` exact-target list;
+- the recipient belongs to the durable delivery set and currently has no online route.
+
+This event is a **push candidate**, not unread-message truth and not a replacement for reconnect synchronization. A recipient may come online, or routing state may change, after the callback was admitted.
+
+## `user.onlinestatus`
+
+This event reports session transitions observed at the UID owner. It is a compatibility string, not a globally ordered presence log, and intermediate states can be missing. See [Payloads](/en/api/webhooks/payloads) for its format.
+
+<Callout type="info" title="There are no other webhook events">
+  Plugin Send/Receive/PersistAfter hooks, cluster RPC, and the benchmark `EVENT` frame are not HTTP webhook events.
+</Callout>

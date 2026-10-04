@@ -24,7 +24,7 @@ type deliveryMetaNode interface {
 }
 
 type recipientSubscriberNode interface {
-	ListChannelSubscribersPage(context.Context, string, int64, string, int) ([]string, string, bool, error)
+	ListChannelSubscribersAuthoritative(context.Context, string, int64, string, int) ([]string, string, bool, error)
 }
 
 // deliveryMetaStore adapts cluster Slot metadata to bench setup and channelappend subscriber scans.

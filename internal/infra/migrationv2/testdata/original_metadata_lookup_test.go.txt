@@ -1,0 +1,69 @@
+package wkdb
+
+import (
+ "testing"
+ "time"
+ "github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
+)
+
+// TestMigrationOriginalMetadataLookups exercises original runtime code using
+// synthetic data only; it never opens an operator's stopped source directory.
+func TestMigrationOriginalMetadataLookups(t *testing.T) {
+ db := NewWukongDB(NewOptions(WithDir(t.TempDir())))
+ if err := db.Open(); err != nil { t.Fatal(err) }
+ defer db.Close()
+ wk := db.(*wukongDB)
+ oldTime, newTime := time.Unix(100,0), time.Unix(200,0)
+ for _, d := range []Device{
+  {Id:10, Uid:"synthetic-user", DeviceFlag:1, DeviceLevel:0, Token:"old-token", CreatedAt:&oldTime, UpdatedAt:&oldTime},
+  {Id:20, Uid:"synthetic-user", DeviceFlag:1, DeviceLevel:1, Token:"new-token", CreatedAt:&newTime, UpdatedAt:&newTime},
+ } { if err := db.AddDevice(d); err != nil { t.Fatal(err) } }
+ hot, err := db.GetDevice("synthetic-user",1)
+ if err != nil || hot.Id != 20 { t.Fatalf("hot lookup: %+v %v",hot,err) }
+ wk.deviceCache.ClearCache()
+ cold, err := db.GetDevice("synthetic-user",1)
+ if err != nil || cold.Id != 10 || cold.Token != "old-token" || cold.DeviceLevel != 0 { t.Fatalf("cold lookup: %+v %v",cold,err) }
+ t.Log("device: hot ID=20; cold UID-index lookup ID=10, with that row's token and level")
+
+ // Seed two original-format primaries through the original writer in one
+ // batch, mirroring a duplicate insertion before the unique index is visible.
+ batch := wk.sharedBatchDB("synthetic-user").NewBatch()
+ for _, c := range []Conversation{
+  {Id:10, Uid:"synthetic-user", ChannelId:"synthetic-group", ChannelType:2, Type:ConversationTypeChat, ReadToMsgSeq:3, DeletedAtMsgSeq:2, CreatedAt:&oldTime, UpdatedAt:&newTime},
+  {Id:20, Uid:"synthetic-user", ChannelId:"synthetic-group", ChannelType:2, Type:ConversationTypeChat, ReadToMsgSeq:7, DeletedAtMsgSeq:5, CreatedAt:&newTime, UpdatedAt:&oldTime},
+ } { if err := wk.writeConversation(c,batch); err != nil { t.Fatal(err) } }
+ if err := batch.CommitWait(); err != nil { t.Fatal(err) }
+ one, err := db.GetConversation("synthetic-user","synthetic-group",2)
+ if err != nil || one.Id != 20 || one.ReadToMsgSeq != 7 { t.Fatalf("unique lookup: %+v %v",one,err) }
+ typed, err := db.GetConversationsByType("synthetic-user",ConversationTypeChat)
+ if err != nil || len(typed)!=1 || typed[0].Id != 20 { t.Fatalf("type lookup: %+v %v",typed,err) }
+ recent, err := db.GetLastConversations("synthetic-user",ConversationTypeChat,0,nil,100)
+ if err != nil || len(recent)!=2 || recent[0].Id!=10 { t.Fatalf("recent lookup: %+v %v",recent,err) }
+ t.Log("conversation: exact/type lookup ID=20; recent-first/API first-wins candidate ID=10")
+ if err := db.UpdateConversationDeletedAtMsgSeq("synthetic-user","synthetic-group",2,9); err != nil { t.Fatal(err) }
+ val,closer,err := wk.shardDB("synthetic-user").Get(key.NewConversationColumnKey("synthetic-user",20,key.TableConversation.Column.DeletedAtMsgSeq))
+ if err != nil { t.Fatal(err) }; n:=wk.endian.Uint64(val); closer.Close()
+ if n!=9 { t.Fatalf("deleted boundary=%d",n) }
+ if err := db.DeleteConversation("synthetic-user","synthetic-group",2); err != nil { t.Fatal(err) }
+ all, err := db.GetConversations("synthetic-user")
+ if err != nil || len(all)!=0 { t.Fatalf("delete all duplicate rows: %+v %v",all,err) }
+ t.Log("delete-boundary update follows unique index; deleting a conversation removes all duplicate primaries")
+}
+
+// Original recent-list limiting happens before API removeDuplicates, so two
+// physical copies can consume the entire limit and hide another channel.
+func TestMigrationOriginalConversationListLimit(t *testing.T) {
+ db:=NewWukongDB(NewOptions(WithDir(t.TempDir())))
+ if err:=db.Open();err!=nil {t.Fatal(err)};defer db.Close();wk:=db.(*wukongDB)
+ newest,middle,oldest:=time.Unix(300,0),time.Unix(200,0),time.Unix(100,0)
+ batch:=wk.sharedBatchDB("synthetic-limit").NewBatch()
+ for _,c:=range []Conversation{
+  {Id:10,Uid:"synthetic-limit",ChannelId:"a",ChannelType:2,Type:ConversationTypeChat,UpdatedAt:&newest},
+  {Id:20,Uid:"synthetic-limit",ChannelId:"a",ChannelType:2,Type:ConversationTypeChat,UpdatedAt:&middle},
+  {Id:30,Uid:"synthetic-limit",ChannelId:"b",ChannelType:2,Type:ConversationTypeChat,UpdatedAt:&oldest},
+ } {if err:=wk.writeConversation(c,batch);err!=nil {t.Fatal(err)}}
+ if err:=batch.CommitWait();err!=nil {t.Fatal(err)}
+ rows,err:=db.GetLastConversations("synthetic-limit",ConversationTypeChat,0,nil,2)
+ if err!=nil || len(rows)!=2 || rows[0].ChannelId!="a" || rows[1].ChannelId!="a" || rows[0].UpdatedAt.UnixNano()!=newest.UnixNano() {t.Fatalf("limit before dedup: %+v %v",rows,err)}
+ t.Log("limit=2 returns a,a before API deduplication; display version comes from the first row's UpdatedAt")
+}

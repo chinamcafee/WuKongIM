@@ -7,7 +7,7 @@ TIMESTAMP="${WK_BENCH_DELIVERY_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
 SCENARIO="${WK_BENCH_DELIVERY_SCENARIO:-group}"
 QPS_LIST="${WK_BENCH_DELIVERY_QPS:-100,200,500,800,1000}"
 OUT_DIR="${WK_BENCH_DELIVERY_OUT_DIR:-$ROOT_DIR/docs/development/perf-runs/${TIMESTAMP}-delivery-${SCENARIO}}"
-WK_BENCH_BIN="${WK_BENCH_BIN:-$ROOT_DIR/data/wkbench-delivery/wkbench}"
+WK_CLI_BIN="${WK_CLI_BIN:-$ROOT_DIR/data/wkbench-delivery/wkcli}"
 WORKER_ADDR="${WK_BENCH_WORKER_ADDR:-http://127.0.0.1:19140}"
 WORKER_LISTEN="${WK_BENCH_WORKER_LISTEN:-127.0.0.1:19140}"
 START_WORKER=1
@@ -59,7 +59,7 @@ Options:
   --scenario NAME          smoke, person, group, group-large, or saturation.
   --qps LIST               Comma-separated offered QPS list.
   --out-dir DIR            Evidence output directory.
-  --wkbench-bin PATH       wkbench binary path.
+  --wkcli-bin PATH       wkcli binary path.
   --worker-addr URL        Worker control URL.
   --worker-listen ADDR     Temporary worker listen address.
   --no-worker              Do not start a temporary worker.
@@ -129,7 +129,7 @@ while [[ $# -gt 0 ]]; do
     --scenario) SCENARIO="${2:?}"; shift 2 ;;
     --qps) QPS_LIST="${2:?}"; QPS_SET=1; shift 2 ;;
     --out-dir) OUT_DIR="${2:?}"; OUT_DIR_SET=1; shift 2 ;;
-    --wkbench-bin) WK_BENCH_BIN="${2:?}"; shift 2 ;;
+    --wkcli-bin) WK_CLI_BIN="${2:?}"; shift 2 ;;
     --worker-addr) WORKER_ADDR="${2:?}"; shift 2 ;;
     --worker-listen) WORKER_LISTEN="${2:?}"; shift 2 ;;
     --no-worker) START_WORKER=0; shift ;;
@@ -295,12 +295,12 @@ rate_per_channel() {
 }
 
 ensure_wkbench_binary() {
-  if [[ -x "$WK_BENCH_BIN" ]]; then
+  if [[ -x "$WK_CLI_BIN" ]]; then
     return
   fi
-  log "building wkbench: $WK_BENCH_BIN"
-  mkdir -p "$(dirname "$WK_BENCH_BIN")"
-  (cd "$ROOT_DIR" && go build -o "$WK_BENCH_BIN" ./cmd/wkbench)
+  log "building wkcli: $WK_CLI_BIN"
+  mkdir -p "$(dirname "$WK_CLI_BIN")"
+  (cd "$ROOT_DIR" && go build -o "$WK_CLI_BIN" ./cmd/wkcli)
 }
 
 worker_ready() {
@@ -319,7 +319,7 @@ ensure_worker() {
   ensure_wkbench_binary
   mkdir -p "$OUT_DIR/worker-state"
   log "starting temporary worker: $WORKER_LISTEN"
-  "$WK_BENCH_BIN" worker --listen "$WORKER_LISTEN" --work-dir "$OUT_DIR/worker-state" --insecure-control >/dev/null 2>&1 &
+  "$WK_CLI_BIN" bench worker --listen "$WORKER_LISTEN" --work-dir "$OUT_DIR/worker-state" --insecure-control >/dev/null 2>&1 &
   WORKER_PID="$!"
   local deadline=$((SECONDS + 15))
   while (( SECONDS <= deadline )); do
@@ -743,7 +743,7 @@ run_attempt() {
   log "running delivery scenario=$SCENARIO qps=$qps tag=$tag"
   scrape_metrics "$tag" before
   exit_status=0
-  "$WK_BENCH_BIN" run \
+  "$WK_CLI_BIN" bench run \
     --target "$OUT_DIR/target.yaml" \
     --scenario "$OUT_DIR/scenarios/scenario-${tag}.yaml" \
     --workers "$OUT_DIR/workers.yaml" \

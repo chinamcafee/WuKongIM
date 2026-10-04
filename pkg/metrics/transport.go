@@ -8,6 +8,7 @@ import (
 )
 
 type TransportMetrics struct {
+	observerDropped   prometheus.Counter
 	rpcDuration       *prometheus.HistogramVec
 	rpcTotal          *prometheus.CounterVec
 	rpcClientDuration *prometheus.HistogramVec
@@ -18,15 +19,18 @@ type TransportMetrics struct {
 	dialTotal         *prometheus.CounterVec
 	sentBytes         *prometheus.CounterVec
 	receivedBytes     *prometheus.CounterVec
-	writeBatches      prometheus.Counter
-	writeFrames       prometheus.Counter
-	writePayloadBytes prometheus.Counter
-	writeSingleFrames prometheus.Counter
-	writeFrameLimit   prometheus.Counter
-	poolActive        *prometheus.GaugeVec
-	poolIdle          *prometheus.GaugeVec
-	poolMu            sync.Mutex
-	poolPeers         map[string]struct{}
+	// Immutable fixed-lane handles attribute payload traffic without peer labels.
+	lanePayloadBytes   *prometheus.CounterVec
+	lanePayloadHandles map[transportLaneKey]prometheus.Counter
+	writeBatches       prometheus.Counter
+	writeFrames        prometheus.Counter
+	writePayloadBytes  prometheus.Counter
+	writeSingleFrames  prometheus.Counter
+	writeFrameLimit    prometheus.Counter
+	poolActive         *prometheus.GaugeVec
+	poolIdle           *prometheus.GaugeVec
+	poolMu             sync.Mutex
+	poolPeers          map[string]struct{}
 	// Handle caches avoid repeated Vec label lookups on stable transport hot paths.
 	rpcDurationHandles       sync.Map
 	rpcTotalHandles          sync.Map
@@ -41,6 +45,8 @@ type TransportMetrics struct {
 	poolActiveHandles        sync.Map
 	poolIdleHandles          sync.Map
 }
+
+type transportLaneKey struct{ direction, priority string }
 
 type transportRPCResultKey struct {
 	service string
@@ -71,9 +77,10 @@ type transportDialResultKey struct {
 
 func newTransportMetrics(registry prometheus.Registerer, labels prometheus.Labels) *TransportMetrics {
 	m := &TransportMetrics{
+		observerDropped: prometheus.NewCounter(prometheus.CounterOpts{Name: "wukongim_transport_observer_dropped_total", Help: "Transport observation events or duration samples dropped by bounded observer storage.", ConstLabels: labels}),
 		rpcDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:        "wukongim_transport_rpc_duration_seconds",
-			Help:        "Transport RPC latency in seconds.",
+			Help:        "Transport handler latency in seconds; transport drains sample one in 32 calls.",
 			ConstLabels: labels,
 			Buckets:     gatewayFrameDurationBuckets,
 		}, []string{"service"}),
@@ -84,7 +91,7 @@ func newTransportMetrics(registry prometheus.Registerer, labels prometheus.Label
 		}, []string{"service", "result"}),
 		rpcClientDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:        "wukongim_transport_rpc_client_duration_seconds",
-			Help:        "Transport RPC client latency in seconds grouped by target node and service.",
+			Help:        "End-to-end transport client latency in seconds; transport drains sample one in 32 calls.",
 			ConstLabels: labels,
 			Buckets:     gatewayFrameDurationBuckets,
 		}, []string{"target_node", "service"}),
@@ -124,6 +131,11 @@ func newTransportMetrics(registry prometheus.Registerer, labels prometheus.Label
 			Help:        "Total inbound transport payload bytes.",
 			ConstLabels: labels,
 		}, []string{"msg_type"}),
+		lanePayloadBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "wukongim_transport_lane_payload_bytes_total",
+			Help:        "Successful transport payload bytes by direction and scheduling lane; excludes wire headers and network overhead.",
+			ConstLabels: labels,
+		}, []string{"direction", "priority"}),
 		writeBatches: prometheus.NewCounter(prometheus.CounterOpts{
 			Name:        "wukongim_transport_write_batches_total",
 			Help:        "Total observed successful transport write batches.",
@@ -162,8 +174,17 @@ func newTransportMetrics(registry prometheus.Registerer, labels prometheus.Label
 		poolPeers: make(map[string]struct{}),
 	}
 
+	// Materialize zero series so a missing node's metric cannot look like no traffic.
+	m.lanePayloadHandles = make(map[transportLaneKey]prometheus.Counter, 10)
+	for _, direction := range []string{"send", "receive"} {
+		for _, priority := range []string{"raft", "control", "rpc", "bulk", "none"} {
+			key := transportLaneKey{direction, priority}
+			m.lanePayloadHandles[key] = m.lanePayloadBytes.WithLabelValues(direction, priority)
+		}
+	}
+
 	registry.MustRegister(
-		m.rpcDuration,
+		m.observerDropped, m.rpcDuration,
 		m.rpcTotal,
 		m.rpcClientDuration,
 		m.rpcClientTotal,
@@ -173,6 +194,7 @@ func newTransportMetrics(registry prometheus.Registerer, labels prometheus.Label
 		m.dialTotal,
 		m.sentBytes,
 		m.receivedBytes,
+		m.lanePayloadBytes,
 		m.writeBatches,
 		m.writeFrames,
 		m.writePayloadBytes,
@@ -183,6 +205,53 @@ func newTransportMetrics(registry prometheus.Registerer, labels prometheus.Label
 	)
 
 	return m
+}
+
+// ObserveRPCBatch records exact totals with explicitly sampled latency observations.
+func (m *TransportMetrics) ObserveRPCBatch(service, result string, count uint64, samples []time.Duration) {
+	if m == nil {
+		return
+	}
+	m.rpcTotalHandle(service, result).Add(float64(count))
+	observer := m.rpcDurationHandle(service)
+	for _, d := range samples {
+		observer.Observe(d.Seconds())
+	}
+}
+
+// ObserveRPCClientBatch separates end-to-end client latency samples from exact call totals.
+func (m *TransportMetrics) ObserveRPCClientBatch(node, service, result string, count uint64, samples []time.Duration) {
+	if m == nil {
+		return
+	}
+	m.rpcClientTotalHandle(node, service, result).Add(float64(count))
+	observer := m.rpcClientDurationHandle(node, service)
+	for _, d := range samples {
+		observer.Observe(d.Seconds())
+	}
+}
+
+// ObserveDropped exposes bounded observation loss independently of sampling policy.
+func (m *TransportMetrics) ObserveDropped(count uint64) {
+	if m != nil {
+		m.observerDropped.Add(float64(count))
+	}
+}
+
+// ObserveWriteBatches records identical frame-count batches with summed payload bytes.
+func (m *TransportMetrics) ObserveWriteBatches(count uint64, frames, payloadBytes, limit int) {
+	if m == nil || frames <= 0 {
+		return
+	}
+	m.writeBatches.Add(float64(count))
+	m.writeFrames.Add(float64(count) * float64(frames))
+	m.writePayloadBytes.Add(float64(max(0, payloadBytes)))
+	if frames == 1 {
+		m.writeSingleFrames.Add(float64(count))
+	}
+	if limit > 0 && frames >= limit {
+		m.writeFrameLimit.Add(float64(count))
+	}
 }
 
 func (m *TransportMetrics) ObserveRPC(service, result string, dur time.Duration) {
@@ -408,4 +477,15 @@ func (m *TransportMetrics) poolIdleHandle(peer string) prometheus.Gauge {
 	handle := m.poolIdle.WithLabelValues(peer)
 	value, _ := m.poolIdleHandles.LoadOrStore(peer, handle)
 	return value.(prometheus.Gauge)
+}
+
+// ObserveLanePayloadBytes records already-aggregated successful payload bytes.
+// Unknown labels are ignored to keep cardinality fixed and totals nonnegative.
+func (m *TransportMetrics) ObserveLanePayloadBytes(direction, priority string, bytes int) {
+	if m == nil || bytes <= 0 {
+		return
+	}
+	if counter := m.lanePayloadHandles[transportLaneKey{direction, priority}]; counter != nil {
+		counter.Add(float64(bytes))
+	}
 }

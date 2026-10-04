@@ -5,18 +5,17 @@ description: 划分业务服务、WuKongIM 集群和客户端 SDK 的职责与�
 
 一个可靠的接入把业务控制面与消息数据面分开：业务服务决定“谁可以做什么”，WuKongIM 集群负责“消息如何实时、有序地传递和保存”。
 
-```text
-终端应用 + 客户端 SDK
-  -> 业务服务：登录并获取 UID、设备与会话配置
-  -> WuKongIM HTTP API：GET /route（只发现地址）
-  -> WuKongIM Gateway：CONNECT / SEND / RECVACK
-
-业务服务
-  -> WuKongIM HTTP API：受信服务端发送与业务变更
-
-WuKongIM Gateway <-> WuKongIM 集群
-  -> 业务 Webhook 接收端：异步、有界、尽力而为
-  -> 业务持久化队列与处理器：接收端持久化之后
+```mermaid
+flowchart LR
+  Client["终端应用 + 客户端 SDK"] -->|登录| Product["业务服务"]
+  Product -->|UID、设备与会话配置| Client
+  Product -->|GET /route、受信发送与变更| HTTP["WuKongIM HTTP API"]
+  HTTP -->|接入地址| Client
+  Client -->|CONNECT / SEND / RECVACK| Gateway["WuKongIM Gateway"]
+  HTTP --> Cluster["WuKongIM 集群"]
+  Gateway <--> Cluster
+  Cluster -.->|异步、有界、尽力而为| Webhook["业务 Webhook 接收端"]
+  Webhook -->|持久化成功后| Queue["业务持久化队列与处理器"]
 ```
 
 ## 职责划分
@@ -32,11 +31,22 @@ WuKongIM Gateway <-> WuKongIM 集群
 
 ## 会话启动顺序
 
-1. 终端使用你的登录机制向业务服务认证。
-2. 业务服务返回稳定 UID、设备标识以及当前环境允许的连接参数。
-3. 客户端调用 `GET /route?uid=<uid>`，获得 `tcp_addr`、`ws_addr` 和 `wss_addr`。
-4. SDK 选择可用入口并发送 CONNECT，协商协议版本和加密材料。
-5. 连接成功后再发送业务消息；连接状态不能替代业务授权状态。
+```mermaid
+sequenceDiagram
+  participant App as 终端应用
+  participant Product as 业务服务
+  participant HTTP as WuKongIM HTTP API
+  participant Gateway as Gateway
+  App->>Product: 使用业务登录机制认证
+  Product->>HTTP: GET /route
+  HTTP-->>Product: tcp_addr / ws_addr / wss_addr
+  Product-->>App: UID、设备、Token 与连接参数
+  App->>Gateway: CONNECT（协议版本与加密材料）
+  Gateway-->>App: CONNACK 成功
+  App->>Gateway: 发送业务消息
+```
+
+连接状态不能替代业务授权状态。
 
 <Callout type="info" title="路由发现不是鉴权">
   当前 `/route` 返回配置好的接入地址，不会校验 UID 的业务权限。不要把能够获取路由解释为用户已被授权。
@@ -52,7 +62,7 @@ WuKongIM Gateway <-> WuKongIM 集群
 ## 故障边界
 
 - 对默认持久化消息，SENDACK 成功表示频道权威写入已作出持久化成功决定。
-- 显式标记 `no_persist` 的消息走实时非持久化路径，不具备相同的恢复保证。
+- 普通和命令式 `NoPersist` 均进入瞬时在线投递，分配消息 ID，序号为零；两者都没有持久历史或离线恢复，详见 [Message Flags](/zh/api/dictionaries/message-flags)。
 - 在线投递、会话活跃投影、Webhook 和插件属于提交后的独立副作用。
 - Webhook 失败不会把已经成功的 SENDACK 改成失败。
 - 客户端断线恢复依赖 SDK 的重连与消息同步，不依赖 Webhook 重放。

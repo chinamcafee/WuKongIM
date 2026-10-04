@@ -1,0 +1,245 @@
+---
+title: Android quickstart
+description: Install the pinned SDK version, obtain credentials from your backend, exchange online messages, and clean up.
+---
+
+This tutorial uses **WK_EASYSDK_ANDROID_VERSION** to exchange online messages between Alice and Bob in separate clients. WebSocket JSON-RPC CONNECT authenticates the connection.
+
+## 1. Prepare
+
+Prepare the following:
+
+- Android 5.0 (API 21) or later.
+- An AndroidX application. For an exact reference, this tag itself uses Kotlin `1.9.0`, Android Gradle Plugin `8.1.4`, Gradle `8.4`, and compileSdk `34`.
+- A WuKongIM single-node cluster or multi-node cluster whose `/readyz` is healthy and whose WebSocket Gateway is reachable from the Android device.
+- A product backend that returns `uid`, a short-lived `token`, and `websocketUrl` separately for Alice and Bob.
+
+Read [Identity & Token](/en/guide/integration/authentication) first. Example variables come from the product backend; real tokens never belong in the APK, repository, Logcat, or crash reports.
+
+To see messages first, follow [the official example](/en/sdk/easy/examples#android) with two clients. The steps below integrate the SDK into your application.
+
+The default device category is **APP `0`**. Store the Token with the same `device_flag` on your backend: APP is `0`, WEB is `1`, and PC is `2`.
+
+## 2. Install the SDK
+
+Add this to the application module's `build.gradle.kts`:
+
+```kotlin
+dependencies {
+    implementation("com.githubim:easysdk-android:WK_EASYSDK_ANDROID_VERSION")
+}
+```
+
+The equivalent Groovy DSL is:
+
+```groovy
+dependencies {
+    implementation 'com.githubim:easysdk-android:WK_EASYSDK_ANDROID_VERSION'
+}
+```
+
+Confirm that `gradle.properties` enables AndroidX:
+
+```properties
+android.useAndroidX=true
+```
+
+
+### Network permissions
+
+Add these entries to `AndroidManifest.xml`:
+
+```xml
+<uses-permission android:name="android.permission.INTERNET" />
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+```
+
+Production uses `wss://`. Android 9 and later restrict cleartext traffic by default; do not globally enable cleartext as a production TLS workaround.
+
+## 3. Connect and listen
+
+```kotlin
+data class IMBootstrap(
+    val uid: String,
+    val token: String,
+    val websocketUrl: String,
+)
+```
+
+The product backend authenticates the current product user and selects a WebSocket address. The Android client receives only its own connection material and no WuKongIM HTTP API management credential.
+
+Android EasySDK is a process singleton, and `WK_EASYSDK_ANDROID_TAG` cannot be initialized a second time with another configuration. This example fits a minimal run with one UID per process. A production application that switches accounts must first design and test a complete logout strategy around this limitation.
+
+```kotlin
+import android.os.Bundle
+import android.util.Log
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
+import com.githubim.easysdk.WuKongConfig
+import com.githubim.easysdk.WuKongEasySDK
+import com.githubim.easysdk.enums.WuKongChannelType
+import com.githubim.easysdk.enums.WuKongEvent
+import com.githubim.easysdk.listener.WuKongEventListener
+import com.githubim.easysdk.model.ConnectResult
+import com.githubim.easysdk.model.DisconnectInfo
+import com.githubim.easysdk.model.Message
+import com.githubim.easysdk.model.WuKongError
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+
+class ChatActivity : AppCompatActivity() {
+    private val easySDK = WuKongEasySDK.getInstance()
+    private var listenersRegistered = false
+    private var connected = false
+
+    private val connectListener = object : WuKongEventListener<ConnectResult> {
+        override fun onEvent(result: ConnectResult) = runOnUiThread {
+            connected = true
+            Log.i("EasySDK", "connected")
+        }
+    }
+
+    private val messageListener = object : WuKongEventListener<Message> {
+        override fun onEvent(message: Message) = runOnUiThread {
+            Log.i("EasySDK", "message received")
+            // Deduplicate by messageId before updating the UI.
+        }
+    }
+
+    private val disconnectListener = object : WuKongEventListener<DisconnectInfo> {
+        override fun onEvent(info: DisconnectInfo) = runOnUiThread {
+            connected = false
+            Log.i("EasySDK", "disconnected")
+        }
+    }
+
+    private val errorListener = object : WuKongEventListener<WuKongError> {
+        override fun onEvent(error: WuKongError) = runOnUiThread {
+            Log.e("EasySDK", "SDK operation failed")
+        }
+    }
+
+    fun connect(bootstrap: IMBootstrap) {
+        val config = WuKongConfig.Builder()
+            .serverUrl(bootstrap.websocketUrl)
+            .uid(bootstrap.uid)
+            .token(bootstrap.token)
+            .connectionTimeout(15_000)
+            .requestTimeout(15_000)
+            .maxReconnectAttempts(5)
+            .debugLogging(false)
+            .build()
+
+        val current = easySDK.getConfig()
+        if (current == null) {
+            easySDK.init(applicationContext, config)
+        } else {
+            check(
+                current.uid == bootstrap.uid &&
+                    current.token == bootstrap.token &&
+                    current.serverUrl == bootstrap.websocketUrl &&
+                    current.connectionTimeoutMs == config.connectionTimeoutMs &&
+                    current.requestTimeoutMs == config.requestTimeoutMs &&
+                    current.maxReconnectAttempts == config.maxReconnectAttempts &&
+                    current.deviceFlag == config.deviceFlag &&
+                    current.debugLogging == config.debugLogging
+            ) {
+                "WuKongEasySDK WK_EASYSDK_ANDROID_TAG cannot apply changed identity or configuration; " +
+                    "stop and restart the process or upgrade the SDK"
+            }
+        }
+        registerListeners()
+        connected = easySDK.isConnected()
+        if (connected) return
+
+        lifecycleScope.launch {
+            runCatching { withTimeout(20_000) { easySDK.connect() } }
+                .onFailure {
+                    connected = false
+                    easySDK.disconnect()
+                    Log.e("EasySDK", "connect failed")
+                }
+        }
+    }
+
+    private fun registerListeners() {
+        if (listenersRegistered) return
+        easySDK.addEventListener(WuKongEvent.CONNECT, connectListener)
+        easySDK.addEventListener(WuKongEvent.DISCONNECT, disconnectListener)
+        easySDK.addEventListener(WuKongEvent.MESSAGE, messageListener)
+        easySDK.addEventListener(WuKongEvent.ERROR, errorListener)
+        listenersRegistered = true
+    }
+
+    override fun onDestroy() {
+        if (listenersRegistered) {
+            easySDK.removeEventListener(WuKongEvent.CONNECT, connectListener)
+            easySDK.removeEventListener(WuKongEvent.DISCONNECT, disconnectListener)
+            easySDK.removeEventListener(WuKongEvent.MESSAGE, messageListener)
+            easySDK.removeEventListener(WuKongEvent.ERROR, errorListener)
+            listenersRegistered = false
+        }
+        if (isFinishing) easySDK.disconnect()
+        super.onDestroy()
+    }
+}
+```
+
+Listeners are registered only after `init`, and the same object references are retained for `removeEventListener`. The outer `withTimeout` bounds the complete wait at 20 seconds and disconnects after failure; SDK connection and request limits are 15 seconds, with at most 5 reconnect attempts. On Activity recreation, the page reads `isConnected()` instead of waiting for a `CONNECT` event that will not be replayed. A changed identity, token, URL, or connection setting stops explicitly rather than silently retaining a stale value. The example sets `debugLogging(false)` explicitly. Maven `WK_EASYSDK_ANDROID_VERSION` applies that master gate to protocol-parsing and event-dispatch diagnostics and redacts public model strings. A production application normally lets an Application-scoped connection manager own the SDK while Activities or Fragments subscribe only to UI events. The screen-level owner above makes the minimal lifecycle visible.
+
+## 4. Exchange the first message
+
+Add this method inside the `ChatActivity` class above and call it from your send button after connection.
+
+```kotlin
+fun sendText(targetUid: String, text: String) {
+    check(connected) { "EasySDK is not connected" }
+    lifecycleScope.launch {
+        val payload: String = org.json.JSONObject()
+            .put("type", 1)
+            .put("version", 1)
+            .put("content", text)
+            .toString()
+
+        runCatching {
+            easySDK.send(
+                channelId = targetUid,
+                channelType = WuKongChannelType.PERSON,
+                payload = payload,
+            )
+        }.onSuccess {
+            Log.i("EasySDK", "SEND completed")
+        }.onFailure {
+            Log.e("EasySDK", "send failed")
+        }
+    }
+}
+```
+
+A returned `send` result means Alice obtained a result for the request. Bob must independently observe the message through his `MESSAGE` listener. Do not mark the peer as “received” inside Alice's send callback.
+
+Because the SDK is a process singleton, use two devices, two emulators, or two independent application processes:
+
+1. Alice and Bob each obtain their own connection material from the product backend.
+2. Both sides observe `CONNECT`; on failure, record only a stable error code and stage, never the original error text.
+3. Alice calls `sendText("bob", ...)` and records the send result.
+4. Bob checks `fromUid`, `channelId`, `messageId`, and the payload.
+5. Bob sends back to Alice and proves the reverse direction.
+6. Recreate the Activity and confirm listeners are not duplicated; exit the application and confirm the connection closes.
+
+## 5. Clean up
+
+`onDestroy()` removes this page’s listeners and disconnects when the Activity finishes. An application connection belongs to the Application. Version `WK_EASYSDK_ANDROID_VERSION` cannot reinitialize with another identity or configuration; never silently reuse an old Token.
+
+## 6. Troubleshooting
+
+- **`SDK is not initialized`:** preserve the `init → addEventListener → connect` order.
+- **The same UID gets a refreshed token or route and configuration changes:** `WK_EASYSDK_ANDROID_TAG` has no public reset API. Stop explicitly and restart the process; do not continue with a stale token or URL.
+- **The emulator connects but a physical device does not:** confirm that the address is reachable outside the host or container and have the product backend return the device-reachable WSS ingress.
+- **CONNECT, SEND, or RECVACK parsing fails:** confirm the server includes the EasySDK JSON-RPC compatibility implementation. The current server accepts snake_case fields and the README-aligned Android JSON text-string payload, as well as JSON objects and Base64 payloads, and returns snake_case results for Android. Use APP `0`, WEB `1`, and PC `2`; do not carry forward older literals.
+- **Raw JSON or `Params` still appears in Logcat with `debugLogging` disabled:** first confirm Gradle resolved `WK_EASYSDK_ANDROID_VERSION`, clean the old build, then use a non-production canary to distinguish SDK output from application or third-party network logs. Stop the rollout and file a minimal reproduction if the Release artifact still exposes that canary.
+- **Messages are duplicated:** prevent repeated listener registration and deduplicate by `messageId`.
+
+## Next
+
+Continue with [messaging](/en/guide/integration/messaging) and [production checks](/en/guide/integration/acceptance). For offline recovery, conversations, unread counts, or push, see [SDK selection](/en/sdk). [Versions and validation records](https://github.com/WuKongIM/WuKongIM/blob/main/docs/superpowers/reports/2026-09-08-easysdk-validation-history.md#android) retain the exact environments and scope of past runs.

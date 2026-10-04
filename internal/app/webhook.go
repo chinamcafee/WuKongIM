@@ -75,6 +75,9 @@ type singleOfflineRecipientsObserver struct {
 }
 
 func (a *App) wireWebhook() error {
+	if err := a.wireBeforeSendWebhook(); err != nil {
+		return err
+	}
 	if !a.cfg.Webhook.Enabled || a.webhook != nil {
 		return nil
 	}
@@ -92,6 +95,8 @@ func (a *App) wireWebhook() error {
 		QueueSize:           a.cfg.Webhook.QueueSize,
 		Workers:             a.cfg.Webhook.Workers,
 		OnlineBatchMaxItems: a.cfg.Webhook.OnlineBatchMaxItems,
+		NotifyBatchMaxItems: a.cfg.Webhook.NotifyBatchMaxItems,
+		NotifyBatchMaxWait:  a.cfg.Webhook.NotifyBatchMaxWait,
 		OnlineBatchMaxWait:  a.cfg.Webhook.OnlineBatchMaxWait,
 		OfflineUIDBatchSize: a.cfg.Webhook.OfflineUIDBatchSize,
 		RequestTimeout:      a.cfg.Webhook.RequestTimeout,

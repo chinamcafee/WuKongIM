@@ -1,8 +1,44 @@
-# Cloud Simulation
+# WuKongIM
 
-The Cloud Simulation context describes time-bounded WuKongIM workloads that run against temporary cloud infrastructure and produce evidence for later diagnosis.
+Shared domain vocabulary for product messaging and Cloud Simulation.
 
 ## Language
+
+### Messaging
+
+**User Send Ban**:
+A reversible restriction on one user's ability to send application messages to any Channel or explicit recipient list. It does not itself prevent login, receipt, or history reads.
+_Avoid_: Personal Channel ban, device ban
+
+**Channel Send Ban**:
+A reversible restriction on application messages sent into one Channel by any sender. A person Channel restriction applies to both participants; lifting it does not lift either participant's User Send Ban.
+_Avoid_: Sender ban, one-way person ban
+
+**Online Delivery**:
+Delivery of a message to connected recipient sessions, identified by their owner node and exact session identity. A receive acknowledgement is distinct from durable message commitment.
+_Avoid_: Durable append, offline synchronization
+
+**Committed Message Page**:
+A bounded selection of ordinary messages from one Channel's committed history, selected by the requested sequence range, read direction, and applicable visibility floor. Selecting the latest page chooses the newest eligible messages; response ordering follows the caller's established contract.
+_Avoid_: Conversation page, history dump
+
+**Message Visibility Floor**:
+The lowest message sequence eligible for a Channel read. For an ordinary user pull, eligibility accounts for when membership began, hidden history, and retained history; the badge's `read_seq` is not a pull cursor.
+_Avoid_: Badge floor, read receipt
+
+**MQTT Session**:
+A ClientID-bound IM access session whose subscriptions and unfinished delivery exchanges can survive a connection ending within its agreed lifetime and resource limits. It belongs to an authenticated UID and is distinct from a device credential or an online connection.
+_Avoid_: Device, socket, Online Delivery route
+
+**MQTT Subscription**:
+One MQTT Session's choice to receive an authorized exact application topic with negotiated delivery options. It does not grant IM Channel membership.
+_Avoid_: Group membership, user-channel membership
+
+**MQTT Delivery Obligation**:
+The responsibility to preserve and deliver a qualifying message for a valid MQTT Subscription until completion, expiry, permission revocation, or explicit session termination. Ordinary Channel history retention does not by itself discharge this responsibility.
+_Avoid_: History visibility, unread count, read receipt
+
+### Cloud Simulation
 
 **Simulation Run**:
 A time-bounded execution of a black-box workload against one temporary three-node cluster, identified independently from the GitHub workflow that starts it.
@@ -132,6 +168,10 @@ _Avoid_: Evidence Bundle, historical diagnostics
 The single existing wkbench coordinator run whose bounded phases generate and evaluate one Scenario Profile on the simulator.
 _Avoid_: Cloud daemon, dev-sim loop
 
+**Worker Assignment**:
+One immutable generation of work assigned to one worker within a Workload Execution. Its identity distinguishes replacement assignments even when the parent run identity is reused.
+_Avoid_: Workload Execution, worker process
+
 **Internal Capability Token**:
 A random, run-scoped credential authorizing one narrow private interaction among simulator services and cluster nodes.
 _Avoid_: Administrator login, shared private token
@@ -155,6 +195,30 @@ _Avoid_: Source credential, host credential, analysis token
 **Run Lease**:
 The immutable cloud-side expiry and cleanup obligation attached to a Simulation Run when it is created.
 _Avoid_: Workflow timeout, simulator timer
+
+**Cloud Lease**:
+A temporary provider-neutral infrastructure allocation with an immutable expiry and cleanup obligation. A Simulation Run may consume one Cloud Lease, while a larger operator flow may consume multiple sequential Cloud Leases.
+_Avoid_: Simulation Run, server purchase, permanent environment
+
+**Lease Plan**:
+The versioned, workload-neutral declaration of the compute, storage, network, expiry, budget, and tags required from a Cloud Lease.
+_Avoid_: Scenario Profile, Deployment Plan, workflow inputs
+
+**Lease Receipt**:
+The non-secret inventory and lifecycle proof returned for one exact Cloud Lease.
+_Avoid_: Credentials, deployment result, workflow artifact
+
+**Deployment Plan**:
+The versioned product-specific intent for activating services, configuration, observability, public entrypoints, and readiness on a Cloud Lease.
+_Avoid_: Lease Plan, ad hoc deployment arguments
+
+**Deployment Receipt**:
+The non-secret proof that one exact Deployment Bundle and Deployment Plan were activated and checked on one exact Cloud Lease.
+_Avoid_: Lease Receipt, deployment logs
+
+**Chat Lifecycle Run**:
+The complete operator-requested chain of a rehearsal Simulation Run, a fresh formal Simulation Run, aged-data capacity testing, evidence, and cleanup.
+_Avoid_: Simulation Run, workflow run
 
 **Cloud Control Plane**:
 The repository-owned lifecycle authority that reconciles Simulation Runs through Cloud Provider Adapters and provider inventory.

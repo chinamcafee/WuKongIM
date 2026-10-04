@@ -11,6 +11,9 @@ const (
 )
 
 var (
+	// ErrAppendNotSubmitted proves this fresh proposal failed before original dispatch.
+	// Callers must suppress it after any earlier uncertain attempt.
+	ErrAppendNotSubmitted = errors.New("channel: original append not submitted")
 	// ErrInvalidConfig reports invalid construction or authoritative metadata.
 	ErrInvalidConfig = errors.New("channel: invalid config")
 	// ErrBackpressured reports that a bounded queue rejected new work.
@@ -27,6 +30,8 @@ var (
 	ErrChannelNotFound = errors.New("channel: channel not found")
 	// ErrNotReplica reports that the local or requesting node is outside the channel replica set.
 	ErrNotReplica = errors.New("channel: not replica")
+	// ErrLogConflict reports that an exact log range has different durable content or a gap.
+	ErrLogConflict = errors.New("channel: log conflict")
 	// ErrClosed reports that the cluster or one of its bounded workers is closed.
 	ErrClosed = errors.New("channel: closed")
 	// ErrTooManyChannels reports that local channel activation hit its limit.

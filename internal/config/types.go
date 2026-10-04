@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -75,6 +76,12 @@ func Load(opts Options) (app.Config, error) {
 		return app.Config{}, fmt.Errorf("load config: %w", err)
 	}
 	cfg.StartupConfigSnapshot = buildStartupSnapshot(values, cfg)
+	cfg.StartupConfigDocument, err = buildStartupDocument(values, cfg)
+	// App.New retains semantic validation ownership. An invalid app config
+	// cannot run or serve this document; do not change Load's validation timing.
+	if err != nil && !errors.Is(err, app.ErrInvalidConfig) {
+		return app.Config{}, fmt.Errorf("load config document: %w", err)
+	}
 	cfg.ConfigPath = loadedConfigPath
 	return cfg, nil
 }

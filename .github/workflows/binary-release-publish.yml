@@ -1,0 +1,1217 @@
+name: Safety Automation - Publish WuKongIM Binaries
+run-name: >-
+  WuKongIM binaries ${{ inputs.version || github.ref_name }}
+  attempt ${{ github.run_attempt }}
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing SemVer tag; dispatch with --ref set to this same tag
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: binary-release-publish-${{ github.repository }}-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  conversation-qps:
+    if: github.repository == 'WuKongIM/WuKongIM'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/conversation-qps-gate.yml
+    with:
+      source_ref: ${{ inputs.version || github.ref_name }}
+  publish:
+    needs: conversation-qps
+    name: Publish immutable release archives
+    if: github.repository == 'WuKongIM/WuKongIM'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    environment: binary-publish
+    env:
+      GOWORK: "off"
+      REQUESTED_VERSION: ${{ inputs.version || github.ref_name }}
+    steps:
+      - name: Checkout immutable release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.REQUESTED_VERSION }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Require the source that passed conversation QPS
+        shell: bash
+        env:
+          QPS_SOURCE_SHA: ${{ needs.conversation-qps.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$QPS_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git rev-parse HEAD)" == "$QPS_SOURCE_SHA" ]]
+
+      - name: Validate release identity and tag policy
+        id: identity
+        shell: bash
+        env:
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          version="$REQUESTED_VERSION"
+          [[ "$version" == v* ]] || {
+            echo "release tag must start with v" >&2
+            exit 1
+          }
+          binary_version="${version#v}"
+          [[ "$binary_version" != *+* ]] || {
+            echo "release policy does not allow SemVer build metadata" >&2
+            exit 1
+          }
+
+          core="$binary_version"
+          prerelease=""
+          if [[ "$binary_version" == *-* ]]; then
+            core="${binary_version%%-*}"
+            prerelease="${binary_version#*-}"
+            [[ -n "$prerelease" ]] || {
+              echo "pre-release suffix must not be empty" >&2
+              exit 1
+            }
+          fi
+
+          IFS=. read -r major minor patch extra <<<"$core"
+          [[ -n "$major" && -n "$minor" && -n "$patch" && -z "${extra:-}" ]] || {
+            echo "release tag must contain major.minor.patch" >&2
+            exit 1
+          }
+          for number in "$major" "$minor" "$patch"; do
+            [[ "$number" =~ ^(0|[1-9][0-9]*)$ ]] || {
+              echo "SemVer core identifiers must be decimal without leading zeroes" >&2
+              exit 1
+            }
+          done
+
+          stable=true
+          if [[ -n "$prerelease" ]]; then
+            stable=false
+            IFS=. read -r -a identifiers <<<"$prerelease"
+            for identifier in "${identifiers[@]}"; do
+              [[ -n "$identifier" && "$identifier" =~ ^[0-9A-Za-z-]+$ ]] || {
+                echo "invalid SemVer pre-release identifier: $identifier" >&2
+                exit 1
+              }
+              if [[ "$identifier" =~ ^[0-9]+$ && ${#identifier} -gt 1 && "$identifier" == 0* ]]; then
+                echo "numeric SemVer pre-release identifiers must not have leading zeroes" >&2
+                exit 1
+              fi
+            done
+          fi
+
+          git show-ref --verify --quiet "refs/tags/$version" || {
+            echo "release tag does not exist: $version" >&2
+            exit 1
+          }
+          source_sha="$(git rev-parse HEAD)"
+          test "$(git rev-parse "refs/tags/$version^{commit}")" = "$source_sha"
+          expected_ref="refs/tags/$version"
+          test "$GITHUB_REF" = "$expected_ref" || {
+            echo "release workflow must run from exact tag ref $expected_ref" >&2
+            echo "manual recovery: gh workflow run binary-release-publish.yml --repo WuKongIM/WuKongIM --ref $version -f version=$version" >&2
+            exit 1
+          }
+          test "$(git rev-parse "$GITHUB_SHA^{commit}")" = "$source_sha" || {
+            echo "workflow event SHA does not resolve to release source" >&2
+            exit 1
+          }
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse "$WORKFLOW_SHA^{commit}")" = "$source_sha" || {
+            echo "workflow definition SHA does not resolve to release source" >&2
+            exit 1
+          }
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          git merge-base --is-ancestor "$source_sha" origin/main || {
+            echo "release source must be reachable from origin/main" >&2
+            exit 1
+          }
+
+          source_epoch="$(git show -s --format=%ct "$source_sha")"
+          [[ "$source_epoch" =~ ^[0-9]+$ ]]
+          {
+            echo "version=$version"
+            echo "binary_version=$binary_version"
+            echo "source_sha=$source_sha"
+            echo "source_epoch=$source_epoch"
+            echo "stable=$stable"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Validate and extract changelog release notes
+        id: changelog
+        shell: bash
+        env:
+          VERSION: ${{ steps.identity.outputs.version }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          parser_path="scripts/extract-release-notes.awk"
+          if [[ ! -f "$parser_path" ]]; then
+            [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]] || {
+              echo "tagged source is missing $parser_path" >&2
+              exit 1
+            }
+            [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+            git fetch --no-tags origin "$WORKFLOW_SHA"
+            parser_path="$RUNNER_TEMP/extract-release-notes.awk"
+            git show "$WORKFLOW_SHA:scripts/extract-release-notes.awk" >"$parser_path"
+            test -s "$parser_path"
+          fi
+          notes_path="$RUNNER_TEMP/changelog-release-notes.md"
+          awk -v version="$VERSION" \
+            -f "$parser_path" CHANGELOG.md >"$notes_path"
+          test -s "$notes_path" || {
+            echo "$VERSION has no non-empty CHANGELOG.md release body" >&2
+            exit 1
+          }
+          echo "notes_path=$notes_path" >>"$GITHUB_OUTPUT"
+
+      - name: Set up repository Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run binary release contracts
+        run: |
+          go test ./cmd/wukongim -count=1
+          go test ./scripts -run 'Test(BinaryRelease|GitHubWorkflow|ReleaseNotesWorkflow)' -count=1
+
+      - name: Build deterministic release archives
+        id: build
+        shell: bash
+        env:
+          BINARY_VERSION: ${{ steps.identity.outputs.binary_version }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+          SOURCE_EPOCH: ${{ steps.identity.outputs.source_epoch }}
+          RELEASE_DIR: ${{ runner.temp }}/wukongim-binary-release
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          test ! -e "$RELEASE_DIR" || {
+            echo "release output already exists: $RELEASE_DIR" >&2
+            exit 1
+          }
+          mkdir -p "$RELEASE_DIR/.build" "$RELEASE_DIR/.stage"
+          tar --version | grep -F 'GNU tar' >/dev/null
+
+          embedded_version=false
+          native_packages=false
+          ldflags='-s -w -buildid='
+          if [[ -f cmd/wukongim/version.go ]]; then
+            embedded_version=true
+            ldflags="$ldflags -X main.buildVersion=$BINARY_VERSION"
+            ldflags="$ldflags -X main.buildCommit=$SOURCE_SHA"
+            ldflags="$ldflags -X main.buildSource=release"
+          fi
+
+          targets=(
+            linux/amd64
+            linux/arm64
+            darwin/amd64
+            darwin/arm64
+          )
+          for target in "${targets[@]}"; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            platform="${goos}_${goarch}"
+            binary_dir="$RELEASE_DIR/.build/$platform"
+            archive_root="wukongim_${BINARY_VERSION}_${platform}"
+            stage_dir="$RELEASE_DIR/.stage/$archive_root"
+            archive="$RELEASE_DIR/$archive_root.tar.gz"
+            mkdir -p "$binary_dir" "$stage_dir"
+
+            goamd64=""
+            [[ "$goarch" != amd64 ]] || goamd64="v1"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" GOAMD64="$goamd64" \
+            go build -trimpath -buildvcs=false -ldflags "$ldflags" \
+              -o "$binary_dir/wukongim" ./cmd/wukongim
+
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" GOAMD64="$goamd64" \
+            go build -trimpath -buildvcs=false -ldflags "$ldflags" \
+              -o "$binary_dir/wkcli" ./cmd/wkcli
+
+            install -m 0755 "$binary_dir/wukongim" "$stage_dir/wukongim"
+            install -m 0755 "$binary_dir/wkcli" "$stage_dir/wkcli"
+            install -m 0644 README.md "$stage_dir/README.md"
+            install -m 0644 README_CN.md "$stage_dir/README_CN.md"
+            install -m 0644 wukongim.toml.example "$stage_dir/wukongim.toml.example"
+
+            go version -m "$binary_dir/wkcli" >"$binary_dir/wkcli-go-version.txt"
+            grep -F $'\tpath\tgithub.com/WuKongIM/WuKongIM/cmd/wkcli' "$binary_dir/wkcli-go-version.txt"
+            grep -F $'\tbuild\tGOOS='"$goos" "$binary_dir/wkcli-go-version.txt"
+            grep -F $'\tbuild\tGOARCH='"$goarch" "$binary_dir/wkcli-go-version.txt"
+
+            go version -m "$binary_dir/wukongim" >"$binary_dir/go-version.txt"
+            grep -F $'\tpath\tgithub.com/WuKongIM/WuKongIM/cmd/wukongim' "$binary_dir/go-version.txt"
+            grep -F $'\tbuild\tGOOS='"$goos" "$binary_dir/go-version.txt"
+            grep -F $'\tbuild\tGOARCH='"$goarch" "$binary_dir/go-version.txt"
+
+            (
+              cd "$RELEASE_DIR/.stage"
+              tar --sort=name \
+                --mtime="@$SOURCE_EPOCH" \
+                --owner=0 --group=0 --numeric-owner \
+                --format=ustar \
+                -cf - "$archive_root" | gzip -n -9 >"$archive"
+            )
+          done
+
+          checksum_name="wukongim_${BINARY_VERSION}_checksums.txt"
+          [[ ! -f .goreleaser.packages.yaml ]] || native_packages=true
+          {
+            echo "embedded_version=$embedded_version"
+            echo "native_packages=$native_packages"
+            echo "checksum_name=$checksum_name"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Build unsigned amd64 native packages
+        if: steps.build.outputs.native_packages == 'true'
+        uses: goreleaser/goreleaser-action@4c6ab561adb47e50c45ef534e2155934e91c40c1 # v7.2.0
+        with:
+          distribution: goreleaser
+          version: v2.18.0
+          args: release --clean --config .goreleaser.packages.yaml
+
+      - name: Normalize unsigned native package assets
+        if: steps.build.outputs.native_packages == 'true'
+        shell: bash
+        env:
+          BINARY_VERSION: ${{ steps.identity.outputs.binary_version }}
+          RELEASE_DIR: ${{ runner.temp }}/wukongim-binary-release
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          shopt -s nullglob
+
+          deb_packages=(dist/*.deb)
+          rpm_packages=(dist/*.rpm)
+          ((${#deb_packages[@]} == 1)) || {
+            echo "GoReleaser must produce exactly one unsigned deb asset" >&2
+            exit 1
+          }
+          ((${#rpm_packages[@]} == 1)) || {
+            echo "GoReleaser must produce exactly one unsigned rpm asset" >&2
+            exit 1
+          }
+          [[ -f "${deb_packages[0]}" && ! -L "${deb_packages[0]}" ]]
+          [[ -f "${rpm_packages[0]}" && ! -L "${rpm_packages[0]}" ]]
+
+          deb_name="wukongim_${BINARY_VERSION}_linux_amd64.deb"
+          rpm_name="wukongim_${BINARY_VERSION}_linux_amd64.rpm"
+          install -m 0644 "${deb_packages[0]}" "$RELEASE_DIR/$deb_name"
+          install -m 0644 "${rpm_packages[0]}" "$RELEASE_DIR/$rpm_name"
+          test "$(dpkg-deb --field "$RELEASE_DIR/$deb_name" Package)" = wukongim
+          test "$(dpkg-deb --field "$RELEASE_DIR/$deb_name" Architecture)" = amd64
+
+      - name: Finalize exact release asset set and checksums
+        shell: bash
+        env:
+          BINARY_VERSION: ${{ steps.identity.outputs.binary_version }}
+          NATIVE_PACKAGES: ${{ steps.build.outputs.native_packages }}
+          CHECKSUM_NAME: ${{ steps.build.outputs.checksum_name }}
+          RELEASE_DIR: ${{ runner.temp }}/wukongim-binary-release
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          release_assets=(
+            "wukongim_${BINARY_VERSION}_linux_amd64.tar.gz"
+            "wukongim_${BINARY_VERSION}_linux_arm64.tar.gz"
+            "wukongim_${BINARY_VERSION}_darwin_amd64.tar.gz"
+            "wukongim_${BINARY_VERSION}_darwin_arm64.tar.gz"
+          )
+          if [[ "$NATIVE_PACKAGES" == true ]]; then
+            release_assets+=(
+              "wukongim_${BINARY_VERSION}_linux_amd64.deb"
+              "wukongim_${BINARY_VERSION}_linux_amd64.rpm"
+            )
+          fi
+          for asset in "${release_assets[@]}"; do
+            [[ -f "$RELEASE_DIR/$asset" && ! -L "$RELEASE_DIR/$asset" ]] || {
+              echo "missing or unsafe release asset: $asset" >&2
+              exit 1
+            }
+          done
+          mapfile -t actual_assets < <(
+            find "$RELEASE_DIR" -maxdepth 1 -type f -printf '%f\n' | sort
+          )
+          mapfile -t expected_assets < <(printf '%s\n' "${release_assets[@]}" | sort)
+          test "${actual_assets[*]}" = "${expected_assets[*]}" || {
+            echo "local release directory does not contain the exact pre-checksum asset set" >&2
+            exit 1
+          }
+          (
+            cd "$RELEASE_DIR"
+            sha256sum "${release_assets[@]}" | sort -k2 >"$CHECKSUM_NAME"
+            sha256sum --check "$CHECKSUM_NAME"
+          )
+
+      - name: Set up QEMU for arm64 validation
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          platforms: arm64
+
+      - name: Validate binary identities and archive contents
+        shell: bash
+        env:
+          BINARY_VERSION: ${{ steps.identity.outputs.binary_version }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+          EMBEDDED_VERSION: ${{ steps.build.outputs.embedded_version }}
+          RELEASE_DIR: ${{ runner.temp }}/wukongim-binary-release
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          for platform in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64; do
+            archive_root="wukongim_${BINARY_VERSION}_${platform}"
+            archive="$RELEASE_DIR/$archive_root.tar.gz"
+            mapfile -t entries < <(tar -tzf "$archive")
+            expected=(
+              "$archive_root/"
+              "$archive_root/README.md"
+              "$archive_root/README_CN.md"
+              "$archive_root/wkcli"
+              "$archive_root/wukongim"
+              "$archive_root/wukongim.toml.example"
+            )
+            test "${entries[*]}" = "${expected[*]}"
+          done
+
+          file "$RELEASE_DIR/.build/linux_amd64/wukongim" | grep -F 'x86-64'
+          file "$RELEASE_DIR/.build/linux_arm64/wukongim" | grep -F 'ARM aarch64'
+          file "$RELEASE_DIR/.build/darwin_amd64/wukongim" | grep -F 'x86_64'
+          file "$RELEASE_DIR/.build/darwin_arm64/wukongim" | grep -F 'arm64'
+
+          for platform in linux_amd64 linux_arm64; do
+            "$RELEASE_DIR/.build/$platform/wkcli" version --output json \
+              >"$RELEASE_DIR/.build/$platform/wkcli-version.json"
+            jq -e --arg version "$BINARY_VERSION" --arg commit "$SOURCE_SHA" \
+              '.version == $version and .commit == $commit and .build_source == "release"' \
+              "$RELEASE_DIR/.build/$platform/wkcli-version.json" >/dev/null
+            for family in bench db migrate; do
+              "$RELEASE_DIR/.build/$platform/wkcli" "$family" --help >/dev/null
+            done
+          done
+
+          if [[ "$EMBEDDED_VERSION" == true ]]; then
+            for platform in linux_amd64 linux_arm64; do
+              "$RELEASE_DIR/.build/$platform/wukongim" version --output json \
+                >"$RELEASE_DIR/.build/$platform/version.json"
+              jq -e \
+                --arg version "$BINARY_VERSION" \
+                --arg commit "$SOURCE_SHA" \
+                '.version == $version and .commit == $commit and .build_source == "release"' \
+                "$RELEASE_DIR/.build/$platform/version.json" >/dev/null
+            done
+          else
+            echo "Legacy tag has no version command; provenance remains bound by tag, checksum, and attestation."
+          fi
+
+      - name: Set up Buildx for published image verification
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          version: v0.36.1
+
+      - name: Verify published Docker images and render Release body
+        id: release_body
+        timeout-minutes: 50
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.identity.outputs.version }}
+          IMAGE_VERSION: ${{ steps.identity.outputs.binary_version }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+          STABLE: ${{ steps.identity.outputs.stable }}
+          CHANGELOG_NOTES: ${{ steps.changelog.outputs.notes_path }}
+          CHECKSUM_NAME: ${{ steps.build.outputs.checksum_name }}
+          CANONICAL_IMAGE: ghcr.io/wukongim/wukongim
+          DOCKERHUB_IMAGE: docker.io/wukongim/wukongim
+          ALIYUN_IMAGE: registry.cn-shanghai.aliyuncs.com/wukongim/wukongim
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          docker_run_pages="$RUNNER_TEMP/docker-release-workflow-runs.json"
+          docker_run_id=""
+          for attempt in {1..80}; do
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/docker-image-publish.yml/runs?per_page=100" \
+              >"$docker_run_pages"
+            docker_run_id="$(jq -r \
+              --arg version "$VERSION" \
+              --arg source "$SOURCE_SHA" '
+                [
+                  .[] | .workflow_runs[]
+                  | select(.status == "completed" and .conclusion == "success")
+                  | select(
+                      (.event == "push" and .head_branch == $version and .head_sha == $source) or
+                      (.event == "workflow_dispatch" and
+                       (.display_title | startswith("Docker image " + $version + " attempt ")))
+                    )
+                ]
+                | sort_by(.id)
+                | last
+                | .id // empty
+              ' "$docker_run_pages")"
+            if [[ "$docker_run_id" =~ ^[1-9][0-9]*$ ]]; then
+              break
+            fi
+            if ((attempt < 80)); then
+              sleep 30
+            fi
+          done
+          [[ "$docker_run_id" =~ ^[1-9][0-9]*$ ]] || {
+            echo "No successful Docker publication workflow for $VERSION completed within 40 minutes" >&2
+            exit 1
+          }
+
+          manifest_dir="$RUNNER_TEMP/published-docker-manifests"
+          mkdir -p "$manifest_dir"
+          images=("$CANONICAL_IMAGE" "$DOCKERHUB_IMAGE" "$ALIYUN_IMAGE")
+          docker_digest=""
+          ready=false
+          for attempt in {1..10}; do
+            ready=true
+            candidate_digest=""
+            for index in "${!images[@]}"; do
+              ref="${images[$index]}:$IMAGE_VERSION"
+              manifest="$manifest_dir/$index.json"
+              errors="$manifest_dir/$index.err"
+              if ! docker buildx imagetools inspect "$ref" \
+                --format '{{json .}}' >"$manifest" 2>"$errors"; then
+                ready=false
+                break
+              fi
+              digest="$(jq -er '.manifest.digest' "$manifest")"
+              [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+              jq -e \
+                --arg digest "$digest" \
+                --arg source "$SOURCE_SHA" \
+                --arg image_version "$IMAGE_VERSION" '
+                  .manifest.digest == $digest and
+                  ([
+                    .manifest.manifests[]
+                    | select(.platform.os == "linux" and .platform.architecture != "unknown")
+                    | .platform.architecture
+                  ] | sort | unique) == ["amd64", "arm64"] and
+                  ([.image[] | .config.Labels["org.opencontainers.image.revision"]] | unique) == [$source] and
+                  ([.image[] | .config.Labels["org.opencontainers.image.version"]] | unique) == [$image_version]
+                ' "$manifest" >/dev/null || {
+                  echo "$ref exists but does not match the required source, version, or platforms" >&2
+                  exit 1
+                }
+              if [[ -z "$candidate_digest" ]]; then
+                candidate_digest="$digest"
+              elif [[ "$candidate_digest" != "$digest" ]]; then
+                echo "$ref has digest $digest instead of $candidate_digest" >&2
+                exit 1
+              fi
+            done
+            if [[ "$ready" == true ]]; then
+              docker_digest="$candidate_digest"
+              break
+            fi
+            if ((attempt < 10)); then
+              sleep 30
+            fi
+          done
+          [[ "$ready" == true && "$docker_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "Docker images for $VERSION were not complete in all registries within 5 minutes after the successful workflow" >&2
+            for errors in "$manifest_dir"/*.err; do
+              [[ -s "$errors" ]] && cat "$errors" >&2 || true
+            done
+            exit 1
+          }
+
+          select_previous_tag() {
+            local mode="$1" candidate candidate_sha item previous=""
+            local candidates=("$VERSION") sorted=()
+            while IFS= read -r candidate; do
+              [[ "$candidate" != "$VERSION" ]] || continue
+              case "$mode" in
+                stable)
+                  [[ "$candidate" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
+                  ;;
+                prerelease)
+                  [[ "$candidate" == "v${IMAGE_VERSION%%-*}-"* ]] || continue
+                  ;;
+                *)
+                  return 2
+                  ;;
+              esac
+              candidate_sha="$(git rev-parse "refs/tags/$candidate^{commit}")"
+              git merge-base --is-ancestor "$candidate_sha" "$SOURCE_SHA" || continue
+              candidates+=("$candidate")
+            done < <(git tag --list 'v*')
+            mapfile -t sorted < <(printf '%s\n' "${candidates[@]}" | sort -V -u)
+            for item in "${sorted[@]}"; do
+              [[ "$item" != "$VERSION" ]] || break
+              previous="$item"
+            done
+            printf '%s' "$previous"
+          }
+
+          if [[ "$STABLE" == true ]]; then
+            previous_tag="$(select_previous_tag stable)"
+          else
+            previous_tag="$(select_previous_tag prerelease)"
+            [[ -n "$previous_tag" ]] || previous_tag="$(select_previous_tag stable)"
+          fi
+
+          release_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$VERSION"
+          release_body="$RUNNER_TEMP/wukongim-release-body.md"
+          {
+            cat "$CHANGELOG_NOTES"
+            echo
+            echo "---"
+            echo
+            echo "## Release artifacts / 发布产物"
+            echo
+            echo "- Source commit / 源码提交: [$SOURCE_SHA]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$SOURCE_SHA)"
+            echo "- Docker workflow: [run $docker_run_id]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$docker_run_id)"
+            echo "- Docker digest: \`$docker_digest\`"
+            echo "- Docker platforms / 镜像平台: \`linux/amd64\`, \`linux/arm64\`"
+            echo
+            echo "### Docker images / Docker 镜像"
+            echo
+            for image in "${images[@]}"; do
+              echo "- \`$image:$IMAGE_VERSION\`"
+            done
+            echo
+            echo "### Binaries / 二进制文件"
+            echo
+            for platform in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64; do
+              asset="wukongim_${IMAGE_VERSION}_${platform}.tar.gz"
+              echo "- [$asset]($release_url/$asset)"
+            done
+            echo "- [$CHECKSUM_NAME]($release_url/$CHECKSUM_NAME)"
+            if [[ -n "$previous_tag" ]]; then
+              echo
+              echo "**Full Changelog**: [$previous_tag...$VERSION]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/$previous_tag...$VERSION)"
+            fi
+          } >"$release_body"
+          test -s "$release_body"
+          {
+            echo "body_path=$release_body"
+            echo "docker_digest=$docker_digest"
+            echo "docker_run_id=$docker_run_id"
+            echo "previous_tag=$previous_tag"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Classify draft GitHub Release assets
+        id: publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.identity.outputs.version }}
+          BINARY_VERSION: ${{ steps.identity.outputs.binary_version }}
+          STABLE: ${{ steps.identity.outputs.stable }}
+          NATIVE_PACKAGES: ${{ steps.build.outputs.native_packages }}
+          CHECKSUM_NAME: ${{ steps.build.outputs.checksum_name }}
+          RELEASE_DIR: ${{ runner.temp }}/wukongim-binary-release
+          EXPECTED_BODY: ${{ steps.release_body.outputs.body_path }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          expected_assets=(
+            "wukongim_${BINARY_VERSION}_linux_amd64.tar.gz"
+            "wukongim_${BINARY_VERSION}_linux_arm64.tar.gz"
+            "wukongim_${BINARY_VERSION}_darwin_amd64.tar.gz"
+            "wukongim_${BINARY_VERSION}_darwin_arm64.tar.gz"
+            "$CHECKSUM_NAME"
+          )
+          if [[ "$NATIVE_PACKAGES" == true ]]; then
+            expected_assets+=(
+              "wukongim_${BINARY_VERSION}_linux_amd64.deb"
+              "wukongim_${BINARY_VERSION}_linux_amd64.rpm"
+            )
+          fi
+          existing_dir="$RUNNER_TEMP/existing-binary-release"
+          mkdir -p "$existing_dir"
+          missing_file="$RUNNER_TEMP/missing-binary-release-assets.txt"
+          release_pages="$RUNNER_TEMP/existing-binary-release-pages.json"
+          matching_releases="$RUNNER_TEMP/existing-binary-release-matches.json"
+          release_json="$RUNNER_TEMP/existing-binary-release.json"
+          : >"$missing_file"
+
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" >"$release_pages"
+          jq --arg version "$VERSION" \
+            '[.[][] | select(.tag_name == $version)]' \
+            "$release_pages" >"$matching_releases"
+          match_count="$(jq 'length' "$matching_releases")"
+          [[ "$match_count" == 0 || "$match_count" == 1 ]] || {
+            echo "$VERSION resolves to multiple GitHub Releases" >&2
+            exit 1
+          }
+
+          release_exists=false
+          release_id=""
+          if [[ "$match_count" == 1 ]]; then
+            release_exists=true
+            jq '.[0]' "$matching_releases" >"$release_json"
+            release_id="$(jq -r '.id' "$release_json")"
+            [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || {
+              echo "$VERSION Release has an invalid numeric id" >&2
+              exit 1
+            }
+            existing_prerelease="$(jq -r '.prerelease' "$release_json")"
+            expected_prerelease=true
+            [[ "$STABLE" != true ]] || expected_prerelease=false
+            test "$existing_prerelease" = "$expected_prerelease" || {
+              echo "$VERSION Release prerelease classification conflicts with SemVer" >&2
+              exit 1
+            }
+            jq -e --rawfile expected "$EXPECTED_BODY" \
+              '.body == $expected' "$release_json" >/dev/null || {
+              echo "$VERSION draft body conflicts with the generated Release body" >&2
+              exit 1
+            }
+          else
+            jq -n '{assets: []}' >"$release_json"
+          fi
+
+          jq -e '[.assets[].name] | length == (unique | length)' "$release_json" >/dev/null || {
+            echo "$VERSION Release contains duplicate asset names" >&2
+            exit 1
+          }
+          while IFS= read -r existing_asset; do
+            expected=false
+            for asset in "${expected_assets[@]}"; do
+              if [[ "$existing_asset" == "$asset" ]]; then
+                expected=true
+                break
+              fi
+            done
+            [[ "$expected" == true ]] || {
+              echo "$VERSION Release contains unexpected asset: $existing_asset" >&2
+              exit 1
+            }
+          done < <(jq -r '.assets[].name' "$release_json")
+
+          existing_count=0
+          for asset in "${expected_assets[@]}"; do
+            asset_id="$(jq -r --arg name "$asset" \
+              '.assets[] | select(.name == $name) | .id' "$release_json")"
+            if [[ -n "$asset_id" ]]; then
+              [[ "$asset_id" =~ ^[1-9][0-9]*$ ]] || {
+                echo "$asset has an invalid numeric asset id" >&2
+                exit 1
+              }
+              existing_count=$((existing_count + 1))
+              gh api \
+                -H 'Accept: application/octet-stream' \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+                >"$existing_dir/$asset"
+              cmp "$RELEASE_DIR/$asset" "$existing_dir/$asset" || {
+                echo "$asset already exists and its content conflicts with this source" >&2
+                exit 1
+              }
+            else
+              printf '%s\n' "$asset" >>"$missing_file"
+            fi
+          done
+
+          if [[ "$release_exists" == true ]] && ! jq -e '.draft == true' "$release_json" >/dev/null; then
+            if [[ "$existing_count" -eq "${#expected_assets[@]}" ]]; then
+              echo "$VERSION already has the complete published binary release" >&2
+            else
+              echo "$VERSION is already published but incomplete; refusing to reuse its tag; publish a new SemVer tag" >&2
+            fi
+            exit 1
+          fi
+          {
+            echo "release_exists=$release_exists"
+            echo "release_id=$release_id"
+            echo "missing_file=$missing_file"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Create GitHub build provenance
+        id: attestation
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/wukongim-binary-release/*.tar.gz
+            ${{ runner.temp }}/wukongim-binary-release/*.deb
+            ${{ runner.temp }}/wukongim-binary-release/*.rpm
+            ${{ runner.temp }}/wukongim-binary-release/*_checksums.txt
+
+      - name: Create or recover draft GitHub Release
+        id: draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.identity.outputs.version }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+          STABLE: ${{ steps.identity.outputs.stable }}
+          RELEASE_EXISTS: ${{ steps.publication.outputs.release_exists }}
+          CLASSIFIED_RELEASE_ID: ${{ steps.publication.outputs.release_id }}
+          MISSING_FILE: ${{ steps.publication.outputs.missing_file }}
+          RELEASE_DIR: ${{ runner.temp }}/wukongim-binary-release
+          EXPECTED_BODY: ${{ steps.release_body.outputs.body_path }}
+        run: |
+          set -euo pipefail
+
+          remote_refs="$(git ls-remote origin \
+            "refs/tags/$VERSION" "refs/tags/$VERSION^{}")"
+          raw_tag_sha="$(awk -v ref="refs/tags/$VERSION" '$2 == ref {print $1}' <<<"$remote_refs")"
+          peeled_tag_sha="$(awk -v ref="refs/tags/$VERSION^{}" '$2 == ref {print $1}' <<<"$remote_refs")"
+          [[ "$raw_tag_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "remote release tag is missing or ambiguous: $VERSION" >&2
+            exit 1
+          }
+          remote_source_sha="${peeled_tag_sha:-$raw_tag_sha}"
+          [[ "$remote_source_sha" =~ ^[0-9a-f]{40}$ && "$remote_source_sha" == "$SOURCE_SHA" ]] || {
+            echo "remote release tag no longer peels to the validated source: $VERSION" >&2
+            exit 1
+          }
+
+          upload_paths=()
+          while IFS= read -r asset; do
+            [[ -n "$asset" ]] || continue
+            upload_paths+=("$RELEASE_DIR/$asset")
+          done <"$MISSING_FILE"
+          release_id="$CLASSIFIED_RELEASE_ID"
+          if [[ "$RELEASE_EXISTS" != true ]]; then
+            expected_prerelease=true
+            [[ "$STABLE" != true ]] || expected_prerelease=false
+            created_release="$RUNNER_TEMP/created-binary-release.json"
+            create_request="$RUNNER_TEMP/create-binary-release-request.json"
+            jq -n \
+              --arg tag_name "$VERSION" \
+              --arg name "WuKongIM $VERSION" \
+              --argjson prerelease "$expected_prerelease" \
+              --rawfile body "$EXPECTED_BODY" \
+              '{
+                tag_name: $tag_name,
+                name: $name,
+                body: $body,
+                draft: true,
+                prerelease: $prerelease
+              }' >"$create_request"
+            gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+              --input "$create_request" \
+              >"$created_release"
+            release_id="$(jq -r '.id' "$created_release")"
+          fi
+          [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || {
+            echo "$VERSION draft has an invalid numeric release id" >&2
+            exit 1
+          }
+          draft_identity="$RUNNER_TEMP/binary-release-draft-identity.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" >"$draft_identity"
+          jq -e --rawfile expected "$EXPECTED_BODY" \
+            '.body == $expected' "$draft_identity" >/dev/null || {
+            echo "$VERSION draft body does not match the generated Release body" >&2
+            exit 1
+          }
+          upload_url="$(jq -r '.upload_url' "$draft_identity")"
+          expected_upload_url="https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets{?name,label}"
+          [[ "$upload_url" == "$expected_upload_url" ]] || {
+            echo "$VERSION draft returned an unexpected asset upload URL" >&2
+            exit 1
+          }
+          upload_endpoint="${upload_url%%\{*}"
+
+          for upload_path in "${upload_paths[@]}"; do
+            asset="$(basename "$upload_path")"
+            [[ "$asset" =~ ^wukongim_[0-9A-Za-z._-]+$ ]] || {
+              echo "refusing unsafe release asset name: $asset" >&2
+              exit 1
+            }
+            upload_response="$RUNNER_TEMP/uploaded-$asset.json"
+            curl --fail-with-body --silent --show-error \
+              --request POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              -H 'Content-Type: application/octet-stream' \
+              --data-binary "@$upload_path" \
+              "$upload_endpoint?name=$asset" \
+              >"$upload_response"
+            local_size="$(stat -c '%s' "$upload_path")"
+            local_sha256="$(sha256sum "$upload_path" | awk '{print $1}')"
+            jq -e \
+              --arg name "$asset" \
+              --arg digest "sha256:$local_sha256" \
+              --argjson size "$local_size" \
+              '.id > 0 and .name == $name and .state == "uploaded" and
+               .size == $size and .digest == $digest' \
+              "$upload_response" >/dev/null || {
+                echo "$asset upload response does not match the local asset" >&2
+                exit 1
+              }
+          done
+          echo "release_id=$release_id" >>"$GITHUB_OUTPUT"
+
+      - name: Verify complete draft Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.identity.outputs.version }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+          BINARY_VERSION: ${{ steps.identity.outputs.binary_version }}
+          STABLE: ${{ steps.identity.outputs.stable }}
+          NATIVE_PACKAGES: ${{ steps.build.outputs.native_packages }}
+          CHECKSUM_NAME: ${{ steps.build.outputs.checksum_name }}
+          RELEASE_DIR: ${{ runner.temp }}/wukongim-binary-release
+          EXPECTED_BODY: ${{ steps.release_body.outputs.body_path }}
+        run: |
+          set -euo pipefail
+          draft_json="$RUNNER_TEMP/draft-binary-release.json"
+          draft_dir="$RUNNER_TEMP/draft-binary-release"
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$draft_json"
+          jq -e --arg version "$VERSION" --rawfile expected "$EXPECTED_BODY" \
+            '.tag_name == $version and .draft == true and
+             (.immutable // false) == false and .body == $expected' \
+            "$draft_json" >/dev/null || {
+            echo "$VERSION must retain the exact generated body and remain mutable and draft until all assets are verified" >&2
+            exit 1
+          }
+          expected_prerelease=true
+          [[ "$STABLE" != true ]] || expected_prerelease=false
+          test "$(jq -r '.prerelease' "$draft_json")" = "$expected_prerelease" || {
+            echo "$VERSION draft prerelease classification conflicts with SemVer" >&2
+            exit 1
+          }
+          mapfile -t actual_assets < <(jq -r '.assets[].name' "$draft_json" | sort)
+          expected_assets=(
+            "wukongim_${BINARY_VERSION}_linux_amd64.tar.gz"
+            "wukongim_${BINARY_VERSION}_linux_arm64.tar.gz"
+            "wukongim_${BINARY_VERSION}_darwin_amd64.tar.gz"
+            "wukongim_${BINARY_VERSION}_darwin_arm64.tar.gz"
+            "$CHECKSUM_NAME"
+          )
+          if [[ "$NATIVE_PACKAGES" == true ]]; then
+            expected_assets+=(
+              "wukongim_${BINARY_VERSION}_linux_amd64.deb"
+              "wukongim_${BINARY_VERSION}_linux_amd64.rpm"
+            )
+          fi
+          mapfile -t expected_assets < <(printf '%s\n' "${expected_assets[@]}" | sort)
+          test "${actual_assets[*]}" = "${expected_assets[*]}" || {
+            echo "$VERSION draft does not contain the exact expected asset set" >&2
+            exit 1
+          }
+
+          mkdir -p "$draft_dir"
+          for local_asset in "$RELEASE_DIR"/*.tar.gz "$RELEASE_DIR"/*.deb "$RELEASE_DIR"/*.rpm "$RELEASE_DIR/$CHECKSUM_NAME"; do
+            [[ -e "$local_asset" ]] || continue
+            asset="$(basename "$local_asset")"
+            asset_id="$(jq -r --arg name "$asset" \
+              '.assets[] | select(.name == $name) | .id' "$draft_json")"
+            [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
+            gh api \
+              -H 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              >"$draft_dir/$asset"
+            cmp "$local_asset" "$draft_dir/$asset"
+          done
+          (
+            cd "$draft_dir"
+            sha256sum --check "$CHECKSUM_NAME"
+          )
+
+      - name: Publish verified draft Release once
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.identity.outputs.version }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+          BINARY_VERSION: ${{ steps.identity.outputs.binary_version }}
+          STABLE: ${{ steps.identity.outputs.stable }}
+          NATIVE_PACKAGES: ${{ steps.build.outputs.native_packages }}
+          CHECKSUM_NAME: ${{ steps.build.outputs.checksum_name }}
+          RELEASE_DIR: ${{ runner.temp }}/wukongim-binary-release
+          EXPECTED_BODY: ${{ steps.release_body.outputs.body_path }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+
+          remote_refs="$(git ls-remote origin \
+            "refs/tags/$VERSION" "refs/tags/$VERSION^{}")"
+          raw_tag_sha="$(awk -v ref="refs/tags/$VERSION" '$2 == ref {print $1}' <<<"$remote_refs")"
+          peeled_tag_sha="$(awk -v ref="refs/tags/$VERSION^{}" '$2 == ref {print $1}' <<<"$remote_refs")"
+          [[ "$raw_tag_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "remote release tag is missing or ambiguous immediately before publication: $VERSION" >&2
+            exit 1
+          }
+          remote_source_sha="${peeled_tag_sha:-$raw_tag_sha}"
+          [[ "$remote_source_sha" =~ ^[0-9a-f]{40}$ && "$remote_source_sha" == "$SOURCE_SHA" ]] || {
+            echo "remote release tag changed after source validation: $VERSION" >&2
+            exit 1
+          }
+          prepublish_json="$RUNNER_TEMP/prepublish-binary-release.json"
+          prepublish_dir="$RUNNER_TEMP/prepublish-binary-release"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$prepublish_json"
+          jq -e --arg version "$VERSION" --rawfile expected "$EXPECTED_BODY" \
+            '.tag_name == $version and .draft == true and
+             (.immutable // false) == false and .body == $expected' \
+            "$prepublish_json" >/dev/null || {
+            echo "$VERSION is no longer the verified draft Release with the exact generated body" >&2
+            exit 1
+          }
+          expected_prerelease=true
+          [[ "$STABLE" != true ]] || expected_prerelease=false
+          test "$(jq -r '.prerelease' "$prepublish_json")" = "$expected_prerelease" || {
+            echo "$VERSION draft prerelease classification changed before publication" >&2
+            exit 1
+          }
+          mapfile -t actual_assets < <(jq -r '.assets[].name' "$prepublish_json" | sort)
+          expected_assets=(
+            "wukongim_${BINARY_VERSION}_linux_amd64.tar.gz"
+            "wukongim_${BINARY_VERSION}_linux_arm64.tar.gz"
+            "wukongim_${BINARY_VERSION}_darwin_amd64.tar.gz"
+            "wukongim_${BINARY_VERSION}_darwin_arm64.tar.gz"
+            "$CHECKSUM_NAME"
+          )
+          if [[ "$NATIVE_PACKAGES" == true ]]; then
+            expected_assets+=(
+              "wukongim_${BINARY_VERSION}_linux_amd64.deb"
+              "wukongim_${BINARY_VERSION}_linux_amd64.rpm"
+            )
+          fi
+          mapfile -t expected_assets < <(printf '%s\n' "${expected_assets[@]}" | sort)
+          test "${actual_assets[*]}" = "${expected_assets[*]}" || {
+            echo "$VERSION draft asset set changed immediately before publication" >&2
+            exit 1
+          }
+          mkdir -p "$prepublish_dir"
+          for local_asset in "$RELEASE_DIR"/*.tar.gz "$RELEASE_DIR"/*.deb "$RELEASE_DIR"/*.rpm "$RELEASE_DIR/$CHECKSUM_NAME"; do
+            [[ -e "$local_asset" ]] || continue
+            asset="$(basename "$local_asset")"
+            asset_json="$(jq -c --arg name "$asset" \
+              '.assets[] | select(.name == $name)' "$prepublish_json")"
+            asset_id="$(jq -r '.id' <<<"$asset_json")"
+            api_size="$(jq -r '.size' <<<"$asset_json")"
+            api_digest="$(jq -r '.digest // empty' <<<"$asset_json")"
+            local_size="$(stat -c '%s' "$local_asset")"
+            local_sha256="$(sha256sum "$local_asset" | awk '{print $1}')"
+            [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
+            [[ "$api_size" =~ ^[0-9]+$ && "$api_size" == "$local_size" ]] || {
+              echo "$asset draft size changed immediately before publication" >&2
+              exit 1
+            }
+            [[ "$api_digest" == "sha256:$local_sha256" ]] || {
+              echo "$asset draft digest changed immediately before publication" >&2
+              exit 1
+            }
+            gh api \
+              -H 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              >"$prepublish_dir/$asset"
+            cmp "$local_asset" "$prepublish_dir/$asset"
+          done
+
+          gh api --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false \
+            >"$RUNNER_TEMP/publish-binary-release.json"
+
+      - name: Verify published immutable Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.identity.outputs.version }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+          BINARY_VERSION: ${{ steps.identity.outputs.binary_version }}
+          STABLE: ${{ steps.identity.outputs.stable }}
+          NATIVE_PACKAGES: ${{ steps.build.outputs.native_packages }}
+          CHECKSUM_NAME: ${{ steps.build.outputs.checksum_name }}
+          RELEASE_DIR: ${{ runner.temp }}/wukongim-binary-release
+          EXPECTED_BODY: ${{ steps.release_body.outputs.body_path }}
+        run: |
+          set -euo pipefail
+          published_json="$RUNNER_TEMP/published-binary-release.json"
+          published_dir="$RUNNER_TEMP/published-binary-release"
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$published_json"
+          jq -e --arg version "$VERSION" --rawfile expected "$EXPECTED_BODY" \
+            '.tag_name == $version and .draft == false and
+             .immutable == true and .body == $expected' \
+            "$published_json" >/dev/null || {
+            echo "$VERSION was not sealed with the exact generated body as an immutable published Release" >&2
+            exit 1
+          }
+          expected_prerelease=true
+          [[ "$STABLE" != true ]] || expected_prerelease=false
+          test "$(jq -r '.prerelease' "$published_json")" = "$expected_prerelease" || {
+            echo "$VERSION published prerelease classification conflicts with SemVer" >&2
+            exit 1
+          }
+          mapfile -t actual_assets < <(jq -r '.assets[].name' "$published_json" | sort)
+          expected_assets=(
+            "wukongim_${BINARY_VERSION}_linux_amd64.tar.gz"
+            "wukongim_${BINARY_VERSION}_linux_arm64.tar.gz"
+            "wukongim_${BINARY_VERSION}_darwin_amd64.tar.gz"
+            "wukongim_${BINARY_VERSION}_darwin_arm64.tar.gz"
+            "$CHECKSUM_NAME"
+          )
+          if [[ "$NATIVE_PACKAGES" == true ]]; then
+            expected_assets+=(
+              "wukongim_${BINARY_VERSION}_linux_amd64.deb"
+              "wukongim_${BINARY_VERSION}_linux_amd64.rpm"
+            )
+          fi
+          mapfile -t expected_assets < <(printf '%s\n' "${expected_assets[@]}" | sort)
+          test "${actual_assets[*]}" = "${expected_assets[*]}" || {
+            echo "$VERSION published Release does not contain the exact expected asset set" >&2
+            exit 1
+          }
+
+          mkdir -p "$published_dir"
+          for local_asset in "$RELEASE_DIR"/*.tar.gz "$RELEASE_DIR"/*.deb "$RELEASE_DIR"/*.rpm "$RELEASE_DIR/$CHECKSUM_NAME"; do
+            [[ -e "$local_asset" ]] || continue
+            asset="$(basename "$local_asset")"
+            asset_json="$(jq -c --arg name "$asset" \
+              '.assets[] | select(.name == $name)' "$published_json")"
+            asset_id="$(jq -r '.id' <<<"$asset_json")"
+            api_size="$(jq -r '.size' <<<"$asset_json")"
+            api_digest="$(jq -r '.digest // empty' <<<"$asset_json")"
+            local_size="$(stat -c '%s' "$local_asset")"
+            local_sha256="$(sha256sum "$local_asset" | awk '{print $1}')"
+            [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
+            [[ "$api_size" =~ ^[0-9]+$ && "$api_size" == "$local_size" ]] || {
+              echo "$asset published size conflicts with the verified local asset" >&2
+              exit 1
+            }
+            if [[ -n "$api_digest" ]]; then
+              [[ "$api_digest" == "sha256:$local_sha256" ]] || {
+                echo "$asset published digest conflicts with the verified local asset" >&2
+                exit 1
+              }
+            fi
+            gh api \
+              -H 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              >"$published_dir/$asset"
+            cmp "$local_asset" "$published_dir/$asset"
+          done
+
+      - name: Write release receipt and summary
+        shell: bash
+        env:
+          VERSION: ${{ steps.identity.outputs.version }}
+          BINARY_VERSION: ${{ steps.identity.outputs.binary_version }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+          STABLE: ${{ steps.identity.outputs.stable }}
+          EMBEDDED_VERSION: ${{ steps.build.outputs.embedded_version }}
+          NATIVE_PACKAGES: ${{ steps.build.outputs.native_packages }}
+          CHECKSUM_NAME: ${{ steps.build.outputs.checksum_name }}
+          RECOVERY: ${{ steps.publication.outputs.release_exists }}
+          DOCKER_DIGEST: ${{ steps.release_body.outputs.docker_digest }}
+          DOCKER_RUN_ID: ${{ steps.release_body.outputs.docker_run_id }}
+          PREVIOUS_TAG: ${{ steps.release_body.outputs.previous_tag }}
+          ATTESTATION_URL: ${{ steps.attestation.outputs.attestation-url }}
+          RELEASE_DIR: ${{ runner.temp }}/wukongim-binary-release
+        run: |
+          set -euo pipefail
+          checksum_path="$RELEASE_DIR/$CHECKSUM_NAME"
+          assets_json="$(jq -Rn '
+            [inputs
+              | capture("^(?<sha256>[0-9a-f]{64})  (?<name>.+)$")
+              | {name: .name, sha256: .sha256}]
+          ' <"$checksum_path")"
+          go_version="$(go version)"
+          receipt="$RELEASE_DIR/wukongim_${BINARY_VERSION}_release.json"
+          jq -n \
+            --arg schema "wukongim/binary-release-receipt/v1" \
+            --arg version "$VERSION" \
+            --arg binary_version "$BINARY_VERSION" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg stable "$STABLE" \
+            --arg embedded_version "$EMBEDDED_VERSION" \
+            --arg native_packages "$NATIVE_PACKAGES" \
+            --arg recovery "$RECOVERY" \
+            --arg docker_digest "$DOCKER_DIGEST" \
+            --arg docker_run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$DOCKER_RUN_ID" \
+            --arg previous_tag "$PREVIOUS_TAG" \
+            --arg event "$GITHUB_EVENT_NAME" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg release_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$VERSION" \
+            --arg workflow_ref "$GITHUB_WORKFLOW_REF" \
+            --arg go_version "$go_version" \
+            --arg checksum_file "$CHECKSUM_NAME" \
+            --arg attestation_url "$ATTESTATION_URL" \
+            --argjson assets "$assets_json" \
+            '{
+              schema: $schema,
+              version: $version,
+              binary_version: $binary_version,
+              source_sha: $source_sha,
+              stable: ($stable == "true"),
+              embedded_version: ($embedded_version == "true"),
+              unsigned_native_packages: ($native_packages == "true"),
+              recovery: ($recovery == "true"),
+              docker_digest: $docker_digest,
+              docker_run_url: $docker_run_url,
+              previous_tag: (if $previous_tag == "" then null else $previous_tag end),
+              trigger: $event,
+              run_url: $run_url,
+              release_url: $release_url,
+              workflow_ref: $workflow_ref,
+              go_version: $go_version,
+              checksum_file: $checksum_file,
+              attestation_url: (if $attestation_url == "" then null else $attestation_url end),
+              platforms: ["linux/amd64", "linux/arm64", "darwin/amd64", "darwin/arm64"],
+              assets: $assets
+            }' >"$receipt"
+
+          {
+            echo "## WuKongIM binary release"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Version | \`$VERSION\` |"
+            echo "| Source | \`$SOURCE_SHA\` |"
+            echo "| Platforms | \`linux/amd64\`, \`linux/arm64\`, \`darwin/amd64\`, \`darwin/arm64\` |"
+            echo "| Embedded version command | \`$EMBEDDED_VERSION\` |"
+            echo "| Unsigned amd64 DEB/RPM | \`$NATIVE_PACKAGES\` |"
+            echo "| Recovery | \`$RECOVERY\` |"
+            echo "| Docker digest | \`$DOCKER_DIGEST\` |"
+            echo "| Docker workflow | $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$DOCKER_RUN_ID |"
+            echo "| Release | $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$VERSION |"
+            [[ -z "$ATTESTATION_URL" ]] || echo "| Attestation | $ATTESTATION_URL |"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload binary release evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wukongim-binary-release-${{ steps.identity.outputs.binary_version }}
+          path: |
+            ${{ runner.temp }}/wukongim-binary-release/*.tar.gz
+            ${{ runner.temp }}/wukongim-binary-release/*.deb
+            ${{ runner.temp }}/wukongim-binary-release/*.rpm
+            ${{ runner.temp }}/wukongim-binary-release/*_checksums.txt
+            ${{ runner.temp }}/wukongim-binary-release/*_release.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Reject tracked-tree mutation
+        if: always()
+        shell: bash
+        run: git diff --exit-code HEAD --

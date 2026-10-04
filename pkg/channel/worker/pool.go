@@ -12,15 +12,24 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/workqueue"
 )
 
+// DefaultStoreAppendBatchMaxWait bounds cross-channel store-append coalescing when no override is set.
+const DefaultStoreAppendBatchMaxWait = 250 * time.Microsecond
+
 const (
+	// DefaultStoreAppendWorkers is the qualified leader append pool size for
+	// sustained 2,000 SEND/s three-replica workloads.
+	DefaultStoreAppendWorkers = 128
+	// DefaultStoreApplyWorkers is the qualified follower apply pool size for
+	// sustained 2,000 SEND/s three-replica workloads.
+	DefaultStoreApplyWorkers = 8
 	// DefaultRPCWorkers bounds the QPS-validated blocking replication pool.
-	DefaultRPCWorkers = 160
+	DefaultRPCWorkers = 96
 	// DefaultRPCBatchMaxItems amortizes one blocking replication transport call
 	// across a bounded number of Pull or PullHint items.
-	DefaultRPCBatchMaxItems      = 16
+	DefaultRPCBatchMaxItems      = 8
 	rpcBatchMaxWait              = 250 * time.Microsecond
 	storeAppendBatchMaxItems     = 64
-	storeAppendBatchMaxWait      = 250 * time.Microsecond
+	storeAppendBatchMaxWait      = DefaultStoreAppendBatchMaxWait
 	storeApplyBatchMaxItems      = 64
 	storeApplyBatchMaxWait       = 250 * time.Microsecond
 	storeCheckpointBatchMaxItems = 64
@@ -34,6 +43,8 @@ type QueueObserver interface {
 }
 
 // InflightObserver receives current and peak running worker counts.
+// Implementations are called synchronously from worker goroutines and must be
+// concurrency-safe and non-blocking.
 type InflightObserver interface {
 	SetWorkerInflight(pool string, inflight int)
 	SetWorkerInflightPeak(pool string, peak int)
@@ -50,6 +61,12 @@ type QueueCapacityObserver interface {
 // Implementations are called synchronously from Submit and should be concurrency-safe and non-blocking.
 type AdmissionObserver interface {
 	ObserveWorkerAdmission(pool string, result string)
+}
+
+// KindAdmissionObserver receives worker enqueue outcomes split by bounded task kind.
+// Implementations are called synchronously from Submit and should be concurrency-safe and non-blocking.
+type KindAdmissionObserver interface {
+	ObserveWorkerAdmissionKind(pool string, kind TaskKind, result string)
 }
 
 // WaitObserver receives queue wait time for accepted worker tasks.
@@ -117,9 +134,20 @@ type Pool struct {
 
 	obsMu sync.RWMutex
 	obs   QueueObserver
+	// queueObservationMu linearizes absolute queue-depth publications. A delayed
+	// older callback reloads the latest physical depth before it reaches the sink.
+	queueObservationMu sync.Mutex
 
 	inflight     atomic.Int64
 	inflightPeak atomic.Int64
+	// inflightObservationMu linearizes absolute current/peak publications. A
+	// delayed older worker samples the latest physical state before publishing.
+	inflightObservationMu sync.Mutex
+	// outstanding reserves one slot before enqueue for every accepted task,
+	// through execution and final result publication, including deferred commits.
+	outstanding atomic.Int64
+	// deferredWG joins deferred completions before Close returns.
+	deferredWG sync.WaitGroup
 	// rpcGroupTurn rotates same-kind RPC target groups between bounded batches.
 	rpcGroupTurn atomic.Uint64
 }
@@ -207,21 +235,29 @@ func (p *Pool) Submit(ctx context.Context, task Task) error {
 	}
 	if p.runtime.Closed() {
 		p.observeAdmission("closed")
+		p.observeAdmissionKind(task.Kind, "closed")
 		p.observeQueueDepth()
 		return ch.ErrClosed
 	}
 	if err := ctx.Err(); err != nil {
-		p.observeAdmission(workerAdmissionResult(err))
+		result := workerAdmissionResult(err)
+		p.observeAdmission(result)
+		p.observeAdmissionKind(task.Kind, result)
 		p.observeQueueDepth()
 		return err
 	}
-	if p.runtime.QueueDepth() >= p.runtime.QueueCapacity() {
+	if p.runtime.QueueDepth() >= p.runtime.QueueCapacity() || !p.reserveOutstanding() {
 		p.observeAdmission("full")
+		p.observeAdmissionKind(task.Kind, "full")
 		p.observeQueueDepth()
 		return ch.ErrBackpressured
 	}
 	queued := queuedTask{task: task, enqueuedAt: time.Now()}
 	err := p.runtime.Submit(ctx, queued)
+	if err != nil {
+		p.outstanding.Add(-1)
+	}
+	p.observeAdmissionKind(task.Kind, workerAdmissionResultFromSubmit(err))
 	switch {
 	case err == nil:
 		return nil
@@ -234,6 +270,21 @@ func (p *Pool) Submit(ctx context.Context, task Task) error {
 	}
 }
 
+// reserveOutstanding atomically charges queued, executing, and unpublished
+// tasks to one fixed budget before the runtime can accept or execute them.
+func (p *Pool) reserveOutstanding() bool {
+	limit := int64(p.cfg.Workers) + int64(p.cfg.QueueSize)
+	for {
+		current := p.outstanding.Load()
+		if current >= limit {
+			return false
+		}
+		if p.outstanding.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
 // Close closes admission, completes queued accepted tasks, cancels running handlers, and waits for exit.
 func (p *Pool) Close() error {
 	if p == nil {
@@ -242,7 +293,10 @@ func (p *Pool) Close() error {
 	if p.runtime == nil {
 		return nil
 	}
-	return p.runtime.Close(context.Background())
+	// Runtime close cancels the pool context, which terminates deferred rounds.
+	err := p.runtime.Close(context.Background())
+	p.deferredWG.Wait()
+	return err
 }
 
 // Name returns the configured pool name.
@@ -261,7 +315,20 @@ func (p *Pool) QueueDepth() int {
 	return p.runtime.QueueDepth()
 }
 
+// QueueCapacity returns the configured bounded admission capacity.
+func (p *Pool) QueueCapacity() int {
+	if p == nil || p.runtime == nil {
+		return 0
+	}
+	return p.runtime.QueueCapacity()
+}
+
 func (p *Pool) observeQueueDepth() {
+	if p == nil {
+		return
+	}
+	p.queueObservationMu.Lock()
+	defer p.queueObservationMu.Unlock()
 	p.observer().SetWorkerQueueDepth(p.cfg.Name, p.QueueDepth())
 }
 
@@ -305,6 +372,14 @@ func (p *Pool) observeAdmission(result string) {
 	obs.ObserveWorkerAdmission(p.cfg.Name, result)
 }
 
+func (p *Pool) observeAdmissionKind(kind TaskKind, result string) {
+	obs, ok := p.observer().(KindAdmissionObserver)
+	if !ok {
+		return
+	}
+	obs.ObserveWorkerAdmissionKind(p.cfg.Name, kind, result)
+}
+
 func (p *Pool) observeWait(kind TaskKind, d time.Duration) {
 	obs, ok := p.observer().(WaitObserver)
 	if !ok {
@@ -334,9 +409,11 @@ func (p *Pool) observeInflight(inflight int) {
 	if !ok {
 		return
 	}
-	obs.SetWorkerInflight(p.cfg.Name, inflight)
-	peak := p.updateInflightPeak(inflight)
-	obs.SetWorkerInflightPeak(p.cfg.Name, peak)
+	p.updateInflightPeak(inflight)
+	p.inflightObservationMu.Lock()
+	defer p.inflightObservationMu.Unlock()
+	obs.SetWorkerInflight(p.cfg.Name, int(p.inflight.Load()))
+	obs.SetWorkerInflightPeak(p.cfg.Name, int(p.inflightPeak.Load()))
 }
 
 func (p *Pool) updateInflightPeak(inflight int) int {
@@ -380,10 +457,14 @@ func (p *Pool) rpcBatchMaxItems() int {
 }
 
 func (p *Pool) completeQueuedClosed(queued queuedTask, err error) {
+	if p == nil {
+		return
+	}
+	defer p.outstanding.Add(-1)
 	if queued.task.Kind == TaskStoreClose && queued.task.StoreClose != nil {
 		_ = queued.task.StoreClose.finalize()
 	}
-	if p == nil || p.sink == nil {
+	if p.sink == nil {
 		return
 	}
 	if err == nil || errors.Is(err, workqueue.ErrClosed) {
@@ -408,7 +489,7 @@ func (o workerWorkqueueObserver) ObserveBoundedPool(obs workqueue.BoundedPoolObs
 		p.observeQueueCapacity()
 		p.observeWorkers()
 	case "depth":
-		p.observer().SetWorkerQueueDepth(p.cfg.Name, obs.QueueDepth)
+		p.observeQueueDepth()
 	case "admission":
 		p.observeAdmission(workerAdmissionResultFromWorkqueue(obs.Result))
 	case "worker":
@@ -435,6 +516,19 @@ func workerAdmissionResult(err error) string {
 		return "timeout"
 	default:
 		return "other"
+	}
+}
+
+func workerAdmissionResultFromSubmit(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, workqueue.ErrFull):
+		return "full"
+	case errors.Is(err, workqueue.ErrClosed):
+		return "closed"
+	default:
+		return workerAdmissionResult(err)
 	}
 }
 

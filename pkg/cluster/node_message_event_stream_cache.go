@@ -435,13 +435,15 @@ func isMessageEventTerminalCacheSession(session *messageEventStreamCacheSession)
 }
 
 type messageEventAppendRPCRequest struct {
-	Op    string                          `json:"op,omitempty"`
-	Event metadb.MessageEventAppend       `json:"event,omitempty"`
-	Keys  []metadb.MessageEventMessageKey `json:"keys,omitempty"`
-	Limit int                             `json:"limit,omitempty"`
+	Sequence *metadb.MessageEventSequenceQuery `json:"sequence,omitempty"`
+	Op       string                            `json:"op,omitempty"`
+	Event    metadb.MessageEventAppend         `json:"event,omitempty"`
+	Keys     []metadb.MessageEventMessageKey   `json:"keys,omitempty"`
+	Limit    int                               `json:"limit,omitempty"`
 }
 
 type messageEventAppendRPCResponse struct {
+	Events []metadb.MessageEventState      `json:"events,omitempty"`
 	Result metadb.MessageEventAppendResult `json:"result,omitempty"`
 	States []messageEventStatesRPCEntry    `json:"states,omitempty"`
 }
@@ -467,6 +469,15 @@ func (h messageEventAppendRPCHandler) HandleRPC(ctx context.Context, payload []b
 			return nil, err
 		}
 		return json.Marshal(messageEventAppendRPCResponse{Result: result})
+	case "sequence":
+		if req.Sequence == nil {
+			return nil, metadb.ErrInvalidArgument
+		}
+		events, err := h.node.listMessageEventStatesBySequenceLocal(ctx, *req.Sequence)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(messageEventAppendRPCResponse{Events: events})
 	case "states_batch":
 		rows, err := h.node.getMessageEventStatesBatchLocal(ctx, req.Keys, req.Limit)
 		if err != nil {

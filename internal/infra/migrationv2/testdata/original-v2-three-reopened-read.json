@@ -1,0 +1,74 @@
+{
+  "source_commit": "a888f89533d0e7d1b2030e06504ca97f1ad891d4",
+  "node_id": 1,
+  "request": {
+    "login_uid": "migrationbob",
+    "channel_id": "migrationgroup",
+    "channel_type": 2,
+    "start_message_seq": 0,
+    "end_message_seq": 0,
+    "pull_mode": 1,
+    "limit": 100
+  },
+  "response": {
+    "start_message_seq": 0,
+    "end_message_seq": 0,
+    "more": 0,
+    "messages": [
+      {
+        "header": {
+          "no_persist": 0,
+          "red_dot": 0,
+          "sync_once": 0
+        },
+        "setting": 0,
+        "message_id": 2096502314880733184,
+        "message_idstr": "2096502314880733184",
+        "client_msg_no": "multi-source-0",
+        "message_seq": 1,
+        "from_uid": "migrationalice",
+        "channel_id": "migrationgroup",
+        "channel_type": 2,
+        "expire": 0,
+        "timestamp": 1788680077,
+        "payload": "aGVsbG8="
+      },
+      {
+        "header": {
+          "no_persist": 0,
+          "red_dot": 1,
+          "sync_once": 0
+        },
+        "setting": 0,
+        "message_id": 2096502314893316096,
+        "message_idstr": "2096502314893316096",
+        "client_msg_no": "multi-source-1",
+        "message_seq": 2,
+        "from_uid": "migrationalice",
+        "channel_id": "migrationgroup",
+        "channel_type": 2,
+        "expire": 0,
+        "timestamp": 1788680077,
+        "payload": "aGVsbG8="
+      },
+      {
+        "header": {
+          "no_persist": 0,
+          "red_dot": 1,
+          "sync_once": 0
+        },
+        "setting": 0,
+        "message_id": 2096502314910093312,
+        "message_idstr": "2096502314910093312",
+        "client_msg_no": "multi-source-2",
+        "message_seq": 3,
+        "from_uid": "migrationalice",
+        "channel_id": "migrationgroup",
+        "channel_type": 2,
+        "expire": 0,
+        "timestamp": 1788680077,
+        "payload": "aGVsbG8="
+      }
+    ]
+  }
+}

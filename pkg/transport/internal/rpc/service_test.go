@@ -79,6 +79,27 @@ func TestServiceObservesQueueAdmissionInflightAndTask(t *testing.T) {
 	if queueEvent.ServiceID != 42 || queueEvent.ServiceAlias != "answer service" || queueEvent.Capacity != 2 || queueEvent.BytesCapacity != 16 {
 		t.Fatalf("service_queue ok = %+v, want bounded queue dimensions", *queueEvent)
 	}
+	var queueEvents []core.Event
+	for _, event := range events {
+		if event.Name == "service_queue" && event.ServiceID == 42 {
+			queueEvents = append(queueEvents, event)
+		}
+	}
+	if len(queueEvents) != 2 {
+		t.Fatalf("service_queue event count = %d, want enqueue and dequeue", len(queueEvents))
+	}
+	// Notifications run outside the queue lock and may arrive in either order.
+	// Identify the physical transitions by state before checking their revisions.
+	enqueued, dequeued := queueEvents[0], queueEvents[1]
+	if enqueued.Items == 0 {
+		enqueued, dequeued = dequeued, enqueued
+	}
+	if enqueued.Items != 1 || enqueued.Bytes != 4 || dequeued.Items != 0 || dequeued.Bytes != 0 {
+		t.Fatalf("service_queue states = %+v, want one queued payload then drained zero", queueEvents)
+	}
+	if enqueued.Revision == 0 || dequeued.Revision <= enqueued.Revision {
+		t.Fatalf("service_queue revisions = %d..%d, want positive physical order", enqueued.Revision, dequeued.Revision)
+	}
 
 	inflightStarted := findInflight(events, 42, 1)
 	if inflightStarted == nil {
@@ -97,6 +118,9 @@ func TestServiceObservesQueueAdmissionInflightAndTask(t *testing.T) {
 	}
 	if inflightDone.Capacity != 1 {
 		t.Fatalf("service_inflight zero capacity = %d, want worker concurrency 1", inflightDone.Capacity)
+	}
+	if inflightStarted.Revision == 0 || inflightDone.Revision <= inflightStarted.Revision {
+		t.Fatalf("service_inflight revisions = %d..%d, want positive physical order", inflightStarted.Revision, inflightDone.Revision)
 	}
 	if inflightDone.PoolCapacity != 1 || inflightDone.PoolWaiting != 0 {
 		t.Fatalf("service_inflight zero pool stats = %+v, want direct executor pool capacity", *inflightDone)
@@ -144,44 +168,6 @@ func TestServiceQueueFullReturnsBusy(t *testing.T) {
 	}
 }
 
-func TestServiceAdmissionUsesChannelCapacityDuringDequeueWindow(t *testing.T) {
-	observer := &recordingObserver{}
-	opts := normalizeServiceOptions(core.ServiceOptions{
-		Concurrency: 1, QueueSize: 1, MaxQueueBytes: 1024,
-	})
-	svc := &Service{
-		ID:       1,
-		opts:     opts,
-		observer: observer,
-		queue:    make(chan Request, opts.QueueSize),
-	}
-
-	req := Request{Payload: core.CopyOwnedBuffer([]byte("queued"))}
-	svc.queue <- req
-	svc.mu.Lock()
-	svc.queuedItems = 1
-	svc.queuedBytes = int64(req.Payload.Len())
-	svc.mu.Unlock()
-	received := <-svc.queue
-	defer received.Payload.Release()
-
-	if err := svc.Enqueue(Request{Payload: core.CopyOwnedBuffer([]byte("next"))}); err != nil {
-		t.Fatalf("Enqueue() error = %v, want accepted while channel has capacity", err)
-	}
-	events := waitForEvent(t, observer, func(event core.Event) bool {
-		return event.Name == "service_queue" && event.Result == "ok"
-	})
-	queueEvent := findEvent(events, "service_queue", "ok")
-	if queueEvent == nil {
-		t.Fatalf("missing service_queue ok event: %#v", events)
-	}
-	if queueEvent.Items > queueEvent.Capacity {
-		t.Fatalf("service_queue items = %d, capacity = %d; want depth capped to capacity", queueEvent.Items, queueEvent.Capacity)
-	}
-	next := <-svc.queue
-	next.Payload.Release()
-}
-
 func TestServiceTimeout(t *testing.T) {
 	svc := NewService(1, func(ctx context.Context, _ []byte) ([]byte, error) {
 		<-ctx.Done()
@@ -202,6 +188,7 @@ func TestServiceTimeout(t *testing.T) {
 
 func TestServiceHandlerPanicRepliesAndReleasesPayload(t *testing.T) {
 	var released atomic.Int32
+	finished := make(chan struct{})
 	svc := NewService(1, func(context.Context, []byte) ([]byte, error) {
 		panic("boom")
 	}, core.ServiceOptions{Concurrency: 1, QueueSize: 1, MaxQueueBytes: 1024}, nil)
@@ -212,7 +199,8 @@ func TestServiceHandlerPanicRepliesAndReleasesPayload(t *testing.T) {
 		Payload: core.NewOwnedBuffer([]byte("panic"), func([]byte) {
 			released.Add(1)
 		}),
-		Reply: reply,
+		Reply:  reply,
+		Finish: func() { close(finished) },
 	})
 	if err != nil {
 		t.Fatalf("Enqueue() error = %v", err)
@@ -222,6 +210,9 @@ func TestServiceHandlerPanicRepliesAndReleasesPayload(t *testing.T) {
 	if resp.Err == nil {
 		t.Fatal("reply err is nil, want panic error")
 	}
+	// Reply delivery precedes deferred request cleanup; join the ownership
+	// boundary before asserting that the payload was released exactly once.
+	waitClosed(t, finished)
 	if got := released.Load(); got != 1 {
 		t.Fatalf("released = %d, want 1", got)
 	}
@@ -460,7 +451,7 @@ func TestServiceReplyPayloadIsCopied(t *testing.T) {
 	}
 }
 
-func TestServiceInvokesRespondCallback(t *testing.T) {
+func TestServiceInvokesRespondBorrowedCallback(t *testing.T) {
 	svc := NewService(7, func(ctx context.Context, payload []byte) ([]byte, error) {
 		return append([]byte("echo:"), payload...), nil
 	}, core.ServiceOptions{Concurrency: 1, QueueSize: 4, MaxQueueBytes: 1 << 20}, nil)
@@ -469,7 +460,8 @@ func TestServiceInvokesRespondCallback(t *testing.T) {
 	got := make(chan Response, 1)
 	err := svc.Enqueue(Request{
 		Payload: core.CopyOwnedBuffer([]byte("hi")),
-		Respond: func(resp Response) {
+		RespondBorrowed: func(resp Response) {
+			resp.Payload = append([]byte(nil), resp.Payload...)
 			got <- resp
 		},
 	})
@@ -479,10 +471,10 @@ func TestServiceInvokesRespondCallback(t *testing.T) {
 	select {
 	case resp := <-got:
 		if resp.Err != nil || string(resp.Payload) != "echo:hi" {
-			t.Fatalf("Respond got %+v, want echo:hi", resp)
+			t.Fatalf("RespondBorrowed got %+v, want echo:hi", resp)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Respond callback not invoked")
+		t.Fatal("RespondBorrowed callback not invoked")
 	}
 }
 
@@ -575,4 +567,28 @@ func findInflight(events []core.Event, serviceID uint16, inflight int) *core.Eve
 		}
 	}
 	return nil
+}
+
+func TestServiceQueueChargesPooledCapacity(t *testing.T) {
+	svc := NewService(1, func(context.Context, []byte) ([]byte, error) { return nil, nil }, core.ServiceOptions{Concurrency: 1, QueueSize: 4, MaxQueueBytes: 7}, nil)
+	defer svc.Stop()
+	payload := core.NewOwnedBufferWithCost(make([]byte, 5), 8, func([]byte) {})
+	if err := svc.Enqueue(Request{Payload: payload}); !errors.Is(err, core.ErrBusy) {
+		t.Fatalf("pooled buffer admitted by logical length: %v", err)
+	}
+}
+
+func TestServiceRetainsMemoryAdmissionUntilHandlerReturns(t *testing.T) {
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	svc := NewService(1, func(context.Context, []byte) ([]byte, error) { started <- struct{}{}; <-release; return nil, nil }, core.ServiceOptions{Concurrency: 2, QueueSize: 4, MaxQueueBytes: 16, MaxRetainedBytes: 8}, nil)
+	defer func() { close(release); svc.Stop() }()
+	payload := func() core.OwnedBuffer { return core.NewOwnedBufferWithCost(make([]byte, 5), 8, func([]byte) {}) }
+	if err := svc.Enqueue(Request{Payload: payload()}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := svc.Enqueue(Request{Payload: payload()}); !errors.Is(err, core.ErrBusy) {
+		t.Fatalf("executing request released its budget early: %v", err)
+	}
 }

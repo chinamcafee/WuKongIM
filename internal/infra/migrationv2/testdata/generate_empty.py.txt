@@ -1,0 +1,57 @@
+import pathlib,socket,subprocess,time,signal,json,urllib.request,tarfile,gzip
+root=pathlib.Path('/tmp/wukongim-migration-original-empty-source');root.mkdir(exist_ok=False)
+held=[];ports=[]
+for i in range(4):
+ s=socket.socket();s.bind(('127.0.0.1',0));ports.append(s.getsockname()[1]);held.append(s)
+config=f'''mode: debug
+rootDir: {root}
+dataDir: {root}/data
+addr: tcp://127.0.0.1:{ports[0]}
+httpAddr: 127.0.0.1:{ports[1]}
+wsAddr: ws://127.0.0.1:{ports[2]}
+manager:
+  on: false
+demo:
+  on: false
+logger:
+  level: 2
+  dir: {root}/logs
+plugin:
+  socketPath: {root}/plugin.sock
+cluster:
+  nodeId: 1
+  addr: tcp://127.0.0.1:{ports[3]}
+  serverAddr: 127.0.0.1:{ports[3]}
+  apiUrl: http://127.0.0.1:{ports[1]}
+  slotCount: 4
+  slotReplicaCount: 1
+  channelReplicaCount: 1
+db:
+  shardNum: 2
+'''
+(root/'source.yaml').write_text(config)
+for s in held:s.close()
+log=(root/'process.log').open('wb')
+p=subprocess.Popen(['/tmp/wukongim-v2-original-a888f895','--config',str(root/'source.yaml')],stdout=log,stderr=subprocess.STDOUT)
+trace=[]
+try:
+ deadline=time.monotonic()+45
+ while 'server started successfully' not in (root/'process.log').read_text():
+  if p.poll() is not None or time.monotonic()>deadline:raise RuntimeError('source readiness failed')
+  time.sleep(.2)
+ def call(path,data):
+  req=urllib.request.Request(f'http://127.0.0.1:{ports[1]}'+path,data=json.dumps(data).encode(),headers={'Content-Type':'application/json'})
+  with urllib.request.urlopen(req,timeout=10) as r:res=json.load(r)
+  trace.append({'path':path,'request':data,'response':res});return res
+ call('/user/token',{'uid':'emptyalice','token':'synthetic-emptyalice','device_flag':1,'device_level':1})
+ call('/channel',{'channel_id':'emptygroup','channel_type':2,'subscribers':['emptyalice']})
+ call('/conversation/sync',{'uid':'emptyalice','msg_count':10})
+ (root/'api.json').write_text(json.dumps(trace,indent=2))
+ print(json.dumps(trace[-1]),flush=True)
+finally:
+ p.send_signal(signal.SIGINT);p.wait(timeout=20);log.close()
+with open(root/'original-v2-empty.tar.gz','wb') as out:
+ with gzip.GzipFile(fileobj=out,mode='wb',mtime=0) as gz:
+  with tarfile.open(fileobj=gz,mode='w') as tar:
+   for f in sorted((root/'data').rglob('*')):
+    tar.add(f,arcname=str(f.relative_to(root/'data')),recursive=False)

@@ -1,6 +1,9 @@
 package meta
 
 import (
+	"encoding/binary"
+
+	"github.com/WuKongIM/WuKongIM/pkg/db/internal/dberrors"
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/keycodec"
 )
 
@@ -10,6 +13,29 @@ type Span struct {
 	Start []byte
 	// End is the exclusive upper bound.
 	End []byte
+}
+
+func readKeyInt64Ordered(src []byte) (int64, []byte, error) {
+	if len(src) < 8 {
+		return 0, nil, dberrors.ErrCorruptValue
+	}
+	ordered := binary.BigEndian.Uint64(src[:8])
+	return int64(ordered ^ (uint64(1) << 63)), src[8:], nil
+}
+
+func validateUID(uid string) error {
+	return validateKeyString(uid)
+}
+
+func validateChannelKey(key ChannelKey) error {
+	return validateKeyString(key.ChannelID)
+}
+
+func validatePageLimit(limit int) error {
+	if limit <= 0 {
+		return dberrors.ErrInvalidArgument
+	}
+	return nil
 }
 
 func hashSlotPartitionID(hashSlot HashSlot) []byte {
@@ -52,6 +78,16 @@ func encodeSystemPrefix(hashSlot HashSlot, systemID uint16) []byte {
 		Key()
 }
 
+func encodeSlotAppliedIndexKey(slotID uint64) []byte {
+	var builder keycodec.Builder
+	key := builder.Reset().
+		Domain(keycodec.DomainMeta).
+		Partition(keycodec.PartitionGlobal, nil).
+		System(0, systemIDSlotApplied).
+		Key()
+	return keycodec.AppendUint64(key, slotID)
+}
+
 func encodeUserRowKey(hashSlot HashSlot, uid string, familyID uint16) []byte {
 	key := encodeRowPrefix(hashSlot, TableIDUser)
 	key = keycodec.AppendString(key, uid)
@@ -86,32 +122,6 @@ func encodeSubscriberRowKey(hashSlot HashSlot, channelID string, channelType int
 	key := encodeSubscriberRowPrefix(hashSlot, channelID, channelType)
 	key = keycodec.AppendString(key, uid)
 	return keycodec.AppendUint16(key, familyID)
-}
-
-func encodeConversationRowPrefix(hashSlot HashSlot, uid string, kind ConversationKind) []byte {
-	key := encodeRowPrefix(hashSlot, TableIDConversation)
-	key = keycodec.AppendString(key, uid)
-	return keycodec.AppendUint64(key, uint64(kind))
-}
-
-func encodeConversationRowKey(hashSlot HashSlot, uid string, kind ConversationKind, channelID string, channelType int64, familyID uint16) []byte {
-	key := encodeConversationRowPrefix(hashSlot, uid, kind)
-	key = keycodec.AppendString(key, channelID)
-	key = keycodec.AppendInt64Ordered(key, int64(channelType))
-	return keycodec.AppendUint16(key, familyID)
-}
-
-func encodeConversationActiveIndexPrefix(hashSlot HashSlot, uid string, kind ConversationKind) []byte {
-	key := encodeIndexPrefix(hashSlot, TableIDConversation, conversationActiveIndexID)
-	key = keycodec.AppendString(key, uid)
-	return keycodec.AppendUint64(key, uint64(kind))
-}
-
-func encodeConversationActiveIndexKey(hashSlot HashSlot, uid string, kind ConversationKind, activeAt int64, channelID string, channelType int64) []byte {
-	key := encodeConversationActiveIndexPrefix(hashSlot, uid, kind)
-	key = keycodec.AppendInt64Desc(key, activeAt)
-	key = keycodec.AppendString(key, channelID)
-	return keycodec.AppendInt64Ordered(key, int64(channelType))
 }
 
 func encodePluginBindingRowPrefix(hashSlot HashSlot, uid string) []byte {
@@ -243,4 +253,30 @@ func hashSlotSystemSpan(hashSlot HashSlot) Span {
 func prefixSpan(prefix []byte) Span {
 	span := keycodec.NewPrefixSpan(prefix)
 	return Span{Start: span.Start, End: span.End}
+}
+
+func encodeConversationRowPrefix(hashSlot HashSlot, uid string, kind ConversationKind) []byte {
+	key := encodeRowPrefix(hashSlot, TableIDConversation)
+	key = keycodec.AppendString(key, uid)
+	return keycodec.AppendUint64(key, uint64(kind))
+}
+
+func encodeConversationRowKey(hashSlot HashSlot, uid string, kind ConversationKind, channelID string, channelType int64, familyID uint16) []byte {
+	key := encodeConversationRowPrefix(hashSlot, uid, kind)
+	key = keycodec.AppendString(key, channelID)
+	key = keycodec.AppendInt64Ordered(key, int64(channelType))
+	return keycodec.AppendUint16(key, familyID)
+}
+
+func encodeConversationActiveIndexPrefix(hashSlot HashSlot, uid string, kind ConversationKind) []byte {
+	key := encodeIndexPrefix(hashSlot, TableIDConversation, conversationActiveIndexID)
+	key = keycodec.AppendString(key, uid)
+	return keycodec.AppendUint64(key, uint64(kind))
+}
+
+func encodeConversationActiveIndexKey(hashSlot HashSlot, uid string, kind ConversationKind, activeAt int64, channelID string, channelType int64) []byte {
+	key := encodeConversationActiveIndexPrefix(hashSlot, uid, kind)
+	key = keycodec.AppendInt64Desc(key, activeAt)
+	key = keycodec.AppendString(key, channelID)
+	return keycodec.AppendInt64Ordered(key, int64(channelType))
 }

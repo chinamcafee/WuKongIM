@@ -1,12 +1,49 @@
 package app
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestNormalizeConfigIsPure(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "not-created")
+	normalized, err := NormalizeConfig(Config{DataDir: dataDir})
+	if err != nil {
+		t.Fatalf("NormalizeConfig() error = %v", err)
+	}
+	if normalized.Plugin.Dir != filepath.Join(dataDir, "plugins") {
+		t.Fatalf("Plugin.Dir = %q", normalized.Plugin.Dir)
+	}
+	if _, err := os.Stat(dataDir); !os.IsNotExist(err) {
+		t.Fatalf("NormalizeConfig() created data directory: %v", err)
+	}
+}
+
+func TestGatewayTokenAuthenticationDefaultsOnAndCanBeExplicitlyDisabled(t *testing.T) {
+	normalized, err := NormalizeConfig(Config{})
+	require.NoError(t, err)
+	require.True(t, normalized.Gateway.TokenAuthOn)
+
+	gatewayConfig := GatewayConfig{}
+	gatewayConfig.SetTokenAuthOn(false)
+	normalized, err = NormalizeConfig(Config{Gateway: gatewayConfig})
+	require.NoError(t, err)
+	require.False(t, normalized.Gateway.TokenAuthOn)
+}
+
+func TestMessageSystemUIDDefaultsAndAllowsOverride(t *testing.T) {
+	normalized, err := NormalizeConfig(Config{})
+	require.NoError(t, err)
+	require.Equal(t, "____system", normalized.Message.SystemUID)
+
+	normalized, err = NormalizeConfig(Config{Message: MessageConfig{SystemUID: "custom-system"}})
+	require.NoError(t, err)
+	require.Equal(t, "custom-system", normalized.Message.SystemUID)
+}
 
 func TestWebhookConfigDefaultsWhenEndpointConfigured(t *testing.T) {
 	cfg, err := NormalizeWebhookConfig(WebhookConfig{

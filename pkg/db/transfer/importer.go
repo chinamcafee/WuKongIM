@@ -44,11 +44,15 @@ func ImportBundle(ctx context.Context, root string, store *db.NodeStore, opts Im
 		FileKindMetaUsers,
 		FileKindMetaDevices,
 		FileKindMetaChannels,
+		FileKindMetaSubscriberSequences,
 		FileKindMetaSubscribers,
 		FileKindMetaUserChannelMemberships,
 		FileKindMetaConversations,
 		FileKindMetaCMDDeviceCursors,
+		FileKindMetaUserCMDChannelMemberships,
 		FileKindMetaChannelLatest,
+		FileKindMetaPersonDirectoryTasks,
+		FileKindMetaMessageUpdates,
 	} {
 		for _, entry := range entries[kind] {
 			if err := importMetaEntry(ctx, root, entry, store, opts, &stats); err != nil {
@@ -75,6 +79,9 @@ func normalizeImportOptions(opts ImportOptions) ImportOptions {
 	if opts.SubscriberBatchSize <= 0 {
 		opts.SubscriberBatchSize = defaultSubscriberBatchSize
 	}
+	if opts.SubscriberBatchSize > 4096 {
+		opts.SubscriberBatchSize = 4096
+	}
 	if opts.MessageBatchSize <= 0 {
 		opts.MessageBatchSize = defaultMessageBatchSize
 	}
@@ -94,6 +101,11 @@ func groupManifestEntries(manifest Manifest) map[FileKind][]FileEntry {
 
 func checkTargetEmpty(ctx context.Context, store *db.NodeStore) error {
 	meta := store.Meta()
+	if present, err := meta.HasSubscriberSequences(ctx); err != nil {
+		return err
+	} else if present {
+		return fmt.Errorf("non-empty target: subscriber allocation sequence")
+	}
 	for _, table := range metadb.InspectTables() {
 		nonEmpty, err := metaTableHasAnyRow(ctx, meta, table.Name)
 		if err != nil {
@@ -157,9 +169,16 @@ func importMetaEntry(ctx context.Context, root string, entry FileEntry, store *d
 
 func importMetaRecord(ctx context.Context, meta *metadb.MetaDB, kind FileKind, record any) error {
 	switch kind {
+	case FileKindMetaSubscriberSequences:
+		row := record.(SubscriberSequenceRecord)
+		return meta.HashSlot(row.HashSlot).ImportSubscriberSequence(ctx, uint64(row.Sequence))
+	case FileKindMetaMessageUpdates:
+		row := record.(MessageUpdateRecord)
+		return meta.ImportMessageUpdate(ctx, metadb.HashSlot(row.HashSlot), row.MessageUpdateImport)
 	case FileKindMetaUsers:
 		row := record.(UserRecord)
 		return meta.HashSlot(row.HashSlot).UpsertUser(ctx, metadb.User{
+			SendBan: row.SendBan, SendBanVersion: uint64(row.SendBanVersion),
 			UID:         row.UID,
 			Token:       row.Token,
 			DeviceFlag:  row.DeviceFlag,
@@ -178,41 +197,45 @@ func importMetaRecord(ctx context.Context, meta *metadb.MetaDB, kind FileKind, r
 	case FileKindMetaChannels:
 		row := record.(ChannelRecord)
 		return meta.HashSlot(row.HashSlot).UpsertChannel(ctx, metadb.Channel{
-			ChannelID:                 row.ChannelID,
-			ChannelType:               row.ChannelType,
-			Ban:                       row.Ban,
-			Disband:                   row.Disband,
-			SendBan:                   row.SendBan,
-			AllowStranger:             row.AllowStranger,
-			Large:                     row.Large,
-			SubscriberMutationVersion: uint64(row.SubscriberMutationVersion),
+			ChannelID:                     row.ChannelID,
+			ChannelType:                   row.ChannelType,
+			Ban:                           row.Ban,
+			Disband:                       row.Disband,
+			SendBan:                       row.SendBan,
+			SendBanVersion:                uint64(row.SendBanVersion),
+			AllowStranger:                 row.AllowStranger,
+			Large:                         row.Large,
+			SubscriberMutationVersion:     uint64(row.SubscriberMutationVersion),
+			DirectoryProjectionState:      metadb.DirectoryProjectionState(row.DirectoryProjectionState),
+			DirectoryProjectionGeneration: uint64(row.DirectoryProjectionGeneration),
 		})
 	case FileKindMetaUserChannelMemberships:
 		row := record.(UserChannelMembershipRecord)
 		return meta.HashSlot(row.HashSlot).UpsertUserChannelMembership(ctx, metadb.UserChannelMembership{
-			UID:         row.UID,
-			ChannelID:   row.ChannelID,
-			ChannelType: row.ChannelType,
-			JoinSeq:     uint64(row.JoinSeq),
-			UpdatedAt:   row.UpdatedAtMS,
+			UID: row.UID, ChannelID: row.ChannelID, ChannelType: row.ChannelType,
+			JoinSeq: uint64(row.JoinSeq), ReadSeq: uint64(row.ReadSeq), DeletedToSeq: uint64(row.DeletedToSeq),
+			ActivatedAt: row.ActivatedAt, Tombstone: row.Tombstone, TombstoneAt: row.TombstoneAt,
+			SourceVersion: uint64(row.SourceVersion), UpdatedAt: row.UpdatedAtMS,
+		})
+	case FileKindMetaUserCMDChannelMemberships:
+		row := record.(UserCMDChannelMembershipRecord)
+		return meta.HashSlot(row.HashSlot).UpsertUserCMDChannelMembership(ctx, metadb.UserCMDChannelMembership{
+			UID: row.UID, CommandChannelID: row.CommandChannelID, ChannelType: row.ChannelType,
+			StartSeq: uint64(row.StartSeq), AckSeq: uint64(row.AckSeq), Tombstone: row.Tombstone,
+			TombstoneAt: row.TombstoneAt, UpdatedAt: row.UpdatedAtMS,
 		})
 	case FileKindMetaConversations:
 		row := record.(ConversationRecord)
-		kind, err := conversationKind(row.Kind)
-		if err != nil {
-			return err
+		var kind metadb.ConversationKind
+		switch row.Kind {
+		case "normal":
+			kind = metadb.ConversationKindNormal
+		case "cmd":
+			kind = metadb.ConversationKindCMD
+		default:
+			return fmt.Errorf("%w: invalid conversation kind", ErrValidation)
 		}
-		return meta.HashSlot(row.HashSlot).UpsertConversationState(ctx, metadb.ConversationState{
-			UID:          row.UID,
-			Kind:         kind,
-			ChannelID:    row.ChannelID,
-			ChannelType:  row.ChannelType,
-			ReadSeq:      uint64(row.ReadSeq),
-			DeletedToSeq: uint64(row.DeletedToSeq),
-			ActiveAt:     row.ActiveAt,
-			UpdatedAt:    row.UpdatedAt,
-			SparseActive: row.SparseActive,
-		})
+		return meta.HashSlot(row.HashSlot).UpsertConversationState(ctx, metadb.ConversationState{UID: row.UID, Kind: kind, ChannelID: row.ChannelID, ChannelType: row.ChannelType, ReadSeq: uint64(row.ReadSeq), DeletedToSeq: uint64(row.DeletedToSeq), ActiveAt: row.ActiveAt, UpdatedAt: row.UpdatedAt, SparseActive: row.SparseActive})
 	case FileKindMetaCMDDeviceCursors:
 		row := record.(CMDDeviceCursorRecord)
 		return meta.HashSlot(row.HashSlot).UpsertCMDDeviceCursor(ctx, metadb.CMDDeviceCursor{
@@ -238,19 +261,19 @@ func importMetaRecord(ctx context.Context, meta *metadb.MetaDB, kind FileKind, r
 			Payload:        row.Payload,
 			UpdatedAt:      row.UpdatedAt,
 		})
+	case FileKindMetaPersonDirectoryTasks:
+		row := record.(PersonDirectoryTaskRecord)
+		batch := meta.NewBatch()
+		defer batch.Close()
+		if err := batch.EnsurePersonDirectoryTask(metadb.HashSlot(row.HashSlot), metadb.PersonDirectoryTask{
+			ChannelID: row.ChannelID, ChannelType: row.ChannelType,
+			CommittedTail: uint64(row.CommittedTail), CreatedAt: row.CreatedAt, Generation: uint64(row.Generation),
+		}); err != nil {
+			return err
+		}
+		return batch.Commit(ctx)
 	default:
 		return fmt.Errorf("%w: unsupported import kind %q", ErrValidation, kind)
-	}
-}
-
-func conversationKind(kind string) (metadb.ConversationKind, error) {
-	switch kind {
-	case "normal":
-		return metadb.ConversationKindNormal, nil
-	case "cmd":
-		return metadb.ConversationKindCMD, nil
-	default:
-		return 0, fmt.Errorf("%w: unknown conversation kind %q", ErrValidation, kind)
 	}
 }
 
@@ -263,16 +286,16 @@ type subscriberGroup struct {
 func importSubscriberEntry(ctx context.Context, root string, entry FileEntry, meta *metadb.MetaDB, opts ImportOptions, stats *ImportStats) error {
 	var current subscriberGroup
 	var haveCurrent bool
-	uids := make([]string, 0, opts.SubscriberBatchSize)
+	rows := make([]metadb.Subscriber, 0, opts.SubscriberBatchSize)
 
 	flush := func() error {
-		if !haveCurrent || len(uids) == 0 {
+		if !haveCurrent || len(rows) == 0 {
 			return nil
 		}
-		if err := meta.HashSlot(current.hashSlot).AddSubscribers(ctx, current.channelID, current.channelType, uids, 0); err != nil {
+		if err := meta.HashSlot(current.hashSlot).ImportSubscribers(ctx, current.channelID, current.channelType, rows); err != nil {
 			return err
 		}
-		uids = uids[:0]
+		rows = rows[:0]
 		return nil
 	}
 
@@ -286,10 +309,10 @@ func importSubscriberEntry(ctx context.Context, root string, entry FileEntry, me
 		}
 		current = next
 		haveCurrent = true
-		uids = append(uids, row.UID)
+		rows = append(rows, metadb.Subscriber{ChannelID: row.ChannelID, ChannelType: row.ChannelType, UID: row.UID, Incarnation: uint64(row.Incarnation)})
 		stats.RowsWritten++
 		stats.SubscribersImported++
-		if len(uids) >= opts.SubscriberBatchSize {
+		if len(rows) >= opts.SubscriberBatchSize {
 			return flush()
 		}
 		return nil
@@ -336,7 +359,7 @@ type messageImportState struct {
 	records []msgdb.Record
 	// batchBaseSeq is the strict append base of records.
 	batchBaseSeq uint64
-	// recordBytes approximates the payload memory held by records.
+	// recordBytes bounds body and publication metadata memory held by records.
 	recordBytes int
 }
 
@@ -364,14 +387,15 @@ func (s *messageImportState) visit(row MessageRecord) error {
 		s.batchBaseSeq = uint64(row.MessageSeq)
 	}
 	s.records = append(s.records, msgdb.Record{
-		ID:                uint64(row.MessageID),
-		ClientMsgNo:       row.ClientMsgNo,
-		FromUID:           row.FromUID,
-		Payload:           row.Payload,
-		SizeBytes:         len(row.Payload),
-		ServerTimestampMS: row.ServerTimestampMS,
+		ID:                  uint64(row.MessageID),
+		ClientMsgNo:         row.ClientMsgNo,
+		FromUID:             row.FromUID,
+		Payload:             row.Payload,
+		PublicationMetadata: row.PublicationMetadata,
+		SizeBytes:           len(row.Payload) + len(row.PublicationMetadata),
+		ServerTimestampMS:   row.ServerTimestampMS,
 	})
-	s.recordBytes += len(row.Payload)
+	s.recordBytes += len(row.Payload) + len(row.PublicationMetadata)
 	s.stats.RowsWritten++
 	s.stats.MessagesImported++
 	if len(s.records) >= s.opts.MessageBatchSize || s.recordBytes >= s.opts.MessageBatchBytes {

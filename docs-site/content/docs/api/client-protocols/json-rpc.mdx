@@ -1,0 +1,39 @@
+---
+title: WebSocket JSON-RPC
+description: 说明 Product Gateway 对固定 EasySDK 核心在线路径的 JSON-RPC 支持矩阵与限制。
+---
+
+<Callout type="info" title="EasySDK 核心路径已支持">
+  Product Gateway 已支持固定 EasySDK 的 CONNECT-first 鉴权生命周期、Ping、在线 SEND/SENDACK、RECV/RECVACK 与服务端向客户端的公开 stream.* EVENT。通用 JSON-RPC、batch、订阅和 SDK 自动离线同步仍不在该合同内。
+</Callout>
+
+## wsmux 选择规则
+
+WebSocket `wsmux` 在首个非空白字节为 `{` 或 `[` 时选择 JSON-RPC，否则选择 WKProto；选择结果在会话内保持。JSON-RPC 出站使用文本消息，WKProto 使用二进制消息。
+
+`[` 只会触发 JSON 模式，当前解码器**不支持 batch 数组**。`jsonrpc` 可省略，请求 ID 必须是 JSON 字符串。SEND `payload` 可为已编码的 JSON 文本字符串、JSON 对象、Base64 字符串或 `null`；服务端在协议边界统一为字节。字符串解码后的内容若是有效 JSON，会优先按 JSON 文本处理，否则再尝试 Base64。JSON-RPC 不执行 WKProto 的 `clientKey` 密钥协商，生产传输必须使用 `wss://`。
+
+## 实际入站矩阵
+
+| 类型 | 方法 | 解码 / 桥接 | 产品结果 |
+| --- | --- | --- | --- |
+| request | `connect` | → `CONNECT` | 必须是首个请求；鉴权、激活成功后返回同 ID `result`，失败返回同 ID `error` 并关闭 |
+| request | `send` | → `SEND` | 仅在已认证会话处理；按请求 ID 返回 `SENDACK` result/error |
+| request | `ping` | → `PING` | 返回同 ID 且显式包含 `result: null` |
+| request | `disconnect` | → `DISCONNECT` | 产品处理器不支持并关闭 |
+| request | `subscribe` / `unsubscribe` | → `SUB`（`action` 分别为 `0` / `1`） | Product Gateway handler 尚不支持 `SUB`；默认以 handler error 关闭连接，当前产品路径不会产生 `SUBACK` |
+| notification | `recvack` | → `RECVACK` | 已认证会话中确认在线投递；iOS `v1.1.1` 同时发送 camelCase `messageId` 与 `messageSeq` |
+| notification | `recv` / `disconnect` / `event` | 仅解码 | 缺少 frame bridge |
+| response | 任意合法 response | 仅解码为 generic response | 缺少 frame bridge |
+
+CONNACK 与 SENDACK 成功时同时输出 camelCase 与 Android snake_case 字段，客户端可忽略另一套别名；非成功 Reason Code 输出为 JSON-RPC `error`，避免 EasySDK 把失败误判为成功。RECV 是无 ID 的 `recv` notification，始终包含 `header: {}`；有效 JSON 对象 Payload 直接输出对象，非对象字节回退为 Base64。Android `v1.0.5` README 示例仍把已编码的 JSON 消息作为文本字符串传入，协议边界也兼容直接 JSON 对象和 Base64 字符串；服务端对四个固定 profile 的常规 JSON 消息字节都以对象形式输出 RECV。
+
+## 在线流式事件
+
+服务端 `EVENT` 编码为无 ID 的 `event` notification，参数是 `{id,type,timestamp,data}`；`data` 的有效 JSON 直接输出对象。EasySDK-JS 通过 `WKIMEvent.CustomEvent` 接收公开 `stream.*` 事件。此能力要求包含在线事件投递实现的服务端，不能归入旧版本的核心消息验收范围。事件尽力投递，无 RECVACK 重放；最终快照通过消息历史恢复。详见 [Agent 流式回复](/zh/sdk/easy/agent-streaming)。
+
+## 已验证范围
+
+服务端 fixture 覆盖当前 iOS `v1.1.1`、Android `v1.0.5`、Flutter `v1.1.0` 与 Web `v2.0.4` 保留的固定 wire profile；这些补丁版本不改变被测 JSON-RPC 形态。真实 `cmd/wukongim` 256 Slot 单节点集群场景使用 iOS 与 Android profile，覆盖 Alice/Bob 双向 CONNECT → SEND → SENDACK → RECV → RECVACK → Ping、断连后的在线状态清理和重连。另一次正式包验收从四个 Registry 解析这些版本，并在 Android 与 iOS Simulator 上完成双向消息。默认 `gateway.token_auth_on=true` 会执行已存设备 Token 精确匹配；生产验收仍需单独证明错误、缺失、撤销和按业务规则过期的 Token 都会被拒绝。
+
+需要轻量在线消息时可使用 [WuKongEasySDK](/zh/sdk/easy)。需要本地消息库、会话、未读、离线恢复或更完整能力时，选择 WKProto 系列 SDK，并参考 [TCP 二进制协议](/zh/api/client-protocols/tcp-binary)。

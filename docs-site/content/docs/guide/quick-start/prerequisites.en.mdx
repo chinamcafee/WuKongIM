@@ -1,47 +1,44 @@
 ---
 title: Prerequisites
-description: Prepare the tools, ports, and local directory required to run WuKongIM from source.
+description: Prepare Docker, a browser, and local ports for your first message exchange.
 ---
 
-The quick start runs from source because that path only needs Git and Go and directly uses the repository's tested single-node cluster example configuration.
+## Try it on your computer
 
-## Required tools
-
-| Tool | Requirement | Purpose |
-| --- | --- | --- |
-| Git | Able to reach GitHub | Fetch the source |
-| Go | `1.25.11` | Build and run WuKongIM |
-| curl | Supports `--fail` | Verify readiness |
-| Browser | Supports modern WebSocket | Use Manager and the Chat Demo |
-
-Check the local environment:
+- Install and start Docker; Docker Desktop is an option for macOS and Windows.
+- Use a browser that can open two independent sessions.
+- Keep local ports `5001`, `5100`, `5200`, and `5301` available.
 
 ```bash
-git --version
-go version
-curl --version
+docker version
 ```
 
-`go version` should report `go1.25.11`. Other versions may build, but they are outside the verified toolchain for this quick start.
+The output should include both Client and Server. Next: [start a single-node cluster with Docker](/en/server/deployment/docker).
 
-## Local ports
-
-The default example requires these ports to be free:
+## Ports
 
 | Port | Purpose |
 | --- | --- |
-| `5001` | HTTP API, readiness, metrics, and embedded Chat Demo |
-| `5100` | WKProto TCP |
-| `5200` | WebSocket multiplexer |
+| `5001` | HTTP API, readiness, and Chat Demo |
+| `5100` | Client TCP |
+| `5200` | Client WebSocket |
 | `5301` | Manager |
-| `7001` | Node transport |
+| `7001` | Node transport; no host port mapping needed |
 
-If a port conflicts, stop the conflicting program or change the corresponding listener in your copied `wukongim.toml`. Do not edit `wukongim.toml.example` directly.
+The example API and Manager ports bind only to your computer. Keep management ports off the public internet; use the Docker guide's SSH tunnel for a remote server.
 
-## Disk and network
+<details>
+<summary>Without Docker: prepare a Linux host</summary>
 
-- The current directory must allow creation of `./data/wukongim-single-node-data`.
-- The first run needs network access to download Go modules.
-- Test users only need local browser access; no public domain is required.
+Linux packages support `amd64` / `x86_64` on Ubuntu 24.04, Debian 13, Rocky Linux 9, AlmaLinux 9, or RHEL 9. You need `sudo`, `curl`, and access to `packages.githubim.com`; remote hosts also need SSH.
 
-When ready, [start the single-node cluster](/en/guide/quick-start/single-node-cluster).
+```bash
+uname -m
+. /etc/os-release && echo "$PRETTY_NAME"
+curl --version
+sudo -v
+```
+
+The package creates `/etc/wukongim`, `/var/lib/wukongim`, and `/var/log/wukongim`. Continue with the [Linux installation path](/en/guide/quick-start/single-node-cluster).
+
+</details>

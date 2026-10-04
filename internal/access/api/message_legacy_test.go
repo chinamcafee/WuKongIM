@@ -28,7 +28,7 @@ func TestSendMessageMapsCompatibleRequestToMessageUsecase(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s, want 200", rec.Code, rec.Body.String())
 	}
-	if !jsonEqual(rec.Body.String(), `{"message_id":99,"message_seq":7,"reason":1}`) {
+	if !jsonEqual(rec.Body.String(), `{"message_id":99,"message_seq":7,"reason":1,"client_msg_no":"c1"}`) {
 		t.Fatalf("body = %q, want send response", rec.Body.String())
 	}
 	if len(messages.sendCalls) != 1 {
@@ -46,6 +46,48 @@ func TestSendMessageMapsCompatibleRequestToMessageUsecase(t *testing.T) {
 	}
 	if cmd.TraceID != "abcdef0123456789abcdef0123456789" {
 		t.Fatalf("trace id = %q, want normalized header trace", cmd.TraceID)
+	}
+}
+
+func TestSendMessageDefaultsMissingFromUIDToSystemUID(t *testing.T) {
+	messages := &recordingMessageUsecase{
+		sendResult: messageusecase.SendResult{MessageID: 99, MessageSeq: 7, Reason: messageusecase.ReasonSuccess},
+	}
+	srv := New(Options{Messages: messages})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/message/send", bytes.NewBufferString(`{"header":{"no_persist":1,"red_dot":1,"sync_once":1},"from_uid":"","channel_id":"u1","channel_type":1,"payload":"eyJ0eXBlIjo5OSwiY21kIjoiY2xlYXJVbnJlYWQiLCJwYXJhbSI6eyJjaGFubmVsSUQiOiJ1MiIsImNoYW5uZWxUeXBlIjoxfX0=","subscribers":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s, want 200", rec.Code, rec.Body.String())
+	}
+	if len(messages.sendCalls) != 1 {
+		t.Fatalf("send calls = %#v, want one call", messages.sendCalls)
+	}
+	if got := messages.sendCalls[0].FromUID; got != "____system" {
+		t.Fatalf("FromUID = %q, want default system UID", got)
+	}
+}
+
+func TestSendMessageUsesConfiguredSystemUIDWhenFromUIDIsMissing(t *testing.T) {
+	messages := &recordingMessageUsecase{
+		sendResult: messageusecase.SendResult{Reason: messageusecase.ReasonSuccess},
+	}
+	srv := New(Options{Messages: messages, SystemUID: "custom-system"})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/message/send", bytes.NewBufferString(`{"channel_id":"u1","channel_type":1,"payload":"aGk="}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s, want 200", rec.Code, rec.Body.String())
+	}
+	if len(messages.sendCalls) != 1 || messages.sendCalls[0].FromUID != "custom-system" {
+		t.Fatalf("send calls = %#v, want configured system sender", messages.sendCalls)
 	}
 }
 
@@ -294,37 +336,26 @@ func TestChannelMessageSyncMapsCompatibleRequestToUsecase(t *testing.T) {
 	}
 }
 
-func TestChannelMessageSyncPreservesHeaderTimestampAndUint64Literals(t *testing.T) {
-	const maxUint64 = ^uint64(0)
-	messages := &recordingMessageUsecase{
-		syncResult: messageusecase.SyncChannelMessagesResult{
-			Messages: []messageusecase.SyncedMessage{{
-				Flags:       messageusecase.MessageFlags{RedDot: true},
-				MessageID:   maxUint64,
-				MessageSeq:  maxUint64,
-				ClientMsgNo: "large-message",
-				FromUID:     "u2",
-				ChannelID:   "u1@u2",
-				ChannelType: frame.ChannelTypePerson,
-				Timestamp:   2147483647,
-			}},
-		},
-	}
+func TestChannelMessageSyncBatchMapsAlignedResults(t *testing.T) {
+	messages := &recordingMessageUsecase{batchResult: messageusecase.SyncChannelMessagesBatchResult{Items: []messageusecase.SyncChannelMessagesBatchItem{
+		{ChannelID: "g1", ChannelType: 2, Result: messageusecase.SyncChannelMessagesResult{More: true, Messages: []messageusecase.SyncedMessage{{MessageID: 7, MessageSeq: 4, ChannelID: "g1", ChannelType: 2, Payload: []byte("a")}}}},
+		{ChannelID: "g2", ChannelType: 2, Err: errors.New("temporarily unavailable")},
+	}}}
 	srv := New(Options{Messages: messages})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/channel/messagesync", bytes.NewBufferString(`{"login_uid":"u1","channel_id":"u2","channel_type":1,"start_message_seq":18446744073709551615,"end_message_seq":18446744073709551615}`))
-	req.Header.Set("Content-Type", "application/json")
 
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/channel/messagesyncbatch", bytes.NewBufferString(`{"login_uid":"u1","items":[{"channel_id":"g1","channel_type":2,"start_message_seq":3,"limit":10,"pull_mode":1},{"channel_id":"g2","channel_type":2,"start_message_seq":8,"limit":10,"pull_mode":1}]}`))
+	req.Header.Set("Content-Type", "application/json")
 	srv.Handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d body = %s, want 200", rec.Code, rec.Body.String())
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	// message_id is the legacy signed compatibility field; message_idstr is the
-	// authoritative lossless uint64 representation consumed by JS clients.
-	want := `{"start_message_seq":18446744073709551615,"end_message_seq":18446744073709551615,"more":0,"messages":[{"header":{"no_persist":0,"red_dot":1,"sync_once":0},"setting":0,"message_id":-1,"message_idstr":"18446744073709551615","client_msg_no":"large-message","message_seq":18446744073709551615,"from_uid":"u2","channel_id":"u2","channel_type":1,"expire":0,"timestamp":2147483647,"payload":null}]}`
-	if rec.Body.String() != want {
-		t.Fatalf("body = %q, want exact lossless uint64 literals and header/timestamp", rec.Body.String())
+	if !jsonEqual(rec.Body.String(), `{"items":[{"channel_id":"g1","channel_type":2,"start_message_seq":3,"end_message_seq":0,"more":1,"messages":[{"header":{"no_persist":0,"red_dot":0,"sync_once":0},"setting":0,"message_id":7,"message_idstr":"7","client_msg_no":"wk3-legacy-7","message_seq":4,"from_uid":"","channel_id":"g1","channel_type":2,"expire":0,"timestamp":0,"payload":"YQ=="}]},{"channel_id":"g2","channel_type":2,"start_message_seq":8,"end_message_seq":0,"more":0,"messages":[],"error":"temporarily unavailable"}]}`) {
+		t.Fatalf("body=%s, want aligned batch response", rec.Body.String())
+	}
+	if len(messages.batchQueries) != 1 || len(messages.batchQueries[0].Items) != 2 || messages.batchQueries[0].LoginUID != "u1" {
+		t.Fatalf("batch queries=%+v", messages.batchQueries)
 	}
 }
 
@@ -476,6 +507,9 @@ type recordingMessageUsecase struct {
 	syncQueries  []messageusecase.SyncChannelMessagesQuery
 	syncResult   messageusecase.SyncChannelMessagesResult
 	syncErr      error
+	batchQueries []messageusecase.SyncChannelMessagesBatchQuery
+	batchResult  messageusecase.SyncChannelMessagesBatchResult
+	batchErr     error
 }
 
 func (r *recordingMessageUsecase) Send(_ context.Context, cmd messageusecase.SendCommand) (messageusecase.SendResult, error) {
@@ -491,4 +525,43 @@ func (r *recordingMessageUsecase) AppendMessageEvent(_ context.Context, event me
 func (r *recordingMessageUsecase) SyncChannelMessages(_ context.Context, query messageusecase.SyncChannelMessagesQuery) (messageusecase.SyncChannelMessagesResult, error) {
 	r.syncQueries = append(r.syncQueries, query)
 	return r.syncResult, r.syncErr
+}
+
+func (r *recordingMessageUsecase) SyncChannelMessagesBatch(_ context.Context, query messageusecase.SyncChannelMessagesBatchQuery) (messageusecase.SyncChannelMessagesBatchResult, error) {
+	r.batchQueries = append(r.batchQueries, query)
+	return r.batchResult, r.batchErr
+}
+
+func TestChannelMessageSyncPreservesHeaderTimestampAndUint64Literals(t *testing.T) {
+	const maxUint64 = ^uint64(0)
+	messages := &recordingMessageUsecase{
+		syncResult: messageusecase.SyncChannelMessagesResult{
+			Messages: []messageusecase.SyncedMessage{{
+				Flags:       messageusecase.MessageFlags{RedDot: true},
+				MessageID:   maxUint64,
+				MessageSeq:  maxUint64,
+				ClientMsgNo: "large-message",
+				FromUID:     "u2",
+				ChannelID:   "u1@u2",
+				ChannelType: frame.ChannelTypePerson,
+				Timestamp:   2147483647,
+			}},
+		},
+	}
+	srv := New(Options{Messages: messages})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/channel/messagesync", bytes.NewBufferString(`{"login_uid":"u1","channel_id":"u2","channel_type":1,"start_message_seq":18446744073709551615,"end_message_seq":18446744073709551615}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s, want 200", rec.Code, rec.Body.String())
+	}
+	// message_id is the legacy signed compatibility field; message_idstr is the
+	// authoritative lossless uint64 representation consumed by JS clients.
+	want := `{"start_message_seq":18446744073709551615,"end_message_seq":18446744073709551615,"more":0,"messages":[{"header":{"no_persist":0,"red_dot":1,"sync_once":0},"setting":0,"message_id":-1,"message_idstr":"18446744073709551615","client_msg_no":"large-message","message_seq":18446744073709551615,"from_uid":"u2","channel_id":"u2","channel_type":1,"expire":0,"timestamp":2147483647,"payload":null}]}`
+	if rec.Body.String() != want {
+		t.Fatalf("body = %q, want exact lossless uint64 literals and header/timestamp", rec.Body.String())
+	}
 }

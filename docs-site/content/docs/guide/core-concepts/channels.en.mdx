@@ -1,57 +1,61 @@
 ---
-title: Channels
-description: Understand Channel identity, types, membership policy, message logs, runtime replicas, and large-group boundaries.
+title: Channel
+description: Use direct and group chat diagrams to understand message targets, Channel identity, and membership.
 ---
 
-A Channel is the core unit of message routing, ordering, and persistence. It is identified jointly by `channel_id` and `channel_type`; the same ID under another type is a different Channel.
+A Channel is a message “address.” Its complete identity is **`channel_id + channel_type`**. The same ID with a different type identifies a different Channel.
 
-## Business Channels
+## Why Channels matter
 
-| Shape | Typical use | Important consideration |
-| --- | --- | --- |
-| Person Channel | Messages between two users | The server normalizes both viewpoints into a stable canonical ID |
-| Group Channel | Group chat, community, or room | The business system maintains the group lifecycle and synchronizes membership |
-| Custom Channel | Notifications, IoT, live interaction, and business topics | Type and value ranges need a stable business/client contract |
-| Temporary recipient list | One request targets a bounded recipient set | Request-scoped membership does not replace a persistent group model |
+Choose a Channel before sending. It defines the recipient scope and numbers, orders, and recovers its ordinary persistent messages. Notifications, support, live interaction, and Agents can reuse this entry point.
 
-A command Channel is a derived identity for internal compatibility and synchronization semantics. Applications should use supported Send/Sync capabilities instead of constructing internal suffixes.
+## Relationship to other concepts
 
-## Two classes of Channel state
+<div className="tutorial-diagram">
 
-### Slot metadata
-
-Slot stores Channel business metadata, subscribers, denylist, allowlist, ban/disband/send-ban flags, and `ChannelRuntimeMeta`. These values route by the Channel ID's physical hash slot to the current logical Slot Raft Leader.
-
-### Channel message log
-
-Channel runtime stores the sequence-ordered log. Authoritative metadata supplies Leader, Replicas, ISR, Channel Epoch, Leader Epoch, retention boundary, and write fence. Runtime replicas enforce those fences while appending, replicating, and advancing HW.
-
-```text
-Slot metadata: policy / members / runtime intent / migration fence
-                              |
-                              v
-Channel runtime: ordered append -> replica progress -> committed HW
+```mermaid
+flowchart TD
+  user["User + Device<br/>send a Message"] --> channel["Channel<br/>target + ordered history"]
+  channel --> conversation["Conversation<br/>personal chat-list entry"]
 ```
 
-The Slot Leader and Channel Leader may be different nodes; neither can be inferred from the other.
+</div>
 
-## Send permission
+A Device does not change Channel identity. Users can have different unread and visibility state in their Conversations.
 
-Depending on Channel type and metadata, the message usecase checks sender ban, Channel ban/disband, subscription, denylist, allowlist, stranger policy, system users, and compatible agent/visitor relationships. The business service still decides who should be a member, when membership ends, and whether content is permitted.
+## Direct chat: send to the peer UID
 
-## 100,000-member groups
+<div className="tutorial-diagram">
 
-Ordinary membership mutations are de-duplicated, chunked, and written under one monotonic mutation version. A single underlying membership command has UID-count and encoded-byte limits, so higher layers must operate in chunks. Post-commit fanout pages members, groups them by Presence Authority, and creates bounded delivery plans; it does not persist one message copy per member.
+```mermaid
+flowchart TD
+  alice["Alice<br/>target: bob"] --> history[Direct-chat history]
+  bob["Bob<br/>target: alice"] --> history
+```
 
-Observe these stages separately:
+</div>
 
-- Channel append and quorum-commit latency;
-- member paging and authority resolution;
-- online-delivery queues, owner push, and Session writes;
-- CPU, network, and tail latency for hot Channels.
+Callers always use the **peer UID**. WuKongIM normalizes both viewpoints internally. Do not construct the internal Channel ID or write it back as a contact ID.
 
-## Lifecycle and migration
+## Group chat: send to a stable group ID
 
-A Channel runtime activates on demand and can checkpoint and unload when idle; messages remain durable. Leader transfer or replica replacement uses Slot-authoritative tasks, epochs, and write fences to drain the old Leader before committing the new placement. A node-local timeout cannot clear an authoritative fence.
+| Task | Owner |
+| --- | --- |
+| Choose the Channel ID | The product supplies a stable group ID |
+| Create, invite, or leave | The product decides; a trusted backend synchronizes membership and policy |
+| Persist, order, and deliver messages | WuKongIM |
 
-Continue with [Messages](/en/guide/core-concepts/messages), [Cluster Configuration](/en/server/configuration/cluster), and [Channel Messaging Layer](/en/server/architecture/channels).
+**Knowing the group ID does not grant send permission.** Channel Type is not authorization. The product owns membership, roles, deny/allow lists, and content policy.
+
+<details>
+  <summary>Group metadata, specialized types, and large groups</summary>
+
+The product owns group names, avatars, announcements, roles, tenant isolation, and moderation. WuKongIM stores synchronized membership and policy and provides message persistence, realtime delivery, and offline recovery.
+
+The product also owns contact, stranger, and send policy for direct chats. Use specialized community, feed, live, visitor, or Agent types only when the server, selected SDK, and product flow support them. Values are listed in [Channel Types](/en/api/dictionaries/channel-types).
+
+For 100,000-member groups, bound membership updates and online delivery work and use paging. See [Large Groups](/en/guide/tutorials/large-groups).
+
+</details>
+
+Continue with [User](/en/guide/core-concepts/users) and [Conversation](/en/guide/core-concepts/conversations). For replicas, commit, and migration, see the [Channel Messaging Layer](/en/server/architecture/channels).

@@ -1,0 +1,147 @@
+---
+title: HarmonyOS quickstart
+description: Install @wukong/wkim 1.1.7, connect a user, and exchange the first online text message.
+---
+
+This page has one goal: exchange one text message between two online HarmonyOS clients.
+
+## Prerequisites
+
+- Your application backend returns a `uid`, `token`, and `host:port` for both `alice` and `bob`.
+- You have two independent application processes or devices. `WKIM.shared` is a process singleton.
+- The project targets HarmonyOS NEXT and declares `ohos.permission.INTERNET` and `ohos.permission.GET_NETWORK_INFO`.
+
+## 1. Install
+
+Pin the package in your project directory:
+
+```bash
+ohpm install @wukong/wkim@1.1.7
+```
+
+## 2. Import and initialize
+
+```typescript
+import { Context } from '@kit.AbilityKit'
+import { WKIM } from '@wukong/wkim'
+import {
+  ConnectionInfo,
+  WKChannel,
+  WKChannelType,
+  WKConnectStatus,
+  WKMsg,
+  WKSendMsgResult,
+  WKSyncConversation
+} from '@wukong/wkim/src/main/ets/entity/Bean'
+import { WKTextContent } from '@wukong/wkim/src/main/ets/model/WKTextContent'
+
+const im = WKIM.shared
+await im.init(bootstrap.uid, bootstrap.token, bootstrap.address, appContext as Context)
+```
+
+`bootstrap.address` should look like `im.example.com:5100`. Do not include `tcp://`, `http://`, or `https://`.
+
+## 3. Supply conversation sync
+
+Before the connection becomes ready, the SDK asks your backend for recent conversations:
+
+```typescript
+im.config.provider.syncConversationCallback = async (
+  lastMsgSeqs: string,
+  msgCount: number,
+  version: number
+): Promise<WKSyncConversation> => {
+  return conversationApi.sync(lastMsgSeqs, msgCount, version)
+}
+```
+
+For a brand-new development account only, you may temporarily return an empty result:
+
+```typescript
+const result = new WKSyncConversation()
+result.uid = bootstrap.uid
+result.conversations = []
+return result
+```
+
+An account with existing chat data must receive its real conversations and recent messages.
+
+## 4. Observe connection and messages
+
+Keep listeners as properties or application-level constants. Removal requires the same function object:
+
+```typescript
+const connectionListener = (
+  status: number,
+  reasonCode?: number,
+  info?: ConnectionInfo
+) => {
+  if (status === WKConnectStatus.syncCompleted) {
+    console.info(`WuKongIM ready on node ${info?.nodeId ?? '-'}`)
+  } else if (status === WKConnectStatus.fail) {
+    console.error(`connect failed: ${reasonCode ?? '-'}`)
+  } else if (status === WKConnectStatus.kicked) {
+    requireLoginAgain()
+  }
+}
+
+const sendStatusListener = (
+  clientSeq: number,
+  messageId: string,
+  messageSeq: number,
+  reasonCode: number
+) => {
+  if (reasonCode === WKSendMsgResult.success) {
+    markMessageSent(clientSeq, messageId, messageSeq)
+  } else {
+    markMessageFailed(clientSeq, reasonCode)
+  }
+}
+
+const newMessagesListener = (messages: WKMsg[]) => {
+  messages.forEach((message) => {
+    if (message.messageContent instanceof WKTextContent) {
+      console.info(`${message.fromUID}: ${message.messageContent.content}`)
+    }
+  })
+}
+
+im.connectionManager().addConnectStatusListener(connectionListener)
+im.messageManager().addSendStatusListener(sendStatusListener)
+im.messageManager().addNewMsgListener(newMessagesListener)
+```
+
+`success` means the connection protocol succeeded. `syncing` and `syncCompleted` follow it. Enable sending only after `syncCompleted`.
+
+## 5. Connect and send text
+
+```typescript
+im.connectionManager().connection()
+```
+
+After Alice reaches `syncCompleted`, send to Bob:
+
+```typescript
+im.messageManager().send(
+  new WKTextContent('Hello, Bob'),
+  new WKChannel('bob', WKChannelType.personal)
+)
+```
+
+`send()` does not return a Promise. The `reasonCode` delivered to `sendStatusListener` tells you whether the server accepted the message.
+
+## Expected result
+
+1. Alice and Bob both reach `syncCompleted`.
+2. Alice receives `WKSendMsgResult.success` in the send callback.
+3. Bob's new-message listener prints “Hello, Bob”.
+
+Remove listeners when the screen or application service ends:
+
+```typescript
+im.connectionManager().removeConnectStatusListener(connectionListener)
+im.messageManager().removeSendStatusListener(sendStatusListener)
+im.messageManager().removeNewMsgListener(newMessagesListener)
+```
+
+Continue with [Connection](/en/sdk/harmonyos/connection) and [Messages](/en/sdk/harmonyos/messages).

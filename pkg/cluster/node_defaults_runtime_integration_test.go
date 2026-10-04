@@ -134,7 +134,7 @@ func TestNodeProbeWriteReadyProposesOneNoopPerPhysicalSlot(t *testing.T) {
 	}
 	node.router.UpdateSlotLeaders([]routing.SlotStatus{{SlotID: 1, Leader: 1}, {SlotID: 2, Leader: 2}})
 	node.snapshot = Snapshot{NodeID: 1, RoutesReady: true, SlotsReady: true, ChannelsReady: true, SlotCount: 2, HashSlotCount: 4}
-	node.channelDataNodes.Update([]uint64{1})
+	node.channelDataNodes.UpdateAtRevision(node.router.Table().Revision, []uint64{1})
 	node.started.Store(true)
 
 	if err := node.ProbeWriteReady(context.Background()); err != nil {
@@ -193,7 +193,7 @@ func TestNodeProbeWriteReadyBoundsPhysicalSlotProbes(t *testing.T) {
 	}
 	node.router.UpdateSlotLeaders(statuses)
 	node.snapshot = Snapshot{NodeID: 1, RoutesReady: true, SlotsReady: true, ChannelsReady: true, SlotCount: 6, HashSlotCount: 6}
-	node.channelDataNodes.Update([]uint64{1})
+	node.channelDataNodes.UpdateAtRevision(node.router.Table().Revision, []uint64{1})
 	node.started.Store(true)
 
 	if err := node.ProbeWriteReady(context.Background()); err != nil {
@@ -271,7 +271,7 @@ func TestNodeProbeWriteReadyMarksChannelDataPlaneLeaseAfterSuccessfulProbe(t *te
 	}
 	node.router.UpdateSlotLeaders([]routing.SlotStatus{{SlotID: 1, Leader: 1}})
 	node.snapshot = Snapshot{NodeID: 1, RoutesReady: true, SlotsReady: true, ChannelsReady: true, SlotCount: 1, HashSlotCount: 1}
-	node.channelDataNodes.Update([]uint64{1})
+	node.channelDataNodes.UpdateAtRevision(node.router.Table().Revision, []uint64{1})
 	node.channels = noopChannelService{}
 	node.started.Store(true)
 
@@ -383,15 +383,16 @@ func TestNodeDefaultChannelsReceiveDataPlaneLeaseGuard(t *testing.T) {
 		t.Fatalf("default channels = %T, want *channels.Service", node.channels)
 	}
 	meta := channelruntime.Meta{
-		Key:         channelruntime.ChannelKey("1:lease-default"),
-		ID:          channelruntime.ChannelID{ID: "lease-default", Type: 1},
-		Epoch:       1,
-		LeaderEpoch: 1,
-		Leader:      1,
-		Replicas:    []channelruntime.NodeID{1},
-		ISR:         []channelruntime.NodeID{1},
-		MinISR:      1,
-		Status:      channelruntime.StatusActive,
+		Key:             channelruntime.ChannelKey("1:lease-default"),
+		ID:              channelruntime.ChannelID{ID: "lease-default", Type: 1},
+		Epoch:           1,
+		LeaderEpoch:     1,
+		RouteGeneration: 1,
+		Leader:          1,
+		Replicas:        []channelruntime.NodeID{1},
+		ISR:             []channelruntime.NodeID{1},
+		MinISR:          1,
+		Status:          channelruntime.StatusActive,
 	}
 	if err := service.ApplyMeta(meta); err != nil {
 		t.Fatalf("ApplyMeta() error = %v", err)
@@ -408,7 +409,7 @@ func TestNodeDefaultChannelsReceiveDataPlaneLeaseGuard(t *testing.T) {
 		t.Fatalf("Append() after lease mark error = %v", err)
 	}
 	if res.MessageSeq != 1 {
-		t.Fatalf("Append() seq = %d, want 1", res.MessageSeq)
+		t.Fatalf("Append() seq = %d, want first business proposal at 1", res.MessageSeq)
 	}
 }
 
@@ -694,6 +695,7 @@ func TestNodeStartMarksDefaultChannelsReadyWithoutController(t *testing.T) {
 }
 
 func TestNodeStopDiscardsDefaultChannelsForRestart(t *testing.T) {
+	record := recordNodeRestartEvidence(t)
 	node, err := New(validNodeConfig(t))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -704,6 +706,8 @@ func TestNodeStopDiscardsDefaultChannelsForRestart(t *testing.T) {
 	if err := node.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop() error = %v", err)
 	}
+	record("stopped", node)
+	assertOwnedSlotReferencesReleased(t, node)
 	if node.channels != nil {
 		t.Fatal("default channels retained after Stop, want discarded")
 	}
@@ -738,6 +742,7 @@ func (recordingCommitCoordinatorObserver) ObserveCommitCoordinatorBatch(messaged
 }
 
 func TestNodeStartFailureDiscardsDefaultChannels(t *testing.T) {
+	record := recordNodeRestartEvidence(t)
 	boom := errors.New("boom")
 	var calls []string
 	node, err := New(validNodeConfig(t), withResources(namedTestResource("boom", &recordingResource{calls: &calls, startErr: boom})))
@@ -747,6 +752,8 @@ func TestNodeStartFailureDiscardsDefaultChannels(t *testing.T) {
 	if err := node.Start(context.Background()); !errors.Is(err, boom) {
 		t.Fatalf("Start() error = %v, want boom", err)
 	}
+	record("failed-start-rollback", node)
+	assertOwnedSlotReferencesReleased(t, node)
 	if node.channels != nil {
 		t.Fatal("default channels retained after failed Start, want discarded")
 	}

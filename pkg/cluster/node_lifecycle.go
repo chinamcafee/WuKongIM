@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/internal/lifecycle"
+	"github.com/WuKongIM/WuKongIM/pkg/dataformat"
 )
 
 // Start starts the node runtime and hosted background loops.
@@ -15,11 +16,11 @@ func (n *Node) Start(ctx context.Context) error {
 	if err := ctxErr(ctx); err != nil {
 		return err
 	}
-	createdDefaultChannels, err := n.ensureDefaultRuntime()
-	if err != nil {
+	if err := dataformat.Check(n.cfg.DataDir); err != nil {
 		return err
 	}
 	started := false
+	createdDefaultChannels := false
 	defer func() {
 		if !started && createdDefaultChannels {
 			n.discardDefaultChannels()
@@ -27,10 +28,20 @@ func (n *Node) Start(ctx context.Context) error {
 		}
 		if !started {
 			n.discardDefaultSlots()
+			if n.defaultProposer {
+				n.proposer = nil
+				n.defaultProposer = false
+			}
 			n.discardDefaultControl()
 			n.discardDefaultTransport()
 		}
 	}()
+	var err error
+	createdDefaultChannels, err = n.ensureDefaultRuntime()
+	if err != nil {
+		return err
+	}
+	n.invalidateWriteProbeProof()
 	n.stopping.Store(false)
 	resources := n.startResources()
 	if err := n.group.Start(ctx, resources...); err != nil {
@@ -53,14 +64,14 @@ func (n *Node) Start(ctx context.Context) error {
 			_ = n.group.Stop(ctx)
 			return err
 		}
-		n.startWatchLoop()
 	}
+	n.started.Store(true)
 	n.startTaskReconcileLoop()
+	n.startWatchLoop()
 	n.startPreferredLeaderReconcileLoop()
 	n.startSlotLeaderLoop()
 	n.markChannelsReady(n.channels != nil)
 	n.startChannelTickLoop()
-	n.started.Store(true)
 	n.startHealthReportLoop()
 	n.startChannelRetentionGCLoop()
 	n.startChannelMigrationLoop()
@@ -89,7 +100,13 @@ func (n *Node) Stop(ctx context.Context) error {
 	if err := ctxErr(ctx); err != nil {
 		return err
 	}
+	n.mu.Lock()
 	n.stopping.Store(true)
+	n.snapshot.RoutesReady = false
+	n.snapshot.SlotsReady = false
+	n.snapshot.ChannelsReady = false
+	n.mu.Unlock()
+	n.invalidateWriteProbeProof()
 	// Stop entry is the mutation fence for background preferred-leader work.
 	// An already-issued nonblocking transfer may finish, but no stale intent may
 	// cross the generation guard while the other background loops wind down.
@@ -104,6 +121,14 @@ func (n *Node) Stop(ctx context.Context) error {
 	n.stopChannelRetentionGCLoop()
 	n.stopChannelMigrationLoop()
 	var errs []error
+	if n.defaultChannels {
+		if n.channelRPCGateway != nil {
+			n.channelRPCGateway.Clear()
+		}
+		if n.channelQuorumGateway != nil {
+			n.channelQuorumGateway.Clear()
+		}
+	}
 	if n.channels != nil {
 		if err := n.channels.Close(); err != nil {
 			errs = append(errs, err)
@@ -112,6 +137,12 @@ func (n *Node) Stop(ctx context.Context) error {
 	if n.defaultChannels {
 		n.channels = nil
 		n.defaultChannels = false
+		if n.defaultChannelReplication != nil {
+			if err := n.defaultChannelReplication.Close(ctx); err != nil {
+				errs = append(errs, err)
+			}
+			n.defaultChannelReplication = nil
+		}
 		if err := n.closeDefaultChannelStore(); err != nil {
 			errs = append(errs, err)
 		}
@@ -131,6 +162,7 @@ func (n *Node) Stop(ctx context.Context) error {
 				errs = append(errs, err)
 			}
 			n.defaultSlotRuntime = nil
+			n.slotRaftDiagnostics = nil
 		}
 		if n.defaultSlotRaftDB != nil {
 			if err := n.defaultSlotRaftDB.Close(); err != nil {
@@ -146,12 +178,21 @@ func (n *Node) Stop(ctx context.Context) error {
 		}
 		n.defaultSlotProxy = nil
 		n.defaultSlotProposer = nil
+		n.slotStatusRuntime = nil
 		n.slots = nil
+		if n.defaultTaskExecutor {
+			n.tasks = nil
+			n.defaultTaskExecutor = false
+		}
 		if n.defaultPreferredLeaderReconciler {
 			n.preferredLeaderReconciler = nil
 			n.defaultPreferredLeaderReconciler = false
 		}
 		n.defaultSlots = false
+	}
+	if n.defaultProposer {
+		n.proposer = nil
+		n.defaultProposer = false
 	}
 	n.discardDefaultControl()
 	n.discardDefaultTransport()

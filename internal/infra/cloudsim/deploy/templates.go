@@ -10,13 +10,21 @@ const (
 	// effectiveNodeRuntimeContractName is the bundle-relative machine-readable runtime contract.
 	effectiveNodeRuntimeContractName = "effective-node-runtime-contract.json"
 	// EffectiveNodeRuntimeContractSchemaV1 is the exact runtime contract schema emitted into bundles and checked at bootstrap.
-	EffectiveNodeRuntimeContractSchemaV1 = "wukongim/cloud-effective-node-runtime-contract/v1"
-	cloudPhysicalHashSlotCount           = 256
-	cloudLogicalSlotGroupCount           = 10
-	cloudSlotReplicaCount                = 3
-	cloudChannelReplicaCount             = 3
-	cloudChannelReactorCount             = 4
-	cloudChannelStoreAppendWorkers       = 8
+	EffectiveNodeRuntimeContractSchemaV1  = "wukongim/cloud-effective-node-runtime-contract/v1"
+	cloudPhysicalHashSlotCount            = 256
+	cloudLogicalSlotGroupCount            = 10
+	cloudSlotReplicaCount                 = 3
+	cloudChannelReplicaCount              = 3
+	cloudChannelReactorCount              = 4
+	cloudDefaultChannelStoreAppendWorkers = 8
+	// cloudMediumChannelStoreAppendWorkers is the bounded Cloud Medium append
+	// concurrency. The chat-20260822T063603Z-45db6ea8 rehearsal observed a
+	// 38ms store-effect envelope and a 2.5s append wait P99 with eight workers.
+	// At 2,000 SEND/s, three replicas, and three evenly loaded nodes, Little's
+	// Law requires about 76 workers per node; 128 keeps 50 percent headroom and
+	// a power-of-two bound without inheriting the local 500-worker diagnostic
+	// profile.
+	cloudMediumChannelStoreAppendWorkers = 128
 	cloudChannelStoreApplyWorkers        = 8
 	cloudDefaultChannelRPCWorkers        = 50
 	// cloudMediumChannelRPCWorkers is acceptance-driven by the completed
@@ -30,20 +38,16 @@ const (
 	// three-process Medium-shaped 256/10/3 gate at 4,500/s actual ingress.
 	// The prior 61.75ms cycle and batch-four saturation corroborate the choice
 	// but are not treated as an ingress-to-RPC-item capacity equation.
-	cloudChannelRPCBatchMaxItems       = 8
-	cloudGatewayGnetEventLoops         = 4
-	cloudGatewayAsyncSendWorkers       = 128
+	cloudChannelRPCBatchMaxItems        = 8
+	cloudGatewayGnetEventLoops          = 4
+	cloudDefaultGatewayAsyncSendWorkers = 128
+	// cloudMediumGatewayAsyncSendWorkers prevents cold Channel activation from
+	// pinning the bounded gateway SEND executors. A real three-node 2,000/s
+	// cold-person wave took 4.38s at 128 workers per node and 1.61-1.67s at
+	// 1,000 while retaining the production metadata batching contract.
+	cloudMediumGatewayAsyncSendWorkers = 1000
 	cloudGatewayAsyncSendQueueCapacity = 131_072
 	cloudDefaultRecipientWorkers       = 100
-	// cloudSmallAuthorityCacheMaxRows preserves the default cache ceiling while
-	// covering the complete 30,860-row Cloud Small conversation working set.
-	cloudSmallAuthorityCacheMaxRows = 100_000
-	// cloudMediumAuthorityCacheMaxRows covers the complete 569,520-row Cloud
-	// Medium working set plus bounded churn and temporary leader skew.
-	cloudMediumAuthorityCacheMaxRows = 750_000
-	// cloudLargeAuthorityCacheMaxRows covers the complete 15,593,050-row Cloud
-	// Large working set plus bounded churn and temporary leader skew.
-	cloudLargeAuthorityCacheMaxRows = 20_000_000
 	// cloudMediumRecipientWorkerConcurrency is the measured Cloud Medium plan
 	// capacity. At 108-113 ms per plan, 320 workers cover the reviewed 5,100
 	// plans/s cluster load when the busiest node owns 40 percent of the ten Slot
@@ -67,7 +71,6 @@ var effectiveRuntimeContractKeys = []string{
 	"WK_GATEWAY_RUNTIME_ASYNC_SEND_WORKERS",
 	"WK_GATEWAY_RUNTIME_ASYNC_SEND_QUEUE_CAPACITY",
 	"WK_DELIVERY_RECIPIENT_WORKER_CONCURRENCY",
-	"WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS",
 }
 
 // EffectiveNodeRuntimeContract is the exact non-secret runtime shape deployed to every cloud node.
@@ -104,8 +107,6 @@ type EffectiveNodeRuntimeContract struct {
 	GatewayAsyncSendQueueCapacity int `json:"gateway_async_send_queue_capacity"`
 	// RecipientWorkerConcurrency is the reviewed delivery recipient worker count.
 	RecipientWorkerConcurrency int `json:"recipient_worker_concurrency"`
-	// ConversationAuthorityCacheMaxRows is the reviewed per-node authority cache ceiling.
-	ConversationAuthorityCacheMaxRows int `json:"conversation_authority_cache_max_rows"`
 	// ValueSources records the observed Manager source for every critical key during bootstrap.
 	// It is omitted from the immutable expected contract stored in the bundle.
 	ValueSources map[string]string `json:"value_sources,omitempty"`
@@ -122,25 +123,24 @@ func effectiveNodeRuntimeContractForScale(scale string) (EffectiveNodeRuntimeCon
 		SlotReplicaCount:              cloudSlotReplicaCount,
 		ChannelReplicaCount:           cloudChannelReplicaCount,
 		ChannelReactorCount:           cloudChannelReactorCount,
-		ChannelStoreAppendWorkers:     cloudChannelStoreAppendWorkers,
+		ChannelStoreAppendWorkers:     cloudDefaultChannelStoreAppendWorkers,
 		ChannelStoreApplyWorkers:      cloudChannelStoreApplyWorkers,
 		ChannelRPCWorkers:             cloudDefaultChannelRPCWorkers,
 		ChannelRPCBatchMaxItems:       cloudChannelRPCBatchMaxItems,
 		GatewayGnetMulticore:          true,
 		GatewayGnetEventLoops:         cloudGatewayGnetEventLoops,
-		GatewayAsyncSendWorkers:       cloudGatewayAsyncSendWorkers,
+		GatewayAsyncSendWorkers:       cloudDefaultGatewayAsyncSendWorkers,
 		GatewayAsyncSendQueueCapacity: cloudGatewayAsyncSendQueueCapacity,
 		RecipientWorkerConcurrency:    cloudDefaultRecipientWorkers,
 	}
 	switch contract.Scale {
 	case "small":
-		contract.ConversationAuthorityCacheMaxRows = cloudSmallAuthorityCacheMaxRows
 	case "medium":
-		contract.ConversationAuthorityCacheMaxRows = cloudMediumAuthorityCacheMaxRows
+		contract.ChannelStoreAppendWorkers = cloudMediumChannelStoreAppendWorkers
 		contract.RecipientWorkerConcurrency = cloudMediumRecipientWorkerConcurrency
 		contract.ChannelRPCWorkers = cloudMediumChannelRPCWorkers
+		contract.GatewayAsyncSendWorkers = cloudMediumGatewayAsyncSendWorkers
 	case "large":
-		contract.ConversationAuthorityCacheMaxRows = cloudLargeAuthorityCacheMaxRows
 	default:
 		return EffectiveNodeRuntimeContract{}, fmt.Errorf("%w: scenario objectives.scale must be small, medium, or large", ErrInvalidBundle)
 	}
@@ -165,8 +165,7 @@ func runtimeContractValuesEqual(left, right EffectiveNodeRuntimeContract) bool {
 		left.GatewayGnetEventLoops == right.GatewayGnetEventLoops &&
 		left.GatewayAsyncSendWorkers == right.GatewayAsyncSendWorkers &&
 		left.GatewayAsyncSendQueueCapacity == right.GatewayAsyncSendQueueCapacity &&
-		left.RecipientWorkerConcurrency == right.RecipientWorkerConcurrency &&
-		left.ConversationAuthorityCacheMaxRows == right.ConversationAuthorityCacheMaxRows
+		left.RecipientWorkerConcurrency == right.RecipientWorkerConcurrency
 }
 
 func cloudViewConfig(runID string, addresses map[string]string) string {
@@ -217,7 +216,7 @@ slot_replica_n = %d
 channel_replica_n = %d
 slot_tick_interval = "50ms"
 slot_heartbeat_tick = 2
-slot_election_tick = 20
+slot_election_tick = 40
 channel_reactor_count = %d
 channel_store_append_workers = %d
 channel_store_apply_workers = %d
@@ -259,12 +258,6 @@ runtime_async_send_workers = %d
 runtime_async_send_queue_capacity = %d
 
 %s
-[conversation]
-# Bounds per-node active-conversation authority rows for the selected reviewed
-# scale. Entries allocate on demand; the ceiling includes bounded churn
-# headroom even when actual Raft leaders are temporarily skewed.
-authority_cache_max_rows = %d
-
 [[gateway.listeners]]
 name = "tcp-wkproto"
 network = "tcp"
@@ -302,7 +295,7 @@ enable = true
 		addresses[fmt.Sprintf("node-%d", nodeID)], addresses[fmt.Sprintf("node-%d", nodeID)],
 		contract.GatewayGnetMulticore, contract.GatewayGnetEventLoops,
 		contract.GatewayAsyncSendWorkers, contract.GatewayAsyncSendQueueCapacity,
-		deliveryConfig, contract.ConversationAuthorityCacheMaxRows, addresses["sim"])
+		deliveryConfig, addresses["sim"])
 }
 
 func targetConfig(addresses map[string]string) string {
@@ -725,7 +718,7 @@ Type=simple
 User=wukongim
 Group=wukongim
 EnvironmentFile=/etc/wukongim/sim.env
-ExecStart=/opt/wukongim/bin/wkbench worker --listen 127.0.0.1:19090 --work-dir /var/lib/wukongim-cloud/worker --control-token ${WK_BENCH_WORKER_TOKEN}
+ExecStart=/opt/wukongim/bin/wkcli bench worker --listen 127.0.0.1:19090 --work-dir /var/lib/wukongim-cloud/worker --control-token ${WK_BENCH_WORKER_TOKEN}
 Restart=on-failure
 RestartSec=2s
 LimitNOFILE=1048576
@@ -745,9 +738,9 @@ Type=oneshot
 User=wukongim
 Group=wukongim
 EnvironmentFile=/etc/wukongim/sim.env
-ExecStart=/opt/wukongim/bin/wkbench validate --target /etc/wukongim/target.yaml --workers /etc/wukongim/workers.yaml --scenario /etc/wukongim/scenario.yaml
-ExecStart=/opt/wukongim/bin/wkbench doctor --target /etc/wukongim/target.yaml --workers /etc/wukongim/workers.yaml --scenario /etc/wukongim/scenario.yaml
-ExecStart=/opt/wukongim/bin/wkbench run --target /etc/wukongim/target.yaml --workers /etc/wukongim/workers.yaml --scenario /etc/wukongim/scenario.yaml
+ExecStart=/opt/wukongim/bin/wkcli bench validate --target /etc/wukongim/target.yaml --workers /etc/wukongim/workers.yaml --scenario /etc/wukongim/scenario.yaml
+ExecStart=/opt/wukongim/bin/wkcli bench doctor --target /etc/wukongim/target.yaml --workers /etc/wukongim/workers.yaml --scenario /etc/wukongim/scenario.yaml
+ExecStart=/opt/wukongim/bin/wkcli bench run --target /etc/wukongim/target.yaml --workers /etc/wukongim/workers.yaml --scenario /etc/wukongim/scenario.yaml
 ExecStopPost=/opt/wukongim/bin/wkcloudview annotate-report --status-url http://127.0.0.1:19443/cloud-view/status --report /var/lib/wukongim-cloud/reports/${WK_CLOUD_RUN_ID}/report.json
 Restart=no
 TimeoutStartSec=infinity

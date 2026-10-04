@@ -138,20 +138,20 @@ func TestBusinessChannelOperationsNormalizeControlSnapshotErrors(t *testing.T) {
 
 func TestBusinessChannelKeyValidationKeepsLegacyStorageValidIDs(t *testing.T) {
 	legacyID := " legacy#channel@" + strings.Repeat("x", 300) + " "
-	got, channelType, err := validateExistingBusinessChannelKey(legacyID, 2)
+	got, channelType, err := (&App{}).validateExistingBusinessChannelKey(legacyID, 2)
 	if err != nil {
 		t.Fatalf("validateExistingBusinessChannelKey(): %v", err)
 	}
 	if got != legacyID || channelType != 2 {
 		t.Fatalf("existing key = (%q, %d), want exact legacy key", got, channelType)
 	}
-	if _, _, err := validateNewBusinessChannelKey(legacyID, 2); !errors.Is(err, metadb.ErrInvalidArgument) {
+	if _, _, err := (&App{}).validateNewBusinessChannelKey(legacyID, 2); !errors.Is(err, metadb.ErrInvalidArgument) {
 		t.Fatalf("validateNewBusinessChannelKey(legacy) error = %v", err)
 	}
-	if got, _, err := validateNewBusinessChannelKey(" new-channel ", 2); err != nil || got != "new-channel" {
+	if got, _, err := (&App{}).validateNewBusinessChannelKey(" new-channel ", 2); err != nil || got != "new-channel" {
 		t.Fatalf("validateNewBusinessChannelKey(trim) = (%q, %v)", got, err)
 	}
-	if _, _, err := validateExistingBusinessChannelKey("__wk_internal_memberlist__/allow/2/ZzE", 2); !errors.Is(err, metadb.ErrInvalidArgument) {
+	if _, _, err := (&App{}).validateExistingBusinessChannelKey("__wk_internal_memberlist__/allow/2/ZzE", 2); !errors.Is(err, metadb.ErrInvalidArgument) {
 		t.Fatalf("validateExistingBusinessChannelKey(internal) error = %v", err)
 	}
 }
@@ -433,4 +433,16 @@ func businessChannelKeyForSlot(t *testing.T, table control.HashSlotTable, slotID
 	}
 	t.Fatalf("no key found for slot %d", slotID)
 	return ""
+}
+
+func TestBusinessChannelsReserveConfiguredCommandSuffix(t *testing.T) {
+	app := New(Options{CommandChannelSuffix: "__commands"})
+	for _, id := range []string{"group__commands", "u1@u2__commands"} {
+		if _, _, err := app.validateExistingBusinessChannelKey(id, 2); !errors.Is(err, metadb.ErrInvalidArgument) {
+			t.Fatalf("internal command %q accepted: %v", id, err)
+		}
+	}
+	if _, _, err := app.validateNewBusinessChannelKey("group", 2); err != nil {
+		t.Fatal(err)
+	}
 }

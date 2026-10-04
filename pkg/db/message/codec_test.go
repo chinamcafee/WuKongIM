@@ -22,7 +22,7 @@ func TestMessageHeaderCodecRoundTrip(t *testing.T) {
 	if err := decodeMessageHeader(key, value, &got); err != nil {
 		t.Fatalf("decodeMessageHeader(): %v", err)
 	}
-	if got.MessageID != row.MessageID || got.ClientMsgNo != row.ClientMsgNo || got.PayloadHash != row.PayloadHash || got.PayloadSize != row.PayloadSize || got.ServerTimestampMS != row.ServerTimestampMS {
+	if got.MessageID != row.MessageID || got.ClientMsgNo != row.ClientMsgNo || got.PayloadHash != row.PayloadHash || got.PayloadSize != row.PayloadSize || string(got.Payload) != string(row.Payload) || got.ServerTimestampMS != row.ServerTimestampMS {
 		t.Fatalf("decoded row = %#v, want %#v", got, row)
 	}
 }
@@ -46,7 +46,7 @@ func TestMessageHeaderDirectCodecMatchesEncoder(t *testing.T) {
 	if err := decodeMessageHeader(key, got, &decoded); err != nil {
 		t.Fatalf("decodeMessageHeader(): %v", err)
 	}
-	if decoded.MessageID != row.MessageID || decoded.ClientMsgNo != row.ClientMsgNo || decoded.PayloadHash != row.PayloadHash || decoded.PayloadSize != row.PayloadSize || decoded.ServerTimestampMS != row.ServerTimestampMS {
+	if decoded.MessageID != row.MessageID || decoded.ClientMsgNo != row.ClientMsgNo || decoded.PayloadHash != row.PayloadHash || decoded.PayloadSize != row.PayloadSize || string(decoded.Payload) != string(row.Payload) || decoded.ServerTimestampMS != row.ServerTimestampMS {
 		t.Fatalf("decoded row = %#v, want %#v", decoded, row)
 	}
 }
@@ -231,4 +231,58 @@ func encodeLegacyCompatibilityPayload(row messageRow) []byte {
 	payload = appendCompatibilityString(payload, row.Topic)
 	payload = appendCompatibilityString(payload, row.FromUID)
 	return appendCompatibilityBytes(payload, row.Payload)
+}
+
+// BenchmarkMessageReadDecode measures the durable header/payload decode path
+// independently of IO, using the release fixture's payload size.
+func BenchmarkMessageReadDecode(b *testing.B) {
+	row := testMessageRow()
+	row.Payload = make([]byte, 256)
+	headerKey := encodeMessageRowKey(ChannelKey("read-bench"), row.MessageSeq, messageHeaderFamilyID)
+	payloadKey := encodeMessageRowKey(ChannelKey("read-bench"), row.MessageSeq, messagePayloadFamilyID)
+	header, err := encodeMessageHeader(headerKey, row)
+	if err != nil {
+		b.Fatal(err)
+	}
+	payload, err := encodeMessagePayload(payloadKey, row)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var got messageRow
+		if err := decodeMessageHeader(headerKey, header, &got); err != nil {
+			b.Fatal(err)
+		}
+		if err := decodeMessagePayload(payloadKey, payload, &got); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestMessageReadDecodeOwnsFieldsAfterInputReuse(t *testing.T) {
+	row := testMessageRow()
+	key := encodeMessageRowKey(ChannelKey("owned"), row.MessageSeq, messageHeaderFamilyID)
+	header, err := encodeMessageHeader(key, row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadKey := encodeMessageRowKey(ChannelKey("owned"), row.MessageSeq, messagePayloadFamilyID)
+	payload, err := encodeMessagePayload(payloadKey, row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got messageRow
+	if err := decodeMessageHeader(key, header, &got); err != nil {
+		t.Fatal(err)
+	}
+	if err := decodeMessagePayload(payloadKey, payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	clear(header)
+	clear(payload)
+	if got.ClientMsgNo != row.ClientMsgNo || got.FromUID != row.FromUID || got.ChannelID != row.ChannelID || string(got.Payload) != string(row.Payload) {
+		t.Fatal("decoded message aliases input")
+	}
 }

@@ -44,7 +44,6 @@ func TestCloudSimulationMonitorPatrolsRunningRunsWithoutStartingThem(t *testing.
 	monitor := readWorkflowText(t, repositoryRoot(t), "cloud-sim-monitor.yml")
 	for _, required := range []string{
 		`cron: "*/30 * * * *"`,
-		"if: vars.ALIBABA_CLOUD_SIM_ENABLED == 'true'",
 		"run_id:",
 		"environment: cloud-sim-analysis",
 		`MAX_PROVIDER_CONFIG_ARTIFACTS: "512"`,
@@ -146,9 +145,6 @@ func TestCloudSimulationWorkflowPrivilegeSeparation(t *testing.T) {
 	oidcSubject := readWorkflowText(t, root, "cloud-sim-oidc-subject.yml")
 
 	assertWorkflowText(t, provision, "build:\n", "provision:\n", "id-token: write", "environment: cloud-sim-provision")
-	if !strings.Contains(provision, "if: vars.ALIBABA_CLOUD_SIM_ENABLED == 'true'") {
-		t.Fatal("provision workflow can run without explicit repository opt-in")
-	}
 	for _, required := range []string{
 		`transition "$RUN_ID" ready`, `transition "$RUN_ID" running --active-until`,
 		`transition "$RUN_ID" analysis_grace`, `destroy "$RUN_ID"`, `./scripts/cloud-sim/finalize.sh $RUN_ID`,
@@ -164,9 +160,6 @@ func TestCloudSimulationWorkflowPrivilegeSeparation(t *testing.T) {
 
 	prepareSection := between(t, analysis, "  prepare:\n", "  close:\n")
 	closeSection := analysis[strings.Index(analysis, "  close:\n"):]
-	if strings.Count(analysis, "vars.ALIBABA_CLOUD_SIM_ENABLED == 'true'") != 2 {
-		t.Fatal("analysis workflow jobs do not require explicit repository opt-in")
-	}
 	if !strings.Contains(prepareSection, "contents: read") || !strings.Contains(prepareSection, "id-token: write") || strings.Contains(prepareSection, "contents: write") {
 		t.Fatal("analysis session preparation privilege boundary is invalid")
 	}
@@ -227,7 +220,7 @@ func TestCloudSimulationWorkflowPrivilegeSeparation(t *testing.T) {
 			t.Fatalf("analysis session workflow missing guardrail %q", required)
 		}
 	}
-	if !strings.Contains(cleanup, `cron: "*/15 * * * *"`) || !strings.Contains(cleanup, "ALIBABA_CLOUD_SIM_PROVISIONER_ROLE_ARN") || !strings.Contains(cleanup, "environment: cloud-sim-cleanup") || !strings.Contains(cleanup, "if: vars.ALIBABA_CLOUD_SIM_ENABLED == 'true'") {
+	if !strings.Contains(cleanup, `cron: "*/15 * * * *"`) || !strings.Contains(cleanup, "ALIBABA_CLOUD_SIM_PROVISIONER_ROLE_ARN") || !strings.Contains(cleanup, "environment: cloud-sim-cleanup") {
 		t.Fatal("cleanup workflow lacks periodic provisioner-backed reconciliation")
 	}
 	for _, required := range []string{
@@ -241,6 +234,94 @@ func TestCloudSimulationWorkflowPrivilegeSeparation(t *testing.T) {
 		if !strings.Contains(oidcSubject, required) {
 			t.Fatalf("OIDC subject workflow missing %q", required)
 		}
+	}
+}
+
+func TestCloudSimulationSafetySchedulesFollowProviderInventoryLifecycle(t *testing.T) {
+	root := repositoryRoot(t)
+	provision := readWorkflowText(t, root, "cloud-sim-provision.yml")
+	cleanup := readWorkflowText(t, root, "cloud-sim-cleanup.yml")
+	monitor := readWorkflowText(t, root, "cloud-sim-monitor.yml")
+
+	provisionJob := provision[strings.Index(provision, "  provision:\n"):]
+	for _, required := range []string{
+		"actions: write",
+		"- name: Enable cloud safety schedules",
+		"./scripts/cloud-sim/set-safety-workflows-state.sh enable",
+	} {
+		if !strings.Contains(provisionJob, required) {
+			t.Fatalf("provision workflow missing safety-schedule lifecycle contract %q", required)
+		}
+	}
+	persistIndex := strings.Index(provisionJob, "- name: Persist provider config before creating billable resources")
+	enableIndex := strings.Index(provisionJob, "- name: Enable cloud safety schedules")
+	createIndex := strings.Index(provisionJob, "- name: Create exact run resources")
+	if persistIndex < 0 || enableIndex <= persistIndex || createIndex <= enableIndex {
+		t.Fatal("provision workflow must persist provider authority, enable safety schedules, then create resources")
+	}
+
+	for _, required := range []string{
+		"actions: write",
+		`jq -e '.destroyed != null and .retained != null and .failed != null'`,
+		`CONFIG_COUNT: ${{ steps.configs.outputs.config_count }}`,
+		`if (( CONFIG_COUNT > 0 )) &&`,
+		`jq -e '(.retained | length) == 0 and (.failed | length) == 0' cleanup-result.json`,
+		"- name: Disable idle cloud safety schedules",
+		"if: inputs.run_id == '' && steps.reconcile.outputs.inventory_empty == 'true'",
+		"./scripts/cloud-sim/set-safety-workflows-state.sh disable",
+	} {
+		if !strings.Contains(cleanup, required) {
+			t.Fatalf("cleanup workflow missing idle-stop contract %q", required)
+		}
+	}
+	reconcileIndex := strings.Index(cleanup, "- name: Destroy exact run or sweep all expired leases")
+	disableIndex := strings.Index(cleanup, "- name: Disable idle cloud safety schedules")
+	if reconcileIndex < 0 || disableIndex <= reconcileIndex {
+		t.Fatal("cleanup workflow may disable schedules only after provider reconciliation")
+	}
+	if strings.Contains(monitor, "actions: write") || strings.Contains(monitor, "set-safety-workflows-state.sh") {
+		t.Fatal("observer-only monitor must not own workflow lifecycle mutation")
+	}
+}
+
+func TestCloudSimulationSafetyWorkflowStateScriptOrdersFailSafeTransitions(t *testing.T) {
+	root := repositoryRoot(t)
+	script := filepath.Join(root, "scripts", "cloud-sim", "set-safety-workflows-state.sh")
+	fakeBin := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "gh.log")
+	fakeGH := filepath.Join(fakeBin, "gh")
+	if err := os.WriteFile(fakeGH, []byte("#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >>\"$GH_CALL_LOG\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(operation string) []string {
+		t.Helper()
+		if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command("/bin/bash", script, operation)
+		command.Env = append(os.Environ(),
+			"PATH="+fakeBin+":"+os.Getenv("PATH"),
+			"GITHUB_REPOSITORY=WuKongIM/WuKongIM",
+			"GH_CALL_LOG="+logPath,
+		)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("%s safety workflows: %v\n%s", operation, err, output)
+		}
+		data, err := os.ReadFile(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Fields(strings.TrimSpace(string(data)))
+	}
+
+	enable := strings.Join(run("enable"), " ")
+	if cleanupIndex, monitorIndex := strings.Index(enable, "cloud-sim-cleanup.yml/enable"), strings.Index(enable, "cloud-sim-monitor.yml/enable"); cleanupIndex < 0 || monitorIndex <= cleanupIndex {
+		t.Fatalf("enable order = %q, want cleanup before monitor", enable)
+	}
+	disable := strings.Join(run("disable"), " ")
+	if monitorIndex, cleanupIndex := strings.Index(disable, "cloud-sim-monitor.yml/disable"), strings.Index(disable, "cloud-sim-cleanup.yml/disable"); monitorIndex < 0 || cleanupIndex <= monitorIndex {
+		t.Fatalf("disable order = %q, want monitor before cleanup", disable)
 	}
 }
 
@@ -357,8 +438,9 @@ func TestCloudSimulationWorkflowRequiresEmpiricalStorageCalibrationForStandardRu
 	provision := readWorkflowText(t, repositoryRoot(t), "cloud-sim-provision.yml")
 	for _, required := range []string{
 		"storage_calibration:",
-		`{"run_id":"...","bytes_per_message":123}`,
-		".bytes_per_message",
+		"RUN_ID:BYTES_PER_MESSAGE",
+		`storage_calibration_run_id="${STORAGE_CALIBRATION%%:*}"`,
+		`storage_bytes_per_message="${STORAGE_CALIBRATION#*:}"`,
 		"48h|168h)",
 		"Standard stability runs require a completed 30m storage calibration",
 		"calibrated_data_disk_gib",

@@ -1,0 +1,39 @@
+---
+title: WebSocket JSON-RPC
+description: Product Gateway's JSON-RPC support matrix and limits for the pinned EasySDK core online path.
+---
+
+<Callout type="info" title="EasySDK core path supported">
+  Product Gateway supports the pinned EasySDK CONNECT-first authentication lifecycle, ping, online SEND/SENDACK, RECV/RECVACK, and server-to-client public stream.* EVENT delivery. General-purpose JSON-RPC, batches, subscriptions, and automatic SDK offline sync remain outside this contract.
+</Callout>
+
+## wsmux selection
+
+WebSocket `wsmux` selects JSON-RPC when the first non-whitespace byte is `{` or `[`, and WKProto otherwise. The choice persists for the session. JSON-RPC output uses text messages; WKProto output uses binary messages.
+
+`[` selects JSON mode, but the decoder does **not** implement batch arrays. `jsonrpc` may be omitted, and request IDs must be JSON strings. SEND `payload` may be an already-encoded JSON text string, a JSON object, a Base64 string, or `null`; the protocol boundary normalizes each form to bytes. A string whose decoded contents are valid JSON is treated as JSON text before the Base64 fallback. JSON-RPC does not perform WKProto `clientKey` negotiation, so production transport must use `wss://`.
+
+## Actual inbound matrix
+
+| Kind | Method | Decode / bridge | Product result |
+| --- | --- | --- | --- |
+| request | `connect` | → `CONNECT` | must be first; successful authentication and activation return same-ID `result`, failure returns same-ID `error` and closes |
+| request | `send` | → `SEND` | handled only on an authenticated session; returns same-ID SENDACK result/error |
+| request | `ping` | → `PING` | returns the same ID with explicit `result: null` |
+| request | `disconnect` | → `DISCONNECT` | unsupported by the product handler; closes |
+| request | `subscribe` / `unsubscribe` | → `SUB` (`action` is `0` / `1`) | the Product Gateway handler does not support `SUB`; the default handler-error policy closes the session, so the current product path cannot emit `SUBACK` |
+| notification | `recvack` | → `RECVACK` | confirms online delivery on an authenticated session; iOS `v1.1.1` sends both camelCase `messageId` and `messageSeq` |
+| notification | `recv` / `disconnect` / `event` | decoded only | frame bridge missing |
+| response | any structurally valid response | decoded to a generic response | frame bridge missing |
+
+Successful CONNACK and SENDACK responses include both camelCase and Android snake_case fields; clients ignore the unused aliases. A non-success Reason Code becomes a JSON-RPC `error`, preventing EasySDK from mistaking failure for success. RECV is an ID-less `recv` notification that always contains `header: {}`. Valid JSON-object payload bytes are emitted as an object; non-object bytes fall back to Base64. The Android `v1.0.5` README example still passes its already-encoded JSON message as a text string, while the protocol boundary also accepts direct objects and Base64 strings; normal JSON message bytes are emitted on RECV as an object for all four pinned profiles.
+
+## Online streaming events
+
+Server `EVENT` becomes an ID-less `event` notification with `{id,type,timestamp,data}` parameters; valid JSON data is emitted as an object. EasySDK-JS receives public `stream.*` events through `WKIMEvent.CustomEvent`. This requires the server online event delivery implementation and is separate from older core-message acceptance. Events are best effort without RECVACK replay; final snapshots recover through message history. See [Agent Streaming Replies](/en/sdk/easy/agent-streaming).
+
+## Verified scope
+
+Server fixtures cover the pinned wire profiles retained by the current iOS `v1.1.1`, Android `v1.0.5`, Flutter `v1.1.0`, and Web `v2.0.4` releases; these patch versions do not change the tested JSON-RPC shapes. A real `cmd/wukongim` 256-slot single-node cluster scenario uses the iOS and Android profiles to cover the Alice/Bob bidirectional CONNECT → SEND → SENDACK → RECV → RECVACK → ping loop, online-presence cleanup after disconnect, and reconnect. A separate released-package acceptance resolves those versions from all four registries and completes bidirectional messaging on Android and iOS Simulators. The default `gateway.token_auth_on=true` performs exact stored-device-token matching; production acceptance must still separately prove rejection of wrong, missing, revoked, and product-expired tokens.
+
+Use [WuKongEasySDK](/en/sdk/easy) for lightweight online messaging. Choose a WKProto SDK and the [TCP binary protocol](/en/api/client-protocols/tcp-binary) when you need a local message store, conversations, unread state, offline recovery, or broader capabilities.

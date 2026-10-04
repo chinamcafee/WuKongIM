@@ -23,15 +23,22 @@ const (
 	runtimeMetaRPCBatchGetID
 	runtimeMetaRPCListID
 	runtimeMetaRPCScanPageID
+	runtimeMetaRPCGetFreshID
 )
 
 // encodeRuntimeMetaRPCRequestBinary encodes runtime meta requests without JSON reflection.
 func encodeRuntimeMetaRPCRequestBinary(req runtimeMetaRPCRequest) ([]byte, error) {
+	if req.Op == runtimeMetaRPCBatchGet && len(req.Keys) > runtimeMetaBatchMaxReads {
+		return nil, fmt.Errorf("%w: runtime metadata batch has %d reads, max %d", metadb.ErrInvalidArgument, len(req.Keys), runtimeMetaBatchMaxReads)
+	}
 	opID, err := runtimeMetaOpID(req.Op)
 	if err != nil {
 		return nil, err
 	}
 	codecVersion := runtimeMetaRPCCodecVersionOrLatest(req.CodecVersion)
+	if req.Op == runtimeMetaRPCGetFresh && (codecVersion != 3 || !validRuntimeMetaFreshRequest(req)) {
+		return nil, metadb.ErrInvalidArgument
+	}
 	requestMagic, err := runtimeMetaRPCRequestMagicForVersion(codecVersion)
 	if err != nil {
 		return nil, err
@@ -42,7 +49,7 @@ func encodeRuntimeMetaRPCRequestBinary(req runtimeMetaRPCRequest) ([]byte, error
 	dst = runtimeMetaAppendUvarint(dst, req.SlotID)
 	dst = runtimeMetaAppendString(dst, req.ChannelID)
 	dst = runtimeMetaAppendVarint(dst, req.ChannelType)
-	dst = runtimeMetaAppendConversationKeys(dst, req.Keys)
+	dst = runtimeMetaAppendChannelKeys(dst, req.Keys)
 	dst = runtimeMetaAppendCursorPtr(dst, req.After)
 	dst = runtimeMetaAppendVarint(dst, int64(req.Limit))
 	return dst, nil
@@ -61,6 +68,11 @@ func decodeRuntimeMetaRPCRequest(body []byte) (runtimeMetaRPCRequest, error) {
 	if err != nil {
 		return runtimeMetaRPCRequest{}, err
 	}
+	// Bound fresh point-read frames before the shared batch decoder allocates
+	// collections or decodes the channel identity.
+	if op == runtimeMetaRPCGetFresh && (requestVersion != 3 || len(body) > 4096) {
+		return runtimeMetaRPCRequest{}, metadb.ErrInvalidArgument
+	}
 	offset++
 
 	var req runtimeMetaRPCRequest
@@ -75,7 +87,7 @@ func decodeRuntimeMetaRPCRequest(body []byte) (runtimeMetaRPCRequest, error) {
 	if req.ChannelType, offset, err = runtimeMetaReadVarint(body, offset); err != nil {
 		return runtimeMetaRPCRequest{}, err
 	}
-	if req.Keys, offset, err = runtimeMetaReadConversationKeys(body, offset); err != nil {
+	if req.Keys, offset, err = runtimeMetaReadChannelKeys(body, offset); err != nil {
 		return runtimeMetaRPCRequest{}, err
 	}
 	if req.After, offset, err = runtimeMetaReadCursorPtr(body, offset); err != nil {
@@ -86,6 +98,9 @@ func decodeRuntimeMetaRPCRequest(body []byte) (runtimeMetaRPCRequest, error) {
 	}
 	if offset != len(body) {
 		return runtimeMetaRPCRequest{}, fmt.Errorf("metastore: trailing runtime meta request bytes")
+	}
+	if req.Op == runtimeMetaRPCGetFresh && (requestVersion != 3 || !validRuntimeMetaFreshRequest(req)) {
+		return runtimeMetaRPCRequest{}, metadb.ErrInvalidArgument
 	}
 	return req, nil
 }
@@ -232,6 +247,8 @@ func runtimeMetaOpID(op string) (byte, error) {
 	switch op {
 	case runtimeMetaRPCGet:
 		return runtimeMetaRPCGetID, nil
+	case runtimeMetaRPCGetFresh:
+		return runtimeMetaRPCGetFreshID, nil
 	case runtimeMetaRPCBatchGet:
 		return runtimeMetaRPCBatchGetID, nil
 	case runtimeMetaRPCList:
@@ -247,6 +264,8 @@ func runtimeMetaOpFromID(op byte) (string, error) {
 	switch op {
 	case runtimeMetaRPCGetID:
 		return runtimeMetaRPCGet, nil
+	case runtimeMetaRPCGetFreshID:
+		return runtimeMetaRPCGetFresh, nil
 	case runtimeMetaRPCBatchGetID:
 		return runtimeMetaRPCBatchGet, nil
 	case runtimeMetaRPCListID:
@@ -258,7 +277,7 @@ func runtimeMetaOpFromID(op byte) (string, error) {
 	}
 }
 
-func runtimeMetaAppendConversationKeys(dst []byte, keys []metadb.ConversationKey) []byte {
+func runtimeMetaAppendChannelKeys(dst []byte, keys []metadb.ChannelKey) []byte {
 	dst = runtimeMetaAppendUvarint(dst, uint64(len(keys)))
 	for _, key := range keys {
 		dst = runtimeMetaAppendString(dst, key.ChannelID)
@@ -267,17 +286,20 @@ func runtimeMetaAppendConversationKeys(dst []byte, keys []metadb.ConversationKey
 	return dst
 }
 
-func runtimeMetaReadConversationKeys(body []byte, offset int) ([]metadb.ConversationKey, int, error) {
+func runtimeMetaReadChannelKeys(body []byte, offset int) ([]metadb.ChannelKey, int, error) {
 	count, next, err := runtimeMetaReadUvarint(body, offset)
 	if err != nil {
 		return nil, offset, err
 	}
 	offset = next
+	if count > runtimeMetaBatchMaxReads {
+		return nil, offset, fmt.Errorf("%w: runtime metadata batch has %d reads, max %d", metadb.ErrInvalidArgument, count, runtimeMetaBatchMaxReads)
+	}
 	keysLen, err := runtimeMetaCollectionLen(count, len(body)-offset, "runtime meta keys")
 	if err != nil {
 		return nil, offset, err
 	}
-	keys := make([]metadb.ConversationKey, keysLen)
+	keys := make([]metadb.ChannelKey, keysLen)
 	for i := range keys {
 		if keys[i].ChannelID, offset, err = runtimeMetaReadString(body, offset); err != nil {
 			return nil, offset, err

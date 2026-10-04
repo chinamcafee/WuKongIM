@@ -1,0 +1,55 @@
+---
+title: Webhook
+description: 配置同步发送前回调与三个异步通知事件。
+---
+
+Webhook 把已提交消息、离线候选接收者和在线状态变化 POST 到一个业务端点。它是服务端出站协议，不是客户端收件箱，也不属于 WuKongIM HTTP API 的入站 `paths`。
+
+[下载 OpenAPI 3.1 Webhook 合同](/contracts/webhooks.openapi.json)
+
+`msg.before_send` 是独立启用的同步发送前回调，响应决定放行、修改或拒绝；以下队列和重试语义仅适用于三个异步通知事件。配置、完整请求和失败策略见[发送前业务回调](/zh/guide/integration/webhooks#发送前业务回调)。
+
+## 请求
+
+```text
+POST {http_addr}?event={event_name}
+Content-Type: application/json
+```
+
+已有查询参数会保留，并覆盖或追加 `event`。事件名只出现在 Query 中；请求体**没有通用信封**，结构由事件决定。支持的回调包括：
+
+| 事件 | 顶层 JSON |
+| --- | --- |
+| `msg.before_send` | 单个待发送消息对象，同步决定是否发送 |
+| `msg.notify` | 已提交消息数组 |
+| `msg.offline.v2` | 一条消息与离线 UID 的扁平对象 |
+| `user.onlinestatus` | 兼容状态字符串数组 |
+
+## 配置
+
+`webhook.http_addr` 非空即启用异步通知；`focus_events=[]` 表示投递全部三个事件。
+
+```toml
+[webhook]
+http_addr = "https://events.example.com/wukongim"
+focus_events = ["msg.notify", "msg.offline.v2", "user.onlinestatus"]
+queue_size = 1024
+workers = 16
+msg_notify_batch_max_items = 100
+msg_notify_batch_max_wait = "500ms"
+online_status_batch_max_items = 512
+online_status_batch_max_wait = "2s"
+offline_uid_batch_size = 512
+request_timeout = "5s"
+retry_max_attempts = 3
+```
+
+<Cards>
+  <Card title="事件类型" description="同步决策与三个异步通知的触发边界。" href="/zh/api/webhooks/events" />
+  <Card title="请求结构" description="消息字段、离线 UID 压缩与状态字符串。" href="/zh/api/webhooks/payloads" />
+  <Card title="可靠性与安全" description="有限重试、幂等、丢失边界与网络信任。" href="/zh/api/webhooks/reliability-and-security" />
+</Cards>
+
+<Callout type="warn" title="异步通知有界、尽力而为">
+  当前使用节点内存队列，没有磁盘 Outbox 或崩溃重放。接收端应先持久化并去重，再快速返回 HTTP 200。
+</Callout>

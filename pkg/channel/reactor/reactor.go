@@ -8,6 +8,7 @@ import (
 
 	ch "github.com/WuKongIM/WuKongIM/pkg/channel"
 	"github.com/WuKongIM/WuKongIM/pkg/channel/machine"
+	"github.com/WuKongIM/WuKongIM/pkg/channel/replication"
 	"github.com/WuKongIM/WuKongIM/pkg/channel/store"
 	"github.com/WuKongIM/WuKongIM/pkg/channel/transport"
 	"github.com/WuKongIM/WuKongIM/pkg/channel/worker"
@@ -22,8 +23,10 @@ const (
 	defaultFollowerRecoveryProbeInterval = 2 * time.Second
 	// defaultFollowerRecoveryProbeJitter spreads recovery probes without exceeding the send timeout budget.
 	defaultFollowerRecoveryProbeJitter = time.Second
+	// defaultFollowerRecoveryProbeMaxWindow caps caught-up anti-entropy backoff while spreading idle probes across its upper half.
+	defaultFollowerRecoveryProbeMaxWindow = time.Minute
 	// defaultCommittedCheckpointInterval coalesces the final HW learned after empty pulls.
-	defaultCommittedCheckpointInterval = time.Second
+	defaultCommittedCheckpointInterval = 5 * time.Second
 )
 
 // ReactorConfig wires one reactor.
@@ -32,6 +35,8 @@ type ReactorConfig struct {
 	LocalNode ch.NodeID
 	Store     store.Factory
 	Pools     *worker.Pools
+	// QuorumLog replaces the store-then-pull append path when configured.
+	QuorumLog replication.DurableQuorumLog
 	// MailboxSize bounds each priority queue in this reactor.
 	MailboxSize int
 	// MaxChannels bounds loaded runtimes owned by this reactor when MaxChannelsEnabled is true.
@@ -134,6 +139,8 @@ type Reactor struct {
 	activeLeaderRuntimeCount int
 	// activeFollowerRuntimeCount tracks loaded follower runtimes without scanning the channel map.
 	activeFollowerRuntimeCount int
+	// parkedFollowerRuntimeCount tracks parked loaded followers without scanning the channel map.
+	parkedFollowerRuntimeCount int
 	// loadedMetaRefreshes tracks only loaded runtimes currently resolving authoritative metadata after a newer PullHint.
 	// The map stays nil on the ordinary hot path so idle channel cardinality has no per-runtime cost.
 	loadedMetaRefreshes map[ch.ChannelKey]*loadedMetaRefreshState
@@ -154,7 +161,14 @@ type runtimeChannel struct {
 	store   store.ChannelStore
 	pending *pendingMetaState
 	loading *storeLoadState
-	waiters map[ch.OpID]*Future
+	// quorumAuthority is the complete authority proven by the last successful install.
+	quorumAuthority replication.Authority
+	// quorumReadReady is set only after recovery and the current-authority barrier.
+	// Unlike CommitReady, a write fence does not make recovered reads unavailable.
+	quorumReadReady bool
+	// quorumInstall owns ApplyMeta futures until recovery and the term barrier finish.
+	quorumInstall *quorumInstallState
+	waiters       map[ch.OpID]*Future
 	// appendQ holds accepted append requests before they are flushed as durable batches.
 	appendQ appendQueue
 	// appendQueuePressure is the last pressure snapshot included in the reactor aggregate.
@@ -179,7 +193,7 @@ type runtimeChannel struct {
 	lifecycle channelRuntimeLifecycle
 	// pullWaiters maps leader-side async pull op ids to request futures.
 	pullWaiters map[ch.OpID]*pullWaiter
-	// lookupWaiters maps async committed-message lookup op ids to request futures.
+	// lookupWaiters owns message/source query futures and their lifecycle guards.
 	lookupWaiters map[ch.OpID]*lookupWaiter
 	// retentionWaiters maps async retention apply op ids to request futures.
 	retentionWaiters map[ch.OpID]*retentionWaiter
@@ -189,6 +203,8 @@ type runtimeChannel struct {
 	committedCheckpointOp ch.OpID
 	// committedCheckpointDue coalesces successive record-free HW advances into one final checkpoint.
 	committedCheckpointDue time.Time
+	// committedCheckpointBackoff bounds retries when the isolated checkpoint pool rejects admission.
+	committedCheckpointBackoff time.Duration
 	// due versions fence stale scheduler entries after channel state changes.
 	appendFlushDueVersion uint64
 	replicationDueVersion uint64
@@ -207,6 +223,12 @@ type loadedMetaRefreshState struct {
 	deadline        time.Time
 	cancel          context.CancelFunc
 	inflight        bool
+}
+
+type quorumInstallState struct {
+	opID      ch.OpID
+	authority replication.Authority
+	futures   []*Future
 }
 
 type storeLoadKind uint8

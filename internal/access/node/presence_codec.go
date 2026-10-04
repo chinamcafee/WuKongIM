@@ -23,6 +23,8 @@ const (
 	presenceOpEndpointsByTargetsID
 	presenceOpAdvanceCredentialFenceID
 	presenceOpAckCredentialActionID
+	presenceOpReadOwnerRoutesID
+	presenceOpReadOwnerRoutesByTargetsID
 )
 
 const maxPresenceRPCCollectionLen = 4096
@@ -83,7 +85,7 @@ func encodePresenceRPCRequestBinary(req presenceRPCRequest) ([]byte, error) {
 	dst := make([]byte, 0, 128)
 	dst = append(dst, presenceRPCRequestMagic[:]...)
 	dst = append(dst, opID)
-	if req.Op == presenceOpEndpointsByTargets {
+	if req.Op == presenceOpEndpointsByTargets || req.Op == presenceOpReadOwnerRoutes || req.Op == presenceOpReadOwnerRoutesByTargets {
 		return appendPresenceEndpointLookupGroups(dst, req.EndpointGroups)
 	}
 	dst = appendPresenceRouteTarget(dst, req.Target)
@@ -115,7 +117,7 @@ func decodePresenceRPCRequest(body []byte) (presenceRPCRequest, error) {
 
 	var req presenceRPCRequest
 	req.Op = op
-	if req.Op == presenceOpEndpointsByTargets {
+	if req.Op == presenceOpEndpointsByTargets || req.Op == presenceOpReadOwnerRoutes || req.Op == presenceOpReadOwnerRoutesByTargets {
 		if req.EndpointGroups, offset, err = readPresenceEndpointLookupGroups(body, offset); err != nil {
 			return presenceRPCRequest{}, err
 		}
@@ -282,6 +284,10 @@ func presenceOpID(op string) (byte, error) {
 		return presenceOpTouchRoutesID, nil
 	case presenceOpApplyRouteAction:
 		return presenceOpApplyRouteActionID, nil
+	case presenceOpReadOwnerRoutesByTargets:
+		return presenceOpReadOwnerRoutesByTargetsID, nil
+	case presenceOpReadOwnerRoutes:
+		return presenceOpReadOwnerRoutesID, nil
 	case presenceOpEndpointsByTargets:
 		return presenceOpEndpointsByTargetsID, nil
 	case presenceOpAdvanceCredentialFence:
@@ -309,6 +315,10 @@ func presenceOpFromID(op byte) (string, error) {
 		return presenceOpTouchRoutes, nil
 	case presenceOpApplyRouteActionID:
 		return presenceOpApplyRouteAction, nil
+	case presenceOpReadOwnerRoutesByTargetsID:
+		return presenceOpReadOwnerRoutesByTargets, nil
+	case presenceOpReadOwnerRoutesID:
+		return presenceOpReadOwnerRoutes, nil
 	case presenceOpEndpointsByTargetsID:
 		return presenceOpEndpointsByTargets, nil
 	case presenceOpAdvanceCredentialFenceID:

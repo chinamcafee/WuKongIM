@@ -1,0 +1,166 @@
+---
+title: C# quickstart
+description: Prepare, install, connect, exchange the first messages, and clean up.
+---
+
+Use .NET 8+ and NuGet **WK_EASYSDK_CSHARP_VERSION** to exchange online messages between two independent console clients.
+
+## 1. Prepare
+
+- Prepare .NET 8 or later on Windows, Linux, or macOS. The target framework is `net8.0`; Unity, .NET Framework, and browser WebAssembly are not currently supported.
+- Start a WuKongIM single-node cluster or multi-node cluster with a healthy `/readyz` and a reachable WebSocket Gateway. A single-node cluster still follows cluster semantics and defaults to 256 hash slots.
+- Have your trusted backend supply separate `uid`, `token`, and `websocketUrl` values for Alice and Bob. Clients do not call WuKongIM HTTP API management routes such as `/user/token` or `/route`.
+- C# defaults to PC/Desktop `2`. The backend token's `device_flag` must match the client; APP is `0` and Web is `1`.
+
+Read [Identity & Token](/en/guide/integration/authentication) first. Production uses HTTPS/WSS with certificate validation. Tokens do not belong in URLs, logs, or source code.
+
+After product login, retrieve this minimal response through a protected product route:
+
+```json
+{
+  "uid": "alice",
+  "token": "backend-issued-desktop-token",
+  "websocketUrl": "wss://im.example.com/ws"
+}
+```
+
+The console example reads these values from `WUKONGIM_WS_URL`, `WUKONGIM_UID`, and `WUKONGIM_TOKEN`. A desktop application can consume the login response directly. These variables belong to the example; they are not the server's `WK_` configuration keys.
+
+Use [the shared example setup](/en/sdk/easy/examples) for the server, test accounts, and reachable addresses, then continue with installation below.
+
+## 2. Install the SDK
+
+```bash
+dotnet new console -n MyChat --framework net8.0
+dotnet add MyChat/MyChat.csproj package WuKongEasySDK --version WK_EASYSDK_CSHARP_VERSION --source https://api.nuget.org/v3/index.json
+```
+
+## 3. Connect and listen
+
+Replace `MyChat/Program.cs` with the following. Set the three environment variables for the current identity and supply the other user's UID as a command-line argument.
+
+```csharp
+using WuKongEasySDK;
+
+static string Required(string name) =>
+    Environment.GetEnvironmentVariable(name)
+    ?? throw new InvalidOperationException($"Missing {name}");
+
+if (args.Length != 1)
+    throw new ArgumentException("Pass the peer UID as the first argument.");
+
+await using var im = new WKIM(Required("WUKONGIM_WS_URL"), new AuthOptions
+{
+    Uid = Required("WUKONGIM_UID"),
+    Token = Required("WUKONGIM_TOKEN"),
+    DeviceFlag = DeviceFlag.Desktop
+}, new WKIMOptions
+{
+    ConnectTimeout = TimeSpan.FromSeconds(10),
+    RequestTimeout = TimeSpan.FromSeconds(15)
+});
+
+Action<RecvMessage> onMessage = message =>
+{
+    // Deduplicate by MessageId and pass Payload to application state.
+    // Marshal WinForms/WPF updates to the UI thread; do not log full messages.
+    Console.WriteLine("Message received.");
+};
+im.Message += onMessage;
+im.Connected += _ => Console.WriteLine("Connected.");
+im.Disconnected += _ => Console.WriteLine("Disconnected.");
+im.Error += _ => Console.WriteLine("SDK operation failed.");
+im.CustomEvent += notification =>
+{
+    // Route notification.Data using notification.Type.
+};
+
+try
+{
+    await im.ConnectAsync();
+    Console.WriteLine("Start the peer, then press Enter to send.");
+    Console.ReadLine();
+    var result = await im.SendAsync(args[0], ChannelType.Person,
+        new { type = 1, content = "Hello from C# 👋" });
+    if (!result.IsSuccess)
+        Console.WriteLine($"SEND rejected: {(int)result.ReasonCode}");
+    else
+        Console.WriteLine("Server accepted SEND.");
+    Console.WriteLine("Press Enter after checking both directions to exit.");
+    Console.ReadLine();
+}
+finally
+{
+    im.Message -= onMessage;
+    await im.DisconnectAsync();
+}
+```
+
+In separate terminals using Alice and Bob's connection material, run `dotnet run --project MyChat -- bob` and `dotnet run --project MyChat -- alice`. Async methods return exceptions to their callers and background failures also raise `Error`; provide application handling for authentication failures, timeouts, and business rejections.
+
+SDK logging is disabled by default. Setting `WKIMOptions.DebugLogger` enables only fixed operational strings, excluding tokens, payloads, raw frames, and server error bodies.
+
+## 4. Exchange the first message
+
+Once both clients are connected, Alice sends to `bob` and Bob checks the sender and content in the message callback. Then Bob sends to `alice`. A send result means the server accepted the request; it is not recipient delivery or a read receipt.
+
+Use `ChannelType.Group` with a backend-managed group ID for group messages. Membership and permissions remain server decisions. `SendOptions` provides `ClientMsgNo`, `Header`, `Setting`, and `Topic`. The default header sets `RedDot = true`; an explicitly supplied header is respected.
+
+`ReasonCode.Success` is **1**. `SendResult.IsSuccess` means the server accepted SEND, not that Bob received, displayed, or read it. Business rejection codes such as `128–255` remain in the result. JSON-RPC errors throw `WKIMRpcException` with a numeric `Code`.
+
+Message IDs use `string`; numeric wire IDs never pass through floating-point conversion. `MessageSeq` and `NodeId` use `ulong`. Message `Timestamp` is Unix **seconds**; custom event `Timestamp` is Unix **milliseconds**.
+
+`RecvMessage.Payload` and `EventNotification.Data` are independently owned `JsonElement` values. Receive payloads accept JSON objects or Base64 JSON; undecodable strings remain unchanged. Custom event JSON strings become JSON values, while plain strings remain strings.
+
+## 5. Clean up
+
+| Behavior | C# SDK contract |
+| --- | --- |
+| Instance ownership | `new WKIM` / `WKIM.Init` creates an independent instance; no implicit global singleton |
+| Concurrent connects | `ConnectAsync` callers share the attempt; canceling one cancels only its wait |
+| Stop shared connection | Await `DisconnectAsync` before connecting again |
+| Initial failure | WebSocket open and authentication share a 10-second budget; failure returns directly |
+| Loss after connection | Up to five retries by default, at 1, 2, 4, 8, and 16 seconds; success resets the budget |
+| Stop automatic retry | Authentication rejection, server disconnect/kick, manual disconnect, or disposal |
+| Final cleanup | Await `DisposeAsync` from lifecycle code, or use `await using` |
+
+For token rotation or account switching, dispose the old instance and create one with fresh backend-issued credentials. Set `AuthOptions.DeviceId` explicitly when the device identifier should persist across processes.
+
+Events run serially in the background. Keep handlers short; do not synchronously wait for SDK async operations or wait for disposal inside a callback. A throwing handler does not prevent other listeners or automatic ACK. Already queued callbacks may finish after listener removal or disconnect; `DisposeAsync` waits for them to drain.
+
+RECVACK means admission to the SDK receive queue, not successful business processing. Defaults are 256 pending requests, 128 queued events, and 1 MiB per complete JSON-RPC envelope. Excess requests throw `WKIMBackpressureException`; a full event queue closes the connection without ACKing the unaccepted message. Configure these bounds through `WKIMOptions`.
+
+The SDK does not queue offline messages or automatically resend SEND. A timeout, cancellation, or disconnect may leave the send outcome uncertain. Reconcile business state first; reuse `SendOptions.ClientMsgNo` when retrying the same logical message. Your application owns offline recovery, conversations, unread counts, push, and business receipts.
+
+## 6. Troubleshooting
+
+**Does reconnect select another address?** Each instance retries its fixed URL. Let the backend choose a live ingress, await `DisposeAsync` on the old instance, and create a replacement. Complete three-node fault recovery still has [known server issues](https://github.com/WuKongIM/WuKongIM/issues/927); single-node messaging does not establish continuous availability during cluster faults.
+
+**Can I retry a timed-out send?** Its result may be unknown. Reconcile first, then follow the `ClientMsgNo` idempotency contract.
+
+**Why does a UI update fail?** Events dispatch in the background; marshal WinForms/WPF updates to the UI thread.
+
+## Alternative installation: source and local packages
+
+```bash
+git clone https://github.com/WuKongIM/WuKongEasySDK-CSharp.git
+git -C WuKongEasySDK-CSharp checkout WK_EASYSDK_CSHARP_SOURCE_REF
+dotnet new console -n MyChat --framework net8.0
+dotnet add MyChat/MyChat.csproj reference WuKongEasySDK-CSharp/src/WuKongEasySDK/WuKongEasySDK.csproj
+```
+
+The two directories are siblings. Record the exact source revision in your build configuration or maintain the reference through a submodule pinned to that commit.
+
+For a local NuGet installation, build the package from that pinned checkout:
+
+```bash
+cd WuKongEasySDK-CSharp
+dotnet pack src/WuKongEasySDK -c Release -o artifacts
+dotnet add ../MyChat/MyChat.csproj package WuKongEasySDK --version WK_EASYSDK_CSHARP_VERSION --source ./artifacts
+```
+
+Choose one of the public package, project reference, or local package. Do not combine them. Here, `--source ./artifacts` is the local feed you just built.
+
+## Next
+
+Continue with [messaging](/en/guide/integration/messaging) and [production checks](/en/guide/integration/acceptance). For offline recovery, conversations, unread counts, or push, see [SDK selection](/en/sdk). [Versions and validation records](https://github.com/WuKongIM/WuKongIM/blob/main/docs/superpowers/reports/2026-09-08-easysdk-validation-history.md#csharp) retain the exact environments and scope of past runs.

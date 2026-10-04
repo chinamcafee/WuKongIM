@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/access/api/demoui"
+	"github.com/WuKongIM/WuKongIM/internal/contracts/protocolmeta"
 	obsdiagnostics "github.com/WuKongIM/WuKongIM/internal/observability/diagnostics"
+	"github.com/WuKongIM/WuKongIM/internal/usecase/benchterminal"
 	channelusecase "github.com/WuKongIM/WuKongIM/internal/usecase/channel"
 	cmdsyncusecase "github.com/WuKongIM/WuKongIM/internal/usecase/cmdsync"
 	conversationusecase "github.com/WuKongIM/WuKongIM/internal/usecase/conversation"
@@ -28,8 +30,26 @@ import (
 
 const versionV1 = "bench/v1"
 
+// DemoHomePath is the catalog linking the five independent Demo scenarios.
+const DemoHomePath = "/demos/"
+
 // DemoPath is the canonical route for the embedded chat Demo.
 const DemoPath = "/demo/"
+
+// StreamDemoPath serves the independent EasySDK streaming demonstration.
+const StreamDemoPath = "/streamdemo/"
+
+// SupportDemoPath serves the customer support UI backed by its Demo process.
+const SupportDemoPath = "/supportdemo/"
+
+// AgentDemoPath serves the task assistant UI backed by its Demo process.
+const AgentDemoPath = "/agentdemo/"
+
+// MQTTDemoPath serves the smart-store UI backed by browser MQTT clients.
+const MQTTDemoPath = "/mqttdemo/"
+
+// LiveDemoPath serves the live-room UI backed by browser SDK clients.
+const LiveDemoPath = "/livedemo/"
 
 // ErrListenAddrRequired reports that the HTTP API listen address is empty.
 var ErrListenAddrRequired = errors.New("internal/access/api: listen address required")
@@ -47,13 +67,19 @@ type GatewayAddresses struct {
 // ChannelRuntimeBenchController exposes benchmark-only channel runtime controls.
 type ChannelRuntimeBenchController interface {
 	Snapshot(context.Context, model.ChannelRuntimeQuery) (model.ChannelRuntimeSnapshot, error)
-	Probe(context.Context, model.ChannelRuntimeQuery) (model.ChannelRuntimeProbeResult, error)
+	Probe(context.Context, model.ChannelRuntimeProbeQuery) (model.ChannelRuntimeProbeResult, error)
 	Evict(context.Context, model.ChannelRuntimeQuery) (model.ChannelRuntimeEvictResult, error)
 }
 
 // PresenceBenchController exposes benchmark-only presence route diagnostics.
 type PresenceBenchController interface {
 	Snapshot(context.Context) (model.PresenceSnapshot, error)
+}
+
+// TerminalFenceBenchController closes and drains one benchmark product
+// generation before issuing its owner-local session fence grant.
+type TerminalFenceBenchController interface {
+	Prepare(context.Context, benchterminal.PrepareRequest) (benchterminal.Grant, error)
 }
 
 // DiagnosticsReader queries node-local diagnostics events for debug API routes.
@@ -78,6 +104,17 @@ type LegacyRouteAddresses struct {
 	WSSAddr string
 }
 
+// LegacyRouteHostFallback permits request-host substitution only for listener-derived
+// default external addresses. Explicit published addresses must leave their flag false.
+type LegacyRouteHostFallback struct {
+	// TCP permits replacing an unspecified TCP listener host.
+	TCP bool
+	// WS permits replacing an unspecified WebSocket listener host.
+	WS bool
+	// WSS permits replacing an unspecified secure WebSocket listener host.
+	WSS bool
+}
+
 // LegacyRouteNodeAddresses stores public and intranet route addresses for one cluster node.
 type LegacyRouteNodeAddresses struct {
 	// External is returned by legacy route APIs unless the request asks for intranet addresses.
@@ -91,6 +128,7 @@ type MessageUsecase interface {
 	Send(context.Context, messageusecase.SendCommand) (messageusecase.SendResult, error)
 	AppendMessageEvent(context.Context, messageusecase.MessageEventAppend) (messageusecase.MessageEventAppendResult, error)
 	SyncChannelMessages(context.Context, messageusecase.SyncChannelMessagesQuery) (messageusecase.SyncChannelMessagesResult, error)
+	SyncChannelMessagesBatch(context.Context, messageusecase.SyncChannelMessagesBatchQuery) (messageusecase.SyncChannelMessagesBatchResult, error)
 }
 
 // CMDSyncUsecase coordinates compatible durable command-message sync routes.
@@ -99,63 +137,41 @@ type CMDSyncUsecase interface {
 	SyncAck(context.Context, cmdsyncusecase.SyncAckCommand) error
 	BatchSync(context.Context, cmdsyncusecase.BatchSyncQuery) (cmdsyncusecase.BatchSyncResult, error)
 	BatchAck(context.Context, cmdsyncusecase.BatchAckCommand) error
+	Bind(context.Context, cmdsyncusecase.BindCommand) error
+	Unbind(context.Context, cmdsyncusecase.UnbindCommand) error
 }
 
 // ConversationUsecase coordinates compatible conversation list and sync routes.
 type ConversationUsecase interface {
 	List(context.Context, conversationusecase.ListRequest) (conversationusecase.ListResult, error)
-	Sync(context.Context, conversationusecase.SyncQuery) (conversationusecase.SyncResult, error)
 	ClearUnread(context.Context, conversationusecase.ClearUnreadCommand) error
 	SetUnread(context.Context, conversationusecase.SetUnreadCommand) error
 	DeleteConversation(context.Context, conversationusecase.DeleteConversationCommand) error
+	ActivateConversation(context.Context, conversationusecase.ActivateConversationCommand) error
 }
 
 // ConversationListObservation captures one /conversation/list request result.
 type ConversationListObservation struct {
 	// Result is a low-cardinality request result label.
 	Result string
-	// Duration is the end-to-end handler latency.
+	// Duration ends before successful response DTO construction and JSON write.
+	// Error observations include the error response write for compatibility.
 	Duration time.Duration
-	// ReturnedItems is the number of conversation rows returned to the client.
+	// ScannedCandidates is the number of membership rows consumed by the page.
+	ScannedCandidates int
+	// ReturnedItems is the number of transient conversation items returned.
 	ReturnedItems int
-	// SparseItems is the number of returned rows using sparse active ordering.
-	SparseItems int
-	// LastMessageLoads is the number of last-message loads attempted for returned rows.
-	LastMessageLoads int
-	// LastMessageErrors is the number of last-message load errors observed by the request.
-	LastMessageErrors int
-	// ActiveIndexStaleSkips is the number of stale active-index rows skipped by the request.
-	ActiveIndexStaleSkips int
-	// More reports whether the active page has another page after this response.
-	More bool
-}
-
-// ConversationSyncObservation captures one /conversation/sync request result.
-type ConversationSyncObservation struct {
-	// Result is a low-cardinality request result label.
-	Result string
-	// Duration is the end-to-end handler latency.
-	Duration time.Duration
-	// OnlyUnread reports whether the request asked for unread conversations only.
-	OnlyUnread bool
-	// WithRecents reports whether the request asked for recent messages.
-	WithRecents bool
-	// ReturnedItems is the number of conversation rows returned to the client.
-	ReturnedItems int
-	// OverlayItems is the number of client-known overlay candidates before sync filtering.
-	OverlayItems int
-	// RecentLoadDuration records how long recent-message loading took when requested.
-	RecentLoadDuration time.Duration
+	// Deletes is the number of tombstone or terminal-channel keys returned.
+	Deletes int
+	// Unresolved is retained for metrics compatibility; canonical lists always report zero.
+	Unresolved int
+	// Done reports whether this membership-directory pass is complete.
+	Done bool
 }
 
 // ConversationListObserver receives performance observations for conversation list reads.
 type ConversationListObserver interface {
 	ObserveConversationList(ConversationListObservation)
-}
-
-// ConversationSyncObserver receives performance observations for conversation sync reads.
-type ConversationSyncObserver interface {
-	ObserveConversationSync(ConversationSyncObservation)
 }
 
 // ChannelUsecase coordinates compatible channel metadata and member mutations.
@@ -227,6 +243,12 @@ type BenchSubscriberMutation struct {
 
 // Options configures the minimal internal HTTP API server.
 type Options struct {
+	// ContentEpoch identifies the durable data generation after cluster restore.
+	ContentEpoch func(context.Context) (uint64, error)
+	// ContentReadFence returns an opaque transition stamp and active-restore flag.
+	// Restore-capable embeddings must supply it to detect completed failed restores.
+	// The stamp changes before data replacement and again before resuming entry.
+	ContentReadFence func() (uint64, bool)
 	// ListenAddr is the HTTP API listen address. An empty value makes Start fail.
 	ListenAddr string
 	// Readyz reports whether the node is ready for benchmark traffic.
@@ -236,7 +258,7 @@ type Options struct {
 	Maintenance func() bool
 	// BenchEnabled exposes /bench/v1/* routes for controlled benchmark runs.
 	BenchEnabled bool
-	// BenchToken optionally requires an exact bearer capability on every /bench/v1/* route.
+	// BenchToken optionally requires one exact bearer capability on every /bench/v1/* and /debug/* route.
 	BenchToken string
 	// BenchMaxBatchSize limits top-level records accepted by one bench mutation request.
 	BenchMaxBatchSize int
@@ -254,6 +276,8 @@ type Options struct {
 	BenchRuntime ChannelRuntimeBenchController
 	// BenchPresence controls benchmark-only presence route diagnostics when configured.
 	BenchPresence PresenceBenchController
+	// BenchTerminalFence controls the one-shot product-generation terminal cut.
+	BenchTerminalFence TerminalFenceBenchController
 	// BenchData stores benchmark channel/subscriber setup when configured.
 	BenchData BenchData
 	// Top provides the node-local read-only operations snapshot for wkcli top.
@@ -266,16 +290,24 @@ type Options struct {
 	DeviceCredentials DeviceCredentialUsecase
 	// Messages handles compatible message send and channel message sync routes.
 	Messages MessageUsecase
+	// Plugins handles the legacy business-backend /plugins/:plugin_no/*path route.
+	Plugins PluginHTTPRouter
+	// PluginTimeout bounds one route invocation; defaults to five seconds.
+	PluginTimeout time.Duration
+	// SystemUID is the configured primary system account used when message senders
+	// are omitted and when legacy conversation responses hide system traffic.
+	SystemUID string
 	// CMDSync handles compatible durable command-message sync routes.
 	CMDSync CMDSyncUsecase
 	// Conversations handles compatible conversation list routes.
 	Conversations ConversationUsecase
 	// ConversationListObserver records conversation list read performance.
 	ConversationListObserver ConversationListObserver
-	// ConversationSyncObserver records conversation sync read performance.
-	ConversationSyncObserver ConversationSyncObserver
 	// LegacyRouteExternal is the default public gateway address set returned by /route APIs.
 	LegacyRouteExternal LegacyRouteAddresses
+	// LegacyRouteHostFallback selects default external addresses eligible for request-host completion.
+	// It never applies to intranet requests or explicit node selectors.
+	LegacyRouteHostFallback LegacyRouteHostFallback
 	// LegacyRouteIntranet is the default intranet gateway address set returned by /route APIs.
 	LegacyRouteIntranet LegacyRouteAddresses
 	// LegacyRouteNodes maps node_id query parameters to node-specific legacy route addresses.
@@ -286,8 +318,8 @@ type Options struct {
 	DebugAPIEnabled bool
 	// DebugConfig returns a bounded configuration snapshot for /debug/config.
 	DebugConfig func() any
-	// DebugCluster returns a bounded cluster snapshot for /debug/cluster.
-	DebugCluster func() any
+	// DebugCluster returns a bounded live cluster snapshot for /debug/cluster.
+	DebugCluster func(context.Context) (any, error)
 	// Diagnostics reads the node-local diagnostics store for debug query endpoints.
 	Diagnostics DiagnosticsReader
 	// GoroutineSnapshot returns the current goroutine registry snapshot. Nil disables the endpoint.
@@ -298,6 +330,8 @@ type Options struct {
 
 // Server exposes health, readiness, and the minimum bench/v1 target surface for wukongim.
 type Server struct {
+	contentEpoch                   func(context.Context) (uint64, error)
+	contentReadFence               func() (uint64, bool)
 	mu                             sync.RWMutex
 	engine                         *gin.Engine
 	httpServer                     *http.Server
@@ -310,46 +344,59 @@ type Server struct {
 	benchToken                     string
 	benchMaxBatchSize              int
 	benchMaxPayloadBytes           int64
-	internalCredentialHMACSecret   string
-	internalCredentialReplayWindow time.Duration
-	internalCredentialMaxBatchSize int
-	internalCredentialNonces       *credentialNonceCache
 	gateway                        GatewayAddresses
 	benchRuntime                   ChannelRuntimeBenchController
 	benchPresence                  PresenceBenchController
+	benchTerminalFence             TerminalFenceBenchController
 	benchData                      BenchData
 	top                            TopSnapshotProvider
 	channels                       ChannelUsecase
 	users                          UserUsecase
-	deviceCredentials              DeviceCredentialUsecase
 	messages                       MessageUsecase
+	plugins                        PluginHTTPRouter
+	pluginTimeout                  time.Duration
+	systemUID                      string
 	cmdSync                        CMDSyncUsecase
 	conversations                  ConversationUsecase
 	conversationObserver           ConversationListObserver
-	conversationSyncObserver       ConversationSyncObserver
 	legacyRouteExternal            LegacyRouteAddresses
+	legacyRouteFallback            LegacyRouteHostFallback
 	legacyRouteIntranet            LegacyRouteAddresses
 	legacyRouteNodes               map[uint64]LegacyRouteNodeAddresses
 	metricsHandler                 http.Handler
 	debugAPIEnabled                bool
 	debugConfig                    func() any
-	debugCluster                   func() any
+	debugCluster                   func(context.Context) (any, error)
 	goroutineSnapshot              func() any
 	diagnostics                    DiagnosticsReader
 	logger                         wklog.Logger
 	counts                         map[string]int
 	started                        bool
+	internalCredentialHMACSecret   string
+	internalCredentialReplayWindow time.Duration
+	internalCredentialMaxBatchSize int
+	internalCredentialNonces       *credentialNonceCache
+	deviceCredentials              DeviceCredentialUsecase
 }
 
 // New creates a minimal internal API server.
 func New(opts Options) *Server {
+	if opts.PluginTimeout <= 0 {
+		opts.PluginTimeout = 5 * time.Second
+	}
 	if gin.Mode() != gin.ReleaseMode {
 		gin.SetMode(gin.ReleaseMode)
 	}
 	engine := gin.New()
 	engine.Use(openCORSMiddleware())
 	engine.HandleMethodNotAllowed = true
+	systemUID := strings.TrimSpace(opts.SystemUID)
+	if systemUID == "" {
+		systemUID = userusecase.DefaultSystemUID
+	}
 	s := &Server{
+		contentEpoch:                   opts.ContentEpoch,
+		contentReadFence:               opts.ContentReadFence,
 		engine:                         engine,
 		listenAddr:                     strings.TrimSpace(opts.ListenAddr),
 		readyz:                         opts.Readyz,
@@ -358,23 +405,23 @@ func New(opts Options) *Server {
 		benchToken:                     strings.TrimSpace(opts.BenchToken),
 		benchMaxBatchSize:              opts.BenchMaxBatchSize,
 		benchMaxPayloadBytes:           opts.BenchMaxPayloadBytes,
-		internalCredentialHMACSecret:   strings.TrimSpace(opts.InternalCredentialHMACSecret),
-		internalCredentialReplayWindow: opts.InternalCredentialReplayWindow,
-		internalCredentialMaxBatchSize: opts.InternalCredentialMaxBatchSize,
 		gateway:                        opts.Gateway,
 		benchRuntime:                   opts.BenchRuntime,
 		benchPresence:                  opts.BenchPresence,
+		benchTerminalFence:             opts.BenchTerminalFence,
 		benchData:                      opts.BenchData,
 		top:                            opts.Top,
 		channels:                       opts.Channels,
 		users:                          opts.Users,
-		deviceCredentials:              opts.DeviceCredentials,
 		messages:                       opts.Messages,
+		plugins:                        opts.Plugins,
+		pluginTimeout:                  opts.PluginTimeout,
+		systemUID:                      systemUID,
 		cmdSync:                        opts.CMDSync,
 		conversations:                  opts.Conversations,
 		conversationObserver:           opts.ConversationListObserver,
-		conversationSyncObserver:       opts.ConversationSyncObserver,
 		legacyRouteExternal:            opts.LegacyRouteExternal,
+		legacyRouteFallback:            opts.LegacyRouteHostFallback,
 		legacyRouteIntranet:            opts.LegacyRouteIntranet,
 		legacyRouteNodes:               cloneLegacyRouteNodes(opts.LegacyRouteNodes),
 		metricsHandler:                 opts.MetricsHandler,
@@ -385,6 +432,10 @@ func New(opts Options) *Server {
 		diagnostics:                    opts.Diagnostics,
 		logger:                         opts.Logger,
 		counts:                         map[string]int{},
+		internalCredentialHMACSecret:   strings.TrimSpace(opts.InternalCredentialHMACSecret),
+		internalCredentialReplayWindow: opts.InternalCredentialReplayWindow,
+		internalCredentialMaxBatchSize: opts.InternalCredentialMaxBatchSize,
+		deviceCredentials:              opts.DeviceCredentials,
 	}
 	if s.internalCredentialReplayWindow <= 0 {
 		s.internalCredentialReplayWindow = 5 * time.Minute
@@ -396,9 +447,22 @@ func New(opts Options) *Server {
 	if s.logger == nil {
 		s.logger = wklog.NewNop()
 	}
+	s.engine.Use(s.debugBearerMiddleware())
 	s.engine.Use(s.restoreMaintenanceMiddleware())
+	s.engine.Use(s.messageContentEpochMiddleware())
 	s.registerRoutes()
 	return s
+}
+
+func (s *Server) debugBearerMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		path := c.Request.URL.Path
+		if s == nil || s.benchToken == "" || (path != "/debug" && !strings.HasPrefix(path, "/debug/")) {
+			c.Next()
+			return
+		}
+		s.requireBenchToken(c)
+	}
 }
 
 func (s *Server) restoreMaintenanceMiddleware() gin.HandlerFunc {
@@ -417,13 +481,19 @@ func (s *Server) restoreMaintenanceMiddleware() gin.HandlerFunc {
 
 func restoreMaintenanceAllowedPath(path string) bool {
 	switch path {
-	case "/healthz", "/readyz", "/metrics", "/top/v1/snapshot":
+	case "/", "/healthz", "/readyz", "/metrics", "/top/v1/snapshot":
 		return true
 	}
 	return strings.HasPrefix(path, "/debug/") ||
 		path == "/debug" ||
+		strings.HasPrefix(path, DemoHomePath) || path == strings.TrimSuffix(DemoHomePath, "/") ||
 		strings.HasPrefix(path, DemoPath) ||
-		path == strings.TrimSuffix(DemoPath, "/")
+		path == strings.TrimSuffix(DemoPath, "/") ||
+		strings.HasPrefix(path, StreamDemoPath) || path == strings.TrimSuffix(StreamDemoPath, "/") ||
+		strings.HasPrefix(path, SupportDemoPath) || path == strings.TrimSuffix(SupportDemoPath, "/") ||
+		strings.HasPrefix(path, AgentDemoPath) || path == strings.TrimSuffix(AgentDemoPath, "/") ||
+		strings.HasPrefix(path, MQTTDemoPath) || path == strings.TrimSuffix(MQTTDemoPath, "/") ||
+		strings.HasPrefix(path, LiveDemoPath) || path == strings.TrimSuffix(LiveDemoPath, "/")
 }
 
 func cloneLegacyRouteNodes(nodes map[uint64]LegacyRouteNodeAddresses) map[uint64]LegacyRouteNodeAddresses {
@@ -553,8 +623,10 @@ func (s *Server) registerRoutes() {
 	s.registerChannelRoutes()
 	s.registerUserRoutes()
 	s.registerDeviceCredentialRoutes()
+	s.registerSendBanRoutes()
 	s.registerMessageRoutes()
 	s.registerConversationRoutes()
+	s.engine.Any("/plugins/:plugin_no/*path", s.handlePluginRoute)
 	s.engine.GET("/top/v1/snapshot", s.handleTopSnapshot)
 	if !s.benchEnabled {
 		return
@@ -567,6 +639,9 @@ func (s *Server) registerRoutes() {
 	bench.GET("/capacity-target", s.handleBenchCapacityTarget)
 	bench.GET("/snapshot", s.handleBenchSnapshot)
 	bench.GET("/presence/snapshot", s.handleBenchPresenceSnapshot)
+	if s.benchTerminalFence != nil && s.benchToken != "" {
+		bench.POST("/terminal-fence/prepare", s.handleBenchTerminalFencePrepare)
+	}
 	bench.GET("/channel-runtime/snapshot", s.handleBenchChannelRuntimeSnapshot)
 	bench.POST("/channel-runtime/probe", s.handleBenchChannelRuntimeProbe)
 	bench.POST("/channel-runtime/evict", s.handleBenchChannelRuntimeEvict)
@@ -576,24 +651,37 @@ func (s *Server) registerRoutes() {
 	bench.POST("/channels/subscribers/remove", s.handleBenchSubscriberRemovals)
 }
 
-// registerDemoRoutes mounts the embedded chat Demo below the product API.
+// registerDemoRoutes mounts read-only embedded Demo bundles below the product API.
 func (s *Server) registerDemoRoutes() {
-	demoPrefix := strings.TrimSuffix(DemoPath, "/")
-	handler := http.StripPrefix(demoPrefix, demoui.Handler())
-	redirect := func(c *gin.Context) {
-		target := DemoPath
+	rootRedirect := func(c *gin.Context) {
+		target := DemoHomePath
 		if c.Request.URL.RawQuery != "" {
 			target += "?" + c.Request.URL.RawQuery
 		}
 		http.Redirect(c.Writer, c.Request, target, http.StatusPermanentRedirect)
 	}
-	serve := func(c *gin.Context) {
-		handler.ServeHTTP(c.Writer, c.Request)
+	s.engine.GET("/", rootRedirect)
+	s.engine.HEAD("/", rootRedirect)
+	for _, bundle := range []struct {
+		path    string
+		handler http.Handler
+	}{{DemoHomePath, demoui.HomeHandler()}, {DemoPath, demoui.Handler()}, {StreamDemoPath, demoui.StreamHandler()}, {SupportDemoPath, demoui.SupportHandler()}, {AgentDemoPath, demoui.AgentHandler()}, {MQTTDemoPath, demoui.MQTTHandler()}, {LiveDemoPath, demoui.LiveHandler()}} {
+		prefix := strings.TrimSuffix(bundle.path, "/")
+		handler := http.StripPrefix(prefix, bundle.handler)
+		redirect := func(c *gin.Context) {
+			target := bundle.path
+			if c.Request.URL.RawQuery != "" {
+				target += "?" + c.Request.URL.RawQuery
+			}
+			http.Redirect(c.Writer, c.Request, target, http.StatusPermanentRedirect)
+		}
+		serve := func(c *gin.Context) { handler.ServeHTTP(c.Writer, c.Request) }
+		s.engine.GET(prefix, redirect)
+		s.engine.HEAD(prefix, redirect)
+		s.engine.GET(prefix+"/*path", serve)
+		s.engine.HEAD(prefix+"/*path", serve)
 	}
-	s.engine.GET(demoPrefix, redirect)
-	s.engine.HEAD(demoPrefix, redirect)
-	s.engine.GET(demoPrefix+"/*path", serve)
-	s.engine.HEAD(demoPrefix+"/*path", serve)
+
 }
 
 func (s *Server) requireBenchToken(c *gin.Context) {
@@ -687,8 +775,11 @@ type capabilitiesSupports struct {
 	// ChannelRuntimeFaults indicates support for runtime fault injection controls.
 	ChannelRuntimeFaults bool `json:"channel_runtime_faults"`
 	// ChannelRuntimeActivate indicates support for server-side diagnostic activation.
-	ChannelRuntimeActivate bool     `json:"channel_runtime_activate"`
-	ChannelTypes           []string `json:"channel_types"`
+	ChannelRuntimeActivate bool `json:"channel_runtime_activate"`
+	// TerminalFencePrepare indicates support for the authenticated one-shot
+	// product-generation terminal cut.
+	TerminalFencePrepare bool     `json:"terminal_fence_prepare"`
+	ChannelTypes         []string `json:"channel_types"`
 }
 
 type capabilitiesLimits struct {
@@ -701,7 +792,7 @@ func (s *Server) handleBenchCapabilities(c *gin.Context) {
 		Enabled: true,
 		Version: versionV1,
 		Supports: capabilitiesSupports{
-			UsersTokensBatch:               true,
+			UsersTokensBatch:               s.users != nil,
 			ChannelsBatch:                  s.benchData != nil,
 			ChannelSubscribersBatch:        s.benchData != nil,
 			ChannelSubscriberRemovalsBatch: s.benchData != nil,
@@ -712,7 +803,8 @@ func (s *Server) handleBenchCapabilities(c *gin.Context) {
 			ChannelRuntimeEvict:            s.benchRuntime != nil,
 			ChannelRuntimeFaults:           false,
 			ChannelRuntimeActivate:         false,
-			ChannelTypes:                   []string{"group"},
+			TerminalFencePrepare:           s.benchTerminalFence != nil && s.benchToken != "",
+			ChannelTypes:                   []string{"person", "group"},
 		},
 		Limits: capabilitiesLimits{
 			MaxBatchSize:    s.benchMaxBatchSize,
@@ -795,7 +887,22 @@ func (s *Server) handleBenchTokens(c *gin.Context) {
 		writeBenchError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.addCount("accepted_users", len(items))
+	if s.users == nil {
+		writeBenchError(c, http.StatusNotImplemented, "bench user token writer is not configured")
+		return
+	}
+	// Token preparation uses the same cluster-backed persistence as /user/token.
+	// A failed batch may have a durable prefix; callers can safely upsert it again.
+	for _, item := range items {
+		if err := s.users.UpdateToken(c.Request.Context(), userusecase.UpdateTokenCommand{
+			UID: item.UID, Token: item.Token,
+			DeviceFlag: protocolmeta.DeviceFlag(item.DeviceFlag), DeviceLevel: protocolmeta.DeviceLevel(item.DeviceLevel),
+		}); err != nil {
+			writeBenchError(c, http.StatusInternalServerError, "bench user token update failed")
+			return
+		}
+		s.addCount("accepted_users", 1)
+	}
 	c.JSON(http.StatusOK, mutationResponse{RunID: req.RunID, BatchID: req.BatchID, Accepted: len(items)})
 }
 

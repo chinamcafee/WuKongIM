@@ -16,7 +16,7 @@ var ErrRequestSubscribersRequired = errors.New("runtime/channelid: request subsc
 type RequestSubscriberChannel struct {
 	// SourceChannelID is the stable temporary channel ID derived from the subscriber snapshot.
 	SourceChannelID string
-	// CommandChannelID is SourceChannelID with the legacy command suffix applied.
+	// CommandChannelID is SourceChannelID with the configured command suffix applied.
 	CommandChannelID string
 	// ChannelType is always the temporary channel type for request-scoped sends.
 	ChannelType uint8
@@ -47,6 +47,11 @@ func NormalizeRequestSubscribers(subscribers []string) []string {
 
 // RequestSubscriberChannelFor derives the stable temp and command channel IDs for a subscriber snapshot.
 func RequestSubscriberChannelFor(subscribers []string) (RequestSubscriberChannel, error) {
+	return (CommandCodec{}).RequestSubscriberChannelFor(subscribers)
+}
+
+// RequestSubscriberChannelFor derives request-scoped IDs with the configured suffix.
+func (c CommandCodec) RequestSubscriberChannelFor(subscribers []string) (RequestSubscriberChannel, error) {
 	normalized := NormalizeRequestSubscribers(subscribers)
 	if len(normalized) == 0 {
 		return RequestSubscriberChannel{}, ErrRequestSubscribersRequired
@@ -57,7 +62,7 @@ func RequestSubscriberChannelFor(subscribers []string) (RequestSubscriberChannel
 	sourceID := strconv.FormatUint(h.Sum64(), 10)
 	return RequestSubscriberChannel{
 		SourceChannelID:  sourceID,
-		CommandChannelID: ToCommandChannel(sourceID),
+		CommandChannelID: c.ToCommandChannel(sourceID),
 		ChannelType:      frame.ChannelTypeTemp,
 		Subscribers:      normalized,
 	}, nil

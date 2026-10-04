@@ -15,10 +15,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/bench/metrics"
 	"github.com/WuKongIM/WuKongIM/internal/bench/report"
+	benchwkproto "github.com/WuKongIM/WuKongIM/internal/bench/wkproto"
 	benchworkload "github.com/WuKongIM/WuKongIM/internal/bench/workload"
 	"github.com/WuKongIM/WuKongIM/pkg/bench/model"
 	"github.com/WuKongIM/WuKongIM/pkg/hashslot"
@@ -173,38 +175,44 @@ func TestWorkerDuplicatePhasePostIsIdempotent(t *testing.T) {
 }
 
 func TestWorkerPhasePostAcceptsLongRunningHookWithoutWaiting(t *testing.T) {
-	runner := newBlockingPrepareRunner()
-	srv := NewServer(Config{ControlToken: "secret", WorkloadRunner: runner})
-	assign(t, srv, "secret", "run-a")
-	defer runner.release()
+	synctest.Test(t, func(t *testing.T) {
+		runner := newBlockingPrepareRunner()
+		defer runner.release()
+		srv := NewServer(Config{ControlToken: "secret", WorkloadRunner: runner})
+		assign(t, srv, "secret", "run-a")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		body := mustJSON(t, RunRequest{RunID: "run-a", AssignmentID: defaultTestAssignmentID("run-a")})
+		req := httptest.NewRequest(http.MethodPost, "/v1/phase/prepare", bytes.NewReader(body)).WithContext(ctx)
+		req.Header.Set("Authorization", "Bearer secret")
+		phaseDone := make(chan *httptest.ResponseRecorder, 1)
+		go func() {
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, req)
+			phaseDone <- rec
+		}()
+		<-runner.entered
+		cancel()
+		synctest.Wait()
+		assertAssignmentPending(t, runner.canceled)
 
-	phaseDone := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		phaseDone <- authorizedRecorder(t, srv, http.MethodPost, "/v1/phase/prepare", "secret", nil)
-	}()
-	require.True(t, runner.waitForCalls(1, time.Second), "prepare hook did not start")
-
-	select {
-	case rec := <-phaseDone:
-		require.Contains(t, []int{http.StatusAccepted, http.StatusOK}, rec.Code, rec.Body.String())
-	case <-time.After(50 * time.Millisecond):
-		t.Fatal("phase POST waited for the long-running hook")
-	}
-
-	status := workerStatusMap(t, srv, "secret")
-	require.Equal(t, string(PhaseAssigned), status["phase"])
-	require.Equal(t, string(PhasePrepare), status["active_phase"])
-	require.Equal(t, string(PhaseAssigned), status["completed_phase"])
-	require.Empty(t, status["last_error"])
-
-	runner.release()
-	require.Eventually(t, func() bool {
+		// Synthetic time reaches the HTTP grace period while the hook is blocked.
+		rec := <-phaseDone
+		require.Equal(t, http.StatusAccepted, rec.Code, rec.Body.String())
 		status := workerStatusMap(t, srv, "secret")
-		return status["phase"] == string(PhasePrepare) &&
-			status["completed_phase"] == string(PhasePrepare) &&
-			status["active_phase"] == nil &&
-			status["last_error"] == nil
-	}, time.Second, 10*time.Millisecond)
+		require.Equal(t, string(PhaseAssigned), status["phase"])
+		require.Equal(t, string(PhasePrepare), status["active_phase"])
+		require.Equal(t, string(PhaseAssigned), status["completed_phase"])
+		require.Empty(t, status["last_error"])
+
+		runner.release()
+		synctest.Wait()
+		status = workerStatusMap(t, srv, "secret")
+		require.Equal(t, string(PhasePrepare), status["phase"])
+		require.Equal(t, string(PhasePrepare), status["completed_phase"])
+		require.Empty(t, status["active_phase"])
+		require.Empty(t, status["last_error"])
+	})
 }
 
 func TestWorkerDuplicateInProgressAndCompletedPhasePostsDoNotRunHookTwice(t *testing.T) {
@@ -459,20 +467,145 @@ func TestWorkerStatusResponseStaysCompactForLargeAssignment(t *testing.T) {
 			OnlineIdentityIndexes: make([]int, 100_000),
 		},
 	}
-	require.NoError(t, srv.state.Assign(assignment))
+	_, err := srv.assignments.Assign(assignment)
+	require.NoError(t, err)
 
 	rec := authorizedRecorder(t, srv, http.MethodGet, "/v1/status", "secret", nil)
 
 	require.Equal(t, http.StatusOK, rec.Code)
-	require.Less(t, rec.Body.Len(), 1024, "status body must not scale with the worker plan")
+	require.LessOrEqual(t, rec.Body.Len(), 2304, "fixed lifecycle proof fields may grow, but status must not scale with the worker plan")
 	require.NotContains(t, rec.Body.String(), "online_identity_indexes")
+	require.NotContains(t, rec.Body.String(), `"clients":[`)
+	require.NotContains(t, rec.Body.String(), "bench-u-")
 	var status Status
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &status))
 	require.Equal(t, assignment.RunID, status.Assignment.RunID)
 	require.Equal(t, assignment.AssignmentID, status.Assignment.AssignmentID)
 	require.Equal(t, assignment.WorkerID, status.Assignment.WorkerID)
 	require.Empty(t, status.Assignment.Plan.OnlineIdentityIndexes)
-	require.Len(t, srv.state.Status().Assignment.Plan.OnlineIdentityIndexes, 100_000, "internal state must retain the full assignment")
+	require.Len(t, srv.assignments.controlStatus().Assignment.Plan.OnlineIdentityIndexes, 100_000, "internal state must retain the full assignment")
+}
+
+func TestWorkerStatusProjectsBoundedLiveLifecycleEvidence(t *testing.T) {
+	runner := &lifecycleSnapshotRunner{lifecycle: LifecycleStatus{
+		ActiveConnections: 2500,
+		ReconnectedUsers:  7,
+		Traffic: TrafficStatus{
+			LogicalSent:              100,
+			SendAttempts:             102,
+			SendACKs:                 99,
+			TerminalErrors:           0,
+			CorrectnessErrors:        0,
+			Remaining:                1,
+			RetryAttempts:            2,
+			RetryExhausted:           0,
+			StableClientMsgNo:        true,
+			RetryEvidenceComplete:    true,
+			MaximumRetriesPerMessage: 3,
+		},
+	}}
+	srv := NewServer(Config{ControlToken: "secret", WorkloadRunner: runner})
+	assign(t, srv, "secret", "run-a")
+
+	rec := authorizedRecorder(t, srv, http.MethodGet, "/v1/status", "secret", nil)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var status Status
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &status))
+	require.False(t, status.ObservedAt.IsZero())
+	require.NotNil(t, status.Lifecycle)
+	require.Equal(t, runner.lifecycle, *status.Lifecycle)
+	require.Less(t, rec.Body.Len(), 2048, "live status must remain independent of message and connection cardinality")
+}
+
+func TestWorkerStopReportsTerminalReceiveSealFailureAfterAssignmentCleanup(t *testing.T) {
+	runner := &terminalReceiveSealFailureRunner{
+		terminalCutTestRunner: newTerminalCutTestRunner(),
+		sealErr:               errors.New("private per-session receive failure"),
+	}
+	srv := NewServer(Config{ControlToken: "secret", WorkloadRunner: runner})
+	assignment := terminalCutTestAssignment(500 * time.Millisecond)
+	assignFull(t, srv, "secret", assignment)
+	for _, path := range []string{"/v1/phase/prepare", "/v1/phase/connect", "/v1/phase/warmup", "/v1/phase/run"} {
+		postPhase(t, srv, "secret", path, http.StatusOK)
+	}
+
+	cooldown := authorizedRecorder(t, srv, http.MethodPost, "/v1/phase/cooldown", "secret", nil)
+	require.Equal(t, http.StatusAccepted, cooldown.Code, cooldown.Body.String())
+	require.Eventually(t, func() bool { return runner.TerminalCutStatus().Ready }, time.Second, 5*time.Millisecond)
+	cut := terminalCutRequestForTest(assignment, time.Now().UTC())
+	ack := authorizedRecorder(t, srv, http.MethodPost, "/v1/terminal-cut", "secret", mustJSON(t, cut))
+	require.Equal(t, http.StatusOK, ack.Code, ack.Body.String())
+	require.Eventually(t, func() bool {
+		status := workerStatus(t, srv, "secret")
+		return status.Phase == PhaseCooldown && status.ActivePhase == ""
+	}, time.Second, 5*time.Millisecond)
+
+	stopBody := mustJSON(t, StopRequest{RunID: assignment.RunID, AssignmentID: assignment.AssignmentID})
+	stop := authorizedRecorder(t, srv, http.MethodPost, "/v1/stop", "secret", stopBody)
+	require.Equal(t, http.StatusInternalServerError, stop.Code, stop.Body.String())
+	require.JSONEq(t, `{"error":"terminal receive seal failed","reason_code":"terminal_receive_seal_failed"}`, stop.Body.String())
+	require.NotContains(t, stop.Body.String(), "private per-session receive failure")
+	require.Equal(t, int32(1), runner.sealCalls.Load())
+	require.Equal(t, int32(1), runner.endCalls.Load(), "terminal proof failure must not abandon assignment cleanup")
+	status := workerStatus(t, srv, "secret")
+	require.Equal(t, PhaseStopped, status.Phase)
+	require.True(t, status.Lifecycle == nil || !status.Lifecycle.TerminalPreClose)
+
+	retry := authorizedRecorder(t, srv, http.MethodPost, "/v1/stop", "secret", stopBody)
+	require.Equal(t, http.StatusInternalServerError, retry.Code, retry.Body.String())
+	require.JSONEq(t, stop.Body.String(), retry.Body.String())
+	require.Equal(t, int32(1), runner.sealCalls.Load(), "exact retry must retain the failed terminal proof")
+	require.Equal(t, int32(1), runner.endCalls.Load(), "exact retry must not repeat teardown")
+}
+
+func TestWorkerStopBeforeCooldownDoesNotClaimTerminalPreCloseProof(t *testing.T) {
+	runner := &lifecycleSnapshotRunner{lifecycle: LifecycleStatus{ActiveConnections: 2500}}
+	srv := NewServer(Config{ControlToken: "secret", WorkloadRunner: runner})
+	assign(t, srv, "secret", "run-a")
+	postPhase(t, srv, "secret", "/v1/phase/connect", http.StatusConflict)
+
+	rec := authorizedRecorder(t, srv, http.MethodPost, "/v1/stop", "secret", nil)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var status Status
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &status))
+	if status.Lifecycle != nil {
+		require.False(t, status.Lifecycle.TerminalPreClose)
+	}
+}
+
+func TestWorkerCooldownFailureDoesNotClaimTerminalPreCloseProof(t *testing.T) {
+	runner := &recordingWorkloadRunner{failPhase: PhaseCooldown, failErr: context.DeadlineExceeded}
+	srv := NewServer(Config{ControlToken: "secret", WorkloadRunner: runner})
+	assign(t, srv, "secret", "run-a")
+	for _, path := range []string{"/v1/phase/prepare", "/v1/phase/connect", "/v1/phase/warmup", "/v1/phase/run"} {
+		postPhase(t, srv, "secret", path, http.StatusOK)
+	}
+	postPhase(t, srv, "secret", "/v1/phase/cooldown", http.StatusInternalServerError)
+
+	rec := authorizedRecorder(t, srv, http.MethodPost, "/v1/stop", "secret", nil)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var status Status
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &status))
+	require.Nil(t, status.Lifecycle, "a failed/canceled drain cannot produce pre-close terminal proof")
+}
+
+func TestWorkerSuccessfulCooldownWithRemainingWorkDoesNotClaimTerminalPreCloseProof(t *testing.T) {
+	runner := &lifecycleSnapshotRunner{lifecycle: LifecycleStatus{
+		ActiveConnections: 2500,
+		Traffic:           TrafficStatus{Remaining: 1},
+	}}
+	srv := NewServer(Config{ControlToken: "secret", WorkloadRunner: runner})
+	assign(t, srv, "secret", "run-a")
+	for _, path := range []string{"/v1/phase/prepare", "/v1/phase/connect", "/v1/phase/warmup", "/v1/phase/run", "/v1/phase/cooldown"} {
+		postPhase(t, srv, "secret", path, http.StatusOK)
+	}
+
+	rec := authorizedRecorder(t, srv, http.MethodPost, "/v1/stop", "secret", nil)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var status Status
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &status))
+	require.Nil(t, status.Lifecycle, "remaining admitted work cannot produce pre-close terminal proof")
 }
 
 func TestWorkerStopAllowsNewRunAssignment(t *testing.T) {
@@ -615,7 +748,7 @@ func TestWorkerDefaultRunnerStartsRecvDrainWithoutRecvAck(t *testing.T) {
 	require.Empty(t, recipient.recvAckSnapshot())
 }
 
-func TestWorkerDefaultRunnerStartsRecvDrainOnlyForTrafficUsers(t *testing.T) {
+func TestWorkerDefaultRunnerStartsRecvDrainForEveryConnectedSession(t *testing.T) {
 	pool := newWorkerPersonClientPool()
 	pool.initialFrames = map[string][]frame.Frame{
 		"bench-u-1": {
@@ -638,7 +771,30 @@ func TestWorkerDefaultRunnerStartsRecvDrainOnlyForTrafficUsers(t *testing.T) {
 
 	idle := pool.client("bench-u-99")
 	require.NotNil(t, idle)
-	require.Equal(t, 1, idle.readFrameCount())
+	require.Eventually(t, func() bool {
+		return idle.readFrameCount() == 0
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestWorkerReceiveDrainSelectionCovers2500OnlineUsersWith100GroupMembers(t *testing.T) {
+	assignment := idleHeavyGroupAssignment()
+	assignment.Plan.IdentityRange = model.Range{Start: 0, End: 2500}
+	profile := assignment.Plan.Profiles["group-a"]
+	profile.MemberRange = model.Range{Start: 0, End: 100}
+	assignment.Plan.Profiles["group-a"] = profile
+
+	clients := make(map[string]benchworkload.PersonClient, 2500)
+	for index := 0; index < 2500; index++ {
+		uid := fmt.Sprintf("bench-u-%d", index)
+		clients[uid] = &workerPersonClient{uid: uid}
+	}
+	personPlan, err := buildPersonExecutionPlan(assignment)
+	require.NoError(t, err)
+	groupPlan, err := buildGroupExecutionPlan(assignment)
+	require.NoError(t, err)
+	selected := autoRecvAckClients(clients, personPlan.users, groupPlan.users, identityRangeUsers(assignment))
+
+	require.Len(t, selected, 2500, "receive drain client_count must cover every connected session, not only 100 group members")
 }
 
 func TestWorkerAutoRecvAckDropsFramesWhenRecvVerificationDisabled(t *testing.T) {
@@ -732,28 +888,144 @@ func TestWorkerDefaultRunnerHoldsConnectionOnlyRunForDuration(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
-func TestWorkerDefaultRunnerHoldsConnectionOnlyCooldownBeforeClose(t *testing.T) {
+func TestWorkerDefaultRunnerHoldsWarmupThroughConfiguredDuration(t *testing.T) {
+	pool := newWorkerPersonClientPool()
+	runner := NewDefaultWorkloadRunner(pool.newClient)
+	assignment := personShardAssignment()
+	assignment.Scenario.Run.Warmup = 50 * time.Millisecond
+	assignment.Scenario.Messages.Traffic[0].RatePerChannel = model.Rate{PerSecond: 100}
+	assignment.Scenario.Messages.Traffic[0].Concurrency = 2
+	require.NoError(t, runner.Connect(context.Background(), assignment))
+	t.Cleanup(func() { require.NoError(t, runner.(AssignmentStopper).EndAssignment(assignment)) })
+
+	startedAt := time.Now()
+	require.NoError(t, runner.Warmup(context.Background(), assignment))
+
+	require.GreaterOrEqual(t, time.Since(startedAt), 40*time.Millisecond,
+		"worker warmup must not end at the final scheduled admission before its configured boundary")
+}
+
+func TestWorkerDefaultRunnerCooldownReturnsEarlyWhenNoMeasuredWorkRemains(t *testing.T) {
 	pool := newWorkerPersonClientPool()
 	runner := NewDefaultWorkloadRunner(pool.newClient)
 	assignment := connectionOnlyAssignment(30 * time.Millisecond)
-	assignment.Scenario.Run.Cooldown = assignment.Scenario.Run.Duration
+	assignment.Scenario.Run.Cooldown = 500 * time.Millisecond
 	require.NoError(t, runner.Connect(context.Background(), assignment))
 
-	done := make(chan error, 1)
-	go func() {
-		done <- runner.Cooldown(context.Background(), assignment)
-	}()
-
-	select {
-	case err := <-done:
-		t.Fatalf("connection-only cooldown returned before duration: %v", err)
-	case <-time.After(10 * time.Millisecond):
-	}
+	startedAt := time.Now()
+	require.NoError(t, runner.Cooldown(context.Background(), assignment))
+	require.Less(t, time.Since(startedAt), 100*time.Millisecond, "an already converged drain must not sleep the full cooldown")
 	active, _ := runner.(ConnectionStatusReporter).ConnectionStatus()
-	require.Equal(t, 3, active)
-	require.NoError(t, <-done)
+	require.Equal(t, 3, active, "terminal evidence must observe the sessions before stop closes them")
+	require.NoError(t, runner.(AssignmentStopper).EndAssignment(assignment))
 	active, _ = runner.(ConnectionStatusReporter).ConnectionStatus()
 	require.Zero(t, active)
+}
+
+func TestWorkerDefaultRunnerMovesMeasuredOperationTailIntoCooldown(t *testing.T) {
+	pool := newBlockingSendWorkerClientPool()
+	runner := NewDefaultWorkloadRunner(pool.newClient)
+	assignment := personShardAssignment()
+	assignment.Scenario.Run.Duration = 40 * time.Millisecond
+	assignment.Scenario.Run.Cooldown = 500 * time.Millisecond
+	traffic := &assignment.Scenario.Messages.Traffic[0]
+	traffic.RatePerChannel = model.Rate{PerSecond: 25}
+	traffic.Concurrency = 2
+	traffic.AckTimeout = time.Second
+	traffic.Retry.Enabled = true
+	require.NoError(t, runner.Connect(context.Background(), assignment))
+	t.Cleanup(func() {
+		pool.releaseAll()
+		_ = runner.(AssignmentStopper).EndAssignment(assignment)
+	})
+
+	runDone := make(chan error, 1)
+	runStartedAt := time.Now()
+	go func() { runDone <- runner.Run(context.Background(), assignment) }()
+	sender := pool.client("bench-u-6")
+	require.NotNil(t, sender)
+	require.Eventually(t, sender.sendStarted, time.Second, time.Millisecond)
+
+	select {
+	case err := <-runDone:
+		require.NoError(t, err)
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("measured phase waited for the admitted SEND tail instead of ending at its admission deadline")
+	}
+	require.GreaterOrEqual(t, time.Since(runStartedAt), 30*time.Millisecond)
+	status := runner.(LifecycleStatusReporter).LifecycleStatus()
+	require.Equal(t, 2, status.ActiveConnections)
+	require.Equal(t, uint64(1), status.Traffic.Remaining)
+
+	cooldownDone := make(chan error, 1)
+	cooldownStartedAt := time.Now()
+	go func() { cooldownDone <- runner.Cooldown(context.Background(), assignment) }()
+	select {
+	case err := <-cooldownDone:
+		t.Fatalf("cooldown returned before the admitted SEND settled: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	pool.releaseAll()
+	require.NoError(t, <-cooldownDone)
+	require.Less(t, time.Since(cooldownStartedAt), 250*time.Millisecond, "drain convergence must return before the configured deadline")
+	status = runner.(LifecycleStatusReporter).LifecycleStatus()
+	require.Equal(t, 2, status.ActiveConnections, "terminal evidence must precede session close")
+	require.Zero(t, status.Traffic.Remaining)
+	require.Equal(t, uint64(1), status.Traffic.SendACKs)
+}
+
+func TestWorkerDefaultRunnerCooldownBoundsUnsettledMeasuredOperation(t *testing.T) {
+	pool := newBlockingSendWorkerClientPool()
+	runner := NewDefaultWorkloadRunner(pool.newClient)
+	assignment := personShardAssignment()
+	assignment.Scenario.Run.Duration = 30 * time.Millisecond
+	assignment.Scenario.Run.Cooldown = 25 * time.Millisecond
+	traffic := &assignment.Scenario.Messages.Traffic[0]
+	traffic.RatePerChannel = model.Rate{PerSecond: 34}
+	traffic.Concurrency = 2
+	traffic.AckTimeout = time.Second
+	traffic.Retry.Enabled = true
+	require.NoError(t, runner.Connect(context.Background(), assignment))
+	t.Cleanup(func() {
+		pool.releaseAll()
+		_ = runner.(AssignmentStopper).EndAssignment(assignment)
+	})
+
+	require.NoError(t, runner.Run(context.Background(), assignment))
+	startedAt := time.Now()
+	err := runner.Cooldown(context.Background(), assignment)
+	require.ErrorContains(t, err, "measured traffic drain exceeded 25ms")
+	require.Less(t, time.Since(startedAt), 150*time.Millisecond)
+	status := runner.(LifecycleStatusReporter).LifecycleStatus()
+	require.Equal(t, 2, status.ActiveConnections)
+	require.Zero(t, status.Traffic.Remaining)
+	require.Zero(t, status.Traffic.TerminalErrors, "planned drain cancellation is not a product SEND failure")
+}
+
+func TestWorkerDefaultRunnerLegacyNonRetryTailDrainsBeforeTerminalEvidence(t *testing.T) {
+	pool := newBlockingSendWorkerClientPool()
+	runner := NewDefaultWorkloadRunner(pool.newClient)
+	assignment := personShardAssignment()
+	assignment.Scenario.Run.Duration = 30 * time.Millisecond
+	assignment.Scenario.Run.Cooldown = 300 * time.Millisecond
+	traffic := &assignment.Scenario.Messages.Traffic[0]
+	traffic.RatePerChannel = model.Rate{PerSecond: 34}
+	traffic.Concurrency = 2
+	traffic.AckTimeout = time.Second
+	require.False(t, traffic.Retry.Enabled)
+	require.NoError(t, runner.Connect(context.Background(), assignment))
+	t.Cleanup(func() {
+		pool.releaseAll()
+		_ = runner.(AssignmentStopper).EndAssignment(assignment)
+	})
+
+	require.NoError(t, runner.Run(context.Background(), assignment))
+	pool.releaseAll()
+	require.NoError(t, runner.Cooldown(context.Background(), assignment))
+	active, _ := runner.(ConnectionStatusReporter).ConnectionStatus()
+	require.Equal(t, 2, active)
+	snapshot := runner.(MetricsReporter).MetricsSnapshot()
+	require.Equal(t, uint64(1), snapshot.Counters["person_send_success_total{channel_type=person,phase=run,profile=person-a,traffic=person-send}"])
 }
 
 func TestWorkerDefaultRunnerMetricsIncludeConnectionOnlyHeartbeatActivity(t *testing.T) {
@@ -798,7 +1070,8 @@ func TestWorkerDefaultRunnerMetricsSurviveCooldown(t *testing.T) {
 
 func TestWorkerDefaultRunnerNewRunResetsConnectMetricsAfterStop(t *testing.T) {
 	pool := newWorkerPersonClientPool()
-	srv := NewServer(Config{ControlToken: "secret", WorkloadClientFactory: pool.newClient})
+	runner := newDefaultWorkloadRunner(pool.newClient).(*defaultWorkloadRunner)
+	srv := NewServer(Config{ControlToken: "secret", WorkloadRunner: runner})
 	assignment := personShardAssignment()
 	assignFull(t, srv, "secret", assignment)
 	postPhase(t, srv, "secret", "/v1/phase/prepare", http.StatusOK)
@@ -815,24 +1088,25 @@ func TestWorkerDefaultRunnerNewRunResetsConnectMetricsAfterStop(t *testing.T) {
 	}
 	assignFull(t, srv, "secret", assignment)
 
-	snap := srv.runner.(MetricsReporter).MetricsSnapshot()
+	snap := runner.MetricsSnapshot()
 	require.Zero(t, snap.Counters["connect_attempt_total"])
 	require.Zero(t, snap.Counters["connect_success_total"])
 }
 
 func TestWorkerDefaultRunnerStopClosesConnectionsAndPreservesMetrics(t *testing.T) {
 	pool := newWorkerPersonClientPool()
-	srv := NewServer(Config{ControlToken: "secret", WorkloadClientFactory: pool.newClient})
+	runner := newDefaultWorkloadRunner(pool.newClient).(*defaultWorkloadRunner)
+	srv := NewServer(Config{ControlToken: "secret", WorkloadRunner: runner})
 	assignment := connectionOnlyAssignment(0)
 	assignFull(t, srv, "secret", assignment)
 	postPhase(t, srv, "secret", "/v1/phase/prepare", http.StatusOK)
 	postPhase(t, srv, "secret", "/v1/phase/connect", http.StatusOK)
-	active, _ := srv.runner.(ConnectionStatusReporter).ConnectionStatus()
+	active, _ := runner.ConnectionStatus()
 	require.Equal(t, 3, active)
 
 	postPhase(t, srv, "secret", "/v1/stop", http.StatusOK)
 
-	active, _ = srv.runner.(ConnectionStatusReporter).ConnectionStatus()
+	active, _ = runner.ConnectionStatus()
 	require.Zero(t, active)
 	rec := authorizedRecorder(t, srv, http.MethodGet, "/v1/metrics", "secret", nil)
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -936,7 +1210,8 @@ func TestWorkerDefaultRunnerTrafficRebuildJoinsOldRecvDrainsBeforeStartingNewOne
 		clientsMu.Unlock()
 		return client, nil
 	}
-	srv := NewServer(Config{ControlToken: "secret", WorkloadClientFactory: factory})
+	runner := newDefaultWorkloadRunner(factory).(*defaultWorkloadRunner)
+	srv := NewServer(Config{ControlToken: "secret", WorkloadRunner: runner})
 	assignment := personShardAssignment()
 	assignFull(t, srv, "secret", assignment)
 	postPhase(t, srv, "secret", "/v1/phase/prepare", http.StatusOK)
@@ -951,7 +1226,6 @@ func TestWorkerDefaultRunnerTrafficRebuildJoinsOldRecvDrainsBeforeStartingNewOne
 		require.Equal(t, int32(1), <-client.starts)
 	}
 
-	runner := srv.runner.(*defaultWorkloadRunner)
 	resetDone := make(chan error, 1)
 	go func() { resetDone <- runner.ResetTraffic(assignment) }()
 	for _, client := range gotClients {
@@ -1091,19 +1365,19 @@ func TestWorkerDefaultRunnerStopArchivesMetricsAndReleasesWorkloadGraphs(t *test
 
 func TestMergeTemporalWorkloadMetricsUsesMaximumGauge(t *testing.T) {
 	first := metrics.SnapshotData{
-		Counters: map[string]uint64{"message_total": 2},
-		Gauges:   map[string]float64{"inflight": 7},
+		Counters: map[string]uint64{"send_attempt_total": 2},
+		Gauges:   map[string]float64{"workload_scheduler_max_pending": 7},
 	}
 	second := metrics.SnapshotData{
-		Counters: map[string]uint64{"message_total": 3},
-		Gauges:   map[string]float64{"inflight": 5},
+		Counters: map[string]uint64{"send_attempt_total": 3},
+		Gauges:   map[string]float64{"workload_scheduler_max_pending": 5},
 	}
 
 	got, err := mergeTemporalWorkloadMetrics([]metrics.SnapshotData{first, second})
 
 	require.NoError(t, err)
-	require.Equal(t, uint64(5), got.Counters["message_total"])
-	require.Equal(t, float64(7), got.Gauges["inflight"], "temporal gauges represent a peak, not the sum of generations")
+	require.Equal(t, uint64(5), got.Counters["send_attempt_total"])
+	require.Equal(t, float64(7), got.Gauges["workload_scheduler_max_pending"], "temporal gauges represent a peak, not the sum of generations")
 }
 
 func TestWorkerDefaultRunnerFailedChurnRebuildDoesNotDuplicateGenerationMetrics(t *testing.T) {
@@ -1379,13 +1653,71 @@ func TestBuildGroupWorkloadsUsesTrafficRatePerStream(t *testing.T) {
 		"bench-u-3": &workerPersonClient{},
 	}
 
-	workloads, err := buildGroupWorkloads(assignment, groupBundlesForTest(t, assignment), clients)
+	workloads, err := buildGroupWorkloads(assignment, groupBundlesForTest(t, assignment), clients, nil)
 	require.NoError(t, err)
 
 	for _, wl := range workloads {
 		require.NoError(t, wl.Run(context.Background()))
 	}
 	require.Len(t, clients["bench-u-0"].(*workerPersonClient).sentFrames, 2)
+}
+
+func TestBuildGroupWorkloadsSharesRoundRobinSenderCreditsAcrossTrafficStreams(t *testing.T) {
+	assignment := groupShardAssignment("http://target.invalid")
+	assignment.Scenario.Run.Duration = time.Second
+	assignment.Scenario.Messages.Traffic = []model.TrafficConfig{
+		{Name: "stream-a", ChannelRef: "huge-group", RatePerChannel: model.Rate{PerSecond: 1}, Concurrency: 2, SenderPick: "round_robin"},
+		{Name: "stream-b", ChannelRef: "huge-group", RatePerChannel: model.Rate{PerSecond: 1}, Concurrency: 2, SenderPick: "round_robin"},
+	}
+	assignment.Plan.Profiles["huge-group"] = model.ProfileShard{
+		Name: "huge-group", ChannelType: model.ChannelTypeGroup,
+		ChannelRange: model.Range{Start: 0, End: 1}, MemberRange: model.Range{Start: 0, End: 4},
+		GlobalRate: model.Rate{PerSecond: 2}, LocalRate: model.Rate{PerSecond: 2},
+		TrafficPartitionCount: 4, OwnedTrafficPartitions: []int{0, 1},
+	}
+	tracker := newAssignmentCreditTracker()
+	t.Cleanup(tracker.releaseAll)
+	clients := make(map[string]benchworkload.PersonClient, 4)
+	for index := range 4 {
+		uid := fmt.Sprintf("bench-u-%d", index)
+		clients[uid] = &assignmentCreditProbeClient{
+			workerPersonClient: workerPersonClient{uid: uid},
+			tracker:            tracker,
+		}
+	}
+
+	bundles := groupBundlesForTest(t, assignment)
+	require.Len(t, bundles, 2)
+	require.GreaterOrEqual(t, len(bundles[0].channels[0].OnlineMembers), 2)
+	workloads, err := buildGroupWorkloads(assignment, bundles, clients, nil)
+	require.NoError(t, err)
+	require.Len(t, workloads, 2)
+
+	done := make(chan error, len(workloads))
+	for _, workload := range workloads {
+		go func(wl *benchworkload.GroupWorkload) { done <- wl.Run(context.Background()) }(workload)
+	}
+	waitStarted := func() string {
+		select {
+		case uid := <-tracker.started:
+			return uid
+		case <-time.After(time.Second):
+			t.Fatal("round-robin traffic stream did not acquire a sender credit")
+			return ""
+		}
+	}
+	first := waitStarted()
+	second := waitStarted()
+	require.NotEqual(t, first, second, "assignment-shared credits must redirect the second stream to an idle member")
+	tracker.releaseAll()
+	for range workloads {
+		require.NoError(t, <-done)
+	}
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	for uid, maximum := range tracker.maxInFlight {
+		require.LessOrEqual(t, maximum, 1, "sender %s held multiple assignment credits", uid)
+	}
 }
 
 func TestBuildGroupWorkloadsAppliesTrafficAckTimeout(t *testing.T) {
@@ -1401,7 +1733,7 @@ func TestBuildGroupWorkloadsAppliesTrafficAckTimeout(t *testing.T) {
 		"bench-u-3": &workerPersonClient{},
 	}
 
-	workloads, err := buildGroupWorkloads(assignment, groupBundlesForTest(t, assignment), clients)
+	workloads, err := buildGroupWorkloads(assignment, groupBundlesForTest(t, assignment), clients, nil)
 	require.NoError(t, err)
 
 	require.NoError(t, workloads[0].Run(context.Background()))
@@ -1444,6 +1776,8 @@ func TestWorkerDefaultRunnerUsesChannelOwnersForHugeGroupPrepare(t *testing.T) {
 
 	srv := NewServer(Config{ControlToken: "secret"})
 	assignment := groupShardAssignment(target.URL)
+	// Ownership checks use the production bounded batch size, rather than 1,250 tiny HTTP requests.
+	assignment.Scenario.Channels.Profiles[0].Prepare.SubscribersBatchSize = 1000
 	assignment.Plan.Profiles["huge-group"] = model.ProfileShard{
 		Name:                   "huge-group",
 		ChannelType:            model.ChannelTypeGroup,
@@ -1480,6 +1814,8 @@ func TestWorkerDefaultRunnerSkipsHugeGroupPrepareWhenAnotherWorkerOwnsChannel(t 
 
 	srv := NewServer(Config{ControlToken: "secret"})
 	assignment := groupShardAssignment(target.URL)
+	// Ownership checks use the production bounded batch size, rather than 1,250 tiny HTTP requests.
+	assignment.Scenario.Channels.Profiles[0].Prepare.SubscribersBatchSize = 1000
 	assignment.Plan.Profiles["huge-group"] = model.ProfileShard{
 		Name:                   "huge-group",
 		ChannelType:            model.ChannelTypeGroup,
@@ -1508,39 +1844,8 @@ func TestWorkerDefaultRunnerRejectsPersonShardWithoutTraffic(t *testing.T) {
 	rec := authorizedRecorder(t, srv, http.MethodPost, "/v1/phase/connect", "secret", nil)
 
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
-	require.Contains(t, rec.Body.String(), "no matching traffic")
+	require.JSONEq(t, `{"error":"worker phase hook failed","reason_code":"phase_hook_failed"}`, rec.Body.String())
 	require.Equal(t, PhasePrepare, workerStatus(t, srv, "secret").Phase)
-}
-
-func TestWorkerConcurrentDuplicatePhaseRunsHookOnce(t *testing.T) {
-	runner := newBlockingConnectRunner()
-	srv := NewServer(Config{ControlToken: "secret", WorkloadRunner: runner})
-	assign(t, srv, "secret", "run-a")
-	postPhase(t, srv, "secret", "/v1/phase/prepare", http.StatusOK)
-
-	var wg sync.WaitGroup
-	recorders := make([]*httptest.ResponseRecorder, 2)
-	wg.Add(2)
-	for i := range recorders {
-		go func(idx int) {
-			defer wg.Done()
-			recorders[idx] = authorizedRecorder(t, srv, http.MethodPost, "/v1/phase/connect", "secret", nil)
-		}(i)
-	}
-
-	require.True(t, runner.waitForCalls(1, time.Second), "first hook call did not start")
-	time.Sleep(50 * time.Millisecond)
-	require.Equal(t, int32(1), runner.calls.Load())
-	runner.release()
-	wg.Wait()
-
-	for _, rec := range recorders {
-		require.Contains(t, []int{http.StatusAccepted, http.StatusOK}, rec.Code, rec.Body.String())
-	}
-	require.Equal(t, int32(1), runner.calls.Load())
-	require.Eventually(t, func() bool {
-		return workerStatus(t, srv, "secret").Phase == PhaseConnect
-	}, time.Second, 10*time.Millisecond)
 }
 
 func TestWorkerStopCancelsActiveAsyncPhase(t *testing.T) {
@@ -1567,50 +1872,6 @@ func TestWorkerStopCancelsActiveAsyncPhase(t *testing.T) {
 	require.Equal(t, PhaseStopped, status.Phase)
 	require.Empty(t, status.ActivePhase)
 	require.Empty(t, status.LastError)
-}
-
-func TestWorkerStopWaitsForActivePhaseExit(t *testing.T) {
-	runner := newDelayedCancelExitRunner()
-	t.Cleanup(runner.release)
-	srv := NewServer(Config{ControlToken: "secret", WorkloadRunner: runner})
-	assign(t, srv, "secret", "run-a")
-
-	phaseDone := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		phaseDone <- authorizedRecorder(t, srv, http.MethodPost, "/v1/phase/prepare", "secret", nil)
-	}()
-	require.True(t, runner.waitStarted(time.Second), "prepare hook did not start")
-	select {
-	case rec := <-phaseDone:
-		require.Equal(t, http.StatusAccepted, rec.Code, rec.Body.String())
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("phase request did not return promptly")
-	}
-
-	stopDone := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		stopDone <- authorizedRecorder(t, srv, http.MethodPost, "/v1/stop", "secret", nil)
-	}()
-	require.True(t, runner.waitCanceled(time.Second), "stop did not cancel active phase context")
-	statusBeforeExit := workerStatus(t, srv, "secret")
-	require.NotEqual(t, PhaseStopped, statusBeforeExit.Phase, "stopped must not be visible before the phase exits")
-	require.Equal(t, PhasePrepare, statusBeforeExit.ActivePhase)
-	require.False(t, runner.waitEnded(20*time.Millisecond), "runner teardown ran before the active phase exited")
-	select {
-	case rec := <-stopDone:
-		t.Fatalf("stop returned %d before the active phase exited", rec.Code)
-	case <-time.After(20 * time.Millisecond):
-	}
-
-	runner.release()
-	select {
-	case rec := <-stopDone:
-		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	case <-time.After(time.Second):
-		t.Fatal("stop did not return after the active phase exited")
-	}
-	require.True(t, runner.waitEnded(time.Second), "runner teardown did not run after the active phase exited")
-	require.Equal(t, PhaseStopped, workerStatus(t, srv, "secret").Phase)
 }
 
 func TestWorkerStopContinuesFinalizationAfterRequestCancellation(t *testing.T) {
@@ -1655,180 +1916,6 @@ func TestWorkerStopContinuesFinalizationAfterRequestCancellation(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return workerStatus(t, srv, "secret").Phase == PhaseStopped
 	}, time.Second, 10*time.Millisecond)
-}
-
-func TestWorkerStopRetriesJoinOneBackgroundFinalizer(t *testing.T) {
-	runner := newDelayedCancelExitRunner()
-	t.Cleanup(runner.release)
-	srv := NewServer(Config{ControlToken: "secret", WorkloadRunner: runner})
-	assign(t, srv, "secret", "run-a")
-	phaseDone := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		phaseDone <- authorizedRecorder(t, srv, http.MethodPost, "/v1/phase/prepare", "secret", nil)
-	}()
-	require.True(t, runner.waitStarted(time.Second), "prepare hook did not start")
-	select {
-	case <-phaseDone:
-	case <-time.After(time.Second):
-		t.Fatal("phase request did not return")
-	}
-
-	stopWithDeadline := func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-		defer cancel()
-		req := httptest.NewRequest(http.MethodPost, "/v1/stop", bytes.NewReader(mustJSON(t, StopRequest{RunID: "run-a", AssignmentID: defaultTestAssignmentID("run-a")}))).WithContext(ctx)
-		req.Header.Set("Authorization", "Bearer secret")
-		srv.ServeHTTP(httptest.NewRecorder(), req)
-	}
-	stopWithDeadline()
-	require.True(t, runner.waitCanceled(time.Second), "first stop did not cancel the active phase")
-	srv.stopMu.Lock()
-	firstTask := srv.stopTask
-	srv.stopMu.Unlock()
-	stopWithDeadline()
-	srv.stopMu.Lock()
-	secondTask := srv.stopTask
-	srv.stopMu.Unlock()
-	require.Same(t, firstTask, secondTask, "same-run stop retry created another background finalizer")
-
-	runner.release()
-	require.True(t, runner.waitEnded(time.Second), "shared finalizer did not end assignment resources")
-	require.Eventually(t, func() bool {
-		return workerStatus(t, srv, "secret").Phase == PhaseStopped
-	}, time.Second, 10*time.Millisecond)
-}
-
-func TestWorkerStopCancelsAndWaitsForPrepareChannelsExecution(t *testing.T) {
-	runner := newBlockingPrepareChannelsStopper()
-	t.Cleanup(runner.release)
-	srv := NewServer(Config{ControlToken: "secret", WorkloadRunner: runner})
-	assign(t, srv, "secret", "run-a")
-
-	prepareDone := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		prepareDone <- authorizedRecorder(t, srv, http.MethodPost, "/v1/prepare/channels", "secret", mustJSON(t, RunRequest{RunID: "run-a"}))
-	}()
-	require.True(t, waitWorkerTestSignal(runner.started, time.Second), "channel preparation did not start")
-	stopDone := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		stopDone <- authorizedRecorder(t, srv, http.MethodPost, "/v1/stop", "secret", mustJSON(t, StopRequest{RunID: "run-a"}))
-	}()
-	require.True(t, waitWorkerTestSignal(runner.canceled, time.Second), "stop did not cancel channel preparation")
-	require.False(t, waitWorkerTestSignal(runner.ended, 20*time.Millisecond), "stop tore down resources before channel preparation exited")
-	select {
-	case rec := <-stopDone:
-		t.Fatalf("stop returned %d before channel preparation exited", rec.Code)
-	case <-time.After(20 * time.Millisecond):
-	}
-
-	runner.release()
-	select {
-	case rec := <-prepareDone:
-		require.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
-	case <-time.After(time.Second):
-		t.Fatal("channel preparation did not return after release")
-	}
-	select {
-	case rec := <-stopDone:
-		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	case <-time.After(time.Second):
-		t.Fatal("stop did not return after channel preparation exited")
-	}
-	require.True(t, waitWorkerTestSignal(runner.ended, time.Second), "stop did not tear down assignment resources")
-}
-
-func TestWorkerStopRejectsPhaseAndPrepareAdmissionDuringTeardown(t *testing.T) {
-	runner := newStopAdmissionRunner()
-	t.Cleanup(runner.releaseEndAssignment)
-	srv := NewServer(Config{ControlToken: "secret", WorkloadRunner: runner})
-	assign(t, srv, "secret", "run-a")
-
-	firstPhaseDone := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		firstPhaseDone <- authorizedRecorder(t, srv, http.MethodPost, "/v1/phase/prepare", "secret", nil)
-	}()
-	require.True(t, runner.waitFirstStarted(time.Second), "first prepare hook did not start")
-	select {
-	case rec := <-firstPhaseDone:
-		require.Equal(t, http.StatusAccepted, rec.Code, rec.Body.String())
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("first phase request did not return promptly")
-	}
-
-	stopDone := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		stopDone <- authorizedRecorder(t, srv, http.MethodPost, "/v1/stop", "secret", nil)
-	}()
-	require.True(t, runner.waitEndEntered(time.Second), "stop did not enter assignment teardown")
-
-	secondPhaseDone := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		secondPhaseDone <- authorizedRecorder(t, srv, http.MethodPost, "/v1/phase/prepare", "secret", mustJSON(t, RunRequest{RunID: "run-a"}))
-	}()
-	select {
-	case rec := <-secondPhaseDone:
-		require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("phase admission did not reject promptly after terminal stop began")
-	}
-	require.False(t, runner.waitSecondStarted(20*time.Millisecond), "phase admission crossed an in-progress terminal stop")
-	prepareAdmissionDone := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		prepareAdmissionDone <- authorizedRecorder(t, srv, http.MethodPost, "/v1/prepare/channels", "secret", mustJSON(t, RunRequest{RunID: "run-a"}))
-	}()
-	select {
-	case rec := <-prepareAdmissionDone:
-		require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("prepare admission did not reject promptly after terminal stop began")
-	}
-	require.Equal(t, http.StatusConflict, assignRecorder(t, srv, "secret", "run-a").Code, "same-assignment retry crossed an in-progress terminal stop")
-
-	runner.releaseEndAssignment()
-	select {
-	case rec := <-stopDone:
-		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	case <-time.After(time.Second):
-		t.Fatal("stop did not return after teardown was released")
-	}
-	require.False(t, runner.waitSecondStarted(20*time.Millisecond), "stopped assignment started a second hook")
-}
-
-func TestWorkerStoppedAssignmentGenerationCannotBeReactivated(t *testing.T) {
-	runner := &assignmentStartRecorder{}
-	srv := NewServer(Config{ControlToken: "secret", WorkloadRunner: runner})
-	assignment := Assignment{RunID: "run-a", AssignmentID: "generation-a", WorkerID: "worker-a"}
-	assignFull(t, srv, "secret", assignment)
-	require.Len(t, runner.started, 1)
-
-	stop := authorizedRecorder(t, srv, http.MethodPost, "/v1/stop", "secret", mustJSON(t, StopRequest{
-		RunID: assignment.RunID, AssignmentID: assignment.AssignmentID,
-	}))
-	require.Equal(t, http.StatusOK, stop.Code, stop.Body.String())
-
-	retry := authorizedRecorder(t, srv, http.MethodPost, "/v1/assign", "secret", mustJSON(t, assignment))
-	require.Equal(t, http.StatusConflict, retry.Code, retry.Body.String())
-	require.Len(t, runner.started, 1, "terminal assignment generation restarted its runner state")
-	status := workerStatus(t, srv, "secret")
-	require.Equal(t, PhaseStopped, status.Phase)
-	require.Equal(t, assignment.RunID, status.Assignment.RunID)
-	require.Equal(t, assignment.AssignmentID, status.Assignment.AssignmentID)
-}
-
-func TestWorkerOldLifecycleTaskCannotClearNewCancellation(t *testing.T) {
-	srv := NewServer(Config{ControlToken: "secret"})
-	firstDone := make(chan struct{})
-	firstID := srv.storeLifecycleTask("run-a", "generation-a", lifecycleTaskPhase, PhasePrepare, func() {}, firstDone)
-	secondCanceled := make(chan struct{})
-	secondDone := make(chan struct{})
-	secondID := srv.storeLifecycleTask("run-a", "generation-a", lifecycleTaskPrepareChannels, "", func() { close(secondCanceled) }, secondDone)
-	require.NotEqual(t, firstID, secondID)
-
-	srv.clearLifecycleTask(firstID)
-	gotDone := srv.cancelActiveLifecycleTask(assignmentIdentity{runID: "run-a", assignmentID: "generation-a"})
-
-	require.Equal(t, (<-chan struct{})(secondDone), gotDone)
-	require.True(t, waitWorkerTestSignal(secondCanceled, time.Second), "old task cleanup erased the newer phase cancel function")
 }
 
 func TestWorkerOldPhaseHookDoesNotAdvanceNewAssignment(t *testing.T) {
@@ -1884,7 +1971,7 @@ func TestWorkerPhaseHookFailureDoesNotAdvanceStatus(t *testing.T) {
 	rec := authorizedRecorder(t, srv, http.MethodPost, "/v1/phase/connect", "secret", nil)
 
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
-	require.JSONEq(t, `{"error":"phase connect failed","reason_code":"phase_hook_failed"}`, rec.Body.String())
+	require.JSONEq(t, `{"error":"worker phase hook failed","reason_code":"phase_hook_failed"}`, rec.Body.String())
 	status := workerStatus(t, srv, "secret")
 	require.Equal(t, PhasePrepare, status.Phase)
 	require.Equal(t, FailureReasonPhaseHookFailed, status.LastErrorCode)
@@ -1910,6 +1997,47 @@ func TestWorkerPhaseHookFailurePublishesSafeOperationCode(t *testing.T) {
 	status := workerStatusMap(t, srv, "secret")
 	require.Equal(t, string(FailureReasonPhaseHookFailed), status["last_error_code"])
 	require.Equal(t, "group_sendack", status["last_error_operation"])
+}
+
+func TestWorkerPhaseFailureStatusAndResponseNeverExposeWorkloadIdentity(t *testing.T) {
+	const (
+		uid         = "canary-uid-493857"
+		channelID   = "canary-channel-291734"
+		clientMsgNo = "canary-client-msg-875104"
+	)
+	runner := &recordingWorkloadRunner{
+		failPhase: PhaseWarmup,
+		failErr: &benchworkload.SessionError{
+			UID:       uid,
+			Operation: "group sendack",
+			Err:       fmt.Errorf("channel=%s client_msg_no=%s", channelID, clientMsgNo),
+		},
+	}
+	srv := NewServer(Config{ControlToken: "secret", WorkloadRunner: runner})
+	assign(t, srv, "secret", "run-a")
+	postPhase(t, srv, "secret", "/v1/phase/prepare", http.StatusOK)
+	postPhase(t, srv, "secret", "/v1/phase/connect", http.StatusOK)
+
+	rec := authorizedRecorder(t, srv, http.MethodPost, "/v1/phase/warmup", "secret", nil)
+	statusData, err := json.Marshal(workerStatus(t, srv, "secret"))
+	require.NoError(t, err)
+	legacyStatusData, err := json.Marshal(Status{
+		LastError:          unsafeWorkloadText(uid, channelID, clientMsgNo),
+		LastErrorCode:      FailureReasonCode("reason-" + uid),
+		LastErrorOperation: FailureOperationCode("operation-" + channelID),
+	})
+	require.NoError(t, err)
+	combined := rec.Body.String() + string(statusData) + string(legacyStatusData)
+	for _, secret := range []string{uid, channelID, clientMsgNo} {
+		require.NotContains(t, combined, secret)
+	}
+	require.Contains(t, combined, `"reason_code":"phase_hook_failed"`)
+	require.Contains(t, combined, `"operation":"group_sendack"`)
+	require.Contains(t, combined, `"last_error_operation":"group_sendack"`)
+}
+
+func unsafeWorkloadText(uid, channelID, clientMsgNo string) string {
+	return "uid=" + uid + " channel=" + channelID + " client_msg_no=" + clientMsgNo
 }
 
 func TestWorkerPhaseHookFailureDropsUnknownOperation(t *testing.T) {
@@ -1957,7 +2085,7 @@ func TestWorkerAsyncPhaseHookFailureIsVisibleInStatus(t *testing.T) {
 			status["completed_phase"] == string(PhasePrepare) &&
 			status["active_phase"] == nil &&
 			status["last_error_code"] == string(FailureReasonPhaseHookFailed) &&
-			strings.Contains(lastError, "phase connect failed")
+			lastError == "worker phase hook failed"
 	}, time.Second, 10*time.Millisecond)
 }
 
@@ -2078,7 +2206,7 @@ func personShardAssignment() Assignment {
 		WorkerID: "worker-a",
 		Target:   model.Target{Gateway: model.TargetGatewayConfig{TCP: model.TargetGatewayTCPConfig{Addrs: []string{"gw-a:5100"}}}},
 		Scenario: model.Scenario{
-			Run:      model.RunConfig{ID: "run-a"},
+			Run:      model.RunConfig{ID: "run-a", Cooldown: 100 * time.Millisecond},
 			Identity: model.IdentityConfig{UIDPrefix: "bench-u", DevicePrefix: "bench-d", ClientMsgPrefix: "bench-msg"},
 			Online:   model.OnlineConfig{GatewayBalance: "round_robin"},
 			Messages: model.MessagesConfig{Traffic: []model.TrafficConfig{{Name: "person-send", ChannelRef: "person-a"}}},
@@ -2487,6 +2615,42 @@ type workerPersonClientPool struct {
 	closeErr      error
 }
 
+type blockingSendWorkerClientPool struct {
+	mu      sync.Mutex
+	clients map[string]*blockingSendWorkerClient
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingSendWorkerClientPool() *blockingSendWorkerClientPool {
+	return &blockingSendWorkerClientPool{
+		clients: make(map[string]*blockingSendWorkerClient),
+		release: make(chan struct{}),
+	}
+}
+
+func (p *blockingSendWorkerClientPool) newClient(user benchworkload.ConnectionUser, addr string) (benchworkload.ConnectionClient, error) {
+	client := &blockingSendWorkerClient{
+		workerPersonClient: workerPersonClient{uid: user.UID, addr: addr},
+		release:            p.release,
+		started:            make(chan struct{}),
+	}
+	p.mu.Lock()
+	p.clients[user.UID] = client
+	p.mu.Unlock()
+	return client, nil
+}
+
+func (p *blockingSendWorkerClientPool) client(uid string) *blockingSendWorkerClient {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.clients[uid]
+}
+
+func (p *blockingSendWorkerClientPool) releaseAll() {
+	p.once.Do(func() { close(p.release) })
+}
+
 func newWorkerPersonClientPool() *workerPersonClientPool {
 	return &workerPersonClientPool{clients: make(map[string]*workerPersonClient)}
 }
@@ -2513,17 +2677,93 @@ func (p *workerPersonClientPool) client(uid string) *workerPersonClient {
 }
 
 type workerPersonClient struct {
-	mu           sync.Mutex
-	uid          string
-	addr         string
-	connected    []workerConnectCall
-	closed       int
-	sentFrames   []*frame.SendPacket
-	readFrames   []frame.Frame
-	recvAckCalls []workerRecvAckCall
-	notify       chan struct{}
-	pingCalls    atomic.Int32
-	closeErr     error
+	mu                 sync.Mutex
+	uid                string
+	addr               string
+	connected          []workerConnectCall
+	closed             int
+	sentFrames         []*frame.SendPacket
+	readFrames         []frame.Frame
+	recvAckCalls       []workerRecvAckCall
+	notify             chan struct{}
+	pingCalls          atomic.Int32
+	closeErr           error
+	ingressSealed      bool
+	terminalFenceGrant frame.TerminalFenceGrant
+}
+
+type assignmentCreditTracker struct {
+	mu          sync.Mutex
+	inFlight    map[string]int
+	maxInFlight map[string]int
+	started     chan string
+	release     chan struct{}
+	releaseOnce sync.Once
+}
+
+func newAssignmentCreditTracker() *assignmentCreditTracker {
+	return &assignmentCreditTracker{
+		inFlight:    make(map[string]int),
+		maxInFlight: make(map[string]int),
+		started:     make(chan string, 4),
+		release:     make(chan struct{}),
+	}
+}
+
+func (t *assignmentCreditTracker) releaseAll() {
+	t.releaseOnce.Do(func() { close(t.release) })
+}
+
+type assignmentCreditProbeClient struct {
+	workerPersonClient
+	tracker *assignmentCreditTracker
+}
+
+func (c *assignmentCreditProbeClient) Send(ctx context.Context, pkt *frame.SendPacket) error {
+	c.tracker.mu.Lock()
+	c.tracker.inFlight[c.uid]++
+	if c.tracker.inFlight[c.uid] > c.tracker.maxInFlight[c.uid] {
+		c.tracker.maxInFlight[c.uid] = c.tracker.inFlight[c.uid]
+	}
+	c.tracker.mu.Unlock()
+	defer func() {
+		c.tracker.mu.Lock()
+		c.tracker.inFlight[c.uid]--
+		c.tracker.mu.Unlock()
+	}()
+	c.tracker.started <- c.uid
+	select {
+	case <-c.tracker.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return c.workerPersonClient.Send(ctx, pkt)
+}
+
+type blockingSendWorkerClient struct {
+	workerPersonClient
+	release   <-chan struct{}
+	started   chan struct{}
+	startOnce sync.Once
+}
+
+func (c *blockingSendWorkerClient) Send(ctx context.Context, pkt *frame.SendPacket) error {
+	c.startOnce.Do(func() { close(c.started) })
+	select {
+	case <-c.release:
+		return c.workerPersonClient.Send(ctx, pkt)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *blockingSendWorkerClient) sendStarted() bool {
+	select {
+	case <-c.started:
+		return true
+	default:
+		return false
+	}
 }
 
 type delayedDrainExitWorkerClient struct {
@@ -2700,6 +2940,22 @@ func (c *workerPersonClient) RecvAck(ctx context.Context, messageID int64, messa
 	return nil
 }
 
+func (c *workerPersonClient) QueueSnapshot() benchwkproto.QueueSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	depth := len(c.readFrames)
+	return benchwkproto.QueueSnapshot{
+		InnerRecvCapacity:   1024,
+		RecvDepth:           depth,
+		RecvCapacity:        1024,
+		SendackCapacity:     1024,
+		ErrorCapacity:       1024,
+		AdapterDepth:        depth,
+		AdapterCapacity:     3072,
+		PublicationCapacity: 1024,
+	}
+}
+
 func (c *workerPersonClient) recvAckCallCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2723,6 +2979,20 @@ func (c *workerPersonClient) Close() error {
 	c.closed++
 	c.signalLocked()
 	return c.closeErr
+}
+
+func (c *workerPersonClient) SealIngress(context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ingressSealed = true
+	return nil
+}
+
+func (c *workerPersonClient) SealIngressWithFence(_ context.Context, grant frame.TerminalFenceGrant) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.terminalFenceGrant = grant
+	return nil
 }
 
 func (c *workerPersonClient) notifyLocked() <-chan struct{} {
@@ -2752,6 +3022,30 @@ func (r *snapshotRunner) Warmup(context.Context, Assignment) error   { return ni
 func (r *snapshotRunner) Run(context.Context, Assignment) error      { return nil }
 func (r *snapshotRunner) Cooldown(context.Context, Assignment) error { return nil }
 func (r *snapshotRunner) MetricsSnapshot() metrics.SnapshotData      { return r.metrics }
+
+type lifecycleSnapshotRunner struct {
+	snapshotRunner
+	lifecycle LifecycleStatus
+}
+
+func (r *lifecycleSnapshotRunner) LifecycleStatus() LifecycleStatus { return r.lifecycle }
+
+type terminalReceiveSealFailureRunner struct {
+	*terminalCutTestRunner
+	sealErr   error
+	sealCalls atomic.Int32
+	endCalls  atomic.Int32
+}
+
+func (r *terminalReceiveSealFailureRunner) SealTerminalReceive(context.Context, Assignment) error {
+	r.sealCalls.Add(1)
+	return r.sealErr
+}
+
+func (r *terminalReceiveSealFailureRunner) EndAssignment(Assignment) error {
+	r.endCalls.Add(1)
+	return nil
+}
 
 type assignmentStartRecorder struct {
 	snapshotRunner
@@ -2808,7 +3102,7 @@ func authorizedRecorder(t *testing.T, srv *Server, method, path, token string, b
 	req := httptest.NewRequest(method, path, bytes.NewReader(body))
 	if method == http.MethodGet && (req.URL.Path == "/v1/metrics" || req.URL.Path == "/v1/report") {
 		query := req.URL.Query()
-		status := srv.state.Status()
+		status := srv.assignments.controlStatus()
 		runID := strings.TrimSpace(query.Get("run_id"))
 		if runID == "" {
 			runID = status.Assignment.RunID
@@ -2842,7 +3136,7 @@ func withDefaultTestAssignmentIdentity(t *testing.T, srv *Server, method, path s
 	if method != http.MethodPost {
 		return body
 	}
-	status := srv.state.Status()
+	status := srv.assignments.controlStatus()
 	switch path {
 	case "/v1/assign":
 		if len(body) == 0 {
@@ -3103,9 +3397,10 @@ func TestWorkerHTTPAppliesWeightedEightyTwentyGroupSenders(t *testing.T) {
 			Gateway:  model.TargetGatewayConfig{TCP: model.TargetGatewayTCPConfig{Addrs: []string{"gw-a:5100"}}},
 		},
 		Scenario: model.Scenario{
-			// Keep a real wall-clock window now that sequential measured traffic
-			// refuses to start work after the configured duration expires.
-			Run:      model.RunConfig{ID: "run-weighted-senders", Duration: 50 * time.Millisecond},
+			// Keep five messages while leaving a bounded 50ms tail after the last
+			// due token; a 50ms window made this wall-clock fixture flaky
+			// under concurrent package load.
+			Run:      model.RunConfig{ID: "run-weighted-senders", Duration: 250 * time.Millisecond},
 			Identity: model.IdentityConfig{TotalUsers: 5, UIDPrefix: "bench-u", DevicePrefix: "bench-d"},
 			Online:   model.OnlineConfig{TotalUsers: 5, GatewayBalance: "round_robin"},
 			Channels: model.ChannelsConfig{Profiles: []model.ChannelProfile{{
@@ -3115,7 +3410,7 @@ func TestWorkerHTTPAppliesWeightedEightyTwentyGroupSenders(t *testing.T) {
 			}}},
 			Messages: model.MessagesConfig{Traffic: []model.TrafficConfig{{
 				Name: "group-send", ChannelRef: "group-a", SenderPick: "weighted_80_20",
-				RatePerChannel: model.Rate{PerSecond: 100},
+				RatePerChannel: model.Rate{PerSecond: 20},
 			}}},
 		},
 		Plan: model.WorkerPlan{
@@ -3158,17 +3453,19 @@ func TestWorkerHTTPChurnReconnectsAndSwapsOfflineIdentity(t *testing.T) {
 			Gateway:  model.TargetGatewayConfig{TCP: model.TargetGatewayTCPConfig{Addrs: []string{"gw-a:5100"}}},
 		},
 		Scenario: model.Scenario{
-			Run:      model.RunConfig{ID: "run-churn", Duration: 2 * time.Nanosecond},
+			// Use two real admission windows. A nanosecond-only fixture can expire
+			// before the worker goroutine starts and cannot exercise churn semantics.
+			Run:      model.RunConfig{ID: "run-churn", Duration: 80 * time.Millisecond, Cooldown: 100 * time.Millisecond},
 			Identity: model.IdentityConfig{TotalUsers: 8, UIDPrefix: "bench-u", DevicePrefix: "bench-d", Token: model.TokenConfig{Mode: "bench_api"}},
 			Online: model.OnlineConfig{TotalUsers: 4, GatewayBalance: "round_robin", Churn: model.ChurnConfig{
-				Enabled: true, Interval: time.Nanosecond, Ratio: 0.5,
+				Enabled: true, Interval: 40 * time.Millisecond, Ratio: 0.5,
 				SameUserRatio: 0.5, IdentitySwapRatio: 0.5, HistorySync: false,
 			}},
 			Channels: model.ChannelsConfig{Profiles: []model.ChannelProfile{{
 				Name: "person-a", ChannelType: model.ChannelTypePerson, Count: 2,
 			}}},
 			Messages: model.MessagesConfig{Traffic: []model.TrafficConfig{{
-				Name: "person-send", ChannelRef: "person-a", RatePerChannel: model.Rate{PerSecond: 1_000_000_000},
+				Name: "person-send", ChannelRef: "person-a", RatePerChannel: model.Rate{PerSecond: 100},
 			}}},
 		},
 		Plan: model.WorkerPlan{

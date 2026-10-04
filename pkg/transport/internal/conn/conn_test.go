@@ -167,7 +167,7 @@ func TestWriteOutboundBatchAggregatesTrafficAndObservesWriteShape(t *testing.T) 
 	limits := testLimits()
 	c := New(newDeadlineConn(), Config{Limits: limits, Observer: observer, NodeID: 12, SourceID: 77}, nil)
 	items := []sched.Item{
-		{Bytes: 3, Value: Outbound{Kind: core.FrameKindRPCRequest, Priority: core.PriorityRPC, Payload: core.CopyOwnedBuffer([]byte("one"))}},
+		{Bytes: 3, Value: Outbound{Kind: core.FrameKindRPCRequest, Priority: core.PriorityRaft, Payload: core.CopyOwnedBuffer([]byte("one"))}},
 		{Bytes: 3, Value: Outbound{Kind: core.FrameKindRPCRequest, Priority: core.PriorityRPC, Payload: core.CopyOwnedBuffer([]byte("two"))}},
 		{Bytes: 5, Value: Outbound{Kind: core.FrameKindRPCResponse, Priority: core.PriorityRPC, Payload: core.CopyOwnedBuffer([]byte("three"))}},
 	}
@@ -195,15 +195,20 @@ func TestWriteOutboundBatchAggregatesTrafficAndObservesWriteShape(t *testing.T) 
 		batch.Bytes != 11 || batch.BytesCapacity != int64(limits.MaxBatchBytes) {
 		t.Fatalf("write_batch = %+v, want node/source and 3 frames/11 bytes with configured limits", batch)
 	}
-	if len(sentBytes) != 2 {
-		t.Fatalf("sent_bytes event count = %d, want one per frame kind; events=%#v", len(sentBytes), events)
+	if len(sentBytes) != 3 {
+		t.Fatalf("sent_bytes event count = %d, want one per frame kind/lane; events=%#v", len(sentBytes), events)
 	}
+	bytesByLane := make(map[core.Priority]int)
 	bytesByKind := make(map[core.FrameKind]int, len(sentBytes))
 	for _, event := range sentBytes {
+		bytesByLane[event.Priority] += event.Bytes
 		bytesByKind[event.Kind] += event.Bytes
 	}
 	if bytesByKind[core.FrameKindRPCRequest] != 6 || bytesByKind[core.FrameKindRPCResponse] != 5 {
 		t.Fatalf("sent bytes by kind = %#v, want request=6 response=5", bytesByKind)
+	}
+	if bytesByLane[core.PriorityRaft] != 3 || bytesByLane[core.PriorityRPC] != 8 {
+		t.Fatalf("mixed batch lost lane identity: %#v", bytesByLane)
 	}
 }
 
@@ -261,7 +266,7 @@ func TestCollectAvailableWriteItemsWaitsForRPCBatch(t *testing.T) {
 	}}
 
 	oldWaitForWriteBatch := waitForWriteBatch
-	waitForWriteBatch = func(wait time.Duration) {
+	waitForWriteBatch = func(_ context.Context, _ <-chan struct{}, wait time.Duration) {
 		if wait != limits.WriteBatchMaxWait {
 			t.Fatalf("write batch wait = %s, want %s", wait, limits.WriteBatchMaxWait)
 		}
@@ -302,7 +307,7 @@ func TestCollectAvailableWriteItemsDoesNotWaitForControl(t *testing.T) {
 
 	oldWaitForWriteBatch := waitForWriteBatch
 	waited := false
-	waitForWriteBatch = func(time.Duration) { waited = true }
+	waitForWriteBatch = func(context.Context, <-chan struct{}, time.Duration) { waited = true }
 	t.Cleanup(func() { waitForWriteBatch = oldWaitForWriteBatch })
 
 	batch, _ = c.collectAvailableWriteItems(batch, nil)
@@ -428,6 +433,7 @@ func TestConnObservesTransportBytes(t *testing.T) {
 			event.NodeID == 12 &&
 			event.SourceID == 77 &&
 			event.Kind == core.FrameKindData &&
+			event.Priority == core.PriorityRPC &&
 			event.Bytes == len("hello")
 	})
 
@@ -446,6 +452,7 @@ func TestConnObservesTransportBytes(t *testing.T) {
 			event.NodeID == 12 &&
 			event.SourceID == 77 &&
 			event.Kind == core.FrameKindNotify &&
+			event.Priority == core.PriorityControl &&
 			event.Bytes == len("notify")
 	})
 }
@@ -582,9 +589,17 @@ func TestPendingRPCObservation(t *testing.T) {
 
 	req := readPeerFrame(t, peer)
 	req.Body.Release()
+	var startedEvent core.Event
 	waitConnEvent(t, observer, func(event core.Event) bool {
-		return event.Name == "pending_rpc" && event.NodeID == 12 && event.SourceID == 77 && event.Inflight == 1
+		matched := event.Name == "pending_rpc" && event.NodeID == 12 && event.SourceID == 77 && event.Inflight == 1
+		if matched {
+			startedEvent = event
+		}
+		return matched
 	})
+	if startedEvent.Revision == 0 {
+		t.Fatal("pending_rpc started revision = 0, want physical-state revision")
+	}
 
 	writePeerFrame(t, peer, wire.Frame{
 		Header: wire.Header{
@@ -602,9 +617,18 @@ func TestPendingRPCObservation(t *testing.T) {
 	if string(got.payload) != "response" {
 		t.Fatalf("payload = %q, want response", got.payload)
 	}
+	var drainedEvent core.Event
 	waitConnEvent(t, observer, func(event core.Event) bool {
-		return event.Name == "pending_rpc" && event.NodeID == 12 && event.SourceID == 77 && event.Inflight == 0
+		matched := event.Name == "pending_rpc" && event.NodeID == 12 && event.SourceID == 77 &&
+			event.Inflight == 0 && event.Revision > startedEvent.Revision
+		if matched {
+			drainedEvent = event
+		}
+		return matched
 	})
+	if drainedEvent.Revision <= startedEvent.Revision {
+		t.Fatalf("pending_rpc revisions = %d..%d, want physical order", startedEvent.Revision, drainedEvent.Revision)
+	}
 	c.Close(nil)
 	waitConnEvent(t, observer, func(event core.Event) bool {
 		return event.Name == "pending_rpc" && event.NodeID == 12 && event.SourceID == 77 &&
@@ -712,6 +736,11 @@ func TestEncodeRPCResponseContentAndRelease(t *testing.T) {
 	got := buf.Bytes()
 	if len(got) != 1+len(payload) || got[0] != wire.ResponseOK || string(got[1:]) != "response-body" {
 		t.Fatalf("EncodeRPCResponse bytes = %v, want status+payload", got)
+	}
+	// Synchronous service callbacks lend handler bytes only until encoding returns.
+	clear(payload)
+	if string(buf.Bytes()[1:]) != "response-body" {
+		t.Fatal("encoded response aliases the borrowed handler payload")
 	}
 	buf.Release()
 	buf.Release()

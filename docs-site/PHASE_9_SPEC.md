@@ -4,20 +4,21 @@
 
 Complete the bilingual guide foundation that later tutorials, SDK guides, and
 API reference pages can link to. Readers should be able to decide whether
-WuKongIM fits a workload, use one stable vocabulary for clusters, messages,
+WuKongIM fits a workload, use one stable application vocabulary for messages,
 channels, users, devices, and conversations, and understand when the current
-plugin subsystem is appropriate. The pages must describe promoted v3 behavior
+plugin subsystem is appropriate. Distributed implementation vocabulary stays
+in the server-architecture path. The pages must describe promoted v3 behavior
 without turning implementation details into product guarantees.
 
 ## Published routes
 
 - Product Overview / Core Capabilities
 - Product Overview / Use Cases
-- Core Concepts / Clusters & Nodes
-- Core Concepts / Messages
-- Core Concepts / Channels
-- Core Concepts / Users & Devices
-- Core Concepts / Conversations
+- Core Concepts / Message
+- Core Concepts / Channel
+- Core Concepts / User
+- Core Concepts / Device
+- Core Concepts / Conversation
 - Integration / Plugin Extensions
 
 Every route above has matching Chinese and English MDX and is included in
@@ -28,7 +29,9 @@ search, sitemap, LLM outputs, and per-page Markdown.
 - Every deployment is a cluster. A one-node deployment is a single-node
   cluster and follows the same Controller, Slot, Channel, routing, and storage
   semantics. The stable route table contains 256 physical hash-slot fences,
-  which can map to a different number of logical Slot Raft Groups.
+  which can map to a different number of logical Slot Raft Groups. These
+  implementation concepts belong in Server Architecture rather than the
+  application-facing Core Concepts navigation.
 - Product capability claims are workload-qualified. Per-channel ordering,
   durable append, replication, offline sync, multi-device sessions, presence,
   operations, plugins, and webhooks are current capabilities; no context-free
@@ -56,7 +59,7 @@ search, sitemap, LLM outputs, and per-page Markdown.
   and a concrete connection Session is owner-node-local. Distributed presence
   stores fenced virtual owner routes, not TCP session handles. Stored token
   metadata exists, but the default v3 Beta app composition does not by itself
-  make product HTTP endpoints trusted or guarantee stored-token CONNECT
+  make WuKongIM HTTP API endpoints trusted or guarantee stored-token CONNECT
   validation.
 - A conversation is a UID-owned projection over Channel-owned committed
   messages. `active_at` determines active-list order; `read_seq` and
@@ -84,6 +87,10 @@ search, sitemap, LLM outputs, and per-page Markdown.
 - Browser QA covers product capabilities, messages, conversations, and plugin
   extensions in both locales at desktop and mobile widths, including console
   output and horizontal overflow.
+
+This is the Phase 9 boundary. Later phases publish the maintained tutorials,
+SDK, API, and Kubernetes routes; Phase 24 leaves no maintained navigation
+entry planned.
 
 ## Excluded
 

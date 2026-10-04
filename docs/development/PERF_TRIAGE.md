@@ -1,6 +1,6 @@
 # WuKongIM Performance Triage
 
-Use this project-local runbook when investigating `wk-sim`, `wkbench dev-sim`, or three-node Docker Compose performance, timeout, throughput, sendack, recv, delivery, Raft, or data-plane regressions.
+Use this project-local runbook when investigating `wk-sim`, `wkcli bench dev-sim`, or three-node Docker Compose performance, timeout, throughput, sendack, recv, delivery, Raft, or data-plane regressions.
 
 ## Core Rule
 
@@ -69,7 +69,7 @@ defaults to a 10,000-group-channel cardinality run, enables metrics and pprof,
 and stores evidence under
 `docs/development/perf-runs/<timestamp>-three-node-activate-10kch/`. It records
 node configs, startup plan, logs, before/after Prometheus snapshots,
-per-node `wkbench metrics classify` attribution files under `metrics/`,
+per-node `wkcli bench metrics classify` attribution files under `metrics/`,
 goroutine/heap pprof data, server process CPU/memory samples under
 `resources/`, the wkbench activation report, console output, and a top-level
 `summary.md`. The server resource sampler writes
@@ -359,9 +359,9 @@ before the measured window and one after it:
 
 ```bash
 curl -fsS http://127.0.0.1:5001/metrics > metrics/before.prom
-# run wkbench capacity send or another measured SEND -> SENDACK workload
+# run wkcli bench capacity send or another measured SEND -> SENDACK workload
 curl -fsS http://127.0.0.1:5001/metrics > metrics/after.prom
-go run ./cmd/wkbench metrics classify --before metrics/before.prom --after metrics/after.prom
+go run ./cmd/wkcli bench metrics classify --before metrics/before.prom --after metrics/after.prom
 ```
 
 The classifier is a first-pass attribution helper. Use the raw `.prom` files,

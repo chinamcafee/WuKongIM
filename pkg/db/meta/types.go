@@ -131,15 +131,11 @@ type MessageEventMessageKey struct {
 	ClientMsgNo string
 }
 
-// ConversationKind identifies one logical UID-owned conversation projection view.
-type ConversationKind uint8
-
-const (
-	// ConversationKindNormal stores ordinary chat conversation cursors.
-	ConversationKindNormal ConversationKind = 1
-	// ConversationKindCMD stores command-channel sync cursors.
-	ConversationKindCMD ConversationKind = 2
-)
+// ChannelKey identifies one channel in metadata APIs.
+type ChannelKey struct {
+	ChannelID   string
+	ChannelType int64
+}
 
 const (
 	// TableIDUser stores user token and device defaults.
@@ -152,7 +148,7 @@ const (
 	TableIDDevice uint32 = 4
 	// TableIDSubscriber stores channel subscribers.
 	TableIDSubscriber uint32 = 5
-	// TableIDConversation stores user conversation state.
+	// TableIDConversation is reserved by the removed development-era conversation table.
 	TableIDConversation uint32 = 6
 	// TableIDCMDConversation is reserved by the development-era split CMD table and must not be reused.
 	TableIDCMDConversation uint32 = 7
@@ -174,6 +170,32 @@ const (
 	TableIDMessageEventApplied uint32 = 15
 	// TableIDCMDDeviceCursor stores device-scoped command-message consumer cursors.
 	TableIDCMDDeviceCursor uint32 = 16
+	// TableIDUserCMDChannelMembership stores UID-owned command-channel discovery state.
+	TableIDUserCMDChannelMembership uint32 = 29
+	// TableIDPersonDirectoryTask stores durable person-channel directory projection work.
+	TableIDPersonDirectoryTask uint32 = 17
+	// TableIDMessageUpdate stores latest payload replacements and ordered indexes.
+	TableIDMessageUpdate uint32 = 18
+	// TableIDMessageUpdateHead stores per-channel edit progress and incarnation.
+	TableIDMessageUpdateHead uint32 = 19
+	// TableIDMessageUpdateRequest stores per-target edit idempotency results.
+	TableIDMessageUpdateRequest uint32 = 20
+	// TableIDMessageUpdatePending stores body-free notification checkpoints.
+	TableIDMessageUpdatePending uint32 = 21
+	// TableIDMQTTSession stores broker-scoped ClientID bindings and session fences.
+	TableIDMQTTSession uint32 = 22
+	// TableIDMQTTSubscription stores owner-fenced subscription intents and recovery stages.
+	TableIDMQTTSubscription uint32 = 23
+	// TableIDMQTTDeliveryCursor stores per-subscription source progress and backlog accounting.
+	TableIDMQTTDeliveryCursor uint32 = 24
+	// TableIDMQTTInflight stores only the bounded unacknowledged exchange window.
+	TableIDMQTTInflight uint32 = 25
+	// TableIDMQTTSourceBinding stores source-owned subscription projections.
+	TableIDMQTTSourceBinding uint32 = 26
+	// TableIDMQTTWill retains configuration, obligations and execution receipts.
+	TableIDMQTTWill uint32 = 27
+	// TableIDMQTTStorageLedger retains non-expiring cluster capacity grants.
+	TableIDMQTTStorageLedger uint32 = 28
 )
 
 const (
@@ -190,8 +212,12 @@ const (
 	subscriberPrimaryFamilyID uint16 = 0
 	subscriberPrimaryIndexID  uint16 = 1
 
-	userChannelMembershipPrimaryFamilyID uint16 = 0
-	userChannelMembershipPrimaryIndexID  uint16 = 1
+	userChannelMembershipPrimaryFamilyID   uint16 = 0
+	userChannelMembershipPrimaryIndexID    uint16 = 1
+	userChannelMembershipActivationIndexID uint16 = 2
+
+	userCMDChannelMembershipPrimaryFamilyID uint16 = 0
+	userCMDChannelMembershipPrimaryIndexID  uint16 = 1
 
 	channelLatestPrimaryFamilyID uint16 = 0
 	channelLatestPrimaryIndexID  uint16 = 1
@@ -211,5 +237,18 @@ const (
 	conversationPrimaryIndexID uint16 = 1
 	conversationActiveIndexID  uint16 = 2
 
-	systemIDSnapshot uint16 = 1
+	systemIDSnapshot    uint16 = 1
+	systemIDSlotApplied uint16 = 2
+	// systemIDSlotRestorePending fences incomplete startup installs outside hash-slot snapshots.
+	systemIDSlotRestorePending uint16 = 3
+)
+
+// ConversationKind identifies one logical UID-owned conversation projection view.
+type ConversationKind uint8
+
+const (
+	// ConversationKindNormal stores ordinary chat conversation cursors.
+	ConversationKindNormal ConversationKind = 1
+	// ConversationKindCMD stores command-channel sync cursors.
+	ConversationKindCMD ConversationKind = 2
 )

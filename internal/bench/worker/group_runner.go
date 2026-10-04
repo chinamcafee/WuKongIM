@@ -164,8 +164,9 @@ func buildGroupExecutionPlan(assignment Assignment) (groupExecutionPlan, error) 
 	return plan, nil
 }
 
-func buildGroupWorkloads(assignment Assignment, bundles []groupWorkloadBundle, clients map[string]benchworkload.PersonClient) ([]*benchworkload.GroupWorkload, error) {
+func buildGroupWorkloads(assignment Assignment, bundles []groupWorkloadBundle, clients map[string]benchworkload.PersonClient, fanoutProof *benchworkload.GroupFanoutProof) ([]*benchworkload.GroupWorkload, error) {
 	workloads := make([]*benchworkload.GroupWorkload, 0, len(bundles))
+	senderCredits := benchworkload.NewAssignmentSenderCredits()
 	for _, bundle := range bundles {
 		wl, err := benchworkload.NewGroupWorkload(benchworkload.GroupConfig{
 			RunID:                  assignment.RunID,
@@ -177,11 +178,13 @@ func buildGroupWorkloads(assignment Assignment, bundles []groupWorkloadBundle, c
 			WarmupDuration:         assignment.Scenario.Run.Warmup,
 			CooldownDuration:       assignment.Scenario.Run.Cooldown,
 			AckTimeout:             bundle.traffic.AckTimeout,
+			RetryEnabled:           bundle.traffic.Retry.Enabled,
 			RecvTimeout:            bundle.traffic.RecvTimeout,
 			VerifyRecvMode:         bundle.traffic.Verify.Recv.Mode,
 			RecvSampleSize:         bundle.traffic.Verify.Recv.SampleSizePerMessage,
 			RecvAck:                bundle.traffic.RecvAck,
 			SenderPick:             bundle.traffic.SenderPick,
+			RandomSeed:             assignment.Scenario.Run.RandomSeed,
 			GlobalRate:             bundle.traffic.RatePerChannel,
 			LocalRate:              benchworkload.GroupLocalRate(bundle.traffic.RatePerChannel, bundle.profile.TrafficPartitionCount, bundle.profile.OwnedTrafficPartitions),
 			MaxConcurrency:         bundle.traffic.Concurrency,
@@ -189,6 +192,8 @@ func buildGroupWorkloads(assignment Assignment, bundles []groupWorkloadBundle, c
 			OwnedTrafficPartitions: bundle.profile.OwnedTrafficPartitions,
 			Channels:               bundle.channels,
 			Metrics:                metrics.NewRegistry(),
+			FanoutProof:            fanoutProof,
+			SenderCredits:          senderCredits,
 		}, clients)
 		if err != nil {
 			return nil, err

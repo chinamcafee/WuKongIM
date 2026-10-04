@@ -269,6 +269,7 @@ func (r *Reactor) handleRuntimeProbe(event Event) {
 			Status:             rc.state.Status,
 			LEO:                rc.state.LEO,
 			HW:                 rc.state.HW,
+			RecoveryRequired:   r.requiresQuorumInstall(rc.state) && !rc.quorumReadReady,
 			CheckpointHW:       rc.state.CheckpointHW,
 			WriteFence:         rc.state.WriteFence,
 			InflightAppend:     rc.state.InflightAppend != nil,
@@ -337,7 +338,7 @@ func (r *Reactor) handleRuntimeEvict(event Event) {
 			result.Evicted++
 			continue
 		}
-		if r.evictRuntimeChannel(key, rc, "bench runtime evict") {
+		if r.evictRuntimeChannel(key, rc, RuntimeEvictionReasonBench) {
 			result.Evicted++
 			continue
 		}

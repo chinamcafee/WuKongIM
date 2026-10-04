@@ -1,0 +1,363 @@
+import type {
+  ProductHTTPOpenAPILocalizedText,
+  ProductHTTPOpenAPILocale,
+} from './product-http-openapi';
+
+export interface ProductHTTPOperationSemantics {
+  scope: ProductHTTPOpenAPILocalizedText;
+  atomicity?: ProductHTTPOpenAPILocalizedText;
+  success?: ProductHTTPOpenAPILocalizedText;
+  recovery?: ProductHTTPOpenAPILocalizedText;
+}
+
+export interface LocalizedProductHTTPOperationSemantics {
+  scope: string;
+  atomicity?: string;
+  success?: string;
+  recovery?: string;
+}
+
+const text = (zh: string, en: string): ProductHTTPOpenAPILocalizedText => ({
+  zh,
+  en,
+});
+
+/**
+ * Reviewed runtime semantics that cannot be expressed precisely with JSON
+ * Schema alone. Keys are stable `METHOD path` pairs from the complete contract.
+ */
+export const productHTTPOperationSemantics = {
+  'POST /user/send_ban': {
+    scope: text('UID 全局应用发送限制；不影响登录、接收或协议 ACK。', 'Global application-send restriction for one UID; login, receiving and protocol ACKs remain allowed.'),
+    atomicity: text('策略与独立 uint64 版本在一次 Slot 应用内原子变更；相同值不递增版本。', 'The policy and its independent uint64 version change atomically in one Slot apply; an identical value does not increment the version.'),
+    success: text('200 返回已应用的策略及十进制字符串版本。', '200 returns the applied policy and a decimal-string version.'),
+    recovery: text('超时或 503 可能已经提交；先 GET 核对当前策略。409 后重读并重新作出变更决定，不盲目重试旧 expected_version。', 'A timeout or 503 may follow a commit; GET the current policy first. After 409, reload and make a new mutation decision instead of blindly retrying the old expected_version.'),
+  },
+  'GET /user/send_ban': {
+    scope: text('UID 全局应用发送限制；不影响登录、接收或协议 ACK。', 'Global application-send restriction for one UID; login, receiving and protocol ACKs remain allowed.'),
+    success: text('读取当前 UID Slot 权威策略；未知 UID 返回允许、版本 0。', 'Reads current UID Slot authority; an unknown UID returns allow/version 0.'),
+    recovery: text('503 时保持策略未知并退避重读，不能把权威不可用当作允许。', 'On 503, keep the policy unknown and retry reads with backoff; unavailable authority is not evidence of allow.'),
+  },
+  'POST /channel/send_ban': {
+    scope: text('实际源 Channel 发送限制；个人 ID 必须规范编码，CMD 派生键不可用；不影响登录、接收或协议 ACK。', 'Restriction for the actual source Channel; person IDs must be canonical and CMD-derived keys are invalid; login, receiving and protocol ACKs remain allowed.'),
+    atomicity: text('策略与独立 uint64 版本在一次 Slot 应用内原子变更；相同值不递增版本。', 'The policy and its independent uint64 version change atomically in one Slot apply; an identical value does not increment the version.'),
+    success: text('200 返回已应用的策略；版本以十进制字符串返回，终态解散不可逆。', '200 returns the applied policy with a decimal-string version; terminal disband is irreversible.'),
+    recovery: text('超时或 503 可能已经提交；先 GET 核对当前策略。409 后重读并重新作出变更决定，不盲目重试旧 expected_version。', 'A timeout or 503 may follow a commit; GET the current policy first. After 409, reload and make a new mutation decision instead of blindly retrying the old expected_version.'),
+  },
+  'GET /channel/send_ban': {
+    scope: text('实际源 Channel 发送限制；个人 ID 必须规范编码，CMD 派生键不可用；不影响登录、接收或协议 ACK。', 'Restriction for the actual source Channel; person IDs must be canonical and CMD-derived keys are invalid; login, receiving and protocol ACKs remain allowed.'),
+    success: text('读取当前 Channel Slot 权威策略；缺失个人 Channel 返回允许、版本 0，缺失非个人 Channel 返回 404。', 'Reads current Channel Slot authority; a missing person Channel returns allow/version 0, a missing non-person Channel returns 404.'),
+    recovery: text('503 时保持策略未知并退避重读，不能把权威不可用当作允许。', 'On 503, keep the policy unknown and retry reads with backoff; unavailable authority is not evidence of allow.'),
+  },
+  'POST /message/update': {
+    scope: text('业务后端负责修改权限和时间窗口；不改变消息 ID、序号、原发送时间、未读或排序。', 'The backend owns editing permissions and time windows; message ID, sequence, original timestamp, unread and ordering stay unchanged.'),
+    success: text('200 表示修改及幂等结果已由 Slot 多数派提交并应用，不等待终端接收。', '200 means the edit and idempotency result were quorum committed and applied by the Slot; it does not wait for devices.'),
+    recovery: text('结果不确定时使用完全相同的 request_id、版本、恢复代数和 payload 重试。版本或恢复代数冲突后重新读取并作出新的修改决定。', 'Retry uncertain outcomes with identical request_id, version, content epoch and payload. After a version or epoch conflict, reload and make a new editing decision.'),
+  },
+  'POST /channel/messageupdates': {
+    scope: text('仅在进入、重连或继续查看当前频道时同步；不是所有会话的更新发现接口。', 'Synchronize the currently viewed channel on entry, reconnect or resume; this endpoint does not discover updates for all conversations.'),
+    success: text('先获得基线再读取可见历史；more=true 时继续分页，即使 updates 为空。消息与游标在同一事务合并；旧消息修改不能覆盖新末条摘要。', 'Obtain a baseline before loading visible history; continue while more=true even when updates is empty. Merge messages and cursor transactionally; an older message edit must not replace a newer tail preview.'),
+    recovery: text('reset_required=true 时按新基线重载可见历史；503 保留原游标并退避重试。忽略旧恢复代数的延迟响应。', 'On reset_required=true, reload visible history from the new baseline; on 503, preserve the cursor and retry with backoff. Discard delayed responses from older content epochs.'),
+  },
+  'POST /conversation/sync': {
+    scope: text('最近消息包含最新修改；即使 last_msg_seqs 已追平，修改过的末条消息也会重复返回，按消息 ID 和版本合并。', 'Recents contain the latest edits; an edited tail is returned again even when last_msg_seqs is caught up. Merge by message ID and version.'),
+    success: text('不改变旧数组结构、会话版本、未读、排序、only_unread 或 msg_count=0 规则。', 'The legacy array, conversation version, unread, ordering, only_unread and msg_count=0 behavior are preserved.'),
+    recovery: text('临时读取失败返回 503 unavailable；保留原请求和缓存，退避重试。恢复代数增加后重置消息版本比较。', 'Transient reads return 503 unavailable; preserve the request and cache and retry with backoff. Reset message version comparisons when the content epoch increases.'),
+  },
+  'POST /messages': {
+    atomicity: text('内容包含最新修改；临时读取失败为 503 unavailable，不返回部分消息。', 'Content includes latest edits; temporary reads fail as 503 unavailable without partial messages.'),
+    scope: text('按当前成员可见范围读取精确消息索引，不使用近期历史扫描代替。', 'Reads exact message indexes within current membership visibility, without a recent-history scan fallback.'),
+    success: text('选择项取并集，按序号去重排序；超限或任一读取失败不返回部分结果。', 'Selectors form a union ordered and deduplicated by sequence; exhaustion or any failed read returns no partial result.'),
+    recovery: text('全部节点须支持精确查询 RPC；旧节点会明确拒绝。', 'Every node must support the indexed-read RPC; older nodes reject it explicitly.'),
+  },
+  'POST /user/token': {
+    scope: text(
+      'Token 持久化到集群；Master 设备的旧连接由请求处理节点在约 10 秒后发起关闭。',
+      'The token is persisted cluster-wide; for a Master device, the handling node starts closing old sessions after about 10 seconds.',
+    ),
+    success: text(
+      '200 表示 Token 写入已完成，不表示旧连接已经关闭。',
+      'A 200 response means the token write completed, not that old sessions are already closed.',
+    ),
+  },
+  'POST /user/device_quit': {
+    scope: text(
+      '设备关闭由请求处理节点在约 2 秒后执行；device_flag=-1 会依次处理 APP、Web、PC。',
+      'The handling node performs session closure after about 2 seconds; device_flag=-1 processes APP, Web, and PC sequentially.',
+    ),
+    atomicity: text(
+      '多设备退出不是事务；较早的设备可能已退出，而较后的设备失败。',
+      'Multi-device sign-out is not transactional; earlier device classes may be signed out before a later one fails.',
+    ),
+    success: text(
+      '目标设备不存在时仍返回 200。',
+      'A missing target device still returns 200.',
+    ),
+  },
+  'POST /user/systemuids_add': {
+    scope: text(
+      'UID 集合先持久化，再只更新请求处理进程的权限缓存。其他节点不会被本请求同步刷新。',
+      'The UID set is persisted first, then only the handling process permission cache is updated. This request does not refresh other nodes.',
+    ),
+    recovery: text(
+      '在每个服务节点刷新本地缓存，或滚动重启节点，使实际权限与持久集合一致。',
+      'Refresh the local cache on every server node, or roll the nodes, so effective permission state matches the persisted set.',
+    ),
+  },
+  'POST /user/systemuids_remove': {
+    scope: text(
+      'UID 集合先从持久状态移除，再只更新请求处理进程的权限缓存。',
+      'UIDs are removed from durable state first, then only from the handling process permission cache.',
+    ),
+    recovery: text(
+      '在每个服务节点刷新本地缓存，或滚动重启节点。',
+      'Refresh the local cache on every server node, or roll the nodes.',
+    ),
+  },
+  'GET /user/systemuids': {
+    scope: text(
+      '返回持久化的系统 UID 集合，不证明每个节点当前内存中的权限缓存已经一致。',
+      'Returns the durable system-UID set; it does not prove that every node currently has the same in-memory permission cache.',
+    ),
+  },
+  'POST /user/systemuids_add_to_cache': {
+    scope: text(
+      '只修改请求处理进程的内存缓存；不持久化，也不广播到其他节点。',
+      'Changes only the handling process in-memory cache; it is neither persisted nor broadcast to other nodes.',
+    ),
+  },
+  'POST /user/systemuids_remove_from_cache': {
+    scope: text(
+      '只修改请求处理进程的内存缓存；不持久化，也不广播到其他节点。',
+      'Changes only the handling process in-memory cache; it is neither persisted nor broadcast to other nodes.',
+    ),
+  },
+  'POST /channel': {
+    scope: text(
+      'Channel 元数据与成员写入集群存储；large 会在成员变更后按当前成员数重新计算。',
+      'Channel metadata and membership are written to cluster storage; large is recomputed from the current member count after membership changes.',
+    ),
+    atomicity: text(
+      '元数据、清空旧成员、分批加入成员和刷新 large 是多个阶段，不构成事务。',
+      'Metadata update, old-member removal, chunked member insertion, and large refresh are separate stages, not one transaction.',
+    ),
+    recovery: text(
+      '超时或 400/5xx 后按业务期望状态重放，并通过受保护的 Manager 查询核对成员。',
+      'After a timeout or 400/5xx, replay the desired business state and verify membership through the protected Manager query.',
+    ),
+  },
+  'POST /channel/subscriber_add': {
+    scope: text(
+      '目标 Channel 不存在时会被隐式创建；省略或传 0 的 channel_type 会按群组类型 2 处理。',
+      'A missing target Channel is created implicitly; an omitted or zero channel_type is treated as group type 2.',
+    ),
+    atomicity: text(
+      'reset 清空、分批加入和 large 刷新是多阶段操作，可能部分完成。',
+      'Reset removal, chunked insertion, and large refresh are separate stages and may partially complete.',
+    ),
+  },
+  'POST /channel/subscriber_remove': {
+    scope: text(
+      '只移除现有成员，不会隐式创建 Channel；channel_type=0 会原样传入。',
+      'Removes existing members without implicitly creating the Channel; channel_type=0 is passed through unchanged.',
+    ),
+    atomicity: text(
+      '成员移除与 large 刷新是两个阶段，可能部分完成。',
+      'Member removal and large refresh are separate stages and may partially complete.',
+    ),
+  },
+  'POST /channel/subscriber_remove_all': {
+    scope: text(
+      '清空普通订阅者后再刷新 large；不支持个人 Channel。',
+      'Clears ordinary subscribers and then refreshes large; person Channels are not supported.',
+    ),
+    atomicity: text(
+      '清空与 large 刷新不是同一事务。',
+      'Removal and large refresh are not one transaction.',
+    ),
+  },
+  'POST /tmpchannel/subscriber_set': {
+    scope: text(
+      '临时订阅者采用全量替换语义。',
+      'Temporary subscribers use full-replacement semantics.',
+    ),
+    atomicity: text(
+      '先清空再分批加入；失败时可能只留下部分新成员。',
+      'The service removes all members before chunked insertion; failure may leave only part of the new set.',
+    ),
+  },
+  'POST /channel/blacklist_set': {
+    scope: text('拒绝列表采用全量替换语义。', 'The denylist uses full-replacement semantics.'),
+    atomicity: text(
+      '先清空再加入；两个阶段不构成事务。',
+      'The list is removed and then inserted; the two stages are not transactional.',
+    ),
+  },
+  'POST /channel/blacklist_add': {
+    scope: text(
+      '入口不验证父 Channel 是否存在；派生拒绝列表可以先于父 Channel 建立，并在父 Channel 后续出现时生效。',
+      'The entry does not verify that the parent Channel exists; derived denylist state can be created first and become effective if the parent Channel appears later.',
+    ),
+  },
+  'POST /channel/whitelist_set': {
+    scope: text('允许列表采用全量替换语义。', 'The allowlist uses full-replacement semantics.'),
+    atomicity: text(
+      '先清空再加入；两个阶段不构成事务。',
+      'The list is removed and then inserted; the two stages are not transactional.',
+    ),
+  },
+  'POST /channel/whitelist_add': {
+    scope: text(
+      '入口不验证父 Channel 是否存在；派生允许列表可以先于父 Channel 建立，并在父 Channel 后续出现时生效。',
+      'The entry does not verify that the parent Channel exists; derived allowlist state can be created first and become effective if the parent Channel appears later.',
+    ),
+  },
+  'POST /message/send': {
+    scope: text(
+      '消息由受信后端提交；可选 X-WK-Trace-ID 必须是 32 位十六进制文本，否则服务端忽略并生成新值。',
+      'Messages are submitted by a trusted backend; optional X-WK-Trace-ID must be 32 hexadecimal characters or the server ignores it and generates a new value.',
+    ),
+    success: text(
+      'HTTP 200 仍必须检查 reason；只有成功 Reason Code 才表示消息被接受。',
+      'Even with HTTP 200, inspect reason; only a success Reason Code means the message was accepted.',
+    ),
+  },
+  'POST /message/eventsync': {
+    scope: text(
+      '读取当前持久化 lane 投影，不返回完整事件日志。此入口不检查调用方身份或成员权限；include_private 由调用方直接控制，只能通过受信后端使用。',
+      'Reads current durable lane projections, not complete event history. This entry checks neither caller identity nor membership; include_private is caller-controlled and requires a trusted backend.',
+    ),
+    success: text(
+      '先读取 limit+1 条原始投影，再过滤 private/restricted；过滤后 more=0 或空页不保证更远处没有可见投影。next_msg_event_seq 只随实际返回项前进。',
+      'Reads limit+1 raw projections before filtering private/restricted entries. A filtered empty page or more=0 does not prove there are no visible projections farther ahead. next_msg_event_seq advances only for returned items.',
+    ),
+  },
+  'POST /message/event': {
+    scope: text(
+      '要求已提交且身份匹配的持久流式基础消息；公开事件尽力投递到在线 Session，private/restricted 不广播。普通消息同步不按 visibility 做访问控制；只能由受信后端授权并筛选。',
+      'Requires a committed persistent stream base with matching identity. Public events are delivered best effort to online Sessions; private/restricted events are not broadcast. Ordinary message sync does not enforce visibility access control; a trusted backend must authorize and filter.',
+    ),
+    success: text(
+      '成功只确认投影接受，不保证在线展示；终态完整 snapshot 与离线消息同步负责恢复。结果未知时重试完全相同的 event_id 与 Payload。',
+      'Success confirms projection acceptance, not online display. Complete terminal snapshots and offline message sync provide recovery. Retry an uncertain write with the exact same event_id and payload.',
+    ),
+  },
+  'POST /channel/messagesync': {
+    recovery: text('读取页面时包含最新修改；503 unavailable 保留原查询重试。恢复代数增加后重置缓存版本比较。', 'Page reads include latest edits; retry the original query on 503 unavailable. Reset cached version comparisons after a content epoch increase.'),
+    scope: text(
+      '读取前必须存在 login_uid 的普通成员关系；join_seq 与 deleted_to_seq 共同形成最低可见序号。返回消息始终按 message_seq 升序排列。',
+      'The login_uid must have an ordinary membership before reading; join_seq and deleted_to_seq establish the lowest visible sequence. Returned messages are always ordered by ascending message_seq.',
+    ),
+    success: text(
+      'pull_mode=1 读取 [start_message_seq, end_message_seq)；其他值向旧消息读取 (end_message_seq, start_message_seq]。边界为 0 时使用开放端。',
+      'pull_mode=1 reads [start_message_seq, end_message_seq); other values read older messages in (end_message_seq, start_message_seq]. A zero boundary selects the open end.',
+    ),
+  },
+  'POST /message/sync': {
+    scope: text(
+      '消息来自持久存储，但本次最新确认 generation 只保存在请求处理进程内存中，默认约 5 分钟且最多 4096 个 UID。',
+      'Messages come from durable storage, but the latest acknowledgement generation is kept only in the handling process memory, by default for about 5 minutes and at most 4,096 UIDs.',
+    ),
+    success: text(
+      'limit 限制返回数量，不限制服务端枚举命令 Channel 与扫描消息的总成本。',
+      'limit bounds returned messages, not the total cost of enumerating command Channels and scanning messages.',
+    ),
+    recovery: text(
+      'sync 与 syncack 必须保持节点亲和；进程重启、过期或驱逐后应重新 sync。',
+      'Keep sync and syncack node-affine; run sync again after process restart, expiry, or eviction.',
+    ),
+  },
+  'POST /message/syncack': {
+    scope: text(
+      '确认只消费当前进程内最近一次 sync 记录的 generation；last_message_seq 仅校验为正数，实际不会参与确认。',
+      'Acknowledgement consumes only the generation recorded by the latest sync in this process; last_message_seq is only validated as positive and is not used for acknowledgement.',
+    ),
+    success: text(
+      '找不到本地 generation 时仍返回 200，且不会确认任何消息。',
+      'If no local generation exists, the endpoint still returns 200 and acknowledges nothing.',
+    ),
+  },
+  'POST /message/cmd/bind': {
+    atomicity: text(
+      '三种互斥形式：uid 加源频道、uids 加源频道、仅 subscribers。最多 1000 个原始接收者，256 KiB 请求体；subscribers 顺序须与 SEND 相同。',
+      'Choose uid plus source, uids plus source, or subscribers only. At most 1000 raw recipients and a 256 KiB body; subscribers must match SEND order.',
+    ),
+    success: text(
+      '重复绑定保留已有起始和确认位置。跨 Slot 失败可部分完成；须重试整个批次并成功后再发送 CMD。',
+      'Retry preserves live start and ack positions. Cross-Slot failure can be partial; retry the complete batch successfully before SEND.',
+    ),
+    scope: text(
+      '持久化用户与命令 Channel 的发现绑定；后续 /message/sync 仍依赖当前进程中的确认 generation。',
+      'Persists discovery binding between a user and a command Channel; later /message/sync acknowledgement still depends on the current-process generation record.',
+    ),
+  },
+  'POST /message/cmd/unbind': {
+    scope: text(
+      '使用与 bind 相同的三种互斥形式及 1000 项、256 KiB 上限；临时范围顺序须与原 SEND 相同。',
+      'Uses the same three exclusive forms and 1000-entry/256 KiB bounds as bind; temporary scope order must match SEND.',
+    ),
+    success: text(
+      '跨 Slot 失败可能部分完成；重试整个批次。解绑不删除消息。',
+      'Cross-Slot failure can be partial; retry the complete batch. Unbinding does not delete messages.',
+    ),
+  },
+  'POST /channel/messagesyncbatch': {
+    scope: text(
+      '每个 items 条目独立执行；响应顺序与请求一致。',
+      'Each items entry runs independently; response order matches request order.',
+    ),
+    success: text(
+      'HTTP 200 仍需逐项检查 error；一个条目失败不代表整个批次使用非 2xx。',
+      'Even with HTTP 200, inspect each item error; one failed item does not make the whole batch non-2xx.',
+    ),
+  },
+  'POST /conversation/list': {
+    recovery: text('摘要包含末条消息的最新修改；503 unavailable 保留游标重试。内容修改不改变会话排序或未读。', 'Previews include the latest tail edit; preserve the cursor on 503 unavailable. Content edits do not change conversation order or unread.'),
+    scope: text(
+      'limit 限制本页扫描的 membership 条目数，不保证 conversations 数组达到该数量；墓碑进入 deletes；最新消息和未读数基于 Leader 已落盘数据，读取不激活运行时。任一读取失败则整页失败，使用原请求和原游标重试。',
+      'limit bounds membership rows scanned, not the number of returned conversations; tombstones go to deletes. Previews use Leader-persisted data without runtime activation. Any read failure fails the whole page; retry the original request and cursor.',
+    ),
+    success: text(
+      '只以 done=true 结束完整轮次并保存 coverage；reset_required=true 时必须重建本地会话目录。',
+      'Only done=true completes a full pass and permits saving coverage; reset_required=true requires rebuilding the local Conversation directory.',
+    ),
+  },
+} as const satisfies Record<string, ProductHTTPOperationSemantics>;
+
+export function operationKey(method: string, path: string) {
+  return `${method.toUpperCase()} ${path}`;
+}
+
+export function getProductHTTPOperationSemantics(method: string, path: string) {
+  return productHTTPOperationSemantics[
+    operationKey(method, path) as keyof typeof productHTTPOperationSemantics
+  ];
+}
+
+export function localizeProductHTTPOperationSemantics(
+  semantics: ProductHTTPOperationSemantics,
+  locale: ProductHTTPOpenAPILocale,
+): LocalizedProductHTTPOperationSemantics {
+  return Object.fromEntries(
+    Object.entries(semantics).map(([name, value]) => [name, value[locale]]),
+  ) as unknown as LocalizedProductHTTPOperationSemantics;
+}
+
+export function applyProductHTTPOperationSemantics(
+  document: unknown,
+  locale: ProductHTTPOpenAPILocale,
+) {
+  if (!document || typeof document !== 'object') return;
+  const paths = (document as { paths?: Record<string, Record<string, unknown>> }).paths;
+  if (!paths) return;
+
+  for (const [path, pathItem] of Object.entries(paths)) {
+    for (const [method, value] of Object.entries(pathItem)) {
+      if (!value || typeof value !== 'object') continue;
+      const semantics = getProductHTTPOperationSemantics(method, path);
+      if (!semantics) continue;
+      (value as Record<string, unknown>)['x-wukongim-semantics'] =
+        localizeProductHTTPOperationSemantics(semantics, locale);
+    }
+  }
+}

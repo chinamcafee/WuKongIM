@@ -1,0 +1,169 @@
+---
+title: Synchronize current message event projections
+full: true
+_openapi:
+  preload:
+    - wukongim-product-http-complete-beta-en
+  method: POST
+  webhook: false
+  toc:
+    - depth: 2
+      title: Request Body
+      url: '#request-body'
+    - depth: 2
+      title: Response Body
+      url: '#response-body'
+  structuredData:
+    headings:
+      - content: Synchronize current message event projections
+        id: synchronize-current-message-event-projections
+    contents:
+      - content: Reads current durable event projections after a sequence cursor, with
+          filtering after a bounded read; not a replayable event log.
+        heading: synchronize-current-message-event-projections
+      - content: >-
+          POST /message/eventsync
+
+          syncMessageEvents
+
+          Synchronize current message event projections
+
+          Reads current durable event projections after a sequence cursor, with
+          filtering after a bounded read; not a replayable event log.
+
+          MessageEventSyncRequest
+
+          Read parameters for current durable message event projections;
+          membership is not checked.
+
+          additionalProperties true
+
+          channel_id `string` pattern: `\S` Non-blank Channel ID; a person
+          channel with non-blank from_uid is normalized using both UIDs.
+
+          channel_type `integer:uint8` 1–255 Channel type in the range 1–255.
+
+          from_uid `string` — Optional sender UID used only for person-channel
+          normalization, not an authenticated identity.
+
+          client_msg_no `string` pattern: `\S` Non-blank client message number
+          of the parent message.
+
+          event_key `string` — Optional event-lane filter; empty reads all
+          lanes.
+
+          from_msg_event_seq `integer:uint64` 0–∞; default: `0` Exclusive
+          sequence boundary; read only current projections after this value,
+          default 0.
+
+          limit `integer` 0–∞; default: `0` Omit or use 0 for 200; negative
+          values are rejected and values above 2000 are capped at 2000.
+
+          include_private `integer:uint8` 0–255; default: `0` Exactly 1 includes
+          private/restricted projections; other uint8 values filter them. This
+          switch is not an authorization check.
+
+          200 Current durable event projections
+
+          MessageEventSyncResponse
+
+          Successful message-event read response.
+
+          additionalProperties false
+
+          status `integer` const: `200` Application status fixed at 200.
+
+          data `MessageEventSyncData` additionalProperties: `false` Current
+          projections and cursors.
+
+          MessageEventSyncData
+
+          Current projections and cursors.
+
+          client_msg_no `string` — Requested client message number.
+
+          from_msg_event_seq `integer:uint64` 0–∞ Echoed request starting
+          cursor.
+
+          next_msg_event_seq `integer:uint64` 0–∞ Sequence of the last returned
+          projection; unchanged from the input cursor when no items are
+          returned.
+
+          more `integer` enum: `0`, `1` 1 when another returnable item exists in
+          the bounded raw page; filtering can make it 0 even when visible
+          projections exist farther ahead.
+
+          events array<`SyncedMessageEvent`> maxItems: 2000 Current projections
+          ordered by event sequence, at most 2000 items.
+
+          filtered_by_event_key `string` — Echoed event_key; empty means no lane
+          filter.
+
+          SyncedMessageEvent
+
+          Current projection of one event lane, not every historical event.
+
+          msg_event_seq `integer:uint64` 0–∞ Latest event sequence of the
+          projection.
+
+          event_id `string` — Latest event ID.
+
+          event_key `string` — Event lane key.
+
+          event_type `string` — Latest event type; a blank original value
+          returns stream.snapshot.
+
+          visibility `string` — Visibility string stored with the projection.
+
+          occurred_at `integer:int64` — Original event time value stored with
+          the projection.
+
+          payload `unknown` — Snapshot JSON value; non-JSON bytes become a
+          string, and a missing snapshot uses an object with status/end_reason
+          and optional error.
+
+          400 Input, validation, dependency, or downstream error
+
+          CompatibilityError
+
+          HTTP 400 error body shared by multiple legacy entries.
+
+          msg `string` — Human-readable error text with no stability guarantee;
+          do not branch on it.
+
+          status `integer` const: `400` Application-level status fixed at 400.
+
+          503 Controller restore maintenance is active
+
+          MaintenanceError
+
+          503 error body returned while cluster restore maintenance is active.
+
+          error `string` const: `"maintenance"` Stable maintenance error
+          category.
+
+          message `string` const: `"restore maintenance is active"` Current
+          restore-maintenance message.
+---
+
+<Callout type="warn" title="Operation boundary">
+
+- **Caller**: Trusted backend only
+- **Scope**: Reads current durable lane projections, not complete event history. This entry checks neither caller identity nor membership; include_private is caller-controlled and requires a trusted backend.
+- **Success**: Reads limit+1 raw projections before filtering private/restricted entries. A filtered empty page or more=0 does not prove there are no visible projections farther ahead. next_msg_event_seq advances only for returned items.
+
+</Callout>
+
+{/* This file was generated by Fumadocs. Do not edit this file directly. Any changes should be made by running the generation command again. */}
+
+export default function Layout(props) {
+  const { APIPage, OpenAPIPage } = props.components ?? {};
+  // "APIPage" is the old name from v10, this allows both for backward compatibility
+  const Comp = OpenAPIPage ?? APIPage;
+  return (
+    <>
+      {props.children}
+      <Comp document="wukongim-product-http-complete-beta-en" operations={[{"path":"/message/eventsync","method":"post"}]} showDescription />
+    </>
+  );
+}

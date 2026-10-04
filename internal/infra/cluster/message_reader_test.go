@@ -2,97 +2,125 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/WuKongIM/WuKongIM/internal/usecase/message"
 	channelruntime "github.com/WuKongIM/WuKongIM/pkg/channel"
 	channelstore "github.com/WuKongIM/WuKongIM/pkg/channel/store"
+	clusterchannels "github.com/WuKongIM/WuKongIM/pkg/cluster/channels"
+	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 )
 
-func TestChannelMessageReaderMapsPullUpRequestAndTrimsHasMore(t *testing.T) {
-	node := &recordingReadNode{
-		result: channelstore.ReadCommittedResult{Messages: []channelruntime.Message{
-			{MessageID: 10, MessageSeq: 2, ChannelID: "g1", ChannelType: 2, Setting: 2, Topic: "topic-a", Expire: 60, RedDot: true, SyncOnce: true, FromUID: "u1", ClientMsgNo: "c1", ServerTimestampMS: 1713859200123, Payload: []byte("a")},
-			{MessageID: 11, MessageSeq: 3, ChannelID: "g1", ChannelType: 2, FromUID: "u1", ClientMsgNo: "c2", Payload: []byte("b")},
-			{MessageID: 12, MessageSeq: 4, ChannelID: "g1", ChannelType: 2, FromUID: "u1", ClientMsgNo: "c3", Payload: []byte("c")},
+func TestMessageMembershipStorePreservesExactPullAuthorizationIdentity(t *testing.T) {
+	t.Parallel()
+
+	node := &recordingMembershipNode{membership: metadb.UserChannelMembership{
+		UID: "u1", ChannelID: "g1", ChannelType: 2,
+	}, found: true}
+	store := NewMessageMembershipStore(node)
+	membership, found, err := store.GetUserChannelMembership(context.Background(), "u1", "g1", 2)
+	if err != nil || !found || membership.UID != "u1" || node.uid != "u1" || node.channelID != "g1" || node.channelType != 2 {
+		t.Fatalf("GetUserChannelMembership() = %#v found=%v args=%q/%q/%d err=%v", membership, found, node.uid, node.channelID, node.channelType, err)
+	}
+
+	var nilStore *MessageMembershipStore
+	if _, _, err := nilStore.GetUserChannelMembership(context.Background(), "u1", "g1", 2); !errors.Is(err, message.ErrSyncMembershipRequired) {
+		t.Fatalf("nil store error = %v, want %v", err, message.ErrSyncMembershipRequired)
+	}
+
+}
+
+func TestCommittedMessageReaderPreservesScanAndRecordOwnership(t *testing.T) {
+	node := &recordingReadNode{batchResults: []clusterchannels.CommittedReadResult{{
+		Read: channelstore.ReadCommittedResult{Messages: []channelruntime.Message{
+			{MessageID: 15, MessageSeq: 5, ChannelID: "g1", ChannelType: 2, SyncOnce: true, ServerTimestampMS: 1700000000123, Payload: []byte("command")},
+			{MessageID: 14, MessageSeq: 4, ChannelID: "g1", ChannelType: 2, Setting: 2, FromUID: "u1", ClientMsgNo: "client-4", RedDot: true, Expire: 3600, Payload: []byte("ordinary")},
 		}},
-	}
-	reader := NewChannelMessageReader(node)
-
-	page, err := reader.SyncMessages(context.Background(), message.ChannelMessageQuery{
-		ChannelID: message.ChannelID{ID: "g1", Type: 2},
-		StartSeq:  2,
-		EndSeq:    5,
-		Limit:     2,
-		PullMode:  message.PullModeUp,
-	})
-
+	}}}
+	reader := NewCommittedMessageReader(node)
+	results, err := reader.ReadCommittedMessages(context.Background(), []message.MessageScanQuery{{
+		ChannelID: message.ChannelID{ID: "g1", Type: 2}, FromSeq: 5, MinSeq: 3, MaxSeq: 9, Limit: 2, MaxBytes: 71, Reverse: true,
+	}})
 	if err != nil {
-		t.Fatalf("SyncMessages() error = %v", err)
+		t.Fatal(err)
 	}
-	if node.lastID != (channelruntime.ChannelID{ID: "g1", Type: 2}) {
-		t.Fatalf("channel id = %#v, want g1/2", node.lastID)
+	if node.batchCalls != 1 || len(node.batchReads) != 1 || node.lastID != (channelruntime.ChannelID{}) {
+		t.Fatalf("reads=%+v, local read=%v, want one routed read", node.batchReads, node.lastID)
 	}
-	if node.lastReq.FromSeq != 2 || node.lastReq.MaxSeq != 4 || node.lastReq.Limit != 3 || node.lastReq.Reverse {
-		t.Fatalf("read request = %#v, want forward 2..4 limit+1", node.lastReq)
+	want := channelstore.ReadCommittedRequest{FromSeq: 5, MinSeq: 3, MaxSeq: 9, Limit: 2, MaxBytes: 71, Reverse: true}
+	if got := node.batchReads[0]; got.ChannelID != (channelruntime.ChannelID{ID: "g1", Type: 2}) || got.Request != want {
+		t.Fatalf("read=%+v, want unchanged scan %+v", got, want)
 	}
-	if !page.HasMore || len(page.Messages) != 2 {
-		t.Fatalf("page = %#v, want two messages with hasMore", page)
+	messages := results[0].Messages
+	if len(messages) != 2 || messages[0].MessageSeq != 5 || !messages[0].Flags.SyncOnce || messages[0].Timestamp != 1700000000 || messages[1].MessageSeq != 4 || messages[1].ClientMsgNo != "client-4" || messages[1].Setting != 2 || !messages[1].Flags.RedDot || messages[0].Flags.RedDot || messages[1].Expire != 3600 {
+		t.Fatalf("messages=%+v, want unchanged scan order, command flag and mapped fields", messages)
 	}
-	if page.Messages[0].MessageID != 10 || page.Messages[1].MessageID != 11 || string(page.Messages[0].Payload) != "a" {
-		t.Fatalf("messages = %#v, want mapped first two messages", page.Messages)
-	}
-	if page.Messages[0].Setting != 2 {
-		t.Fatalf("message setting = %d, want 2", page.Messages[0].Setting)
-	}
-	if page.Messages[0].Flags.NoPersist || !page.Messages[0].Flags.RedDot || !page.Messages[0].Flags.SyncOnce {
-		t.Fatalf("message flags = %#v, want durable red-dot sync-once", page.Messages[0].Flags)
-	}
-	if page.Messages[0].Topic != "topic-a" || page.Messages[0].Expire != 60 {
-		t.Fatalf("topic/expire = %q/%d, want topic-a/60", page.Messages[0].Topic, page.Messages[0].Expire)
-	}
-	if page.Messages[0].Timestamp != 1713859200 {
-		t.Fatalf("message timestamp = %d, want committed timestamp in Unix seconds", page.Messages[0].Timestamp)
+	messages[1].Payload[0] = 'X'
+	if string(node.batchResults[0].Read.Messages[1].Payload) != "ordinary" {
+		t.Fatal("mapped payload aliases cluster storage")
 	}
 }
 
-func TestChannelMessageReaderMapsPullDownAndReturnsAscending(t *testing.T) {
-	node := &recordingReadNode{
-		result: channelstore.ReadCommittedResult{Messages: []channelruntime.Message{
-			{MessageID: 15, MessageSeq: 5, ChannelID: "g1", ChannelType: 2},
-			{MessageID: 14, MessageSeq: 4, ChannelID: "g1", ChannelType: 2},
-			{MessageID: 13, MessageSeq: 3, ChannelID: "g1", ChannelType: 2},
-		}},
+func TestCommittedMessageReaderPreservesAlignedErrorsAndTransportCauses(t *testing.T) {
+	queries := []message.MessageScanQuery{{ChannelID: message.ChannelID{ID: "a", Type: 2}}, {ChannelID: message.ChannelID{ID: "b", Type: 2}}}
+	node := &recordingReadNode{batchResults: []clusterchannels.CommittedReadResult{{}, {Err: channelruntime.ErrNotReady}}}
+	reader := NewCommittedMessageReader(node)
+	results, err := reader.ReadCommittedMessages(context.Background(), queries)
+	if err != nil || len(results) != 2 || results[0].Err != nil || !errors.Is(results[1].Err, channelruntime.ErrNotReady) {
+		t.Fatalf("results=%+v err=%v", results, err)
 	}
-	reader := NewChannelMessageReader(node)
+	node.batchResults = nil
+	if _, err := reader.ReadCommittedMessages(context.Background(), queries); !errors.Is(err, message.ErrSyncBatchResultMismatch) {
+		t.Fatalf("cardinality error=%v", err)
+	}
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded, metadb.ErrNotFound} {
+		node.err = cause
+		if _, err := reader.ReadCommittedMessages(context.Background(), queries); !errors.Is(err, cause) {
+			t.Fatalf("error=%v, want cause %v", err, cause)
+		}
+	}
+}
 
-	page, err := reader.SyncMessages(context.Background(), message.ChannelMessageQuery{
-		ChannelID: message.ChannelID{ID: "g1", Type: 2},
-		StartSeq:  5,
-		EndSeq:    2,
-		Limit:     2,
-		PullMode:  message.PullModeDown,
-	})
-
-	if err != nil {
-		t.Fatalf("SyncMessages() error = %v", err)
+func TestCommittedMessageReaderRequiresRoutedCapability(t *testing.T) {
+	var missing *CommittedMessageReader
+	if _, err := missing.ReadCommittedMessages(context.Background(), nil); !errors.Is(err, message.ErrMessageReaderRequired) {
+		t.Fatalf("nil reader error=%v", err)
 	}
-	if node.lastReq.FromSeq != 5 || node.lastReq.Limit != 3 || !node.lastReq.Reverse {
-		t.Fatalf("read request = %#v, want reverse from 5 limit+1", node.lastReq)
-	}
-	if !page.HasMore || len(page.Messages) != 2 {
-		t.Fatalf("page = %#v, want two messages with hasMore", page)
-	}
-	if page.Messages[0].MessageSeq != 4 || page.Messages[1].MessageSeq != 5 {
-		t.Fatalf("messages = %#v, want ascending seq 4,5", page.Messages)
+	reader := NewCommittedMessageReader(&recordingManagementMessageNode{})
+	if _, err := reader.ReadCommittedMessages(context.Background(), nil); !errors.Is(err, message.ErrSyncBatchReaderRequired) {
+		t.Fatalf("local-only reader error=%v", err)
 	}
 }
 
 type recordingReadNode struct {
-	lastID  channelruntime.ChannelID
-	lastReq channelstore.ReadCommittedRequest
-	result  channelstore.ReadCommittedResult
-	err     error
+	lastID       channelruntime.ChannelID
+	lastReq      channelstore.ReadCommittedRequest
+	result       channelstore.ReadCommittedResult
+	err          error
+	batchCalls   int
+	batchReads   []clusterchannels.CommittedRead
+	batchResults []clusterchannels.CommittedReadResult
+}
+
+type recordingMembershipNode struct {
+	membership  metadb.UserChannelMembership
+	found       bool
+	err         error
+	uid         string
+	channelID   string
+	channelType int64
+}
+
+func (n *recordingMembershipNode) GetUserChannelMembership(_ context.Context, uid, channelID string, channelType int64) (metadb.UserChannelMembership, bool, error) {
+	n.uid, n.channelID, n.channelType = uid, channelID, channelType
+	return n.membership, n.found, n.err
+}
+
+func (n *recordingReadNode) ReadChannelCommittedBatch(_ context.Context, reads []clusterchannels.CommittedRead) ([]clusterchannels.CommittedReadResult, error) {
+	n.batchCalls++
+	n.batchReads = append([]clusterchannels.CommittedRead(nil), reads...)
+	return n.batchResults, n.err
 }
 
 func (n *recordingReadNode) ReadChannelCommitted(_ context.Context, id channelruntime.ChannelID, req channelstore.ReadCommittedRequest) (channelstore.ReadCommittedResult, error) {

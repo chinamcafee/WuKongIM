@@ -53,7 +53,7 @@ on:
         default: "70"
         type: string
       storage_calibration:
-        description: 'Completed 30m calibration JSON: {"run_id":"...","bytes_per_message":123}; required for 48h and 168h'
+        description: Completed 30m calibration as RUN_ID:BYTES_PER_MESSAGE; required for 48h and 168h
         required: false
         default: ""
         type: string
@@ -149,7 +149,7 @@ jobs:
           mkdir -p bundle/bin downloads
           targets=(
             wukongim:./cmd/wukongim
-            wkbench:./cmd/wkbench
+            wkcli:./cmd/wkcli
             wkanalysis:./cmd/wkanalysis
             wkcloudsim:./cmd/wkcloudsim
             wkcloudbundle:./cmd/wkcloudbundle
@@ -225,6 +225,7 @@ jobs:
     environment: cloud-sim-provision
     permissions:
       contents: read
+      actions: write
       id-token: write
     env:
       GOWORK: "off"
@@ -295,7 +296,11 @@ jobs:
           fi
           case '${{ inputs.duration }}' in
             48h|168h)
-              if [[ -z "$storage_calibration_run_id" || -z "$storage_bytes_per_message" ]]; then
+              storage_calibration_run_id="${STORAGE_CALIBRATION%%:*}"
+              storage_bytes_per_message="${STORAGE_CALIBRATION#*:}"
+              if [[ "$storage_calibration_run_id" == "$STORAGE_CALIBRATION" || "$storage_bytes_per_message" == *:* ||
+                    ! "$storage_calibration_run_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] ||
+                 ! jq -en --arg value "$storage_bytes_per_message" '$value | tonumber | . > 0' >/dev/null; then
                 echo "Standard stability runs require a completed 30m storage calibration" >&2
                 exit 1
               fi
@@ -318,6 +323,11 @@ jobs:
           path: provider.json
           retention-days: 90
           if-no-files-found: error
+      - name: Enable cloud safety schedules
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/cloud-sim/set-safety-workflows-state.sh enable
       - name: Prepare run identity and capabilities
         id: prepare
         shell: bash

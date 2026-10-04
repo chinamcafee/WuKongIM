@@ -2,15 +2,78 @@ package cluster
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/control"
+	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
+	"github.com/WuKongIM/WuKongIM/pkg/protocol/channelid"
 	"github.com/WuKongIM/WuKongIM/pkg/raftlog"
 	metafsm "github.com/WuKongIM/WuKongIM/pkg/slot/fsm"
 	"github.com/WuKongIM/WuKongIM/pkg/slot/multiraft"
 	"go.etcd.io/raft/v3/raftpb"
 )
+
+func TestInspectSlotLogEntryPayloadDistinguishesUnsupportedFromCorrupt(t *testing.T) {
+	data, err := metafsm.EncodeEnsureUserChannelMembershipBatchCommandChecked([]metafsm.UserChannelMembershipBatchItem{{
+		HashSlot: 7, Membership: metadb.UserChannelMembership{UID: "u1", ChannelID: channelid.EncodePersonChannel("u1", "u2"), ChannelType: 1, JoinSeq: 10, SourceVersion: 3},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsupported := append([]byte(nil), metafsm.EncodeNoopCommand()...)
+	unsupported[1] = 255 // An unregistered command type from a newer writer.
+	unsupportedVersion := append([]byte(nil), metafsm.EncodeNoopCommand()...)
+	unsupportedVersion[0] = 255
+	readSeq := metafsm.EncodeAdvanceUserChannelMembershipReadSeqCommand([]metadb.UserChannelMembership{{UID: "u1", ChannelID: "g1", ChannelType: 2, ReadSeq: 42, UpdatedAt: 170}})
+	for _, tc := range []struct {
+		name, status, command string
+		data                  []byte
+	}{
+		{"membership", "ok", "ensure_user_channel_membership_batch", data},
+		{"migrated membership", "ok", "apply_delta", metafsm.EncodeApplyDeltaCommand(1, 2, 7, data)},
+		{"read progress", "ok", "advance_user_channel_membership_read_seq", readSeq},
+		{"unsupported version", "unsupported", "unknown", unsupportedVersion},
+		{"unsupported inspection", "unsupported", "unknown", unsupported},
+		{"migrated unsupported inspection", "unsupported", "unknown", metafsm.EncodeApplyDeltaCommand(1, 2, 7, unsupported)},
+		{"truncated membership", "corrupt", "unknown", data[:len(data)-1]},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const createdAtMS = int64(1781754611123)
+			var item LogEntry
+			inspectSlotLogEntryPayload(&item, raftpb.Entry{Type: raftpb.EntryNormal, Data: multiraftPayloadWithCreatedAt(7, createdAtMS, tc.data)})
+			if item.DecodeStatus != tc.status || item.DecodedType != tc.command {
+				t.Fatalf("inspection = %#v, want status %q command %q", item, tc.status, tc.command)
+			}
+			if item.CreatedAtMS != createdAtMS {
+				t.Fatalf("created_at_ms = %d, want %d", item.CreatedAtMS, createdAtMS)
+			}
+			if tc.status == "ok" {
+				if item.Decoded["command"] != tc.command || item.Decoded["hash_slot"] != uint64(7) {
+					t.Fatalf("decoded = %#v, want command and proposal hash slot", item.Decoded)
+				}
+				payload := item.Decoded
+				if tc.command == "apply_delta" {
+					payload = payload["original"].(map[string]any)
+				}
+				if tc.command == "advance_user_channel_membership_read_seq" {
+					items := payload["memberships"].([]map[string]any)
+					if len(items) != 1 || items[0]["uid"] != "u1" || items[0]["read_seq"] != uint64(42) || items[0]["updated_at"] != int64(170) {
+						t.Fatalf("read progress payload = %#v", payload)
+					}
+				} else {
+					items := payload["items"].([]map[string]any)
+					if len(items) != 1 || items[0]["uid"] != "u1" || items[0]["source_version"] != uint64(3) {
+						t.Fatalf("membership payload = %#v, want UID and generation", payload)
+					}
+				}
+			} else if item.Decoded["error"] == nil {
+				t.Fatalf("inspection = %#v, want error detail", item)
+			}
+		})
+	}
+}
 
 func TestLocalControllerLogEntriesUsesControlFacade(t *testing.T) {
 	controller := &controllerLogReaderStub{
@@ -222,6 +285,75 @@ func TestSlotRaftStatusFromRuntimeIncludesCurrentVoters(t *testing.T) {
 	if !equalUint64s(got.CurrentVoters, []uint64{1, 2, 3}) {
 		t.Fatalf("CurrentVoters = %v, want [1 2 3]", got.CurrentVoters)
 	}
+}
+
+func TestSlotRaftStatusFromRuntimeIncludesSortedReplicaProgress(t *testing.T) {
+	runtimeProgress := map[multiraft.NodeID]multiraft.PeerProgress{
+		3: {Match: 8, Next: 9, State: "StateProbe"},
+		1: {Match: 10, Next: 11, State: "StateReplicate"},
+		2: {Match: 9, Next: 10, State: "StateSnapshot"},
+	}
+	got := slotRaftStatusFromRuntime(1, 9, multiraft.Status{
+		SlotID: 9, NodeID: 1, LeaderID: 1, CommitIndex: 10, Progress: runtimeProgress,
+	})
+
+	want := []SlotRaftReplicaProgress{
+		{NodeID: 1, MatchIndex: 10, NextIndex: 11, State: "StateReplicate"},
+		{NodeID: 2, MatchIndex: 9, NextIndex: 10, State: "StateSnapshot"},
+		{NodeID: 3, MatchIndex: 8, NextIndex: 9, State: "StateProbe"},
+	}
+	if !reflect.DeepEqual(got.ReplicaProgress, want) {
+		t.Fatalf("ReplicaProgress = %#v, want %#v", got.ReplicaProgress, want)
+	}
+	runtimeProgress[1] = multiraft.PeerProgress{Match: 99}
+	if got.ReplicaProgress[0].MatchIndex != 10 {
+		t.Fatalf("ReplicaProgress aliased runtime map: %#v", got.ReplicaProgress)
+	}
+}
+
+func TestLocalSlotRaftStatusUsesFreshRuntimeStatus(t *testing.T) {
+	ctx := context.WithValue(context.Background(), freshStatusContextKey{}, "fresh")
+	reader := &fakeFreshSlotStatusReader{status: multiraft.Status{
+		SlotID: 9, NodeID: 1, LeaderID: 1, Role: multiraft.RoleLeader,
+		CurrentVoters: []multiraft.NodeID{1, 2, 3}, CommitIndex: 10, AppliedIndex: 10,
+		Progress: map[multiraft.NodeID]multiraft.PeerProgress{
+			3: {Match: 8, Next: 9, State: "StateProbe"},
+			1: {Match: 10, Next: 11, State: "StateReplicate"},
+			2: {Match: 9, Next: 10, State: "StateReplicate"},
+		},
+	}}
+	node, err := New(Config{NodeID: 1, ListenAddr: "127.0.0.1:0", DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	node.slotRaftDiagnostics = reader
+	node.started.Store(true)
+
+	got, err := node.LocalSlotRaftStatus(ctx, 9)
+	if err != nil {
+		t.Fatalf("LocalSlotRaftStatus() error = %v", err)
+	}
+	if reader.ctx != ctx || reader.slotID != 9 {
+		t.Fatalf("FreshStatus() input ctx/slot = %v/%d, want exact ctx/9", reader.ctx == ctx, reader.slotID)
+	}
+	if len(got.ReplicaProgress) != 3 || got.ReplicaProgress[0].NodeID != 1 || got.ReplicaProgress[1].NodeID != 2 || got.ReplicaProgress[2].NodeID != 3 {
+		t.Fatalf("ReplicaProgress = %#v, want three sorted real rows", got.ReplicaProgress)
+	}
+}
+
+type freshStatusContextKey struct{}
+
+type fakeFreshSlotStatusReader struct {
+	ctx    context.Context
+	slotID multiraft.SlotID
+	status multiraft.Status
+	err    error
+}
+
+func (f *fakeFreshSlotStatusReader) FreshStatus(ctx context.Context, slotID multiraft.SlotID) (multiraft.Status, error) {
+	f.ctx = ctx
+	f.slotID = slotID
+	return f.status, f.err
 }
 
 type controllerLogReaderStub struct {

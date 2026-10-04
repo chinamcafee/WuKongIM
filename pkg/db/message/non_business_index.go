@@ -1,0 +1,280 @@
+package message
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+
+	"github.com/WuKongIM/WuKongIM/pkg/db/internal/dberrors"
+	"github.com/WuKongIM/WuKongIM/pkg/db/internal/engine"
+	"github.com/WuKongIM/WuKongIM/pkg/db/internal/keycodec"
+)
+
+// ordinaryIndexProof stores no message or unread result: it proves that the
+// complete durable SyncOnce index was empty in one import generation.
+type ordinaryIndexProof struct {
+	epoch uint64
+	empty bool
+}
+
+// CountOrdinaryMessages counts persisted log positions excluding SyncOnce entries.
+// The caller supplies its effective visibility/read floor and selected frontier.
+// A sparse cumulative index keeps steady-state reads independent of history size.
+func (l *ChannelLog) CountOrdinaryMessages(ctx context.Context, after, through uint64) (uint64, error) {
+	if err := l.beginUse(); err != nil {
+		return 0, err
+	}
+	defer l.endUse()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if through <= after {
+		return 0, nil
+	}
+	l.appendMu.Lock()
+	defer l.appendMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	epoch := l.db.ordinaryIndexEpoch.Load()
+	if l.ordinaryIndexProof.empty && l.ordinaryIndexProof.epoch == epoch {
+		if l.db.engine.IsClosed() {
+			return 0, dberrors.ErrClosed
+		}
+		return through - after, nil
+	}
+	if err := l.ensureNonBusinessIndexLocked(ctx); err != nil {
+		return 0, err
+	}
+	prefix := encodeMessageIndexPrefix(l.key, messageIndexIDNonBusinessSeq)
+	span := keycodec.NewPrefixSpan(prefix)
+	it, err := l.db.engine.NewIter(engine.Span{Start: span.Start, End: span.End}, engine.IterOptions{})
+	if err != nil {
+		return 0, err
+	}
+	defer it.Close()
+	// Both ranks use one bounded view under append ownership. An empty sparse
+	// index proves the entire range ordinary without a second seek or iterator.
+	before, empty, err := nonBusinessRankAt(ctx, it, prefix, after)
+	if err != nil {
+		return 0, err
+	}
+	if empty {
+		l.ordinaryIndexProof = ordinaryIndexProof{epoch: epoch, empty: true}
+		return through - after, nil
+	}
+	last, _, err := nonBusinessRankAt(ctx, it, prefix, through)
+	if err != nil {
+		return 0, err
+	}
+	if last < before || last-before > through-after {
+		return 0, dberrors.ErrCorruptState
+	}
+	return through - after - (last - before), nil
+}
+
+func nonBusinessIndexKey(key ChannelKey, seq uint64) []byte {
+	return keycodec.AppendUint64(encodeMessageIndexPrefix(key, messageIndexIDNonBusinessSeq), seq)
+}
+func nonBusinessVersionKey(key ChannelKey) []byte {
+	return encodeMessageSystemPrefix(key, messageSystemIDNonBusinessIndex)
+}
+
+// ensureNonBusinessIndexLocked rebuilds older unindexed rows in bounded batches.
+// Only a complete rebuild publishes the marker. All primary writers must maintain
+// this index after publication; mixed-version writers are not supported.
+func (l *channelEntry) ensureNonBusinessIndexLocked(ctx context.Context) error {
+	value, ok, err := l.db.engine.Get(nonBusinessVersionKey(l.key))
+	if err != nil {
+		return err
+	}
+	if ok {
+		if !bytes.Equal(value, []byte{1}) {
+			return dberrors.ErrCorruptValue
+		}
+		return nil
+	}
+	span := keycodec.NewPrefixSpan(encodeMessageIndexPrefix(l.key, messageIndexIDNonBusinessSeq))
+	batch := l.db.engine.NewBatch()
+	defer func() { _ = batch.Close() }()
+	if err := batch.DeleteRange(engine.Span{Start: span.Start, End: span.End}); err != nil {
+		return err
+	}
+	primary := keycodec.NewPrefixSpan(encodeMessageRowPrefix(l.key))
+	it, err := l.db.engine.NewIter(engine.Span{Start: primary.Start, End: primary.End}, engine.IterOptions{})
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+	var ordinal uint64
+	var staged int
+	for valid := it.First(); valid; valid = it.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		seq, family, valid := decodeMessageRowKey(l.key, it.Key())
+		if !valid {
+			return dberrors.ErrCorruptValue
+		}
+		if family != messageHeaderFamilyID {
+			continue
+		}
+		raw, err := it.Value()
+		if err != nil {
+			return err
+		}
+		row := messageRow{MessageSeq: seq}
+		if err := decodeMessageHeader(it.Key(), raw, &row); err != nil {
+			return err
+		}
+		if row.FramerFlags&4 == 0 {
+			continue
+		}
+		ordinal++
+		if err := batch.Set(nonBusinessIndexKey(l.key, seq), encodeUint64(ordinal)); err != nil {
+			return err
+		}
+		staged++
+		if staged == 4096 {
+			if err := batch.Commit(true); err != nil {
+				return err
+			}
+			if err := batch.Close(); err != nil {
+				return err
+			}
+			batch = l.db.engine.NewBatch()
+			staged = 0
+		}
+	}
+	if err := it.Error(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := batch.Set(nonBusinessVersionKey(l.key), []byte{1}); err != nil {
+		return err
+	}
+	return batch.Commit(true)
+}
+
+// nonBusinessRank uses the first surviving ordinal as the baseline after prefix
+// retention. Removing an entire prefix therefore never resets unread history.
+func (l *channelEntry) nonBusinessRank(ctx context.Context, through uint64) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	prefix := encodeMessageIndexPrefix(l.key, messageIndexIDNonBusinessSeq)
+	span := keycodec.NewPrefixSpan(prefix)
+	it, err := l.db.engine.NewIter(engine.Span{Start: span.Start, End: span.End}, engine.IterOptions{})
+	if err != nil {
+		return 0, err
+	}
+	defer it.Close()
+	rank, _, err := nonBusinessRankAt(ctx, it, prefix, through)
+	return rank, err
+}
+
+// nonBusinessRankAt positions an existing bounded iterator at one rank. If no
+// predecessor survives retention, the first surviving ordinal defines the
+// baseline. Empty is true only when the bounded index is empty without an error.
+func nonBusinessRankAt(ctx context.Context, it *engine.Iter, prefix []byte, through uint64) (rank uint64, empty bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	found := false
+	baseline := false
+	if through == 0 {
+		// Zero-floor previews need the first surviving ordinal, including its
+		// retained baseline, without first seeking below the first sequence.
+		found = it.First()
+		baseline = true
+	} else if through == ^uint64(0) {
+		found = it.Last()
+	} else {
+		found = it.SeekLT(keycodec.AppendUint64(prefix, through+1))
+	}
+	if !found && !baseline {
+		if err := it.Error(); err != nil {
+			return 0, false, err
+		}
+		found = it.First()
+		baseline = true
+	}
+	if !found {
+		err := it.Error()
+		return 0, err == nil, err
+	}
+	key := it.Key()
+	if len(key) != len(prefix)+8 {
+		return 0, false, dberrors.ErrCorruptValue
+	}
+	if through == 0 && binary.BigEndian.Uint64(key[len(prefix):]) == 0 {
+		// A zero key may have malformed successors below sequence one. Keep
+		// the old predecessor validation for this exceptional stored state.
+		if !it.SeekLT(keycodec.AppendUint64(prefix, 1)) {
+			if err := it.Error(); err != nil {
+				return 0, false, err
+			}
+			return 0, false, dberrors.ErrCorruptState
+		}
+		if len(it.Key()) != len(prefix)+8 {
+			return 0, false, dberrors.ErrCorruptValue
+		}
+		baseline = false
+	}
+	value, err := it.Value()
+	if err != nil {
+		return 0, false, err
+	}
+	if len(value) != 8 {
+		return 0, false, dberrors.ErrCorruptValue
+	}
+	rank = binary.BigEndian.Uint64(value)
+	if rank == 0 {
+		return 0, false, dberrors.ErrCorruptValue
+	}
+	if baseline {
+		rank--
+	}
+	return rank, false, nil
+}
+
+// nonBusinessStager belongs to one channel's atomic write batch. Its ordinal
+// includes earlier uncommitted rows in that batch and is discarded on failure.
+type nonBusinessStager struct {
+	entry   *channelEntry
+	batch   *engine.Batch
+	ctx     context.Context
+	loaded  bool
+	ordinal uint64
+	lastSeq uint64
+}
+
+func (s *nonBusinessStager) stage(row messageRow, cache *appendKeyCache) error {
+	if row.FramerFlags&4 != 0 {
+		// Invalidate before staging, including uncertain or aborted commits.
+		// Append ownership prevents a reader from republishing until terminal.
+		s.entry.ordinaryIndexProof = ordinaryIndexProof{}
+		if !s.loaded {
+			if err := s.entry.ensureNonBusinessIndexLocked(s.ctx); err != nil {
+				return err
+			}
+			count, err := s.entry.nonBusinessRank(s.ctx, row.MessageSeq-1)
+			if err != nil {
+				return err
+			}
+			s.ordinal = count
+			s.loaded = true
+		}
+		if row.MessageSeq <= s.lastSeq || s.ordinal == ^uint64(0) {
+			return dberrors.ErrCorruptState
+		}
+		s.ordinal++
+		s.lastSeq = row.MessageSeq
+		if err := s.batch.Set(nonBusinessIndexKey(s.entry.key, row.MessageSeq), encodeUint64(s.ordinal)); err != nil {
+			return err
+		}
+	}
+	return s.entry.stageMessageRow(s.batch, row, cache)
+}

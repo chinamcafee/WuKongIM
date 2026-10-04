@@ -3,6 +3,7 @@ package message
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/dberrors"
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/engine"
@@ -52,20 +53,85 @@ func (l *ChannelLog) ReadReverse(ctx context.Context, fromSeq uint64, opts ReadO
 		}
 		fromSeq = leo
 	}
-	all, err := l.readForward(ctx, 1, fromSeq, ReadOptions{})
+	rows, err := readMessageRowsReverseRaw(ctx, l.db, l.key, fromSeq, opts)
 	if err != nil {
 		return nil, err
 	}
-	messages := make([]Message, 0, boundedCapacity(len(all), opts.Limit))
+	messages := make([]Message, len(rows))
+	for i, row := range rows {
+		messages[i] = messageFromRow(row)
+	}
+	return messages, nil
+}
+
+func readMessageRowsReverseRaw(ctx context.Context, db *MessageDB, channelKey ChannelKey, fromSeq uint64, opts ReadOptions) ([]messageRow, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if db == nil || db.engine == nil {
+		return nil, dberrors.ErrClosed
+	}
+	// A persisted preview already knows its selected sequence. Read that exact
+	// row without a range iterator; a missing bound still needs predecessor
+	// lookup. Decode/corruption and I/O errors must never fall back to older data.
+	if opts.Limit == 1 && fromSeq > 0 && fromSeq < math.MaxUint64 {
+		row, found, err := getMessageRowBySeq(ctx, db, channelKey, fromSeq)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			// As with range reads, the first record is returned even when its
+			// payload exceeds MaxBytes; callers enforce their response budget.
+			return []messageRow{row}, nil
+		}
+	}
+	prefix := encodeMessageRowPrefix(channelKey)
+	span := keycodec.NewPrefixSpan(prefix)
+	end := span.End
+	if fromSeq < math.MaxUint64 {
+		end = encodeMessageRowKey(channelKey, fromSeq+1, messageHeaderFamilyID)
+	}
+	iter, err := db.engine.NewIter(engine.Span{Start: span.Start, End: end}, engine.IterOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	rows := make([]messageRow, 0, boundedCapacity(16, opts.Limit))
 	var totalBytes int
-	for i := len(all) - 1; i >= 0; i-- {
-		var stop bool
-		messages, totalBytes, stop = appendReadMessage(messages, totalBytes, all[i], opts)
-		if stop {
+	for ok := iter.Last(); ok; ok = iter.Prev() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		key := iter.Key()
+		seq, familyID, ok := decodeMessageRowKey(channelKey, key)
+		if !ok || seq > fromSeq || familyID != messageHeaderFamilyID {
+			continue
+		}
+		value, err := iter.Value()
+		if err != nil {
+			return nil, err
+		}
+		row := messageRow{MessageSeq: seq}
+		if err := decodeMessageHeader(key, value, &row); err != nil {
+			return nil, err
+		}
+		if err := validateMaterializedMessageRow(row); err != nil {
+			return nil, err
+		}
+		if opts.MaxBytes > 0 && len(rows) > 0 && totalBytes+len(row.Payload)+len(row.PublicationMetadata) > opts.MaxBytes {
+			break
+		}
+		rows = append(rows, row)
+		totalBytes += len(row.Payload) + len(row.PublicationMetadata)
+		if opts.Limit > 0 && len(rows) >= opts.Limit {
 			break
 		}
 	}
-	return messages, nil
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 // GetLastVisibleMessage returns the newest message whose sequence is greater than visibleAfterSeq.
@@ -139,13 +205,12 @@ func readMessagesRaw(ctx context.Context, db *MessageDB, channelKey ChannelKey, 
 	var currentSeq uint64
 	var haveRow bool
 	var haveHeader bool
-	var havePayload bool
 
 	flush := func() (bool, error) {
 		if !haveRow {
 			return false, nil
 		}
-		if !haveHeader || !havePayload {
+		if !haveHeader {
 			return false, fmt.Errorf("%w: incomplete message row at seq %d", dberrors.ErrCorruptState, currentSeq)
 		}
 		if err := validateMaterializedMessageRow(current); err != nil {
@@ -156,7 +221,6 @@ func readMessagesRaw(ctx context.Context, db *MessageDB, channelKey ChannelKey, 
 		messages, totalBytes, stop = appendReadMessage(messages, totalBytes, msg, opts)
 		haveRow = false
 		haveHeader = false
-		havePayload = false
 		current = messageRow{}
 		currentSeq = 0
 		return stop, nil
@@ -196,11 +260,6 @@ func readMessagesRaw(ctx context.Context, db *MessageDB, channelKey ChannelKey, 
 				return nil, err
 			}
 			haveHeader = true
-		case messagePayloadFamilyID:
-			if err := decodeMessagePayload(storageKey, value, &current); err != nil {
-				return nil, err
-			}
-			havePayload = true
 		}
 	}
 	if err := iter.Error(); err != nil {
@@ -231,22 +290,11 @@ func (l *ChannelLog) getRowBySeq(ctx context.Context, seq uint64) (messageRow, b
 	if err != nil {
 		return messageRow{}, false, err
 	}
-	payloadKey := encodeMessageRowKey(l.key, seq, messagePayloadFamilyID)
-	payloadValue, okPayload, err := l.db.engine.Get(payloadKey)
-	if err != nil {
-		return messageRow{}, false, err
-	}
-	if !okHeader && !okPayload {
+	if !okHeader {
 		return messageRow{}, false, nil
-	}
-	if !okHeader || !okPayload {
-		return messageRow{}, false, fmt.Errorf("%w: incomplete message row at seq %d", dberrors.ErrCorruptState, seq)
 	}
 	row := messageRow{MessageSeq: seq}
 	if err := decodeMessageHeader(headerKey, headerValue, &row); err != nil {
-		return messageRow{}, false, err
-	}
-	if err := decodeMessagePayload(payloadKey, payloadValue, &row); err != nil {
 		return messageRow{}, false, err
 	}
 	if err := validateMaterializedMessageRow(row); err != nil {
@@ -256,7 +304,7 @@ func (l *ChannelLog) getRowBySeq(ctx context.Context, seq uint64) (messageRow, b
 }
 
 func appendReadMessage(messages []Message, totalBytes int, msg Message, opts ReadOptions) ([]Message, int, bool) {
-	payloadBytes := len(msg.Payload)
+	payloadBytes := len(msg.Payload) + len(msg.PublicationMetadata)
 	if opts.MaxBytes > 0 && len(messages) > 0 && totalBytes+payloadBytes > opts.MaxBytes {
 		return messages, totalBytes, true
 	}
@@ -270,15 +318,18 @@ func appendReadMessage(messages []Message, totalBytes int, msg Message, opts Rea
 
 func messageFromRow(row messageRow) Message {
 	return Message{
-		MessageSeq:        row.MessageSeq,
-		MessageID:         row.MessageID,
-		ChannelID:         row.ChannelID,
-		ChannelType:       row.ChannelType,
-		ClientMsgNo:       row.ClientMsgNo,
-		FromUID:           row.FromUID,
-		PayloadHash:       row.PayloadHash,
-		Payload:           append([]byte(nil), row.Payload...),
-		ServerTimestampMS: row.ServerTimestampMS,
+		RedDot:              row.FramerFlags&2 != 0,
+		Expire:              uint32(row.Expire),
+		MessageSeq:          row.MessageSeq,
+		MessageID:           row.MessageID,
+		ChannelID:           row.ChannelID,
+		ChannelType:         row.ChannelType,
+		ClientMsgNo:         row.ClientMsgNo,
+		FromUID:             row.FromUID,
+		PayloadHash:         row.PayloadHash,
+		Payload:             append([]byte(nil), row.Payload...),
+		PublicationMetadata: append([]byte(nil), row.PublicationMetadata...),
+		ServerTimestampMS:   row.ServerTimestampMS,
 	}
 }
 

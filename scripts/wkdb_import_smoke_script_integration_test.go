@@ -15,7 +15,7 @@ func TestWKDBImportSmokeScriptValidatesAndImportsBundle(t *testing.T) {
 	runHeavyShellScriptTestInParallel(t)
 	root := repoRoot(t)
 	wkdbBin := filepath.Join(t.TempDir(), "wkdb")
-	build := exec.Command(goTool(t), "build", "-o", wkdbBin, "./cmd/wkdb")
+	build := exec.Command(goTool(t), "build", "-o", wkdbBin, "./cmd/wkcli")
 	build.Dir = root
 	build.Env = append(os.Environ(), "GOWORK=off")
 	if output, err := build.CombinedOutput(); err != nil {
@@ -25,7 +25,7 @@ func TestWKDBImportSmokeScriptValidatesAndImportsBundle(t *testing.T) {
 	workDir := t.TempDir()
 	cmd := exec.Command("bash", "scripts/wkdb-import-smoke.sh", "--work-dir", workDir)
 	cmd.Dir = root
-	cmd.Env = append(os.Environ(), "WKDB_BIN="+wkdbBin)
+	cmd.Env = append(os.Environ(), "WK_CLI_BIN="+wkdbBin)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("smoke script failed: %v\n%s", err, output)
@@ -52,7 +52,7 @@ func TestWKDBExportRoundTripSmokeScript(t *testing.T) {
 	runHeavyShellScriptTestInParallel(t)
 	root := repoRoot(t)
 	wkdbBin := filepath.Join(t.TempDir(), "wkdb")
-	build := exec.Command(goTool(t), "build", "-o", wkdbBin, "./cmd/wkdb")
+	build := exec.Command(goTool(t), "build", "-o", wkdbBin, "./cmd/wkcli")
 	build.Dir = root
 	build.Env = append(os.Environ(), "GOWORK=off")
 	if output, err := build.CombinedOutput(); err != nil {
@@ -62,7 +62,7 @@ func TestWKDBExportRoundTripSmokeScript(t *testing.T) {
 	workDir := t.TempDir()
 	cmd := exec.Command("bash", "scripts/wkdb-export-roundtrip-smoke.sh", "--work-dir", workDir)
 	cmd.Dir = root
-	cmd.Env = append(os.Environ(), "WKDB_BIN="+wkdbBin)
+	cmd.Env = append(os.Environ(), "WK_CLI_BIN="+wkdbBin)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("export smoke script failed: %v\n%s", err, output)
@@ -83,7 +83,7 @@ func TestWKDBDiffSmokeScript(t *testing.T) {
 	runHeavyShellScriptTestInParallel(t)
 	root := repoRoot(t)
 	wkdbBin := filepath.Join(t.TempDir(), "wkdb")
-	build := exec.Command(goTool(t), "build", "-o", wkdbBin, "./cmd/wkdb")
+	build := exec.Command(goTool(t), "build", "-o", wkdbBin, "./cmd/wkcli")
 	build.Dir = root
 	build.Env = append(os.Environ(), "GOWORK=off")
 	if output, err := build.CombinedOutput(); err != nil {
@@ -93,7 +93,7 @@ func TestWKDBDiffSmokeScript(t *testing.T) {
 	workDir := t.TempDir()
 	cmd := exec.Command("bash", "scripts/wkdb-diff-smoke.sh", "--work-dir", workDir)
 	cmd.Dir = root
-	cmd.Env = append(os.Environ(), "WKDB_BIN="+wkdbBin)
+	cmd.Env = append(os.Environ(), "WK_CLI_BIN="+wkdbBin)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("diff smoke script failed: %v\n%s", err, output)

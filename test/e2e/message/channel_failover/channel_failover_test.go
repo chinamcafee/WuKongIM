@@ -34,7 +34,7 @@ func TestChannelThreeNodeLeaderFailoverAfterNodeKill(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	require.NoError(t, cluster.WaitClusterReady(ctx), cluster.DumpDiagnostics())
+	require.NoError(t, cluster.WaitHTTPReady(ctx), cluster.DumpDiagnostics())
 
 	channelsByLeader := createChannelsLedByEveryNode(t, cluster)
 	leaders := sortedLeaderIDs(channelsByLeader)
@@ -60,7 +60,7 @@ func TestChannelThreeNodeLeaderFailoverAfterNodeKill(t *testing.T) {
 	require.NoError(t, cluster.StartStoppedNode(killedNode), cluster.DumpDiagnostics())
 	ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	require.NoError(t, cluster.WaitClusterReady(ctx), cluster.DumpDiagnostics())
+	require.NoError(t, cluster.WaitHTTPReady(ctx), cluster.DumpDiagnostics())
 	requireNodeSchedulableEventually(t, cluster, survivor, killedNode)
 
 	afterRestart := sendGroupMessageWithin(t, cluster.MustNode(killedNode), affected.ChannelID, affected.ChannelType, "after-old-leader-restart", 20*time.Second)
@@ -74,7 +74,7 @@ func TestChannelNewPlacementFailsClosedWhenReplicaCountUnavailable(t *testing.T)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	require.NoError(t, cluster.WaitClusterReady(ctx), cluster.DumpDiagnostics())
+	require.NoError(t, cluster.WaitHTTPReady(ctx), cluster.DumpDiagnostics())
 
 	const stoppedNode = uint64(3)
 	survivor := cluster.MustNode(1)
@@ -91,7 +91,7 @@ func TestChannelNewPlacementFailsClosedWhenReplicaCountUnavailable(t *testing.T)
 	require.NoError(t, cluster.StartStoppedNode(stoppedNode), cluster.DumpDiagnostics())
 	ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	require.NoError(t, cluster.WaitClusterReady(ctx), cluster.DumpDiagnostics())
+	require.NoError(t, cluster.WaitHTTPReady(ctx), cluster.DumpDiagnostics())
 	requireNodeSchedulableEventually(t, cluster, survivor, stoppedNode)
 
 	recovered := sendGroupMessage(t, survivor, channelID, frame.ChannelTypeGroup, "placement-recovered")
@@ -108,7 +108,7 @@ func TestChannelFollowerReplicaRepairAfterNodeKill(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	require.NoError(t, cluster.WaitClusterReady(ctx), cluster.DumpDiagnostics())
+	require.NoError(t, cluster.WaitHTTPReady(ctx), cluster.DumpDiagnostics())
 
 	manager := cluster.ManagerClient(t, 1)
 	node4 := cluster.StartSeedJoinNode(t, suite.SeedJoinNodeConfig{
@@ -134,7 +134,7 @@ func TestChannelFollowerReplicaRepairAfterNodeKill(t *testing.T) {
 	require.NoError(t, cluster.StartStoppedNode(candidate.StoppedFollower), cluster.DumpDiagnostics())
 	restartCtx, restartCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer restartCancel()
-	require.NoError(t, cluster.WaitClusterReady(restartCtx), cluster.DumpDiagnostics())
+	require.NoError(t, cluster.WaitHTTPReady(restartCtx), cluster.DumpDiagnostics())
 	managerNode := cluster.MustNode(candidate.Leader)
 	requireNodeSchedulableEventually(t, cluster, managerNode, candidate.StoppedFollower)
 	repairedMeta = requireReplicaRepairTopologyEventually(t, cluster, cluster.MustNode(candidate.SlotLeader), candidate, 20*time.Second)
@@ -167,6 +167,9 @@ func fastRecoveryOptionsForNodes(nodeCount int, extra map[string]string) []suite
 	opts := []suite.Option{suite.WithManagerHTTP()}
 	for nodeID := uint64(1); nodeID <= uint64(nodeCount); nodeID++ {
 		overrides := map[string]string{
+			// This Channel-only fixture uses the tokenless WKProto readiness probe.
+			"WK_GATEWAY_TOKEN_AUTH_ON":                       "false",
+			"WK_CLUSTER_HASH_SLOT_COUNT":                     "256",
 			"WK_CLUSTER_NODE_HEALTH_REPORT_INTERVAL":         fastRecoveryHealthReportInterval.String(),
 			"WK_CLUSTER_NODE_HEALTH_REPORT_TTL":              fastRecoveryHealthReportTTL.String(),
 			"WK_CHANNEL_MIGRATION_ENABLE":                    "true",
@@ -586,21 +589,7 @@ func findExpectedReplicaRepair(items []channelMigrationItem, candidate followerR
 	return channelMigrationItem{}, false
 }
 
-type channelRuntimeMetaPage struct {
-	Items []channelRuntimeMetaItem `json:"items"`
-}
-
-type channelRuntimeMetaItem struct {
-	ChannelID   string   `json:"channel_id"`
-	ChannelType int64    `json:"channel_type"`
-	SlotID      uint32   `json:"slot_id"`
-	Leader      uint64   `json:"leader"`
-	SlotLeader  uint64   `json:"slot_leader"`
-	Replicas    []uint64 `json:"replicas"`
-	ISR         []uint64 `json:"isr"`
-	MinISR      int64    `json:"min_isr"`
-	Status      string   `json:"status"`
-}
+type channelRuntimeMetaItem = suite.ChannelRuntimeMeta
 
 func requireReplicaRepairTopologyEventually(t *testing.T, cluster *suite.StartedCluster, node *suite.StartedNode, candidate followerRepairCandidate, timeout time.Duration) channelRuntimeMetaItem {
 	t.Helper()
@@ -654,23 +643,7 @@ func replicaRepairTopologyPrecondition(meta channelRuntimeMetaItem, candidate fo
 }
 
 func channelRuntimeMeta(ctx context.Context, node *suite.StartedNode, channelID string, channelType uint8) (channelRuntimeMetaItem, error) {
-	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-
-	var page channelRuntimeMetaPage
-	query := url.Values{}
-	query.Set("channel_id", channelID)
-	query.Set("limit", "10")
-	_, err := suite.GetJSON(reqCtx, "http://"+node.ManagerAddr()+"/manager/channel-runtime-meta?"+query.Encode(), &page)
-	if err != nil {
-		return channelRuntimeMetaItem{}, err
-	}
-	for _, item := range page.Items {
-		if item.ChannelID == channelID && item.ChannelType == int64(channelType) {
-			return item, nil
-		}
-	}
-	return channelRuntimeMetaItem{}, fmt.Errorf("runtime meta for %s/%d not found in %+v", channelID, channelType, page.Items)
+	return suite.GetChannelRuntimeMeta(ctx, node, channelID, channelType)
 }
 
 type managerSlotsPage struct {

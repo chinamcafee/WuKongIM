@@ -54,6 +54,20 @@ func (a *App) applyRestoreGatewayMaintenance(enabled bool) {
 	if a == nil {
 		return
 	}
+	a.restoreAdmissionMu.Lock()
+	defer a.restoreAdmissionMu.Unlock()
+	enabled = enabled || a.restoreAdmissionStopped
+	// Publish the complete read fence before data/cache replacement or entry resume.
+	for {
+		previous := a.restoreReadFence.Load()
+		next := (previous + 2) &^ uint64(1)
+		if enabled {
+			next |= 1
+		}
+		if a.restoreReadFence.CompareAndSwap(previous, next) {
+			break
+		}
+	}
 	a.restoreMaintenance.Store(enabled)
 	gateway, ok := a.gateway.(restoreGatewayRuntime)
 	if !ok {
@@ -62,6 +76,17 @@ func (a *App) applyRestoreGatewayMaintenance(enabled bool) {
 	gateway.SetAcceptingNewSessions(!enabled)
 	if enabled {
 		gateway.DisconnectAll()
+	}
+}
+
+// stopRestoreAdmission serializes shutdown fencing with a late restore observer.
+// It takes no side-effect/runtime lock, so transport callbacks can still drain.
+func (a *App) stopRestoreAdmission() {
+	a.restoreAdmissionMu.Lock()
+	defer a.restoreAdmissionMu.Unlock()
+	a.restoreAdmissionStopped = true
+	if gateway, ok := a.gateway.(restoreGatewayRuntime); ok {
+		gateway.SetAcceptingNewSessions(false)
 	}
 }
 
@@ -87,17 +112,25 @@ func (a *App) suspendRestoreSideEffects(ctx context.Context) error {
 	// idempotent stops on every call so a later startup pass cannot escape a
 	// maintenance fence merely because an earlier pass saw closed workers.
 	a.restoreSideEffectsSuspended = true
+	if err := a.mqtt.Suspend(ctx); err != nil {
+		return err
+	}
 	var resultErr error
-	conversationQuiesced := true
 	if err := a.pauseRestoreAdmissions(ctx); err != nil {
-		conversationQuiesced = false
-		resultErr = errors.Join(resultErr, err)
+		// Accepted submissions still call append/storage. Preserve those dependencies
+		// and the same maintenance fence for the next bounded drain attempt.
+		return err
 	}
 	if a.channelAppends != nil {
 		a.channelAppends.PauseForRestore()
 		if err := a.channelAppends.WaitIdle(ctx); err != nil {
 			resultErr = errors.Join(resultErr, err)
 		} else if err := a.channelAppends.ResetAfterRestore(); err != nil {
+			resultErr = errors.Join(resultErr, err)
+		}
+	}
+	if a.messageUpdateWorker != nil {
+		if err := a.messageUpdateWorker.Stop(ctx); err != nil {
 			resultErr = errors.Join(resultErr, err)
 		}
 	}
@@ -116,15 +149,6 @@ func (a *App) suspendRestoreSideEffects(ctx context.Context) error {
 			resultErr = errors.Join(resultErr, err)
 		}
 	}
-	if a.conversationActiveWorker != nil {
-		if err := a.conversationActiveWorker.Stop(ctx); err != nil {
-			conversationQuiesced = false
-			resultErr = errors.Join(resultErr, err)
-		}
-	}
-	if a.conversationAuthority != nil && conversationQuiesced {
-		a.conversationAuthority.resetAfterRestore()
-	}
 	a.resetRestoreSensitiveCaches()
 	if runtime, ok := a.cluster.(interface{ PauseLocalRestoreRuntime() }); ok {
 		runtime.PauseLocalRestoreRuntime()
@@ -141,6 +165,13 @@ func (a *App) resumeRestoreSideEffects(ctx context.Context) error {
 	if !a.restoreSideEffectsSuspended {
 		return nil
 	}
+	// A failed suspension may still own routing callbacks. Join that same fence
+	// before restarting dependencies or reopening either append admission.
+	if a.channelSubmissions != nil {
+		if err := a.channelSubmissions.Pause(ctx); err != nil {
+			return err
+		}
+	}
 	var resultErr error
 	// Clear again after the durable logical activation. The first reset at
 	// maintenance entry drains pre-restore state; this second reset prevents
@@ -148,11 +179,6 @@ func (a *App) resumeRestoreSideEffects(ctx context.Context) error {
 	a.resetRestoreSensitiveCaches()
 	if a.users != nil {
 		if err := a.users.ReloadSystemUIDCache(ctx); err != nil {
-			resultErr = errors.Join(resultErr, err)
-		}
-	}
-	if a.conversationActiveWorker != nil {
-		if err := a.conversationActiveWorker.Start(ctx); err != nil {
 			resultErr = errors.Join(resultErr, err)
 		}
 	}
@@ -166,6 +192,11 @@ func (a *App) resumeRestoreSideEffects(ctx context.Context) error {
 			resultErr = errors.Join(resultErr, err)
 		}
 	}
+	if a.messageUpdateWorker != nil {
+		if err := a.messageUpdateWorker.Start(ctx); err != nil {
+			resultErr = errors.Join(resultErr, err)
+		}
+	}
 	if a.deliveryWorker != nil {
 		if err := a.deliveryWorker.Start(ctx); err != nil {
 			resultErr = errors.Join(resultErr, err)
@@ -174,14 +205,21 @@ func (a *App) resumeRestoreSideEffects(ctx context.Context) error {
 	if resultErr != nil {
 		return resultErr
 	}
+	// Publish MQTT's fresh boot and complete worker cohort while the cluster
+	// maintenance fence still excludes clients. A failed rebuild stays retryable.
+	if err := a.mqtt.Resume(ctx); err != nil {
+		return err
+	}
 	if a.channelAppends != nil {
 		a.channelAppends.ResumeAfterRestore()
 	}
-	if a.conversationAuthority != nil {
-		a.conversationAuthority.resumeAfterRestore()
-	}
 	if runtime, ok := a.cluster.(interface{ ResumeLocalRestoreRuntime() }); ok {
 		runtime.ResumeLocalRestoreRuntime()
+	}
+	if a.channelSubmissions != nil {
+		if err := a.channelSubmissions.Resume(); err != nil {
+			return err
+		}
 	}
 	a.restoreSideEffectsSuspended = false
 	return nil
@@ -212,8 +250,8 @@ func (a *App) pauseRestoreAdmissions(ctx context.Context) error {
 	if a.channelAppends != nil {
 		a.channelAppends.PauseForRestore()
 	}
-	if a.conversationAuthority != nil {
-		return a.conversationAuthority.pauseForRestore(ctx)
+	if a.channelSubmissions != nil {
+		return a.channelSubmissions.Pause(ctx)
 	}
 	return nil
 }

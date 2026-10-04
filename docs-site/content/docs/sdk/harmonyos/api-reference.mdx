@@ -1,0 +1,104 @@
+---
+title: HarmonyOS API 参考
+description: 按管理器快速查找 @wukong/wkim 常用入口、Provider、监听器、模型和状态。
+---
+
+本页是常用入口速查。完整用法和调用顺序请回到对应任务页面。SDK 单例是 `WKIM.shared`。
+
+## 导入与初始化
+
+包根只导出 `WKIM`：
+
+```typescript
+import { WKIM } from '@wukong/wkim'
+```
+
+模型和常量从 `@wukong/wkim/src/main/ets/entity/Bean` 导入，正文从 `@wukong/wkim/src/main/ets/model/...` 导入。
+
+| API | 用途 |
+| --- | --- |
+| `init(uid, token, address?, context?)` | 配置用户并打开该 UID 的本地数据库 |
+| `config.provider` | 应用提供的地址、同步、资料和上传接口 |
+| `connectionManager()` | 连接与状态 |
+| `messageManager()` | 消息收发与查询 |
+| `conversationManager()` | 会话列表与未读数 |
+| `channelManager()` | 用户和群资料 |
+| `channelMemberManager()` | 群成员资料 |
+
+## 常用 Provider
+
+| 字段 | 用途 |
+| --- | --- |
+| `connectAddrCallback` | 动态返回 `host:port` |
+| `syncConversationCallback` | 同步会话、最近消息和未读数 |
+| `syncMessageCallback` | 同步一个频道的历史消息 |
+| `channelInfoCallback` | 获取用户或群资料 |
+| `channelMemberCallback` | 增量同步群成员 |
+| `channelMemberWithPageCallback` | 分页或搜索群成员 |
+| `uploadAttachmentCallback` | 上传媒体并回填 URL |
+
+Provider 是进程全局字段，再次赋值会覆盖旧实现。
+
+## `ConnectionManager`
+
+| API | 用途 |
+| --- | --- |
+| `connection()` | 发起连接 |
+| `disConnection(false)` | 断开但保留当前账号 |
+| `disConnection(true)` | 退出账号并关闭本地数据库 |
+| `addConnectStatusListener(listener)` | 监听连接状态 |
+| `removeConnectStatusListener(listener)` | 用同一函数对象移除监听 |
+
+状态：`fail`、`success`、`kicked`、`syncing`、`connecting`、`noNetwork`、`syncCompleted`。
+
+## `MessageManager`
+
+| API | 用途 |
+| --- | --- |
+| `send(content, channel)` | 使用默认选项发送 |
+| `sendWithOption(content, channel, options)` | 使用自定义选项发送 |
+| `addInsertedListener` | 监听本地插入；单一全局回调 |
+| `addSendStatusListener` | 监听服务端发送结果 |
+| `addNewMsgListener` | 监听新消息 |
+| `addRefreshListener` | 监听消息对象变化 |
+| `getOrSyncHistoryMessages` | 读取本地并按需同步历史 |
+| `registerMsgContent` | 注册自定义正文 |
+
+发送状态：`WKSendMsgResult.loading`、`success`、`fail`，以及关系限制 `noRelation`、`blackList`、`notOnWhiteList`。
+
+## `ConversationManager`
+
+| API | 用途 |
+| --- | --- |
+| `all()` | 读取全部本地会话 |
+| `getWithChannel` | 读取一个频道的会话 |
+| `updateRedDot` | 更新未读数 |
+| `clearAllRedDot` | 清除全部未读数 |
+| `delete` | 删除本地会话列表项 |
+| `addRefreshListener` | 监听会话变化 |
+| `addDeletedListener` | 监听会话删除 |
+
+## 频道与成员 Manager
+
+| API | 用途 |
+| --- | --- |
+| `channelManager().getChannel` | 读取本地频道资料 |
+| `channelManager().fetchChannelInfo` | 请求刷新频道资料 |
+| `channelManager().addRefreshListener` | 监听资料变化 |
+| `channelMemberManager().sync` | 增量同步成员 |
+| `channelMemberManager().getMember` | 读取一个成员 |
+| `channelMemberManager().getWithPageOrSearch` | 分页或搜索成员 |
+
+## 常用模型
+
+| 类型 | 说明 |
+| --- | --- |
+| `WKChannel` | `channelId` 和 `channelType` 共同确定聊天目标 |
+| `WKMsg` | 消息身份、正文、序号和发送状态 |
+| `WKMessageContent` | 消息正文基类 |
+| `WKTextContent` / `WKImageContent` | 内置文本和图片正文 |
+| `WKConversation` | 会话列表项和未读数 |
+| `WKSyncConversation` / `WKSyncChannelMsg` | 业务 API 返回给 SDK 的同步结果 |
+| `WKSendOptions` / `ChannelMsgOptions` / `SyncOptions` | 发送、读取历史和远端同步选项 |
+
+常用频道类型：`WKChannelType.personal`、`WKChannelType.group`。

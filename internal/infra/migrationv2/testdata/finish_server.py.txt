@@ -1,0 +1,14 @@
+import json,urllib.request,pathlib,base64
+root=pathlib.Path('/tmp/wukongim-migration-original-process-source'); trace=json.loads((root/'api-baseline.json').read_text())
+def call(path,data):
+    req=urllib.request.Request('http://127.0.0.1:56187'+path,data=json.dumps(data,ensure_ascii=False).encode(),headers={'Content-Type':'application/json'})
+    with urllib.request.urlopen(req,timeout=15) as r: result=json.load(r)
+    trace.append({'path':path,'request':data,'response':result});(root/'api-baseline.json').write_text(json.dumps(trace,ensure_ascii=False,indent=2)); print(path,json.dumps(result,ensure_ascii=False));return result
+call('/conversations/clearUnread',{'uid':'migrationbob','channel_id':'migrationgroup','channel_type':2})
+call('/conversations/delete',{'uid':'migrationbob','channel_id':'migrationgroup','channel_type':2})
+call('/message/send',{'header':{'red_dot':1,'sync_once':1},'from_uid':'migrationalice','channel_id':'migrationgroup','channel_type':2,'client_msg_no':'original-v2-cmd','payload':base64.b64encode(b'{"type":99}').decode()})
+for eventid,eventtype,payload in [('event-snapshot','stream.snapshot',{'kind':'text','text':'持久快照'}),('event-close','stream.close',{'kind':'text','text':'持久快照','end_reason':1})]:
+    call('/message/event',{'channel_id':'migrationgroup','channel_type':2,'from_uid':'migrationalice','client_msg_no':'original-v2-0','event_id':eventid,'event_type':eventtype,'event_key':'main','visibility':'public','occurred_at':1700000000000,'payload':payload})
+call('/message/eventsync',{'channel_id':'migrationgroup','channel_type':2,'from_uid':'migrationbob','client_msg_no':'original-v2-0','limit':100})
+call('/message/sync',{'uid':'migrationbob','limit':100})
+call('/conversation/sync',{'uid':'migrationbob','msg_count':10})

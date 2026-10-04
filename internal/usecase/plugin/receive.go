@@ -114,7 +114,7 @@ func (a *App) invokeReceiveOffline(ctx context.Context, event pluginevents.Recei
 	if !a.markReceiveDedupe(event.MessageID, event.UID) {
 		return nil
 	}
-	packet := receivePacketFromOfflineEvent(event)
+	packet := a.receivePacketFromOfflineEvent(event)
 	startedAt := time.Now()
 	err := a.InvokeReceive(ctx, plugin, packet)
 	result := "ok"
@@ -217,19 +217,19 @@ func (a *App) boundReceivePluginForUIDFromCandidates(
 	return ObservedPlugin{}, false, nil
 }
 
-func receivePacketFromOfflineEvent(event pluginevents.ReceiveOffline) *pluginproto.RecvPacket {
+func (a *App) receivePacketFromOfflineEvent(event pluginevents.ReceiveOffline) *pluginproto.RecvPacket {
 	return &pluginproto.RecvPacket{
 		FromUid:     event.FromUID,
 		ToUid:       event.UID,
-		ChannelId:   receiveChannelIDForRecipient(event),
+		ChannelId:   a.receiveChannelIDForRecipient(event),
 		ChannelType: uint32(event.ChannelType),
 		// Marshal synchronously owns the wire copy; the batch payload is immutable here.
 		Payload: event.Payload,
 	}
 }
 
-func receiveChannelIDForRecipient(event pluginevents.ReceiveOffline) string {
-	sourceChannelID, _ := runtimechannelid.FromCommandChannel(event.ChannelID)
+func (a *App) receiveChannelIDForRecipient(event pluginevents.ReceiveOffline) string {
+	sourceChannelID, _ := a.commandChannels.FromCommandChannel(event.ChannelID)
 	if protocolmeta.ChannelType(event.ChannelType) != protocolmeta.ChannelTypePerson || event.UID == "" {
 		return sourceChannelID
 	}

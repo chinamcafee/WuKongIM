@@ -58,7 +58,9 @@ func (db *MessageDB) listChannelsPage(ctx context.Context, after ChannelKey, lim
 		if !ok {
 			return nil, "", false, fmt.Errorf("%w: corrupt catalog key", dberrors.ErrCorruptValue)
 		}
-		if after != "" && key <= after {
+		// The iterator starts at the encoded cursor. Only that exact key is
+		// excluded; longer keys may sort lower as decoded strings.
+		if after != "" && key == after {
 			continue
 		}
 		value, err := iter.Value()
@@ -88,6 +90,17 @@ func (db *MessageDB) listChannelsPage(ctx context.Context, after ChannelKey, lim
 func (l *channelEntry) stageCatalog(batch *engine.Batch) error {
 	cache := l.appendKeyCache
 	return batch.Set(cache.catalogKey, cache.catalogValue)
+}
+
+// stageCatalogForAppend writes the immutable catalog row only with the first
+// message. A later base sequence proves that the channel was cataloged by an
+// earlier durable message or system mutation, so rewriting it would only add
+// write amplification to the append hot path.
+func (l *channelEntry) stageCatalogForAppend(batch *engine.Batch, baseSeq uint64) error {
+	if baseSeq > 1 {
+		return nil
+	}
+	return l.stageCatalog(batch)
 }
 
 func encodeCatalogValue(id ChannelID) []byte {

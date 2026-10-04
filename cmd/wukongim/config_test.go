@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strconv"
@@ -48,18 +49,18 @@ func TestLoadConfigDefaultValues(t *testing.T) {
 		t.Fatalf("gateway token auth defaults = enabled:%v timeout:%s, want true/3s",
 			cfg.Gateway.TokenAuthEnabled, cfg.Gateway.TokenAuthTimeout)
 	}
-	wantLoops := adaptiveGatewayGnetEventLoops(runtime.GOMAXPROCS(0))
+	wantLoops := min(4, runtime.GOMAXPROCS(0))
 	if cfg.Gateway.Transport.Gnet.NumEventLoop != wantLoops {
 		t.Fatalf("Gnet.NumEventLoop = %d, want adaptive %d", cfg.Gateway.Transport.Gnet.NumEventLoop, wantLoops)
 	}
-	if wantLoops > 1 && !cfg.Gateway.Transport.Gnet.Multicore {
-		t.Fatalf("Gnet.Multicore = false, want true for %d event loops", wantLoops)
+	if !cfg.Gateway.Transport.Gnet.Multicore {
+		t.Fatal("Gnet.Multicore = false, want true")
 	}
 	if cfg.Gateway.Session.AsyncSendBatchMaxWait != time.Millisecond {
 		t.Fatalf("AsyncSendBatchMaxWait = %s, want 1ms", cfg.Gateway.Session.AsyncSendBatchMaxWait)
 	}
-	if cfg.Gateway.Session.AsyncSendBatchMaxRecords != 512 {
-		t.Fatalf("AsyncSendBatchMaxRecords = %d, want 512", cfg.Gateway.Session.AsyncSendBatchMaxRecords)
+	if cfg.Gateway.Session.AsyncSendBatchMaxRecords != 128 {
+		t.Fatalf("AsyncSendBatchMaxRecords = %d, want 128", cfg.Gateway.Session.AsyncSendBatchMaxRecords)
 	}
 	if cfg.Channel.LargeGroupSubscriberThreshold != 500 {
 		t.Fatalf("Channel.LargeGroupSubscriberThreshold = %d, want 500", cfg.Channel.LargeGroupSubscriberThreshold)
@@ -67,8 +68,8 @@ func TestLoadConfigDefaultValues(t *testing.T) {
 	if !cfg.Delivery.Enabled {
 		t.Fatalf("Delivery.Enabled = false, want true by default")
 	}
-	if cfg.Delivery.RecipientWorkerConcurrency != 100 {
-		t.Fatalf("Delivery.RecipientWorkerConcurrency = %d, want 100 by default", cfg.Delivery.RecipientWorkerConcurrency)
+	if cfg.Delivery.RecipientWorkerConcurrency != 320 {
+		t.Fatalf("Delivery.RecipientWorkerConcurrency = %d, want 320 by default", cfg.Delivery.RecipientWorkerConcurrency)
 	}
 	if !cfg.Plugin.Enable {
 		t.Fatalf("Plugin.Enable = false, want true by default")
@@ -170,26 +171,6 @@ func TestLoadConfigParsesManagerLoginSettings(t *testing.T) {
 	}
 	if len(user.Permissions) != 1 || user.Permissions[0].Resource != "cluster.node" || len(user.Permissions[0].Actions) != 1 || user.Permissions[0].Actions[0] != "r" {
 		t.Fatalf("manager permissions = %#v, want cluster.node read", user.Permissions)
-	}
-}
-
-func TestAdaptiveGatewayGnetEventLoops(t *testing.T) {
-	tests := []struct {
-		name       string
-		gomaxprocs int
-		want       int
-	}{
-		{name: "invalid clamps to one", gomaxprocs: 0, want: 1},
-		{name: "small server keeps one", gomaxprocs: 2, want: 1},
-		{name: "medium server uses half", gomaxprocs: 6, want: 3},
-		{name: "larger server caps at four", gomaxprocs: 16, want: 4},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := adaptiveGatewayGnetEventLoops(tt.gomaxprocs); got != tt.want {
-				t.Fatalf("adaptiveGatewayGnetEventLoops(%d) = %d, want %d", tt.gomaxprocs, got, tt.want)
-			}
-		})
 	}
 }
 
@@ -348,17 +329,6 @@ func TestLoadConfigExplicitConfigFile(t *testing.T) {
 		"WK_PRESENCE_TOUCH_FLUSH_INTERVAL=2s",
 		"WK_PRESENCE_TOUCH_BATCH_SIZE=1024",
 		"WK_PRESENCE_ROUTE_TTL=2m",
-		"WK_CONVERSATION_MAX_LAST_MESSAGE_CONCURRENCY=48",
-		"WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS_PER_UID=8192",
-		"WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS=200000",
-		"WK_CONVERSATION_AUTHORITY_LIST_DB_WINDOW_MAX=1500",
-		"WK_CONVERSATION_AUTHORITY_HANDOFF_TIMEOUT=4s",
-		"WK_CONVERSATION_AUTHORITY_ACTIVE_COOLDOWN=90m",
-		"WK_CONVERSATION_AUTHORITY_FLUSH_INTERVAL=1500ms",
-		"WK_CONVERSATION_AUTHORITY_FLUSH_TIMEOUT=2500ms",
-		"WK_CONVERSATION_AUTHORITY_FLUSH_BATCH_ROWS=384",
-		"WK_CONVERSATION_AUTHORITY_ADMIT_BATCH_ROWS=256",
-		"WK_CONVERSATION_AUTHORITY_ADMIT_CONCURRENCY=8",
 		"WK_CHANNEL_LARGE_GROUP_SUBSCRIBER_THRESHOLD=600",
 		"WK_DELIVERY_ENABLE=true",
 		"WK_CHANNEL_APPEND_SHARD_COUNT=10",
@@ -505,21 +475,6 @@ func TestLoadConfigExplicitConfigFile(t *testing.T) {
 	if cfg.Presence.RouteTTL != 2*time.Minute {
 		t.Fatalf("Presence.RouteTTL = %s, want 2m", cfg.Presence.RouteTTL)
 	}
-	if cfg.Conversation.MaxLastMessageConcurrency != 48 {
-		t.Fatalf("Conversation.MaxLastMessageConcurrency = %d, want 48", cfg.Conversation.MaxLastMessageConcurrency)
-	}
-	assertConversationAuthorityConfig(t, cfg.Conversation, app.ConversationConfig{
-		AuthorityCacheMaxRowsPerUID: 8192,
-		AuthorityCacheMaxRows:       200000,
-		AuthorityListDBWindowMax:    1500,
-		AuthorityHandoffTimeout:     4 * time.Second,
-		AuthorityActiveCooldown:     90 * time.Minute,
-		AuthorityFlushInterval:      1500 * time.Millisecond,
-		AuthorityFlushTimeout:       2500 * time.Millisecond,
-		AuthorityFlushBatchRows:     384,
-		AuthorityAdmitBatchRows:     256,
-		AuthorityAdmitConcurrency:   8,
-	})
 	if cfg.Channel.LargeGroupSubscriberThreshold != 600 {
 		t.Fatalf("Channel.LargeGroupSubscriberThreshold = %d, want 600", cfg.Channel.LargeGroupSubscriberThreshold)
 	}
@@ -668,53 +623,6 @@ func TestLoadConfigExplicitConfigFile(t *testing.T) {
 	if cfg.Gateway.Session.AsyncSendBatchMaxBytes != 262144 {
 		t.Fatalf("AsyncSendBatchMaxBytes = %d, want 262144", cfg.Gateway.Session.AsyncSendBatchMaxBytes)
 	}
-}
-
-func TestLoadConfigConversationAuthorityEnvOverridesFile(t *testing.T) {
-	unsetLoadConfigEnv(t)
-	dir := t.TempDir()
-	path := filepath.Join(dir, "wukongim.toml")
-	lines := append(requiredConfigLines(dir),
-		"WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS_PER_UID=4096",
-		"WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS=100000",
-		"WK_CONVERSATION_AUTHORITY_LIST_DB_WINDOW_MAX=1000",
-		"WK_CONVERSATION_AUTHORITY_HANDOFF_TIMEOUT=3s",
-		"WK_CONVERSATION_AUTHORITY_ACTIVE_COOLDOWN=2h",
-		"WK_CONVERSATION_AUTHORITY_FLUSH_INTERVAL=1s",
-		"WK_CONVERSATION_AUTHORITY_FLUSH_TIMEOUT=5s",
-		"WK_CONVERSATION_AUTHORITY_FLUSH_BATCH_ROWS=512",
-		"WK_CONVERSATION_AUTHORITY_ADMIT_BATCH_ROWS=512",
-		"WK_CONVERSATION_AUTHORITY_ADMIT_CONCURRENCY=16",
-	)
-	writeConf(t, path, lines...)
-	t.Setenv("WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS_PER_UID", "2048")
-	t.Setenv("WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS", "50000")
-	t.Setenv("WK_CONVERSATION_AUTHORITY_LIST_DB_WINDOW_MAX", "750")
-	t.Setenv("WK_CONVERSATION_AUTHORITY_HANDOFF_TIMEOUT", "2s")
-	t.Setenv("WK_CONVERSATION_AUTHORITY_ACTIVE_COOLDOWN", "45m")
-	t.Setenv("WK_CONVERSATION_AUTHORITY_FLUSH_INTERVAL", "750ms")
-	t.Setenv("WK_CONVERSATION_AUTHORITY_FLUSH_TIMEOUT", "1250ms")
-	t.Setenv("WK_CONVERSATION_AUTHORITY_FLUSH_BATCH_ROWS", "96")
-	t.Setenv("WK_CONVERSATION_AUTHORITY_ADMIT_BATCH_ROWS", "128")
-	t.Setenv("WK_CONVERSATION_AUTHORITY_ADMIT_CONCURRENCY", "4")
-
-	cfg, err := loadConfig([]string{"-config", path})
-	if err != nil {
-		t.Fatalf("loadConfig() error = %v", err)
-	}
-
-	assertConversationAuthorityConfig(t, cfg.Conversation, app.ConversationConfig{
-		AuthorityCacheMaxRowsPerUID: 2048,
-		AuthorityCacheMaxRows:       50000,
-		AuthorityListDBWindowMax:    750,
-		AuthorityHandoffTimeout:     2 * time.Second,
-		AuthorityActiveCooldown:     45 * time.Minute,
-		AuthorityFlushInterval:      750 * time.Millisecond,
-		AuthorityFlushTimeout:       1250 * time.Millisecond,
-		AuthorityFlushBatchRows:     96,
-		AuthorityAdmitBatchRows:     128,
-		AuthorityAdmitConcurrency:   4,
-	})
 }
 
 func TestChannelMessageRetentionConfigEnvOverrides(t *testing.T) {
@@ -1144,6 +1052,7 @@ func TestLoadConfigEnvOverridesFile(t *testing.T) {
 	t.Setenv("WK_CLUSTER_COMMIT_COORDINATOR_MAX_RECORDS", "512")
 	t.Setenv("WK_CLUSTER_COMMIT_COORDINATOR_MAX_BYTES", "262144")
 	t.Setenv("WK_CLUSTER_COMMIT_COORDINATOR_SHARDS", "8")
+	t.Setenv("WK_CLUSTER_STORAGE_DISK_SLOW_THRESHOLD", "750ms")
 	t.Setenv("WK_GATEWAY_GNET_NUM_EVENT_LOOP", "5")
 	t.Setenv("WK_GATEWAY_RUNTIME_ASYNC_SEND_WORKERS", "256")
 	t.Setenv("WK_GATEWAY_RUNTIME_ASYNC_SEND_QUEUE_CAPACITY", "8192")
@@ -1161,7 +1070,6 @@ func TestLoadConfigEnvOverridesFile(t *testing.T) {
 	t.Setenv("WK_PRESENCE_TOUCH_FLUSH_INTERVAL", "1500ms")
 	t.Setenv("WK_PRESENCE_TOUCH_BATCH_SIZE", "128")
 	t.Setenv("WK_PRESENCE_ROUTE_TTL", "3m")
-	t.Setenv("WK_CONVERSATION_MAX_LAST_MESSAGE_CONCURRENCY", "16")
 	t.Setenv("WK_CHANNEL_LARGE_GROUP_SUBSCRIBER_THRESHOLD", "700")
 	t.Setenv("WK_DELIVERY_ENABLE", "true")
 	t.Setenv("WK_CHANNEL_APPEND_SHARD_COUNT", "7")
@@ -1266,6 +1174,9 @@ func TestLoadConfigEnvOverridesFile(t *testing.T) {
 	if cfg.Cluster.Storage.CommitFlushWindow != time.Millisecond {
 		t.Fatalf("Storage.CommitFlushWindow = %s, want 1ms", cfg.Cluster.Storage.CommitFlushWindow)
 	}
+	if cfg.Cluster.Storage.DiskSlowThreshold != 750*time.Millisecond {
+		t.Fatalf("Storage.DiskSlowThreshold = %s, want 750ms", cfg.Cluster.Storage.DiskSlowThreshold)
+	}
 	if cfg.Cluster.Storage.CommitMaxRequests != 32 || cfg.Cluster.Storage.CommitMaxRecords != 512 || cfg.Cluster.Storage.CommitMaxBytes != 262144 || cfg.Cluster.Storage.CommitShards != 8 {
 		t.Fatalf("Storage commit env override = requests:%d records:%d bytes:%d shards:%d", cfg.Cluster.Storage.CommitMaxRequests, cfg.Cluster.Storage.CommitMaxRecords, cfg.Cluster.Storage.CommitMaxBytes, cfg.Cluster.Storage.CommitShards)
 	}
@@ -1286,9 +1197,6 @@ func TestLoadConfigEnvOverridesFile(t *testing.T) {
 	}
 	if cfg.Presence.RouteTTL != 3*time.Minute {
 		t.Fatalf("Presence.RouteTTL = %s, want 3m", cfg.Presence.RouteTTL)
-	}
-	if cfg.Conversation.MaxLastMessageConcurrency != 16 {
-		t.Fatalf("Conversation env override = %#v", cfg.Conversation)
 	}
 	if cfg.Channel.LargeGroupSubscriberThreshold != 700 {
 		t.Fatalf("Channel.LargeGroupSubscriberThreshold = %d, want 700", cfg.Channel.LargeGroupSubscriberThreshold)
@@ -1513,9 +1421,6 @@ func TestLoadConfigExampleFile(t *testing.T) {
 	if cfg.Observability.DebugAPIEnabled {
 		t.Fatalf("Observability.DebugAPIEnabled = true, want false")
 	}
-	if cfg.Conversation.AuthorityFlushBatchRows != 512 {
-		t.Fatalf("Conversation.AuthorityFlushBatchRows = %d, want 512", cfg.Conversation.AuthorityFlushBatchRows)
-	}
 	assertExampleDiagnostics(t, cfg.Observability.Diagnostics)
 }
 
@@ -1535,9 +1440,6 @@ func TestLoadConfigRootExampleFile(t *testing.T) {
 	}
 	if cfg.Bench.APIEnabled {
 		t.Fatalf("Bench.APIEnabled = true, want false")
-	}
-	if cfg.Conversation.AuthorityFlushBatchRows != 512 {
-		t.Fatalf("Conversation.AuthorityFlushBatchRows = %d, want 512", cfg.Conversation.AuthorityFlushBatchRows)
 	}
 	assertExampleDiagnostics(t, cfg.Observability.Diagnostics)
 }
@@ -1606,9 +1508,6 @@ func TestLoadConfigMultiNodeExampleFiles(t *testing.T) {
 			}
 			if len(cfg.Gateway.Listeners) != 2 {
 				t.Fatalf("Gateway.Listeners len = %d, want 2", len(cfg.Gateway.Listeners))
-			}
-			if cfg.Conversation.AuthorityFlushBatchRows != 512 {
-				t.Fatalf("Conversation.AuthorityFlushBatchRows = %d, want 512", cfg.Conversation.AuthorityFlushBatchRows)
 			}
 			if cfg.Observability.DebugAPIEnabled {
 				t.Fatalf("Observability.DebugAPIEnabled = true, want false")
@@ -1679,6 +1578,8 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		{name: "commit coordinator max records negative", line: "WK_CLUSTER_COMMIT_COORDINATOR_MAX_RECORDS=-1", wantKey: "WK_CLUSTER_COMMIT_COORDINATOR_MAX_RECORDS"},
 		{name: "commit coordinator max bytes", line: "WK_CLUSTER_COMMIT_COORDINATOR_MAX_BYTES=many", wantKey: "WK_CLUSTER_COMMIT_COORDINATOR_MAX_BYTES"},
 		{name: "commit coordinator max bytes negative", line: "WK_CLUSTER_COMMIT_COORDINATOR_MAX_BYTES=-1", wantKey: "WK_CLUSTER_COMMIT_COORDINATOR_MAX_BYTES"},
+		{name: "storage disk slow threshold", line: "WK_CLUSTER_STORAGE_DISK_SLOW_THRESHOLD=soon", wantKey: "WK_CLUSTER_STORAGE_DISK_SLOW_THRESHOLD"},
+		{name: "storage disk slow threshold zero", line: "WK_CLUSTER_STORAGE_DISK_SLOW_THRESHOLD=0s", wantKey: "WK_CLUSTER_STORAGE_DISK_SLOW_THRESHOLD"},
 		{name: "commit coordinator shards", line: "WK_CLUSTER_COMMIT_COORDINATOR_SHARDS=many", wantKey: "WK_CLUSTER_COMMIT_COORDINATOR_SHARDS"},
 		{name: "commit coordinator shards negative", line: "WK_CLUSTER_COMMIT_COORDINATOR_SHARDS=-1", wantKey: "WK_CLUSTER_COMMIT_COORDINATOR_SHARDS"},
 		{name: "cluster nodes json", line: "WK_CLUSTER_NODES=not-json", wantKey: "WK_CLUSTER_NODES"},
@@ -1709,28 +1610,6 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		{name: "presence touch max routes below default batch", line: "WK_PRESENCE_TOUCH_MAX_ROUTES_PER_FLUSH=511", wantKey: "WK_PRESENCE_TOUCH_MAX_ROUTES_PER_FLUSH"},
 		{name: "presence route ttl", line: "WK_PRESENCE_ROUTE_TTL=soon", wantKey: "WK_PRESENCE_ROUTE_TTL"},
 		{name: "presence route ttl negative", line: "WK_PRESENCE_ROUTE_TTL=-1s", wantKey: "WK_PRESENCE_ROUTE_TTL"},
-		{name: "conversation max last message concurrency", line: "WK_CONVERSATION_MAX_LAST_MESSAGE_CONCURRENCY=many", wantKey: "WK_CONVERSATION_MAX_LAST_MESSAGE_CONCURRENCY"},
-		{name: "conversation max last message concurrency negative", line: "WK_CONVERSATION_MAX_LAST_MESSAGE_CONCURRENCY=-1", wantKey: "WK_CONVERSATION_MAX_LAST_MESSAGE_CONCURRENCY"},
-		{name: "conversation authority cache max rows per uid", line: "WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS_PER_UID=many", wantKey: "WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS_PER_UID"},
-		{name: "conversation authority cache max rows per uid zero", line: "WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS_PER_UID=0", wantKey: "WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS_PER_UID"},
-		{name: "conversation authority cache max rows", line: "WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS=many", wantKey: "WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS"},
-		{name: "conversation authority cache max rows zero", line: "WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS=0", wantKey: "WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS"},
-		{name: "conversation authority list db window max", line: "WK_CONVERSATION_AUTHORITY_LIST_DB_WINDOW_MAX=many", wantKey: "WK_CONVERSATION_AUTHORITY_LIST_DB_WINDOW_MAX"},
-		{name: "conversation authority list db window max zero", line: "WK_CONVERSATION_AUTHORITY_LIST_DB_WINDOW_MAX=0", wantKey: "WK_CONVERSATION_AUTHORITY_LIST_DB_WINDOW_MAX"},
-		{name: "conversation authority handoff timeout", line: "WK_CONVERSATION_AUTHORITY_HANDOFF_TIMEOUT=soon", wantKey: "WK_CONVERSATION_AUTHORITY_HANDOFF_TIMEOUT"},
-		{name: "conversation authority handoff timeout zero", line: "WK_CONVERSATION_AUTHORITY_HANDOFF_TIMEOUT=0s", wantKey: "WK_CONVERSATION_AUTHORITY_HANDOFF_TIMEOUT"},
-		{name: "conversation authority active cooldown", line: "WK_CONVERSATION_AUTHORITY_ACTIVE_COOLDOWN=soon", wantKey: "WK_CONVERSATION_AUTHORITY_ACTIVE_COOLDOWN"},
-		{name: "conversation authority active cooldown zero", line: "WK_CONVERSATION_AUTHORITY_ACTIVE_COOLDOWN=0s", wantKey: "WK_CONVERSATION_AUTHORITY_ACTIVE_COOLDOWN"},
-		{name: "conversation authority flush interval", line: "WK_CONVERSATION_AUTHORITY_FLUSH_INTERVAL=soon", wantKey: "WK_CONVERSATION_AUTHORITY_FLUSH_INTERVAL"},
-		{name: "conversation authority flush interval zero", line: "WK_CONVERSATION_AUTHORITY_FLUSH_INTERVAL=0s", wantKey: "WK_CONVERSATION_AUTHORITY_FLUSH_INTERVAL"},
-		{name: "conversation authority flush timeout", line: "WK_CONVERSATION_AUTHORITY_FLUSH_TIMEOUT=soon", wantKey: "WK_CONVERSATION_AUTHORITY_FLUSH_TIMEOUT"},
-		{name: "conversation authority flush timeout zero", line: "WK_CONVERSATION_AUTHORITY_FLUSH_TIMEOUT=0s", wantKey: "WK_CONVERSATION_AUTHORITY_FLUSH_TIMEOUT"},
-		{name: "conversation authority flush batch rows", line: "WK_CONVERSATION_AUTHORITY_FLUSH_BATCH_ROWS=many", wantKey: "WK_CONVERSATION_AUTHORITY_FLUSH_BATCH_ROWS"},
-		{name: "conversation authority flush batch rows zero", line: "WK_CONVERSATION_AUTHORITY_FLUSH_BATCH_ROWS=0", wantKey: "WK_CONVERSATION_AUTHORITY_FLUSH_BATCH_ROWS"},
-		{name: "conversation authority admit batch rows", line: "WK_CONVERSATION_AUTHORITY_ADMIT_BATCH_ROWS=many", wantKey: "WK_CONVERSATION_AUTHORITY_ADMIT_BATCH_ROWS"},
-		{name: "conversation authority admit batch rows zero", line: "WK_CONVERSATION_AUTHORITY_ADMIT_BATCH_ROWS=0", wantKey: "WK_CONVERSATION_AUTHORITY_ADMIT_BATCH_ROWS"},
-		{name: "conversation authority admit concurrency", line: "WK_CONVERSATION_AUTHORITY_ADMIT_CONCURRENCY=many", wantKey: "WK_CONVERSATION_AUTHORITY_ADMIT_CONCURRENCY"},
-		{name: "conversation authority admit concurrency zero", line: "WK_CONVERSATION_AUTHORITY_ADMIT_CONCURRENCY=0", wantKey: "WK_CONVERSATION_AUTHORITY_ADMIT_CONCURRENCY"},
 		{name: "channel large group subscriber threshold", line: "WK_CHANNEL_LARGE_GROUP_SUBSCRIBER_THRESHOLD=many", wantKey: "WK_CHANNEL_LARGE_GROUP_SUBSCRIBER_THRESHOLD"},
 		{name: "channel large group subscriber threshold negative", line: "WK_CHANNEL_LARGE_GROUP_SUBSCRIBER_THRESHOLD=-1", wantKey: "WK_CHANNEL_LARGE_GROUP_SUBSCRIBER_THRESHOLD"},
 		{name: "delivery enable", line: "WK_DELIVERY_ENABLE=maybe", wantKey: "WK_DELIVERY_ENABLE"},
@@ -1971,29 +1850,13 @@ func assertExampleDiagnostics(t *testing.T, diagnostics app.DiagnosticsConfig) {
 	}
 }
 
-func assertConversationAuthorityConfig(t *testing.T, got, want app.ConversationConfig) {
-	t.Helper()
-	if got.AuthorityCacheMaxRowsPerUID != want.AuthorityCacheMaxRowsPerUID ||
-		got.AuthorityCacheMaxRows != want.AuthorityCacheMaxRows ||
-		got.AuthorityListDBWindowMax != want.AuthorityListDBWindowMax ||
-		got.AuthorityHandoffTimeout != want.AuthorityHandoffTimeout ||
-		got.AuthorityActiveCooldown != want.AuthorityActiveCooldown ||
-		got.AuthorityFlushInterval != want.AuthorityFlushInterval ||
-		got.AuthorityFlushTimeout != want.AuthorityFlushTimeout ||
-		got.AuthorityFlushBatchRows != want.AuthorityFlushBatchRows ||
-		got.AuthorityAdmitBatchRows != want.AuthorityAdmitBatchRows ||
-		got.AuthorityAdmitConcurrency != want.AuthorityAdmitConcurrency {
-		t.Fatalf("conversation authority config = %#v, want %#v", got, want)
-	}
-}
-
 func assertListeners(t *testing.T, got, want []gateway.ListenerOptions) {
 	t.Helper()
 	if len(got) != len(want) {
 		t.Fatalf("listeners len = %d, want %d: %#v", len(got), len(want), got)
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		if !reflect.DeepEqual(got[i], want[i]) {
 			t.Fatalf("listener[%d] = %#v, want %#v", i, got[i], want[i])
 		}
 	}
@@ -2154,21 +2017,4 @@ func testSupportedConfigKeys() []string {
 		keys = append(keys, field.EnvKey)
 	}
 	return keys
-}
-
-func adaptiveGatewayGnetEventLoops(gomaxprocs int) int {
-	if gomaxprocs <= 0 {
-		return 1
-	}
-	if gomaxprocs <= 2 {
-		return 1
-	}
-	loops := gomaxprocs / 2
-	if loops < 1 {
-		return 1
-	}
-	if loops > 4 {
-		return 4
-	}
-	return loops
 }

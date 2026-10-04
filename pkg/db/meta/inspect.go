@@ -81,6 +81,20 @@ func InspectScan(ctx context.Context, db *MetaDB, req InspectScanRequest) (Inspe
 	}
 
 	switch req.Table {
+	case "mqtt_storage_ledger":
+		return inspectScanTable(ctx, db, req, slots, mqttStorageTable, inspectMQTTStorageRow)
+	case "mqtt_will":
+		return inspectScanTable(ctx, db, req, slots, mqttWillTable, inspectMQTTWillRow)
+	case "mqtt_source_binding":
+		return inspectScanTable(ctx, db, req, slots, mqttSourceBindingTable, inspectMQTTSourceBindingRow)
+	case "mqtt_inflight":
+		return inspectScanTable(ctx, db, req, slots, mqttInflightTable, inspectMQTTInflightRow)
+	case "mqtt_delivery_cursor":
+		return inspectScanTable(ctx, db, req, slots, mqttDeliveryCursorTable, inspectMQTTDeliveryCursorRow)
+	case "mqtt_subscription":
+		return inspectScanTable(ctx, db, req, slots, mqttSubscriptionTable, inspectMQTTSubscriptionRow)
+	case "mqtt_session":
+		return inspectScanTable(ctx, db, req, slots, mqttSessionTable, inspectMQTTSessionRow)
 	case "user":
 		return inspectScanTable(ctx, db, req, slots, userTable, inspectUserRow)
 	case "device":
@@ -93,8 +107,20 @@ func InspectScan(ctx context.Context, db *MetaDB, req InspectScanRequest) (Inspe
 		return inspectScanTable(ctx, db, req, slots, subscriberTable, inspectSubscriberRow)
 	case "user_channel_membership":
 		return inspectScanTable(ctx, db, req, slots, userChannelMembershipTable, inspectUserChannelMembershipRow)
+	case "user_cmd_channel_membership":
+		return inspectScanTable(ctx, db, req, slots, userCMDChannelMembershipTable, inspectUserCMDChannelMembershipRow)
+	case "person_directory_task":
+		return inspectScanTable(ctx, db, req, slots, personDirectoryTaskTable, inspectPersonDirectoryTaskRow)
 	case "channel_latest":
 		return inspectScanTable(ctx, db, req, slots, channelLatestTable, inspectChannelLatestRow)
+	case "message_update":
+		return inspectScanTable(ctx, db, req, slots, messageUpdateTable, inspectMessageUpdateRow)
+	case "message_update_pending":
+		return inspectScanTable(ctx, db, req, slots, messageUpdatePendingTable, inspectMessageUpdateRow)
+	case "message_update_head":
+		return inspectScanTable(ctx, db, req, slots, messageUpdateHeadTable, inspectMessageUpdateHeadRow)
+	case "message_update_request":
+		return inspectScanTable(ctx, db, req, slots, messageUpdateRequestTable, inspectMessageUpdateRequestRow)
 	case "message_event_state":
 		return inspectScanTable(ctx, db, req, slots, messageEventStateTable, inspectMessageEventStateRow)
 	case "message_event_cursor":
@@ -445,6 +471,7 @@ func inspectUserRow(user User) InspectRow {
 		"token":        user.Token,
 		"device_flag":  user.DeviceFlag,
 		"device_level": user.DeviceLevel,
+		"send_ban":     user.SendBan, "send_ban_version": user.SendBanVersion,
 	}
 }
 
@@ -467,15 +494,18 @@ func inspectDeviceRow(device Device) InspectRow {
 
 func inspectChannelRow(channel Channel) InspectRow {
 	return InspectRow{
-		"channel_id":                  channel.ChannelID,
-		"channel_type":                channel.ChannelType,
-		"ban":                         channel.Ban,
-		"disband":                     channel.Disband,
-		"send_ban":                    channel.SendBan,
-		"allow_stranger":              channel.AllowStranger,
-		"large":                       channel.Large,
-		"subscriber_mutation_version": channel.SubscriberMutationVersion,
-		"subscriber_count":            channel.SubscriberCount,
+		"channel_id":                      channel.ChannelID,
+		"channel_type":                    channel.ChannelType,
+		"ban":                             channel.Ban,
+		"disband":                         channel.Disband,
+		"send_ban":                        channel.SendBan,
+		"send_ban_version":                channel.SendBanVersion,
+		"allow_stranger":                  channel.AllowStranger,
+		"large":                           channel.Large,
+		"subscriber_mutation_version":     channel.SubscriberMutationVersion,
+		"subscriber_count":                channel.SubscriberCount,
+		"directory_projection_state":      uint8(channel.DirectoryProjectionState),
+		"directory_projection_generation": channel.DirectoryProjectionGeneration,
 	}
 }
 
@@ -499,6 +529,7 @@ func inspectChannelRuntimeMetaRow(meta ChannelRuntimeMeta) InspectRow {
 		"write_fence_version":     meta.WriteFenceVersion,
 		"write_fence_reason":      meta.WriteFenceReason,
 		"write_fence_until_ms":    meta.WriteFenceUntilMS,
+		"directory_generation":    meta.DirectoryGeneration,
 	}
 }
 
@@ -507,16 +538,47 @@ func inspectSubscriberRow(subscriber Subscriber) InspectRow {
 		"channel_id":   subscriber.ChannelID,
 		"channel_type": subscriber.ChannelType,
 		"uid":          subscriber.UID,
+		"incarnation":  subscriber.Incarnation,
 	}
 }
 
 func inspectUserChannelMembershipRow(membership UserChannelMembership) InspectRow {
 	return InspectRow{
-		"uid":          membership.UID,
-		"channel_id":   membership.ChannelID,
-		"channel_type": membership.ChannelType,
-		"join_seq":     membership.JoinSeq,
-		"updated_at":   membership.UpdatedAt,
+		"uid":                             membership.UID,
+		"channel_id":                      membership.ChannelID,
+		"channel_type":                    membership.ChannelType,
+		"join_seq":                        membership.JoinSeq,
+		"read_seq":                        membership.ReadSeq,
+		"deleted_to_seq":                  membership.DeletedToSeq,
+		"conversation_hidden_through_seq": membership.ConversationHiddenThroughSeq,
+		"activated_at":                    membership.ActivatedAt,
+		"tombstone":                       membership.Tombstone,
+		"tombstone_at":                    membership.TombstoneAt,
+		"source_version":                  membership.SourceVersion,
+		"updated_at":                      membership.UpdatedAt,
+	}
+}
+
+func inspectUserCMDChannelMembershipRow(membership UserCMDChannelMembership) InspectRow {
+	return InspectRow{
+		"uid":                membership.UID,
+		"command_channel_id": membership.CommandChannelID,
+		"channel_type":       membership.ChannelType,
+		"start_seq":          membership.StartSeq,
+		"ack_seq":            membership.AckSeq,
+		"tombstone":          membership.Tombstone,
+		"tombstone_at":       membership.TombstoneAt,
+		"updated_at":         membership.UpdatedAt,
+	}
+}
+
+func inspectPersonDirectoryTaskRow(task PersonDirectoryTask) InspectRow {
+	return InspectRow{
+		"channel_id":     task.ChannelID,
+		"channel_type":   task.ChannelType,
+		"committed_tail": task.CommittedTail,
+		"created_at":     task.CreatedAt,
+		"generation":     task.Generation,
 	}
 }
 
@@ -719,4 +781,14 @@ func inspectFloatNumeric(value float64) (inspectNumericValue, bool, bool) {
 		return inspectNumericValue{}, true, false
 	}
 	return inspectNumericValue{magnitude: uint64(value)}, true, true
+}
+
+func inspectMessageUpdateRow(r MessageUpdate) InspectRow {
+	return InspectRow{"channel_id": r.ChannelID, "channel_type": r.ChannelType, "message_id": r.MessageID, "message_seq": r.MessageSeq, "version": r.Version, "update_seq": r.UpdateSeq, "payload": r.Payload, "updated_at_ms": r.UpdatedAtMS, "pending": r.Pending, "pending_after_uid": r.PendingAfterUID}
+}
+func inspectMessageUpdateHeadRow(r MessageUpdateHead) InspectRow {
+	return InspectRow{"channel_id": r.ChannelID, "channel_type": r.ChannelType, "generation": r.Generation, "update_seq": r.UpdateSeq, "replica_set": r.ReplicaSet}
+}
+func inspectMessageUpdateRequestRow(r MessageUpdateRequest) InspectRow {
+	return InspectRow{"channel_id": r.ChannelID, "channel_type": r.ChannelType, "message_id": r.MessageID, "request_id": r.RequestID, "digest": r.Digest, "message_seq": r.MessageSeq, "version": r.Version, "update_seq": r.UpdateSeq, "updated_at_ms": r.UpdatedAtMS}
 }

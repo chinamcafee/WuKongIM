@@ -12,8 +12,11 @@ import (
 )
 
 const (
-	defaultSyncMessagesLimit = 100
-	maxSyncMessagesLimit     = 10000
+	defaultSyncMessagesLimit  = 100
+	maxSyncMessagesLimit      = 10000
+	maxSyncMessagesBatchItems = 200
+	// Bound authority-routed permission reads independently of the requested batch size.
+	maxSyncPermissionWorkers = 8
 	legacySettingStream      = 1 << 1
 )
 
@@ -39,6 +42,9 @@ type MessageFlags struct {
 
 // SyncedMessage is a channel message returned by the compatible sync usecase.
 type SyncedMessage struct {
+	// Version and UpdatedAtMS describe the latest committed payload replacement.
+	Version     uint64
+	UpdatedAtMS int64
 	// Flags contains the legacy framer flags exposed in HTTP responses.
 	Flags MessageFlags
 	// Setting is the legacy message setting bitset.
@@ -85,7 +91,8 @@ type SyncChannelMessagesQuery struct {
 	ChannelID string
 	// ChannelType is the client-facing channel type.
 	ChannelType uint8
-	// StartMessageSeq is the inclusive starting sequence boundary.
+	// StartMessageSeq is the inclusive starting sequence boundary. Together with
+	// EndMessageSeq=0, a zero value selects the latest visible page.
 	StartMessageSeq uint64
 	// EndMessageSeq is the exclusive ending sequence boundary.
 	EndMessageSeq uint64
@@ -107,14 +114,17 @@ type SyncChannelMessagesResult struct {
 	More bool
 }
 
-// ChannelMessageQuery is the storage-facing channel message sync request.
+// ChannelMessageQuery carries page intent and an independently computed visibility floor.
 type ChannelMessageQuery struct {
 	// ChannelID identifies the normalized channel to scan.
 	ChannelID ChannelID
-	// StartSeq is the inclusive starting sequence boundary.
+	// StartSeq is the inclusive starting sequence boundary. Zero with EndSeq=0
+	// preserves the compatibility sentinel for the latest visible page.
 	StartSeq uint64
 	// EndSeq is the exclusive ending sequence boundary.
 	EndSeq uint64
+	// MinSeq is the lowest membership-visible sequence.
+	MinSeq uint64
 	// Limit is the maximum number of messages to return.
 	Limit int
 	// PullMode selects whether to pull older or newer messages.
@@ -129,44 +139,244 @@ type ChannelMessagePage struct {
 	HasMore bool
 }
 
+// ChannelMessageReadResult is aligned with one message-page batch query.
+type ChannelMessageReadResult struct {
+	// Page contains one authoritative message page under the selected reader contract.
+	Page ChannelMessagePage
+	// Err is scoped to this channel read and preserves batch alignment.
+	Err error
+}
+
+// SyncChannelMessagesBatchQuery describes one bounded UID-owned batch pull.
+type SyncChannelMessagesBatchQuery struct {
+	// LoginUID owns every ordinary membership validated before batch reads.
+	LoginUID string
+	// Items contains the bounded client-visible channel requests.
+	Items []SyncChannelMessagesQuery
+}
+
+// SyncChannelMessagesBatchItem preserves one requested channel identity.
+type SyncChannelMessagesBatchItem struct {
+	// ChannelID preserves the client-facing requested channel id.
+	ChannelID string
+	// ChannelType preserves the client-facing requested channel type.
+	ChannelType uint8
+	// Result contains the compatible message page on success.
+	Result SyncChannelMessagesResult
+	// Err is item-scoped after all memberships pass preflight validation.
+	Err error
+}
+
+// SyncChannelMessagesBatchResult preserves input ordering.
+type SyncChannelMessagesBatchResult struct {
+	// Items is positionally aligned with SyncChannelMessagesBatchQuery.Items.
+	Items []SyncChannelMessagesBatchItem
+}
+
+type preparedSyncChannelMessages struct {
+	query     ChannelMessageQuery
+	eventMode string
+	// empty marks a new person conversation without membership; never read its history.
+	empty bool
+}
+
 // SyncChannelMessages returns a compatible message page for a channel.
 func (a *App) SyncChannelMessages(ctx context.Context, query SyncChannelMessagesQuery) (SyncChannelMessagesResult, error) {
-	loginUID := strings.TrimSpace(query.LoginUID)
-	if loginUID == "" {
-		return SyncChannelMessagesResult{}, ErrSyncLoginUIDRequired
+	prepared, err := a.prepareSyncChannelMessages(ctx, query)
+	if err != nil {
+		return SyncChannelMessagesResult{}, err
 	}
-	channelID := strings.TrimSpace(query.ChannelID)
-	if channelID == "" {
-		return SyncChannelMessagesResult{}, ErrSyncChannelIDRequired
+	if prepared.empty {
+		return SyncChannelMessagesResult{Messages: []SyncedMessage{}}, nil
 	}
-	if query.ChannelType == 0 {
-		return SyncChannelMessagesResult{}, ErrSyncChannelTypeRequired
-	}
-	if query.ChannelType == channelTypePerson {
-		normalized, err := runtimechannelid.NormalizePersonChannel(loginUID, channelID)
-		if err != nil {
-			return SyncChannelMessagesResult{}, err
-		}
-		channelID = normalized
-	}
-	if a == nil || a.reader == nil {
-		return SyncChannelMessagesResult{}, ErrMessageReaderRequired
-	}
-	page, err := a.reader.SyncMessages(ctx, ChannelMessageQuery{
-		ChannelID: ChannelID{ID: channelID, Type: query.ChannelType},
-		StartSeq:  query.StartMessageSeq,
-		EndSeq:    query.EndMessageSeq,
-		Limit:     normalizeSyncMessagesLimit(query.Limit),
-		PullMode:  query.PullMode,
-	})
-	if errors.Is(err, metadb.ErrNotFound) {
+	page, err := a.reader.SyncMessages(ctx, prepared.query)
+	if errors.Is(err, metadb.ErrNotFound) || errors.Is(err, ErrChannelNotFound) {
 		return SyncChannelMessagesResult{Messages: []SyncedMessage{}}, nil
 	}
 	if err != nil {
 		return SyncChannelMessagesResult{}, err
 	}
-	messages := cloneSyncedMessages(page.Messages)
-	if err := a.enrichSyncedMessagesWithEvents(ctx, normalizeEventSummaryMode(query), messages); err != nil {
+	_, ownsMessages := a.reader.(*PageReader)
+	return a.finishSyncChannelMessages(ctx, prepared.eventMode, page, ownsMessages)
+}
+
+// SyncChannelMessagesBatch validates every UID-owned membership before
+// issuing one cluster-routed, item-aligned message read batch. Permission reads
+// overlap within a fixed bound; failures retain input-order precedence.
+func (a *App) SyncChannelMessagesBatch(ctx context.Context, query SyncChannelMessagesBatchQuery) (SyncChannelMessagesBatchResult, error) {
+	reader, _ := a.reader.(ChannelMessageBatchReader)
+	return a.syncChannelMessagesBatch(ctx, query, reader, false)
+}
+
+// SyncPersistedChannelMessagesBatch supplies conversation recents from disk only.
+// It retains membership, visibility and event enrichment, and propagates every read failure.
+func (a *App) SyncPersistedChannelMessagesBatch(ctx context.Context, query SyncChannelMessagesBatchQuery) (SyncChannelMessagesBatchResult, error) {
+	return a.syncChannelMessagesBatch(ctx, query, a.persistedReader, true)
+}
+
+func (a *App) syncChannelMessagesBatch(ctx context.Context, query SyncChannelMessagesBatchQuery, batchReader ChannelMessageBatchReader, persisted bool) (SyncChannelMessagesBatchResult, error) {
+	loginUID := strings.TrimSpace(query.LoginUID)
+	if loginUID == "" {
+		return SyncChannelMessagesBatchResult{}, ErrSyncLoginUIDRequired
+	}
+	if len(query.Items) == 0 {
+		return SyncChannelMessagesBatchResult{}, ErrSyncBatchItemsRequired
+	}
+	if len(query.Items) > maxSyncMessagesBatchItems {
+		return SyncChannelMessagesBatchResult{}, ErrSyncBatchTooLarge
+	}
+	if batchReader == nil {
+		return SyncChannelMessagesBatchResult{}, ErrSyncBatchReaderRequired
+	}
+	prepared := make([]preparedSyncChannelMessages, len(query.Items))
+	reads := make([]ChannelMessageQuery, 0, len(query.Items))
+	readIndexes := make([]int, 0, len(query.Items))
+	result := SyncChannelMessagesBatchResult{Items: make([]SyncChannelMessagesBatchItem, len(query.Items))}
+	preparationErrors := a.prepareSyncBatch(ctx, loginUID, query.Items, prepared)
+	// All workers have joined before inspecting results or starting a message read.
+	for index, item := range query.Items {
+		if err := preparationErrors[index]; err != nil {
+			return SyncChannelMessagesBatchResult{}, err
+		}
+		preparedItem := prepared[index]
+		result.Items[index] = SyncChannelMessagesBatchItem{
+			ChannelID: item.ChannelID, ChannelType: item.ChannelType,
+			Result: SyncChannelMessagesResult{Messages: []SyncedMessage{}},
+		}
+		if !preparedItem.empty {
+			reads = append(reads, preparedItem.query)
+			readIndexes = append(readIndexes, index)
+		}
+	}
+	if len(reads) == 0 {
+		return result, nil
+	}
+	readResults, err := batchReader.SyncMessagesBatch(ctx, reads)
+	if err != nil {
+		return SyncChannelMessagesBatchResult{}, err
+	}
+	if len(readResults) != len(reads) {
+		return SyncChannelMessagesBatchResult{}, ErrSyncBatchResultMismatch
+	}
+	_, ownsMessages := batchReader.(*PageReader)
+	for readIndex, readResult := range readResults {
+		index := readIndexes[readIndex]
+		item := &result.Items[index]
+		if !persisted && (errors.Is(readResult.Err, metadb.ErrNotFound) || errors.Is(readResult.Err, ErrChannelNotFound)) {
+			continue
+		}
+		if readResult.Err != nil {
+			item.Err = readResult.Err
+			continue
+		}
+		item.Result, err = a.finishSyncChannelMessages(ctx, prepared[index].eventMode, readResult.Page, ownsMessages)
+		if err != nil {
+			return SyncChannelMessagesBatchResult{}, err
+		}
+	}
+	return result, nil
+}
+
+func (a *App) prepareSyncChannelMessages(ctx context.Context, query SyncChannelMessagesQuery) (preparedSyncChannelMessages, error) {
+	query, err := a.normalizeSyncChannelMessages(query)
+	if err != nil {
+		return preparedSyncChannelMessages{}, err
+	}
+	membership, ok, err := a.memberships.GetUserChannelMembership(ctx, query.LoginUID, query.ChannelID, int64(query.ChannelType))
+	if err != nil {
+		return preparedSyncChannelMessages{}, err
+	}
+	prepared, err := prepareSyncMembership(query, membership, ok)
+	if err != nil || prepared.empty {
+		return prepared, err
+	}
+	if a.channelState != nil {
+		channel, err := a.channelState.GetChannelForMessagePull(ctx, query.ChannelID, int64(query.ChannelType))
+		if err := validateSyncChannelState(channel, err); err != nil {
+			return preparedSyncChannelMessages{}, err
+		}
+	}
+	return prepared, nil
+}
+
+func (a *App) normalizeSyncChannelMessages(query SyncChannelMessagesQuery) (SyncChannelMessagesQuery, error) {
+	loginUID := strings.TrimSpace(query.LoginUID)
+	if loginUID == "" {
+		return SyncChannelMessagesQuery{}, ErrSyncLoginUIDRequired
+	}
+	channelID := strings.TrimSpace(query.ChannelID)
+	if channelID == "" {
+		return SyncChannelMessagesQuery{}, ErrSyncChannelIDRequired
+	}
+	if query.ChannelType == 0 {
+		return SyncChannelMessagesQuery{}, ErrSyncChannelTypeRequired
+	}
+	if query.ChannelType == channelTypePerson {
+		normalized, err := runtimechannelid.NormalizePersonChannel(loginUID, channelID)
+		if err != nil {
+			return SyncChannelMessagesQuery{}, err
+		}
+		channelID = normalized
+	}
+	if a == nil || a.reader == nil {
+		return SyncChannelMessagesQuery{}, ErrMessageReaderRequired
+	}
+	if a.memberships == nil {
+		return SyncChannelMessagesQuery{}, ErrSyncMembershipRequired
+	}
+	query.LoginUID = loginUID
+	query.ChannelID = channelID
+	return query, nil
+}
+
+// prepareSyncMembership keeps single and batch pulls on the same visibility policy.
+func prepareSyncMembership(query SyncChannelMessagesQuery, membership metadb.UserChannelMembership, ok bool) (preparedSyncChannelMessages, error) {
+	visibilityMinSeq := uint64(0)
+	if !ok && query.ChannelType == channelTypePerson {
+		// The first persistent person SEND establishes membership. Opening a new
+		// chat before then has no visible history and must not create membership.
+		return preparedSyncChannelMessages{empty: true}, nil
+	}
+	if !ok || membership.Tombstone {
+		return preparedSyncChannelMessages{}, ErrSyncMembershipRequired
+	}
+	visibilityFloor := membership.DeletedToSeq
+	if membership.JoinSeq > 0 && membership.JoinSeq-1 > visibilityFloor {
+		visibilityFloor = membership.JoinSeq - 1
+	}
+	if visibilityFloor != ^uint64(0) {
+		visibilityMinSeq = visibilityFloor + 1
+	} else {
+		visibilityMinSeq = visibilityFloor
+	}
+	return preparedSyncChannelMessages{query: ChannelMessageQuery{
+		ChannelID: ChannelID{ID: query.ChannelID, Type: query.ChannelType},
+		StartSeq:  query.StartMessageSeq,
+		EndSeq:    query.EndMessageSeq,
+		MinSeq:    visibilityMinSeq,
+		Limit:     normalizeSyncMessagesLimit(query.Limit),
+		PullMode:  query.PullMode,
+	}, eventMode: normalizeEventSummaryMode(query)}, nil
+}
+
+func validateSyncChannelState(channel metadb.Channel, err error) error {
+	if err != nil && !errors.Is(err, metadb.ErrNotFound) {
+		return err
+	}
+	if err == nil && channel.Disband != 0 {
+		return ErrSyncChannelDisbanded
+	}
+	return nil
+}
+
+func (a *App) finishSyncChannelMessages(ctx context.Context, eventMode string, page ChannelMessagePage, ownsMessages bool) (SyncChannelMessagesResult, error) {
+	// Only the concrete PageReader transfers owned scan data. Custom readers
+	// may retain their pages, including wrappers that embed a PageReader.
+	messages := page.Messages
+	if !ownsMessages {
+		messages = cloneSyncedMessages(messages)
+	}
+	if err := a.enrichSyncedMessagesWithEvents(ctx, eventMode, messages); err != nil {
 		return SyncChannelMessagesResult{}, err
 	}
 	return SyncChannelMessagesResult{
@@ -359,7 +569,41 @@ func cloneMessageEventMeta(meta *MessageEventMeta) *MessageEventMeta {
 	}
 	cp := *meta
 	cp.Events = append([]MessageEventKeyMeta(nil), meta.Events...)
+	for i := range cp.Events {
+		cp.Events[i].Snapshot = cloneMessageEventSnapshot(cp.Events[i].Snapshot)
+	}
 	return &cp
+}
+
+// cloneMessageEventSnapshot detaches decoded JSON objects/arrays and raw bytes
+// supplied by a custom reader; scalar JSON values are immutable.
+func cloneMessageEventSnapshot(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		if v == nil {
+			return v
+		}
+		out := make(map[string]any, len(v))
+		for key, item := range v {
+			out[key] = cloneMessageEventSnapshot(item)
+		}
+		return out
+	case []any:
+		if v == nil {
+			return v
+		}
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = cloneMessageEventSnapshot(item)
+		}
+		return out
+	case json.RawMessage:
+		return append(json.RawMessage(nil), v...)
+	case []byte:
+		return cloneBytes(v)
+	default:
+		return value
+	}
 }
 
 func cloneMessageEventStates(states []MessageEventState) []MessageEventState {

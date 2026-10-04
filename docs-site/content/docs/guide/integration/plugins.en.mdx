@@ -21,12 +21,14 @@ WuKongIM v3 Beta can extend message paths and host RPC through local `.wkp` proc
 
 ## Lifecycle
 
-```text
-local plugin directory
-  -> plugin process starts and calls /plugin/start
-  -> server validates observed manifest
-  -> merge node-local desired enable/config state
-  -> running + enabled + advertised method = hook candidate
+```mermaid
+flowchart TD
+  Directory["Local plugin directory"] --> Start["Plugin process starts and calls /plugin/start"]
+  Start --> Validate["Server validates the observed manifest"]
+  Validate --> Merge["Merge node-local desired enable and config state"]
+  Merge --> Candidate{"Running, enabled, and advertises the method?"}
+  Candidate -->|yes| Hook["Hook candidate"]
+  Candidate -->|no| Inactive["Excluded from Hook calls"]
 ```
 
 When Manager updates configuration, an existing secret represented by `SecretHidden` is preserved, and returned details redact secrets. A running plugin that advertises `ConfigUpdate` receives a synchronous configuration update call. Uninstall first writes disabled desired state, then stops and removes the local process.
@@ -36,7 +38,7 @@ When Manager updates configuration, an existing secret represented by `SecretHid
 | Hook | Timing | Failure semantics |
 | --- | --- | --- |
 | Send | After permission succeeds, before Channel append admission | Synchronous; fail-closed by default with explicit fail-open option; may mutate payload or reject |
-| Receive | After durable commit for an offline UID batch | Independent recipient failure does not change SENDACK, online delivery, or conversation projection |
+| Receive | After durable commit for an offline UID batch | Independent recipient failure does not change SENDACK, online delivery, or membership state |
 | PersistAfter | After durable commit | Failure reaches worker logs/metrics only and never rolls back the message |
 
 Candidate plugins are ordered by priority descending and plugin number ascending. A Send response may replace only the payload, not sender, Channel, Session, or routing fields. A plugin-origin send still enters the message usecase, permission checks, recursion guard, and Channel authority.
@@ -58,6 +60,14 @@ Current compatibility capabilities include:
 - forward a bounded HTTP request to a plugin route locally or on one specified node.
 
 Host RPC still enforces body, header, query, timeout, and target validation. `toNodeId=-1` fanout is explicitly deferred and does not perform a silent partial broadcast.
+
+## Business HTTP routes
+
+A business backend can call `ANY /plugins/:plugin_no/*path` on the WuKongIM HTTP API listener, for example `POST /plugins/wk.plugin.search/search`. The server forwards the method, path, body, and first value of each header/query entry to the connected plugin's `Route` method on that node, then returns its status, body, and end-to-end headers. The plugin defines its payload schema; these extension routes are separate from the core WuKongIM HTTP API JSON operation inventory.
+
+The entry inherits the WuKongIM HTTP API network boundary and maintenance gate without adding authentication. Request and response bodies are limited to 10 MiB. Execution uses `plugin.timeout` (default 5 seconds). Oversized requests return 413, unavailable plugins or invalid responses return 502, and an unwired plugin runtime returns 503. Hop-by-hop response headers and plugin-supplied `Content-Length` are removed.
+
+This compatibility entry is a fix after `v3.0.0-beta.13`, which returns 404 for this path. Existing integrations require a server containing the fix and acceptance tests against their actual plugin.
 
 ## Safety and capacity checklist
 

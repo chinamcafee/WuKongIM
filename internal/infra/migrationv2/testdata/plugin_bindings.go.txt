@@ -1,0 +1,50 @@
+// External caller of unmodified SourceCommit. All records are synthetic.
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
+	"github.com/cockroachdb/pebble"
+)
+
+func must(err error) { if err != nil { panic(err) } }
+type pair struct { Key, Value []byte }
+
+func main() {
+	dir, err := os.MkdirTemp("", "original-v2-plugin-binding-"); must(err)
+	defer os.RemoveAll(dir)
+	open := func() wkdb.DB {
+		db := wkdb.NewWukongDB(wkdb.NewOptions(wkdb.WithDir(dir), wkdb.WithNodeId(1), wkdb.WithShardNum(2)))
+		must(db.Open()); return db
+	}
+	db := open()
+	at := time.Unix(1700000000, 123456789).UTC()
+	must(db.AddUser(wkdb.User{Uid: "bound-user"}))
+	must(db.AddOrUpdatePlugin(wkdb.Plugin{No: "legacy-receive", Priority: 7, Methods: []string{"Receive"}}))
+	must(db.AddOrUpdatePluginUsers([]wkdb.PluginUser{{PluginNo: "legacy-receive", Uid: "bound-user", CreatedAt: &at, UpdatedAt: &at}}))
+	must(db.Close())
+	db = open()
+	user, err := db.GetUser("bound-user"); must(err)
+	exists, err := db.ExistPluginByUid("bound-user"); must(err)
+	selected, err := db.GetHighestPriorityPluginByUid("bound-user"); must(err)
+	bindings, err := db.GetPluginUsers("legacy-receive"); must(err)
+	if !exists || selected != "legacy-receive" || len(bindings) != 1 || user.PluginNo != "" { panic("unexpected original binding read") }
+	must(db.Close())
+	raw, err := pebble.Open(filepath.Join(dir, "wukongimdb", "shard000"), &pebble.Options{ReadOnly: true}); must(err)
+	iter := raw.NewIter(nil)
+	var rows []pair
+	for iter.First(); iter.Valid(); iter.Next() {
+		k := iter.Key()
+		if len(k) >= 2 && k[0] == 0x16 && k[1] == 1 {
+			rows = append(rows, pair{append([]byte(nil), k...), append([]byte(nil), iter.Value()...)})
+		}
+	}
+	must(iter.Error()); must(iter.Close()); must(raw.Close())
+	result := map[string]any{"uid": "bound-user", "plugin_no": selected, "user_plugin_no_empty": user.PluginNo == "", "exists": exists, "binding_count": len(bindings), "created_at_ns": at.UnixNano(), "rows": rows}
+	data, err := json.MarshalIndent(result, "", "  "); must(err)
+	must(os.WriteFile(os.Args[1], append(data, '\n'), 0600))
+}

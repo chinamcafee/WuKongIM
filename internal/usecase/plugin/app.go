@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/plugin/pluginproto"
+	runtimechannelid "github.com/WuKongIM/WuKongIM/pkg/protocol/channelid"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 )
 
@@ -27,6 +28,7 @@ func NewApp(opts Options) (*App, error) {
 		opts.ReceiveDedupeTTL = 5 * time.Minute
 	}
 	return &App{
+		commandChannels:  runtimechannelid.CommandCodec{Suffix: opts.CommandChannelSuffix},
 		runtime:          opts.Runtime,
 		invoker:          opts.Invoker,
 		desired:          opts.DesiredStore,

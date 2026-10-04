@@ -1,0 +1,125 @@
+---
+title: Android 快速开始
+description: 安装 WuKongIMAndroidSDK 1.5.5，连接用户并完成第一条在线文本消息。
+---
+
+这一页只做一件事：让两个在线的 Android 客户端互相发送一条文本消息。
+
+## 前置条件
+
+- 业务服务端已为 `alice` 和 `bob` 返回各自的 `uid`、`token`、网关地址和端口；
+- 两个独立的 App 进程或设备；
+- Android 工程可以访问 JitPack。
+
+## 1. 安装
+
+在依赖仓库中加入 JitPack：
+
+```groovy
+maven { url 'https://jitpack.io' }
+```
+
+在 App 模块中固定 SDK 版本：
+
+```groovy
+dependencies {
+    implementation 'com.github.WuKongIM:WuKongIMAndroidSDK:1.5.5'
+}
+```
+
+## 2. 初始化并提供连接地址
+
+业务登录成功后，用 Application Context 初始化 SDK：
+
+```java
+WKIM im = WKIM.getInstance();
+im.setDebug(false);
+im.init(getApplicationContext(), uid, token);
+
+im.getConnectionManager().addOnGetIpAndPortListener(callback ->
+    callback.onGetSocketIpAndPort("im.example.com", 5100)
+);
+```
+
+如果网关地址来自接口，就在这个监听器中异步请求，成功后再调用 `onGetSocketIpAndPort`。
+
+## 3. 监听连接和消息
+
+```java
+private static final String LISTENER_KEY = "chat-home";
+private boolean syncInProgress = false;
+
+im.getConnectionManager().addOnConnectionStatusListener(
+    LISTENER_KEY,
+    (status, reason) -> {
+        if (status == WKConnectStatus.syncMsg) {
+            syncInProgress = true;
+            Log.d("WKIM", "restoring messages");
+        } else if (status == WKConnectStatus.syncCompleted) {
+            Log.d("WKIM", "message restore complete");
+        } else if (status == WKConnectStatus.success && syncInProgress) {
+            syncInProgress = false;
+            Log.d("WKIM", "connected");
+        } else if (status == WKConnectStatus.kicked ||
+                   status == WKConnectStatus.noNetwork) {
+            syncInProgress = false;
+            Log.e("WKIM", "connection interrupted: " + reason);
+        } else if (status == WKConnectStatus.fail) {
+            syncInProgress = false;
+            Log.e("WKIM", "connect failed: " + reason);
+        }
+    }
+);
+
+im.getMsgManager().addOnNewMsgListener(LISTENER_KEY, messages -> {
+    for (WKMsg message : messages) {
+        if (message.baseContentMsgModel instanceof WKTextContent) {
+            WKTextContent text = (WKTextContent) message.baseContentMsgModel;
+            Log.d("WKIM", message.fromUID + ": " + text.content);
+        }
+    }
+});
+
+im.getMsgManager().addOnSendMsgAckListener(LISTENER_KEY, message -> {
+    if (message.status == WKSendMsgResult.send_success) {
+        Log.d("WKIM", "message sent: " + message.clientMsgNO);
+    } else {
+        Log.e("WKIM", "message failed: " + message.clientMsgNO);
+    }
+});
+```
+
+每个监听器都使用稳定且唯一的 key，页面销毁时再用同一个 key 移除。
+
+## 4. 连接并发送
+
+```java
+im.getConnectionManager().connection();
+```
+
+`1.5.5` 会在开始同步前和同步结束后各报告一次 `success`。必须等待
+`syncMsg`、`syncCompleted` 之后的第二次 `success`，再让 Alice 向 Bob 发送：
+
+```java
+WKTextContent content = new WKTextContent("你好，Bob");
+WKChannel channel = new WKChannel("bob", WKChannelType.PERSONAL);
+im.getMsgManager().send(content, channel);
+```
+
+## 预期结果
+
+1. Alice 和 Bob 都在同步结束后收到最终连接成功状态；
+2. Alice 的发送状态监听器收到 `send_success`；
+3. Bob 的新消息监听器打印“你好，Bob”。
+
+如果连接失败，检查地址、客户端端口以及 Token 是否属于当前 UID。如果发送没有结果，确认发送发生在连接成功之后，并确认监听器 key 没有被其他页面覆盖。
+
+页面结束时清理：
+
+```java
+im.getConnectionManager().removeOnConnectionStatusListener(LISTENER_KEY);
+im.getMsgManager().removeNewMsgListener(LISTENER_KEY);
+im.getMsgManager().removeSendMsgAckListener(LISTENER_KEY);
+```
+
+下一步阅读[连接管理](/zh/sdk/android/connection)和[消息管理](/zh/sdk/android/messages)。

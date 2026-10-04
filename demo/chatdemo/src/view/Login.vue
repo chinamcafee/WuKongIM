@@ -1,151 +1,88 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import { t } from '../i18n'
+import { demoLogoURL } from '../services/assets'
 import APIClient from '../services/APIClient'
-import { useRouter, useRoute } from "vue-router";
 import { WKSDK } from 'wukongimjssdk';
-const router = useRouter();
+import { establishSession, loadSession } from '../services/session'
+import { demoHomeURL } from '../../../shared/home'
+import '../../../shared/home.css'
 
 
-const getUrlParam = (name: string) => {
-  var reg = new RegExp("(^|&)" + name + "=([^&]*)(&|$)"); // 构造一个含有目标参数的正则表达式对象
-  var r = window.location.search.substr(1).match(reg); // 匹配目标参数
-  if (r != null) return unescape(r[2]);
-  return null; // 返回参数值
-}
+const saved = loadSession(window.sessionStorage)
+const home = demoHomeURL(import.meta.env.DEV)
+const requestedURL = new URLSearchParams(window.location.search).get('apiurl')?.trim()
+const apiAddr = ref(requestedURL || saved?.apiURL || (import.meta.env.DEV ? 'http://127.0.0.1:5001' : window.location.origin))
+const username = ref(saved?.uid || '')
+const password = ref(saved?.token || '')
+const createDemoCredentials = ref(true)
+const submitting = ref(false)
+const errorMessage = ref('')
 
-var apiurl = getUrlParam("apiurl")
-
-
-if (!apiurl || apiurl?.trim() == "") {
-  apiurl = import.meta.env.DEV ? "http://127.0.0.1:5001" : window.location.origin
-} else {
-  // 去掉 apiurl后的 “/”
-  if (apiurl && apiurl.endsWith("/")) {
-    apiurl = apiurl.substring(0, apiurl.length - 1)
+const login = async () => {
+  if (submitting.value) return
+  submitting.value = true
+  errorMessage.value = ''
+  try {
+    const session = await establishSession(window.sessionStorage, {
+      apiURL: apiAddr.value, uid: username.value, token: password.value,
+    }, createDemoCredentials.value, async session => {
+      APIClient.shared.config.apiURL = session.apiURL
+      await APIClient.shared.post('/user/token', {
+        uid: session.uid, token: session.token, device_flag: 1, device_level: 0,
+      })
+    })
+    APIClient.shared.config.apiURL = session.apiURL
+    // Recreate the SDK singleton so another account cannot inherit cached messages.
+    window.location.replace(window.location.pathname + window.location.search + '#/chat')
+  } catch {
+    errorMessage.value = t('loginFailed')
+  } finally {
+    submitting.value = false
   }
-}
-
-
-console.log("apiurl--->", apiurl)
-
-// defineProps<{ msg: string }>()
-
-const count = ref(0)
-const apiAddr = ref(apiurl || '')
-const username = ref('')
-const password = ref('')
-
-const login = () => {
-  APIClient.shared.config.apiURL = apiAddr.value
-  // 注意：这里的登录接口是悟空IM的演示接口，仅供演示使用，这些接口不应该暴露给前端，应该由后端封装后提供给前端
-  APIClient.shared.post('/user/token', {
-    uid: username.value, // 第三方服务端的用户唯一uid
-    token: password.value || "default111111", // 第三方服务端的用户的token
-    device_flag: 1, // 设备标识  0.app 1.web （相同用户相同设备标记的主设备登录会互相踢，从设备将共存）
-    device_level: 0,  // 设备等级 0.为从设备 1.为主设备
-  }).then((res) => {
-    console.log(res)
-    router.push({ path: '/chat', query: { uid: username.value, token: password.value } })
-  }).catch((err) => {
-    alert(err.msg)
-  })
 }
 
 
 
 </script>
 <template>
-  <div class="hello">
-    <div>
-      <a href="https://githubim.com" target="_blank">
-        <img src="/logo.png" class="logo" alt="Vite logo" />
-      </a>
-    </div>
-    <p>
-      悟空IM演示程序，当前SDK版本：[v{{ WKSDK.shared().config.sdkVersion }}]
-    </p>
-    <div class="form">
-      <div class="item">
-        <div class="label">
-          <label>API基地址</label>
-        </div>
-        <div class="field">
-          <input type="text" placeholder="请输入API基地址" v-model="apiAddr" />
-        </div>
-      </div>
-      <div class="item">
-        <div class="label">
-          <label>登录账号</label>
-        </div>
-        <div class="field">
-          <input type="text" placeholder="演示下，随便输，唯一即可" v-model="username" />
-        </div>
-      </div>
-      <div class="item">
-        <div class="label">
-          <label>登录密码</label>
-        </div>
-        <div class="field">
-          <input type="text" placeholder="演示下，随便输" v-model="password" />
-        </div>
-      </div>
-      <button class="submit" v-on:click="login">登录</button>
-    </div>
-  </div>
+  <main class="login-page">
+    <section class="login-card">
+      <a class="demo-home-link" :href="home" data-demo-home><span aria-hidden="true">←</span>{{ t('backToHome') }}</a>
+      <div class="login-brand"><img :src="demoLogoURL" :alt="t('logo')" /><span>WuKongIM</span></div>
+      <h1>{{ t('loginTitle') }}</h1><p class="intro">{{ t('loginIntro') }}</p>
+      <form @submit.prevent="login">
+        <label for="api-address">{{ t('apiAddress') }}</label>
+        <input id="api-address" type="url" :placeholder="t('apiAddressPlaceholder')" v-model="apiAddr" required />
+        <label for="account-uid">{{ t('username') }}</label>
+        <input id="account-uid" type="text" autocomplete="username" :placeholder="t('usernamePlaceholder')" v-model="username" required />
+        <label for="account-token">{{ t('password') }}</label>
+        <input id="account-token" type="password" autocomplete="off" :placeholder="t('passwordPlaceholder')" v-model="password" required />
+        <p class="token-hint">{{ t('existingTokenHint') }}</p>
+        <label class="demo-credentials"><input type="checkbox" v-model="createDemoCredentials" />{{ t('createDemoCredentials') }}</label>
+        <p v-if="errorMessage" class="login-error" role="alert">{{ errorMessage }}</p>
+        <button class="primary" type="submit" :disabled="submitting">{{ t(submitting ? 'loggingIn' : 'login') }} <span aria-hidden="true">→</span></button>
+      </form>
+      <footer><span>SDK v{{ WKSDK.shared().config.sdkVersion }}</span><a href="https://github.com/WuKongIM/WuKongIM" target="_blank" rel="noopener">GitHub ↗</a></footer>
+    </section>
+  </main>
 </template>
 
 <style scoped>
-.form {
-  width: 100%;
-  margin-top: 40px;
-}
-
-.item {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 100%;
-  margin-top: 20px;
-}
-
-.item label {
-  font-size: 17px;
-}
-
-.field input {
-  width: 200px;
-  height: 30px;
-  border: none;
-  margin-left: 20px;
-  font-size: 17px;
-}
-
-.form .submit {
-  margin-top: 40px;
-  height: 60px;
-  min-width: 300px;
-  max-width: 600px;
-  width: 80%;
-  border: none;
-  border-radius: 4px;
-  color: white;
-  background-color: rgb(228, 98, 64);
-  font-size: 20px;
-  cursor: pointer;
-}
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: filter 300ms;
-}
-
-.logo:hover {
-  filter: drop-shadow(0 0 2em #646cffaa);
-}
-
-.logo.vue:hover {
-  filter: drop-shadow(0 0 2em #42b883aa);
-}
+.login-page { height: 100%; overflow-y: auto; display: grid; align-items: center; justify-items: center; padding: max(24px, env(safe-area-inset-top)) 20px max(24px, env(safe-area-inset-bottom)); background: radial-gradient(ellipse at 25% 0, var(--accent-soft), transparent 60%), var(--chat-background); }
+.login-card { width: min(100%, 440px); padding: 34px; border: 1px solid var(--line); border-radius: 24px; background: var(--surface); box-shadow: var(--shadow); }
+.login-brand { display: flex; align-items: center; gap: 10px; font-size: 18px; font-weight: 700; letter-spacing: -.5px; }
+.login-card > .demo-home-link { margin-bottom: 24px; }
+.login-brand img { width: 40px; height: 40px; border-radius: 12px; }
+h1 { font-size: 26px; letter-spacing: -.8px; margin: 30px 0 8px; }
+.intro { color: var(--muted); font-size: 14px; margin: 0 0 28px; }
+form > label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; }
+form > input { display: block; width: 100%; margin-bottom: 20px; }
+.token-hint { font-size: 12px; color: var(--muted); line-height: 1.7; margin: -6px 0 20px; }
+form > .demo-credentials { display: flex; gap: 8px; align-items: flex-start; font-weight: 400; font-size: 12px; color: var(--muted); line-height: 1.6; margin-bottom: 22px; }
+.demo-credentials input { accent-color: var(--accent); margin: 3px 0 0; flex-shrink: 0; }
+form > button { width: 100%; padding: 12px 16px; font-size: 15px; display: flex; justify-content: space-between; align-items: center; border-radius: 10px; }
+.login-error { color: var(--danger); font-size: 13px; line-height: 1.5; }
+footer { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 26px; }
+@media (max-width: 480px) { .login-card { padding: 26px 22px; border-radius: 20px; } h1 { font-size: 24px; } }
 </style>

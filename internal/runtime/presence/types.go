@@ -11,7 +11,7 @@ var ErrNotLeader = errors.New("internal/runtime/presence: not leader")
 // ErrStaleRoute reports an owner route older than the stored owner-sequence fence.
 var ErrStaleRoute = errors.New("internal/runtime/presence: stale route")
 
-// ErrRouteNotReady reports that a pending route token cannot be committed or aborted.
+// ErrRouteNotReady reports incomplete authority reconstruction or a pending route conflict.
 var ErrRouteNotReady = errors.New("internal/runtime/presence: route not ready")
 
 // ErrCredentialFenceConflict reports equal-version credential metadata disagreement.
@@ -211,6 +211,8 @@ type ExpireResult struct {
 
 // DirectoryOptions configures the authority route directory.
 type DirectoryOptions struct {
+	// RequireRecovery keeps UID lookups unavailable until current owners have been queried.
+	RequireRecovery bool
 	// LocalNodeID optionally fences authority targets to this local node.
 	LocalNodeID uint64
 	// ShardCount controls the number of hash-slot shards; values <= 0 use the default.

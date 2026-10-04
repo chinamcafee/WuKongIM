@@ -1,6 +1,9 @@
 package transfer
 
-import "errors"
+import (
+	"errors"
+	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
+)
 
 const (
 	bundleFormat  = "wkdb-import-bundle"
@@ -26,14 +29,22 @@ const (
 	FileKindMetaChannels FileKind = "meta.channels"
 	// FileKindMetaSubscribers stores channel subscriber rows.
 	FileKindMetaSubscribers FileKind = "meta.subscribers"
+	// FileKindMetaSubscriberSequences retains per-Slot join allocation high water.
+	FileKindMetaSubscriberSequences FileKind = "meta.subscriber_sequences"
 	// FileKindMetaUserChannelMemberships stores user-to-channel membership rows.
 	FileKindMetaUserChannelMemberships FileKind = "meta.user_channel_memberships"
 	// FileKindMetaConversations stores conversation projection rows.
 	FileKindMetaConversations FileKind = "meta.conversations"
 	// FileKindMetaCMDDeviceCursors stores per-device-class command-channel progress.
 	FileKindMetaCMDDeviceCursors FileKind = "meta.cmd_device_cursors"
+	// FileKindMetaUserCMDChannelMemberships stores user-to-command-channel bindings.
+	FileKindMetaUserCMDChannelMemberships FileKind = "meta.user_cmd_channel_memberships"
 	// FileKindMetaChannelLatest stores latest channel message projection rows.
 	FileKindMetaChannelLatest FileKind = "meta.channel_latest"
+	// FileKindMetaPersonDirectoryTasks stores durable pending person-directory projections.
+	FileKindMetaPersonDirectoryTasks FileKind = "meta.person_directory_tasks"
+	// FileKindMetaMessageUpdates preserves all four exact message-edit projections.
+	FileKindMetaMessageUpdates FileKind = "meta.message_updates"
 	// FileKindMessageChannels stores message channel index rows.
 	FileKindMessageChannels FileKind = "message.channels"
 	// FileKindMessageMessages stores message log rows.
@@ -74,7 +85,7 @@ type ImportOptions struct {
 	SubscriberBatchSize int
 	// MessageBatchSize bounds message record chunks written through the typed message API.
 	MessageBatchSize int
-	// MessageBatchBytes bounds approximate payload bytes per message import chunk.
+	// MessageBatchBytes bounds body plus publication metadata bytes per import chunk.
 	MessageBatchBytes int
 }
 
@@ -136,6 +147,10 @@ type UserRecord struct {
 	DeviceFlag int64 `json:"device_flag"`
 	// DeviceLevel describes the device trust or login level.
 	DeviceLevel int64 `json:"device_level"`
+	// SendBan is the UID-wide sending restriction.
+	SendBan int64 `json:"send_ban"`
+	// SendBanVersion preserves the exact policy CAS revision.
+	SendBanVersion Uint64 `json:"send_ban_version"`
 }
 
 // DeviceRecord represents one imported user device metadata row.
@@ -182,12 +197,34 @@ type ChannelRecord struct {
 	Disband int64 `json:"disband"`
 	// SendBan is the numeric 0/1 flag that marks whether sending is disabled for the channel.
 	SendBan int64 `json:"send_ban"`
+	// SendBanVersion preserves the exact policy CAS revision.
+	SendBanVersion Uint64 `json:"send_ban_version"`
 	// AllowStranger is the numeric 0/1 flag that marks whether non-subscribers may interact with the channel.
 	AllowStranger int64 `json:"allow_stranger"`
 	// Large is the numeric 0/1 flag that marks whether the channel should use large-channel behavior.
 	Large int64 `json:"large"`
 	// SubscriberMutationVersion is the exact subscriber mutation version.
 	SubscriberMutationVersion Uint64 `json:"subscriber_mutation_version"`
+	// DirectoryProjectionState is the durable none, pending, or ready state.
+	DirectoryProjectionState uint8 `json:"directory_projection_state"`
+	// DirectoryProjectionGeneration fences stale person-directory projection work.
+	DirectoryProjectionGeneration Uint64 `json:"directory_projection_generation"`
+}
+
+// PersonDirectoryTaskRecord represents one durable pending directory projection.
+type PersonDirectoryTaskRecord struct {
+	// HashSlot is the source Channel-owned hash slot.
+	HashSlot uint16 `json:"hash_slot"`
+	// ChannelID is the canonical person Channel identifier.
+	ChannelID string `json:"channel_id"`
+	// ChannelType is always the person Channel type.
+	ChannelType int64 `json:"channel_type"`
+	// CommittedTail is the projection baseline captured at admission.
+	CommittedTail Uint64 `json:"committed_tail"`
+	// CreatedAt is the durable admission timestamp.
+	CreatedAt int64 `json:"created_at"`
+	// Generation is the exact source incarnation projected by this task.
+	Generation Uint64 `json:"generation"`
 }
 
 // SubscriberRecord represents one imported channel subscriber row.
@@ -200,6 +237,8 @@ type SubscriberRecord struct {
 	ChannelType int64 `json:"channel_type"`
 	// UID is the stable subscriber user identifier.
 	UID string `json:"uid"`
+	// Incarnation zero preserves legacy membership identity 1.
+	Incarnation Uint64 `json:"incarnation,omitempty"`
 }
 
 // UserChannelMembershipRecord represents one imported user-to-channel membership row.
@@ -214,32 +253,42 @@ type UserChannelMembershipRecord struct {
 	ChannelType int64 `json:"channel_type"`
 	// JoinSeq is the exact message sequence visible when the user joined.
 	JoinSeq Uint64 `json:"join_seq"`
+	// ReadSeq is the monotonic badge baseline.
+	ReadSeq Uint64 `json:"read_seq"`
+	// DeletedToSeq is the monotonic visibility floor.
+	DeletedToSeq Uint64 `json:"deleted_to_seq"`
+	// ActivatedAt is the explicit directory ordering timestamp.
+	ActivatedAt int64 `json:"activated_at"`
+	// Tombstone reports that the membership has been removed.
+	Tombstone bool `json:"tombstone"`
+	// TombstoneAt records when the membership was removed.
+	TombstoneAt int64 `json:"tombstone_at"`
+	// SourceVersion fences stale subscriber-derived mutations.
+	SourceVersion Uint64 `json:"source_version"`
 	// UpdatedAtMS is the last update time in milliseconds.
 	UpdatedAtMS int64 `json:"updated_at_ms"`
 }
 
-// ConversationRecord represents one imported user conversation projection row.
-type ConversationRecord struct {
-	// HashSlot is the hash slot that owns this conversation row.
+// UserCMDChannelMembershipRecord represents one imported command-channel binding.
+type UserCMDChannelMembershipRecord struct {
+	// HashSlot is the UID-owned hash slot.
 	HashSlot uint16 `json:"hash_slot"`
-	// UID is the stable user identifier.
+	// UID identifies the binding owner.
 	UID string `json:"uid"`
-	// Kind is the conversation kind and must be normal or cmd.
-	Kind string `json:"kind"`
-	// ChannelID is the stable channel identifier.
-	ChannelID string `json:"channel_id"`
-	// ChannelType is the numeric channel type.
+	// CommandChannelID identifies the bound command channel.
+	CommandChannelID string `json:"command_channel_id"`
+	// ChannelType identifies the channel namespace.
 	ChannelType int64 `json:"channel_type"`
-	// ReadSeq is the exact latest read message sequence.
-	ReadSeq Uint64 `json:"read_seq"`
-	// DeletedToSeq is the exact highest message sequence deleted for this conversation.
-	DeletedToSeq Uint64 `json:"deleted_to_seq"`
-	// ActiveAt is the conversation active timestamp.
-	ActiveAt int64 `json:"active_at"`
-	// UpdatedAt is the conversation update timestamp.
-	UpdatedAt int64 `json:"updated_at"`
-	// SparseActive marks rows imported from sparse active conversation state.
-	SparseActive bool `json:"sparse_active"`
+	// StartSeq is the first visible command sequence.
+	StartSeq Uint64 `json:"start_seq"`
+	// AckSeq is the monotonic command acknowledgement cursor.
+	AckSeq Uint64 `json:"ack_seq"`
+	// Tombstone reports that the binding has been removed.
+	Tombstone bool `json:"tombstone"`
+	// TombstoneAt records when the binding was removed.
+	TombstoneAt int64 `json:"tombstone_at"`
+	// UpdatedAtMS records the latest binding mutation.
+	UpdatedAtMS int64 `json:"updated_at_ms"`
 }
 
 // CMDDeviceCursorRecord represents one device-scoped command-channel cursor.
@@ -318,4 +367,38 @@ type MessageRecord struct {
 	PayloadB64 string `json:"payload_b64"`
 	// Payload is the decoded message payload.
 	Payload []byte `json:"-"`
+	// PublicationMetadataB64 is optional canonical publication content. Omitting
+	// it preserves native JSONL rows and old strict-reader compatibility.
+	PublicationMetadataB64 string `json:"publication_metadata_b64,omitempty"`
+	// PublicationMetadata is the owned decoded value, bounded to 32 KiB.
+	PublicationMetadata []byte `json:"-"`
+}
+
+// MessageUpdateRecord transfers a bounded exact edit-table row, including its Hash Slot.
+type MessageUpdateRecord struct {
+	HashSlot uint16 `json:"hash_slot"`
+	metadb.MessageUpdateImport
+}
+
+type ConversationRecord struct {
+	// HashSlot is the hash slot that owns this conversation row.
+	HashSlot uint16 `json:"hash_slot"`
+	// UID is the stable user identifier.
+	UID string `json:"uid"`
+	// Kind is the conversation kind and must be normal or cmd.
+	Kind string `json:"kind"`
+	// ChannelID is the stable channel identifier.
+	ChannelID string `json:"channel_id"`
+	// ChannelType is the numeric channel type.
+	ChannelType int64 `json:"channel_type"`
+	// ReadSeq is the exact latest read message sequence.
+	ReadSeq Uint64 `json:"read_seq"`
+	// DeletedToSeq is the exact highest message sequence deleted for this conversation.
+	DeletedToSeq Uint64 `json:"deleted_to_seq"`
+	// ActiveAt is the conversation active timestamp.
+	ActiveAt int64 `json:"active_at"`
+	// UpdatedAt is the conversation update timestamp.
+	UpdatedAt int64 `json:"updated_at"`
+	// SparseActive marks rows imported from sparse active conversation state.
+	SparseActive bool `json:"sparse_active"`
 }

@@ -1,12 +1,26 @@
 package meta
 
 import (
+	"bytes"
 	"context"
 	"errors"
 
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/dberrors"
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/engine"
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/schema"
+)
+
+// DirectoryProjectionState records whether a person channel has admitted and
+// completed its UID-owned directory projection.
+type DirectoryProjectionState uint8
+
+const (
+	// DirectoryProjectionNone means no durable projection task is admitted.
+	DirectoryProjectionNone DirectoryProjectionState = iota
+	// DirectoryProjectionPending means a durable task exists and SEND may proceed.
+	DirectoryProjectionPending
+	// DirectoryProjectionReady means both UID memberships exist and the task is gone.
+	DirectoryProjectionReady
 )
 
 // Channel stores durable channel flags and subscriber metadata version.
@@ -19,8 +33,10 @@ type Channel struct {
 	Ban int64
 	// Disband marks the channel as disbanded.
 	Disband int64
-	// SendBan marks the channel as send-banned.
+	// SendBan blocks every sender into this source Channel.
 	SendBan int64
+	// SendBanVersion advances only when the sending restriction changes.
+	SendBanVersion uint64
 	// AllowStranger records whether non-subscribers may access the channel.
 	AllowStranger int64
 	// Large marks the channel as a large-group channel.
@@ -31,13 +47,21 @@ type Channel struct {
 	SubscriberMutationVersion uint64
 	// SubscriberCount stores the durable number of ordinary subscriber rows.
 	SubscriberCount uint64
+	// DirectoryProjectionState advances from none to pending to ready for a live
+	// person-channel projection. Runtime retirement withdraws readiness atomically.
+	DirectoryProjectionState DirectoryProjectionState
+	// DirectoryProjectionGeneration is the exact durable incarnation whose
+	// pending task or completed UID projection the state describes.
+	DirectoryProjectionGeneration uint64
 }
 
 // ChannelBusinessFlags contains the Manager-editable channel flags.
 type ChannelBusinessFlags struct {
-	Ban     int64
-	Disband int64
-	SendBan int64
+	// PreserveSendBan makes unrelated mutations retain the apply-time policy.
+	PreserveSendBan bool
+	Ban             int64
+	Disband         int64
+	SendBan         int64
 }
 
 // ChannelConditionalMutationResult is populated after a conditional batch commit.
@@ -154,14 +178,101 @@ func (s *Shard) DeleteChannel(ctx context.Context, channelID string, channelType
 	if err := s.check(ctx); err != nil {
 		return err
 	}
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := batch.DeleteChannel(s.hashSlot, channelID, channelType); err != nil {
+		return err
+	}
+	return batch.Commit(ctx)
+}
+
+// DeleteChannel stages the complete Channel-owned deletion boundary. For a
+// person Channel, deleting a live incarnation also advances the runtime
+// directory and append-route generations before removing its pending task.
+func (b *Batch) DeleteChannel(hashSlot HashSlot, channelID string, channelType int64) error {
+	if err := b.ensureOpen(); err != nil {
+		return err
+	}
 	if err := validateKeyString(channelID); err != nil {
 		return err
 	}
-	primaryKey := encodeChannelRowKey(s.hashSlot, channelID, channelType, channelPrimaryFamilyID)
-	if err := channelTable.Delete(ctx, s, KeyParts{String(channelID), Int64Ordered(channelType)}); err != nil {
-		return err
+	pk := KeyParts{String(channelID), Int64Ordered(channelType)}
+	primaryKey := encodeChannelRowKey(hashSlot, channelID, channelType, channelPrimaryFamilyID)
+	var directoryTaskKey []byte
+	if channelType == 1 {
+		var err error
+		directoryTaskKey, err = personDirectoryTaskTable.primaryRowKey(hashSlot, personDirectoryTaskPrimaryKey(channelID, channelType))
+		if err != nil {
+			return err
+		}
 	}
-	s.db.forgetChannel(primaryKey)
+	b.addOp(hashSlot, func(ctx context.Context, state *batchCommitState, engineBatch *engine.Batch) error {
+		existing, exists, err := state.loadChannel(ctx, primaryKey, channelID, channelType)
+		decodedExisting := err == nil
+		if err != nil && !errors.Is(err, dberrors.ErrCorruptValue) {
+			return err
+		}
+		// Physical deletion must remain possible for a corrupt primary. Its raw
+		// presence still advances a person-directory generation, while decoded
+		// secondary indexes are removed only when their source row was readable.
+		if errors.Is(err, dberrors.ErrCorruptValue) {
+			exists = true
+		}
+		if err := channelTable.stageDeletePrimaryFromIndexEntries(engineBatch, hashSlot, pk); err != nil {
+			return err
+		}
+		if exists && decodedExisting && channelTable.hasDecodedIndexEntries() {
+			if err := channelTable.stageDeleteIndexEntries(engineBatch, hashSlot, existing, pk); err != nil {
+				return err
+			}
+		}
+		if err := engineBatch.Delete(primaryKey); err != nil {
+			return err
+		}
+		if err := deleteChannelMessageUpdates(state, engineBatch, hashSlot, channelID, channelType); err != nil {
+			return err
+		}
+		delete(state.channelPublishes, string(primaryKey))
+		state.channelDeletes[string(primaryKey)] = struct{}{}
+		if len(directoryTaskKey) != 0 {
+			if err := engineBatch.Delete(directoryTaskKey); err != nil {
+				return err
+			}
+			state.tableRows[string(directoryTaskKey)] = tableRowOverlay{exists: false}
+			if exists {
+				runtimeKey := encodeChannelRuntimeMetaRowKey(hashSlot, channelID, channelType, channelRuntimeMetaPrimaryFamilyID)
+				runtimeMeta, runtimeExists, err := state.loadRuntimeMeta(ctx, hashSlot, runtimeKey, channelID, channelType)
+				if err != nil {
+					return err
+				}
+				if runtimeExists {
+					if runtimeMeta.DirectoryGeneration == ^uint64(0) || runtimeMeta.RouteGeneration == ^uint64(0) {
+						return dberrors.ErrConflict
+					}
+					runtimeMeta.DirectoryGeneration++
+					runtimeMeta.RouteGeneration++
+					runtimeValue, err := channelRuntimeMetaTable.encodeValue(runtimeKey, runtimeMeta)
+					if err != nil {
+						return err
+					}
+					if err := engineBatch.Set(runtimeKey, runtimeValue); err != nil {
+						return err
+					}
+					state.runtimeMeta[string(runtimeKey)] = runtimeMetaOverlay{meta: runtimeMeta, exists: true}
+				}
+			}
+		}
+		subscriberPrefix := encodeSubscriberRowPrefix(hashSlot, channelID, channelType)
+		// Hide disk rows and earlier point overlays from subsequent commands.
+		state.subscriberDeletes = append(state.subscriberDeletes, subscriberPrefix)
+		for key := range state.subscriberRows {
+			if bytes.HasPrefix([]byte(key), subscriberPrefix) {
+				delete(state.subscriberRows, key)
+			}
+		}
+		subscriberSpan := prefixSpan(subscriberPrefix)
+		return engineBatch.DeleteRange(engine.Span{Start: subscriberSpan.Start, End: subscriberSpan.End})
+	})
 	return nil
 }
 
@@ -233,6 +344,15 @@ func (s *Shard) writeChannel(ctx context.Context, channel Channel, mode tableWri
 		}
 		if err == nil {
 			channel.SubscriberCount = existing.SubscriberCount
+			if existing.Disband != 0 {
+				channel.Disband = 1
+			}
+			if existing.DirectoryProjectionState > channel.DirectoryProjectionState {
+				channel.DirectoryProjectionState = existing.DirectoryProjectionState
+			}
+			if existing.DirectoryProjectionGeneration > channel.DirectoryProjectionGeneration {
+				channel.DirectoryProjectionGeneration = existing.DirectoryProjectionGeneration
+			}
 		}
 	}
 
@@ -248,6 +368,12 @@ func (s *Shard) writeChannel(ctx context.Context, channel Channel, mode tableWri
 }
 
 func validateChannel(channel Channel) error {
+	if channel.DirectoryProjectionState > DirectoryProjectionReady {
+		return dberrors.ErrInvalidArgument
+	}
+	if (channel.DirectoryProjectionState == DirectoryProjectionNone) != (channel.DirectoryProjectionGeneration == 0) {
+		return dberrors.ErrInvalidArgument
+	}
 	return validateKeyString(channel.ChannelID)
 }
 
@@ -260,7 +386,9 @@ func encodeChannelValue(channel Channel) []byte {
 	value = appendValueUint64(value, channel.SubscriberCount)
 	value = appendValueInt64(value, channel.Large)
 	value = appendValueInt64(value, channel.ExpireAtUnixSeconds)
-	return value
+	value = appendValueInt64(value, int64(channel.DirectoryProjectionState))
+	value = appendValueUint64(value, channel.DirectoryProjectionGeneration)
+	return appendValueUint64(value, channel.SendBanVersion)
 }
 
 func decodeChannelValue(channelID string, channelType int64, value []byte) (Channel, error) {
@@ -292,26 +420,48 @@ func decodeChannelValue(channelID string, channelType int64, value []byte) (Chan
 	if err != nil {
 		return Channel{}, err
 	}
+	// Old Link-U rows append one expiry value; upstream appends three
+	// directory/policy values. The merged layout retains expiry before those values.
 	var expireAtUnixSeconds int64
-	if len(rest) > 0 {
+	var directoryState int64
+	var directoryGeneration, sendBanVersion uint64
+	if len(rest) == 8 || len(rest) == 32 {
 		expireAtUnixSeconds, rest, err = readValueInt64(rest)
 		if err != nil {
 			return Channel{}, err
 		}
 	}
 	if len(rest) != 0 {
+		directoryState, rest, err = readValueInt64(rest)
+		if err != nil {
+			return Channel{}, err
+		}
+		directoryGeneration, rest, err = readValueUint64(rest)
+		if err != nil {
+			return Channel{}, err
+		}
+		sendBanVersion, rest, err = readValueUint64(rest)
+		if err != nil {
+			return Channel{}, err
+		}
+	}
+	if (sendBan != 0 && sendBan != 1) || len(rest) != 0 || directoryState < int64(DirectoryProjectionNone) || directoryState > int64(DirectoryProjectionReady) ||
+		(directoryState == int64(DirectoryProjectionNone)) != (directoryGeneration == 0) {
 		return Channel{}, dberrors.ErrCorruptValue
 	}
 	return Channel{
-		ChannelID:                 channelID,
-		ChannelType:               channelType,
-		Ban:                       ban,
-		Disband:                   disband,
-		SendBan:                   sendBan,
-		AllowStranger:             allowStranger,
-		Large:                     large,
-		ExpireAtUnixSeconds:       expireAtUnixSeconds,
-		SubscriberMutationVersion: version,
-		SubscriberCount:           subscriberCount,
+		ChannelID:                     channelID,
+		ChannelType:                   channelType,
+		Ban:                           ban,
+		Disband:                       disband,
+		SendBan:                       sendBan,
+		SendBanVersion:                sendBanVersion,
+		AllowStranger:                 allowStranger,
+		Large:                         large,
+		SubscriberMutationVersion:     version,
+		SubscriberCount:               subscriberCount,
+		ExpireAtUnixSeconds:           expireAtUnixSeconds,
+		DirectoryProjectionState:      DirectoryProjectionState(directoryState),
+		DirectoryProjectionGeneration: directoryGeneration,
 	}, nil
 }

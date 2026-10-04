@@ -3,9 +3,12 @@ package multiraft
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"sort"
 	"sync"
@@ -19,30 +22,39 @@ import (
 )
 
 type slot struct {
-	mu           sync.Mutex
-	id           SlotID
-	logger       wklog.Logger
-	storage      Storage
-	stateMachine StateMachine
-	observer     SchedulerObserver
-	status       Status
-	storageView  *storageAdapter
-	apply        *applyPipeline
-	closed       bool
-	fatalErr     error
-	cond         *sync.Cond
-	processing   bool
+	// checkpoint is advanced only by the serialized apply/compaction owner.
+	checkpoint *RecoveryCheckpoint
+	clusterID  string
+	// recovery tracks only the committed suffix present when this Slot opens.
+	recovery                     *recoveryReporter
+	recoveryFrom, recoveryTarget uint64
+	mu                           sync.Mutex
+	id                           SlotID
+	logger                       wklog.Logger
+	storage                      Storage
+	stateMachine                 StateMachine
+	observer                     SchedulerObserver
+	status                       Status
+	storageView                  *storageAdapter
+	apply                        *applyPipeline
+	closed                       bool
+	fatalErr                     error
+	cond                         *sync.Cond
+	processing                   bool
 	// applying counts async apply tasks that have been accepted for this Slot.
-	applying                    int
-	rawNode                     *raft.RawNode
-	requests                    []raftpb.Message
-	requestWorkBuf              []raftpb.Message
-	requestCount                int
-	controls                    []controlAction
-	controlWorkBuf              []controlAction
-	submittedProposals          []*future
-	submittedConfigs            []*future
-	pendingProposals            map[uint64]trackedFuture
+	applying           int
+	rawNode            *raft.RawNode
+	requests           []raftpb.Message
+	requestWorkBuf     []raftpb.Message
+	requestCount       int
+	controls           []controlAction
+	controlWorkBuf     []controlAction
+	submittedProposals []*future
+	submittedConfigs   []*future
+	pendingProposals   map[uint64]trackedFuture
+	// pendingReads and readSequence are guarded by mu; only the Raft worker issues requests.
+	pendingReads                map[string]*readBarrierRequest
+	readSequence                uint64
 	pendingConfigs              map[uint64]trackedFuture
 	pendingProposalCap          int
 	pendingConfigCap            int
@@ -99,6 +111,8 @@ const (
 	controlTransferLeader
 	controlCompactLog
 	controlCaptureHashSlotSnapshot
+	controlFreshStatus
+	controlReadBarrier
 )
 
 type controlAction struct {
@@ -111,6 +125,8 @@ type controlAction struct {
 	compact        *logCompactionRequest
 	backupSnapshot *hashSlotSnapshotRequest
 	strictTransfer *strictLeaderTransferRequest
+	freshStatus    *freshStatusRequest
+	readBarrier    *readBarrierRequest
 }
 
 // strictLeaderTransferRequest carries one exact, timeout-bounded placement
@@ -225,6 +241,25 @@ func (r *hashSlotSnapshotRequest) finish(response hashSlotSnapshotResponse) bool
 	return true
 }
 
+type freshStatusRequest struct {
+	ctx  context.Context
+	resp chan freshStatusResponse
+	done atomic.Bool
+}
+
+type freshStatusResponse struct {
+	status Status
+	err    error
+}
+
+func (r *freshStatusRequest) finish(response freshStatusResponse) bool {
+	if r == nil || !r.done.CompareAndSwap(false, true) {
+		return false
+	}
+	r.resp <- response
+	return true
+}
+
 type applyStateEvent struct {
 	observer     ApplyStateObserver
 	slotID       SlotID
@@ -276,9 +311,19 @@ func (e proposalAdmissionEvent) emit() {
 	}
 }
 
-func newSlot(ctx context.Context, nodeID NodeID, logger wklog.Logger, raftOpts RaftOptions, opts SlotOptions, observer SchedulerObserver, apply *applyPipeline) (*slot, error) {
+func newSlot(ctx context.Context, nodeID NodeID, logger wklog.Logger, raftOpts RaftOptions, opts SlotOptions, observer SchedulerObserver, apply *applyPipeline) (_ *slot, retErr error) {
 	raftOpts = NormalizeRaftOptions(raftOpts)
-	state, snapshot, memory, err := newStorageAdapter(opts.Storage).load(ctx)
+	progress := newRecoveryReporter(logger, nodeID, opts.ID)
+	progress.report(RecoveryProgress{Stage: "open"})
+	defer func() {
+		if retErr != nil {
+			progress.fail(retErr)
+		}
+	}()
+	state, snapshot, memory, opened, err := openRecoverySnapshot(ctx, opts, progress.report)
+	if opened != nil && opened.Reader != nil {
+		defer opened.Reader.Close()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -286,14 +331,45 @@ func newSlot(ctx context.Context, nodeID NodeID, logger wklog.Logger, raftOpts R
 	appliedIndex := state.AppliedIndex
 	if !raft.IsEmptySnap(snapshot) {
 		appliedIndex = snapshot.Metadata.Index
+	} else if durableStateMachine, ok := opts.StateMachine.(DurableAppliedStateMachine); ok {
+		stateMachineApplied, err := durableStateMachine.DurableAppliedIndex(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if stateMachineApplied > appliedIndex {
+			appliedIndex = stateMachineApplied
+		}
 	}
-	snapshotData, snapshotConfigAppliedIndex, err := decodeSlotSnapshotData(snapshot.Data)
+	var snapshotData []byte
+	var snapshotConfigAppliedIndex uint64
+	var stream io.ReadSeeker
+	var streamSize int64
+	if opened != nil && opened.Reader != nil {
+		stream, streamSize, snapshotConfigAppliedIndex, err = startupSnapshotPayload(opened)
+	} else {
+		snapshotData, snapshotConfigAppliedIndex, err = decodeSlotSnapshotData(snapshot.Data)
+	}
 	if err != nil {
 		return nil, err
+	}
+	digest := sha256.Sum256(snapshot.Data)
+	if opened != nil && opened.Reader != nil {
+		digest = opened.Digest
+	}
+	checkpoint, reuse, err := selectRecoveryCheckpoint(ctx, nodeID, opts, state, snapshot, memory, digest, snapshotConfigAppliedIndex, progress)
+	if err != nil {
+		return nil, err
+	}
+	if reuse {
+		appliedIndex = checkpoint.AppliedIndex
+		memory.confState = cloneConfState(checkpoint.ConfState)
 	}
 	configAppliedIndex, err := restoreConfigAppliedIndex(memory, appliedIndex, state.ConfigAppliedIndex, snapshotConfigAppliedIndex)
 	if err != nil {
 		return nil, err
+	}
+	if reuse {
+		configAppliedIndex = checkpoint.ConfigAppliedIndex
 	}
 	rawNode, err := raft.NewRawNode(&raft.Config{
 		ID:              uint64(nodeID),
@@ -304,6 +380,7 @@ func newSlot(ctx context.Context, nodeID NodeID, logger wklog.Logger, raftOpts R
 		MaxSizePerMsg:   maxSizePerMsg(raftOpts.MaxSizePerMsg),
 		MaxInflightMsgs: maxInflight(raftOpts.MaxInflight),
 		CheckQuorum:     raftOpts.CheckQuorum,
+		ReadOnlyOption:  raft.ReadOnlySafe,
 		PreVote:         raftOpts.PreVote,
 		Logger:          newEtcdRaftLogger(logger, nodeID, opts.ID),
 	})
@@ -312,6 +389,8 @@ func newSlot(ctx context.Context, nodeID NodeID, logger wklog.Logger, raftOpts R
 	}
 
 	g := &slot{
+		clusterID:    opts.ClusterID,
+		checkpoint:   checkpoint,
 		id:           opts.ID,
 		storage:      opts.Storage,
 		stateMachine: opts.StateMachine,
@@ -339,14 +418,37 @@ func newSlot(ctx context.Context, nodeID NodeID, logger wklog.Logger, raftOpts R
 	}
 	g.cond = sync.NewCond(&g.mu)
 	g.storageView.memory = memory
-	if !raft.IsEmptySnap(snapshot) {
-		if err := g.stateMachine.Restore(ctx, Snapshot{
-			Index: snapshot.Metadata.Index,
-			Term:  snapshot.Metadata.Term,
-			Data:  snapshotData,
-		}); err != nil {
+	if !raft.IsEmptySnap(snapshot) && !reuse {
+		progress.report(RecoveryProgress{Stage: "snapshot_restore", SnapshotIndex: snapshot.Metadata.Index})
+		snap := Snapshot{Index: snapshot.Metadata.Index, Term: snapshot.Metadata.Term, Data: snapshotData}
+		if stream != nil {
+			err = g.stateMachine.(StartupSnapshotRestorer).RestoreStartupSnapshot(ctx, snap, stream, streamSize, progress.report)
+		} else {
+			err = g.stateMachine.Restore(ctx, snap)
+		}
+		if err != nil {
 			return nil, err
 		}
+		if checkpoint != nil {
+			// Installation invalidates live epochs; only its completed, fenced
+			// snapshot establishes a replacement anchor for the installed state.
+			info, err := g.stateMachine.(CheckpointStateMachine).RecoveryState(ctx)
+			if err != nil {
+				return nil, err
+			}
+			checkpoint.LiveEpoch = info.LiveEpoch
+			if err := g.stateMachine.(CheckpointStateMachine).PersistRecoveryCheckpoint(ctx, *checkpoint); err != nil {
+				return nil, err
+			}
+		}
+	}
+	g.recovery = progress
+	g.recoveryFrom = appliedIndex
+	g.recoveryTarget = state.HardState.Commit
+	if g.recoveryTarget > appliedIndex {
+		progress.report(RecoveryProgress{Stage: "log_replay", TotalEntries: int64(g.recoveryTarget - appliedIndex)})
+	} else {
+		progress.report(RecoveryProgress{Stage: "complete"})
 	}
 	g.refreshStatus()
 	return g, nil
@@ -387,7 +489,7 @@ func (g *slot) enqueueControl(action controlAction) error {
 	}
 	action.proposalClass = normalizeProposalClass(action.proposalClass)
 	switch action.kind {
-	case controlPropose, controlConfigChange:
+	case controlPropose, controlConfigChange, controlReadBarrier:
 		if g.status.Role != RoleLeader {
 			event := g.proposalAdmissionEventLocked(action, "not_leader")
 			g.mu.Unlock()
@@ -432,10 +534,21 @@ func (g *slot) processControls(ctx context.Context) bool {
 
 	for _, action := range controls {
 		switch action.kind {
+		case controlReadBarrier:
+			g.issueReadBarrier(action.readBarrier)
 		case controlPropose:
 			action.future.observeStageSince("meta_create_slot_control_wait", nil, action.future.createdAt)
+			// Temporary-copy controls select opaque command bytes without adding
+			// product command knowledge or changing ordinary proposal admission.
+			pauseMatch := ""
+			// gofail: var wkSlotProposalPauseMatch string
+			// pauseMatch = wkSlotProposalPauseMatch
+			if pauseMatch != "" && matchesSlotFaultCommand(action.data, pauseMatch) {
+				// gofail: var wkSlotBeforeRawProposal bool
+				// _ = wkSlotBeforeRawProposal
+			}
 			if err := g.rawNode.Propose(action.data); err != nil {
-				action.future.resolve(Result{}, classifyRawProposalError(err, g.rawNode.BasicStatus()))
+				action.future.resolveAndDispatch(Result{}, classifyRawProposalError(err, g.rawNode.BasicStatus()))
 				continue
 			}
 			g.mu.Lock()
@@ -444,11 +557,11 @@ func (g *slot) processControls(ctx context.Context) bool {
 		case controlConfigChange:
 			cc, err := toRaftConfChange(action.change)
 			if err != nil {
-				action.future.resolve(Result{}, err)
+				action.future.resolveAndDispatch(Result{}, err)
 				continue
 			}
 			if err := g.rawNode.ProposeConfChange(cc); err != nil {
-				action.future.resolve(Result{}, err)
+				action.future.resolveAndDispatch(Result{}, err)
 				continue
 			}
 			g.mu.Lock()
@@ -596,6 +709,22 @@ func (g *slot) processControls(ctx context.Context) bool {
 				CapturedAtUnixMillis: time.Now().UTC().UnixMilli(),
 				Reader:               reader,
 			}})
+		case controlFreshStatus:
+			request := action.freshStatus
+			if request == nil || request.done.Load() {
+				continue
+			}
+			if err := request.ctx.Err(); err != nil {
+				request.finish(freshStatusResponse{err: err})
+				continue
+			}
+			if err := g.currentErr(); err != nil {
+				request.finish(freshStatusResponse{err: err})
+				continue
+			}
+			g.refreshFullStatus()
+			status, err := g.statusSnapshot()
+			request.finish(freshStatusResponse{status: status, err: err})
 		}
 	}
 	return len(controls) > 0
@@ -752,6 +881,19 @@ func (g *slot) processReady(ctx context.Context, transport Transport) (bool, boo
 		g.failPending(err)
 		return true, false
 	}
+	// A reached temporary marker proves persistence before quorum commit; it
+	// deliberately does not fire for already-committed single-node entries.
+	persistMatch := ""
+	// gofail: var wkSlotPersistedCommandMatch string
+	// persistMatch = wkSlotPersistedCommandMatch
+	if persistMatch != "" {
+		for _, entry := range ready.Entries {
+			if matchesSlotFaultCommand(entry.Data, persistMatch) && entry.Index > g.rawNode.BasicStatus().Commit {
+				// gofail: var wkSlotPersistedUncommitted bool
+				// _ = wkSlotPersistedUncommitted
+			}
+		}
+	}
 	requiresSyncApply := readyRequiresSynchronousApply(ready)
 	if requiresSyncApply {
 		if err := g.waitApplyIdle(ctx); err != nil {
@@ -777,6 +919,7 @@ func (g *slot) processReady(ctx context.Context, transport Transport) (bool, boo
 		g.transportBuf = g.transportBuf[:0]
 	}
 
+	g.acceptReadStates(ready.ReadStates)
 	if requiresSyncApply {
 		return g.processReadySynchronously(ctx, ready)
 	}
@@ -813,6 +956,10 @@ func (g *slot) processReadySynchronously(ctx context.Context, ready raft.Ready) 
 		}
 		g.recordConfigChangeApplied(snapshotConfigAppliedIndex)
 		lastApplied = ready.Snapshot.Metadata.Index
+		if err := g.resetCheckpointAnchor(ctx, ready.Snapshot, snapshotConfigAppliedIndex); err != nil {
+			g.fail(err)
+			return true, false
+		}
 	}
 
 	batchSM, canBatch := g.stateMachine.(BatchStateMachine)
@@ -824,7 +971,7 @@ func (g *slot) processReadySynchronously(ctx context.Context, ready raft.Ready) 
 
 	if lastApplied > appliedBeforeReady {
 		started := time.Now()
-		err := g.storage.MarkApplied(ctx, lastApplied)
+		err := g.markApplied(ctx, lastApplied)
 		g.observeResolutionFutures(resolutions, "meta_create_slot_mark_applied", err, time.Since(started))
 		if err != nil {
 			g.fail(err)
@@ -857,6 +1004,22 @@ func (g *slot) processReadySynchronously(ctx context.Context, ready raft.Ready) 
 		}
 	}
 	return true, requeue || g.rawNode.HasReady()
+}
+
+func (g *slot) markApplied(ctx context.Context, index uint64) error {
+	if durableStateMachine, ok := g.stateMachine.(DurableAppliedStateMachine); ok {
+		durableIndex, err := durableStateMachine.DurableAppliedIndex(ctx)
+		if err != nil {
+			return err
+		}
+		if durableIndex > index {
+			return fmt.Errorf("multiraft: state-machine applied index %d exceeds Slot applied index %d", durableIndex, index)
+		}
+		if durableIndex == index {
+			return nil
+		}
+	}
+	return g.storage.MarkApplied(ctx, index)
 }
 
 func (g *slot) processReadyAsyncNormal(ctx context.Context, ready raft.Ready) (bool, bool) {
@@ -907,17 +1070,26 @@ func (g *slot) applyCommittedEntries(
 ) ([]futureResolution, bool) {
 	// Collect contiguous normal entries for batched apply.
 	var batchEntries []raftpb.Entry
+	var batchProofs []*RecoveryCheckpoint
+	var lastCertified uint64
+	if g.checkpoint != nil {
+		lastCertified = g.checkpoint.AppliedIndex
+	}
 	var configChanged bool
 
 	flushBatch := func() bool {
 		if len(batchEntries) == 0 {
 			return true
 		}
-		defer func() { batchEntries = batchEntries[:0] }()
+		defer func() {
+			batchEntries = batchEntries[:0]
+			clear(batchProofs)
+			batchProofs = batchProofs[:0]
+		}()
 
 		if !canBatch || len(batchEntries) == 1 {
 			// Fall back to one-by-one Apply.
-			for _, entry := range batchEntries {
+			for i, entry := range batchEntries {
 				fut := g.proposalFuture(entry.Index, entry.Term)
 				var trackedAt time.Time
 				if fut != nil {
@@ -936,11 +1108,12 @@ func (g *slot) applyCommittedEntries(
 				applyCtx := withProposalStageObservers(ctx, proposalStageObserversFromFutures([]*future{fut}))
 				started := time.Now()
 				result, err := g.stateMachine.Apply(applyCtx, Command{
-					SlotID:   g.id,
-					HashSlot: hashSlot,
-					Index:    entry.Index,
-					Term:     entry.Term,
-					Data:     data,
+					Checkpoint: batchProofs[i],
+					SlotID:     g.id,
+					HashSlot:   hashSlot,
+					Index:      entry.Index,
+					Term:       entry.Term,
+					Data:       data,
 				})
 				fut.observeStage("meta_create_slot_fsm_apply", err, time.Since(started))
 				if err != nil {
@@ -963,6 +1136,7 @@ func (g *slot) applyCommittedEntries(
 						Data:  result,
 					},
 				})
+				lastCertified = entry.Index
 			}
 			return true
 		}
@@ -981,11 +1155,12 @@ func (g *slot) applyCommittedEntries(
 				return false
 			}
 			cmds[i] = Command{
-				SlotID:   g.id,
-				HashSlot: hashSlot,
-				Index:    entry.Index,
-				Term:     entry.Term,
-				Data:     data,
+				Checkpoint: batchProofs[i],
+				SlotID:     g.id,
+				HashSlot:   hashSlot,
+				Index:      entry.Index,
+				Term:       entry.Term,
+				Data:       data,
 			}
 		}
 		observeFuturesSince(futures, "meta_create_slot_raft_commit_wait", nil, func(f *future) time.Time {
@@ -1008,6 +1183,7 @@ func (g *slot) applyCommittedEntries(
 			g.fail(err)
 			return false
 		}
+		lastCertified = batchEntries[len(batchEntries)-1].Index
 		for i, entry := range batchEntries {
 			var data []byte
 			if i < len(results) {
@@ -1032,10 +1208,17 @@ func (g *slot) applyCommittedEntries(
 		*lastApplied = entry.Index
 		switch entry.Type {
 		case raftpb.EntryNormal:
+			proof, err := g.advanceCheckpoint(entry)
+			if err != nil {
+				g.fail(err)
+				return resolutions, configChanged
+			}
 			if len(entry.Data) == 0 {
 				continue
 			}
 			batchEntries = append(batchEntries, entry)
+			batchProofs = append(batchProofs, proof)
+			continue
 		case raftpb.EntryConfChange:
 			// Flush pending normal entries before processing conf change.
 			if !flushBatch() {
@@ -1093,10 +1276,18 @@ func (g *slot) applyCommittedEntries(
 				},
 			})
 		}
+		if _, err := g.advanceCheckpoint(entry); err != nil {
+			g.fail(err)
+			return resolutions, configChanged
+		}
 	}
 
-	// Flush any remaining normal entries.
-	flushBatch()
+	// Flush any remaining normal entries, then certify a config/noop-only tail.
+	if flushBatch() && g.checkpoint != nil && g.checkpoint.AppliedIndex > lastCertified {
+		if err := g.stateMachine.(CheckpointStateMachine).PersistRecoveryCheckpoint(ctx, *g.checkpoint); err != nil {
+			g.fail(err)
+		}
+	}
 	return resolutions, configChanged
 }
 
@@ -1201,8 +1392,9 @@ func (g *slot) refreshBasicStatus() {
 	st := g.rawNode.BasicStatus()
 	g.mu.Lock()
 	g.basicStatusRefreshCount++
-	leaderEvent, applyEvent := g.applyBasicStatusLocked(st)
+	leaderEvent, applyEvent, completions := g.applyBasicStatusLocked(st)
 	g.mu.Unlock()
+	dispatchFutureCompletions(completions)
 	leaderEvent.emit()
 	applyEvent.emit()
 }
@@ -1218,8 +1410,9 @@ func (g *slot) refreshFullStatus() {
 	g.status.CurrentLearners = currentLearnersFromRaftStatus(st)
 	g.status.ConfState = confStateFromRaftStatus(st)
 	g.status.Progress = progressFromRaftStatus(st)
-	leaderEvent, applyEvent := g.applyBasicStatusLocked(st.BasicStatus)
+	leaderEvent, applyEvent, completions := g.applyBasicStatusLocked(st.BasicStatus)
 	g.mu.Unlock()
+	dispatchFutureCompletions(completions)
 	leaderEvent.emit()
 	applyEvent.emit()
 }
@@ -1232,7 +1425,7 @@ func (g *slot) refreshDurableAppliedStatus() {
 	applyEvent.emit()
 }
 
-func (g *slot) applyBasicStatusLocked(st raft.BasicStatus) (leaderChangeEvent, applyStateEvent) {
+func (g *slot) applyBasicStatusLocked(st raft.BasicStatus) (leaderChangeEvent, applyStateEvent, []futureCompletion) {
 	prevRole := g.status.Role
 	nextRole := mapRole(st.RaftState)
 	nextLeader := NodeID(st.Lead)
@@ -1244,11 +1437,13 @@ func (g *slot) applyBasicStatusLocked(st raft.BasicStatus) (leaderChangeEvent, a
 	g.status.CommitIndex = st.Commit
 	g.status.AppliedIndex = g.durableAppliedIndex
 	g.status.Role = nextRole
+	g.completeReadBarriersLocked()
 	applyEvent := g.applyStateEventLocked(st.Commit, g.durableAppliedIndex)
+	var completions []futureCompletion
 	if prevRole == RoleLeader && g.status.Role != RoleLeader {
-		g.failLeadershipDependentLocked(ErrNotLeader)
+		completions = g.failLeadershipDependentLocked(ErrNotLeader)
 	}
-	return leaderEvent, applyEvent
+	return leaderEvent, applyEvent, completions
 }
 
 func (g *slot) needsLearnerProgressRefreshLocked() bool {
@@ -1415,7 +1610,7 @@ func encodeSlotSnapshotData(payload []byte, configAppliedIndex uint64) []byte {
 
 func decodeSlotSnapshotData(data []byte) ([]byte, uint64, error) {
 	if !bytes.HasPrefix(data, []byte(slotSnapshotDataMagic)) {
-		return append([]byte(nil), data...), 0, nil
+		return data, 0, nil
 	}
 	if len(data) < slotSnapshotDataHeaderSize {
 		return nil, 0, fmt.Errorf("slot snapshot data envelope too short: %d", len(data))
@@ -1425,7 +1620,7 @@ func decodeSlotSnapshotData(data []byte) ([]byte, uint64, error) {
 		return nil, 0, fmt.Errorf("slot snapshot data envelope version %d unsupported", version)
 	}
 	configAppliedIndex := binary.BigEndian.Uint64(data[len(slotSnapshotDataMagic)+1 : slotSnapshotDataHeaderSize])
-	return append([]byte(nil), data[slotSnapshotDataHeaderSize:]...), configAppliedIndex, nil
+	return data[slotSnapshotDataHeaderSize:], configAppliedIndex, nil
 }
 
 func selectLeaderTransferTransferee(st raft.Status, preferred NodeID) NodeID {
@@ -1520,10 +1715,24 @@ func (g *slot) appliedIndex() uint64 {
 func (g *slot) setDurableAppliedIndex(index uint64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.recovery != nil && g.recoveryTarget > g.recoveryFrom {
+		done := index
+		if done > g.recoveryTarget {
+			done = g.recoveryTarget
+		}
+		if done >= g.recoveryFrom {
+			stage := "log_replay"
+			if done == g.recoveryTarget {
+				stage = "complete"
+			}
+			g.recovery.report(RecoveryProgress{Stage: stage, Entries: int64(done - g.recoveryFrom), TotalEntries: int64(g.recoveryTarget - g.recoveryFrom)})
+		}
+	}
 	if index > g.durableAppliedIndex {
 		g.durableAppliedIndex = index
 	}
 	g.status.AppliedIndex = g.durableAppliedIndex
+	g.completeReadBarriersLocked()
 }
 
 func (g *slot) pendingConfigAppliedIndex(lastApplied uint64) uint64 {
@@ -1821,13 +2030,18 @@ func (g *slot) hasFatalErr() bool {
 }
 
 func (g *slot) fail(err error) {
+	if g.recovery != nil {
+		g.recovery.fail(err)
+	}
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	if err == nil || g.closed || g.fatalErr != nil {
+		g.mu.Unlock()
 		return
 	}
 	g.fatalErr = err
-	g.failPendingLocked(err)
+	completions := g.failPendingLocked(err)
+	g.mu.Unlock()
+	dispatchFutureCompletions(completions)
 }
 
 func countTrackedReadyEntries(entries []raftpb.Entry) (proposalCount, configCount int) {
@@ -1973,75 +2187,110 @@ func (g *slot) resolveProposal(index, term uint64, result Result, err error) {
 	g.mu.Unlock()
 	g.observeSlotProposal(fut)
 	if fut != nil {
-		fut.resolve(result, err)
+		fut.resolveAndDispatch(result, err)
 	}
 }
 
 func (g *slot) failPending(err error) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.failPendingLocked(err)
+	completions := g.failPendingLocked(err)
+	g.mu.Unlock()
+	dispatchFutureCompletions(completions)
 }
 
-func (g *slot) failPendingLocked(err error) {
+func (g *slot) failPendingLocked(err error) []futureCompletion {
+	if g.closed || g.fatalErr != nil {
+		g.failReadBarriersLocked(err)
+	} else {
+		g.failUnconfirmedReadCallersLocked(err)
+	}
+	completions := make([]futureCompletion, 0, len(g.submittedProposals)+len(g.submittedConfigs)+len(g.pendingProposals)+len(g.pendingConfigs))
 	for i := range g.controls {
+		if g.controls[i].readBarrier != nil {
+			g.controls[i].readBarrier.finish(err)
+		}
 		if g.controls[i].strictTransfer != nil {
 			g.controls[i].strictTransfer.cancel(err)
 		}
 		if g.controls[i].backupSnapshot != nil {
 			g.controls[i].backupSnapshot.finish(hashSlotSnapshotResponse{err: err})
 		}
+		if g.controls[i].freshStatus != nil {
+			g.controls[i].freshStatus.finish(freshStatusResponse{err: err})
+		}
 	}
 	for _, fut := range g.submittedProposals {
-		fut.resolve(Result{}, err)
+		if completion := fut.resolve(Result{}, err); completion.future != nil {
+			completions = append(completions, completion)
+		}
 	}
 	for _, fut := range g.submittedConfigs {
-		fut.resolve(Result{}, err)
+		if completion := fut.resolve(Result{}, err); completion.future != nil {
+			completions = append(completions, completion)
+		}
 	}
 	for index, pending := range g.pendingProposals {
-		pending.future.resolve(Result{}, err)
+		if completion := pending.future.resolve(Result{}, err); completion.future != nil {
+			completions = append(completions, completion)
+		}
 		delete(g.pendingProposals, index)
 	}
 	for index, pending := range g.pendingConfigs {
-		pending.future.resolve(Result{}, err)
+		if completion := pending.future.resolve(Result{}, err); completion.future != nil {
+			completions = append(completions, completion)
+		}
 		delete(g.pendingConfigs, index)
 	}
 	g.submittedProposals = nil
 	g.submittedConfigs = nil
+	return completions
 }
 
-func (g *slot) failLeadershipDependentLocked(err error) {
-	if err == nil {
-		return
+func (g *slot) failLeadershipDependentLocked(err error) []futureCompletion {
+	if err != nil {
+		g.failReadBarriersLocked(err)
 	}
+	if err == nil {
+		return nil
+	}
+	completions := make([]futureCompletion, 0, len(g.submittedProposals)+len(g.submittedConfigs)+len(g.pendingProposals)+len(g.pendingConfigs))
 	for _, fut := range g.submittedProposals {
-		fut.resolve(Result{}, err)
+		if completion := fut.resolve(Result{}, err); completion.future != nil {
+			completions = append(completions, completion)
+		}
 	}
 	for _, fut := range g.submittedConfigs {
-		fut.resolve(Result{}, err)
+		if completion := fut.resolve(Result{}, err); completion.future != nil {
+			completions = append(completions, completion)
+		}
 	}
 	for index, pending := range g.pendingProposals {
-		pending.future.resolve(Result{}, err)
+		if completion := pending.future.resolve(Result{}, err); completion.future != nil {
+			completions = append(completions, completion)
+		}
 		delete(g.pendingProposals, index)
 	}
 	for index, pending := range g.pendingConfigs {
-		pending.future.resolve(Result{}, err)
+		if completion := pending.future.resolve(Result{}, err); completion.future != nil {
+			completions = append(completions, completion)
+		}
 		delete(g.pendingConfigs, index)
 	}
 	g.submittedProposals = nil
 	g.submittedConfigs = nil
+	return completions
 }
 
 func (g *slot) resolveConfig(index, term uint64, result Result, err error) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
-
 	pending, ok := g.pendingConfigs[index]
 	if !ok || pending.term != term {
+		g.mu.Unlock()
 		return
 	}
 	delete(g.pendingConfigs, index)
-	pending.future.resolve(result, err)
+	g.mu.Unlock()
+	pending.future.resolveAndDispatch(result, err)
 }
 
 func (g *slot) observeSlotProposal(fut *future) {
@@ -2053,6 +2302,14 @@ func (g *slot) observeSlotProposal(fut *future) {
 		return
 	}
 	observer.ObserveSlotProposal(g.id, time.Since(fut.createdAt))
+}
+
+// matchesSlotFaultCommand accepts a temporary hex selector because gofail v0.2
+// string parsing cannot preserve escaped quotes in opaque JSON command bytes.
+// Empty ordinary selectors never invoke it. Invalid selectors match no command.
+func matchesSlotFaultCommand(data []byte, selector string) bool {
+	needle, err := hex.DecodeString(selector)
+	return err == nil && len(needle) > 0 && bytes.Contains(data, needle)
 }
 
 func wrapMessages(slotID SlotID, messages []raftpb.Message) []Envelope {
@@ -2074,7 +2331,27 @@ func transportOwnsReadyMessagePayloads(transport Transport) bool {
 
 func wrapMessagesIntoWithPayloadMode(dst []Envelope, slotID SlotID, messages []raftpb.Message, clonePayloads bool) []Envelope {
 	out := dst[:0]
+	// Exact temporary command loss keeps heartbeats, voting and the ordinary
+	// Raft retry path. The empty ordinary selector adds no payload inspection.
+	dropMatch := ""
+	// gofail: var wkSlotAppendDropMatch string
+	// dropMatch = wkSlotAppendDropMatch
 	for _, msg := range messages {
+		matched := false
+		if dropMatch != "" && msg.Type == raftpb.MsgApp {
+			for _, entry := range msg.Entries {
+				if matchesSlotFaultCommand(entry.Data, dropMatch) {
+					matched = true
+					break
+				}
+			}
+		}
+		if matched {
+			// gofail: var wkSlotDroppedAppend bool
+			// if wkSlotDroppedAppend {
+			//     continue
+			// }
+		}
 		out = append(out, Envelope{
 			SlotID:  slotID,
 			Message: cloneMessage(msg, clonePayloads),

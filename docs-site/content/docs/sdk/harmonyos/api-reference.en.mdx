@@ -1,0 +1,104 @@
+---
+title: HarmonyOS API reference
+description: Find common @wukong/wkim entry points, providers, listeners, models, and states by manager.
+---
+
+This page is a quick lookup. Return to each task page for complete usage and call order. The SDK singleton is `WKIM.shared`.
+
+## Imports and initialization
+
+The package root exports only `WKIM`:
+
+```typescript
+import { WKIM } from '@wukong/wkim'
+```
+
+Import models and constants from `@wukong/wkim/src/main/ets/entity/Bean`, and payloads from `@wukong/wkim/src/main/ets/model/...`.
+
+| API | Purpose |
+| --- | --- |
+| `init(uid, token, address?, context?)` | Configure the user and open that UID's local database |
+| `config.provider` | Application implementations for routing, sync, metadata, and upload |
+| `connectionManager()` | Connection and state |
+| `messageManager()` | Message sending, receiving, and queries |
+| `conversationManager()` | Conversation list and unread counts |
+| `channelManager()` | User and group metadata |
+| `channelMemberManager()` | Group-member metadata |
+
+## Common providers
+
+| Field | Purpose |
+| --- | --- |
+| `connectAddrCallback` | Return a dynamic `host:port` |
+| `syncConversationCallback` | Synchronize conversations, recent messages, and unread counts |
+| `syncMessageCallback` | Synchronize history for one channel |
+| `channelInfoCallback` | Fetch user or group metadata |
+| `channelMemberCallback` | Incrementally synchronize group members |
+| `channelMemberWithPageCallback` | Page or search group members |
+| `uploadAttachmentCallback` | Upload media and set its URL |
+
+Providers are process-global fields; assigning one again replaces its previous implementation.
+
+## `ConnectionManager`
+
+| API | Purpose |
+| --- | --- |
+| `connection()` | Start connecting |
+| `disConnection(false)` | Disconnect while retaining the current account |
+| `disConnection(true)` | Log out and close the local database |
+| `addConnectStatusListener(listener)` | Observe connection state |
+| `removeConnectStatusListener(listener)` | Remove it with the same function object |
+
+States: `fail`, `success`, `kicked`, `syncing`, `connecting`, `noNetwork`, and `syncCompleted`.
+
+## `MessageManager`
+
+| API | Purpose |
+| --- | --- |
+| `send(content, channel)` | Send with default options |
+| `sendWithOption(content, channel, options)` | Send with custom options |
+| `addInsertedListener` | Observe local insertion; one global callback |
+| `addSendStatusListener` | Observe the server send result |
+| `addNewMsgListener` | Observe new messages |
+| `addRefreshListener` | Observe message-object changes |
+| `getOrSyncHistoryMessages` | Read local history and synchronize when needed |
+| `registerMsgContent` | Register a custom payload |
+
+Send states are `WKSendMsgResult.loading`, `success`, and `fail`, plus relationship restrictions `noRelation`, `blackList`, and `notOnWhiteList`.
+
+## `ConversationManager`
+
+| API | Purpose |
+| --- | --- |
+| `all()` | Read all local conversations |
+| `getWithChannel` | Read one channel's conversation |
+| `updateRedDot` | Update an unread count |
+| `clearAllRedDot` | Clear all unread counts |
+| `delete` | Remove a local conversation-list item |
+| `addRefreshListener` | Observe conversation changes |
+| `addDeletedListener` | Observe conversation deletion |
+
+## Channel and member managers
+
+| API | Purpose |
+| --- | --- |
+| `channelManager().getChannel` | Read local channel metadata |
+| `channelManager().fetchChannelInfo` | Request a metadata refresh |
+| `channelManager().addRefreshListener` | Observe metadata changes |
+| `channelMemberManager().sync` | Incrementally synchronize members |
+| `channelMemberManager().getMember` | Read one member |
+| `channelMemberManager().getWithPageOrSearch` | Page or search members |
+
+## Common models
+
+| Type | Meaning |
+| --- | --- |
+| `WKChannel` | `channelId` and `channelType` together identify a chat target |
+| `WKMsg` | Message identity, payload, sequence, and send state |
+| `WKMessageContent` | Base class for message payloads |
+| `WKTextContent` / `WKImageContent` | Built-in text and image payloads |
+| `WKConversation` | A conversation-list item and unread count |
+| `WKSyncConversation` / `WKSyncChannelMsg` | Sync results returned from your API to the SDK |
+| `WKSendOptions` / `ChannelMsgOptions` / `SyncOptions` | Send, history-query, and remote-sync options |
+
+Common channel types are `WKChannelType.personal` and `WKChannelType.group`.

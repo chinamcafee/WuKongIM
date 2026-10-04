@@ -2,16 +2,28 @@ package engine
 
 import (
 	"errors"
+	"io"
+	"runtime"
+	"sync"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/dberrors"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/bloom"
+	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
 const (
-	defaultCacheSize    = 128 << 20
-	defaultMemTableSize = 32 << 20
+	defaultCacheSize                = 128 << 20
+	defaultMemTableSize             = 32 << 20
+	defaultL0CompactionConcurrency  = 6
+	defaultCompactionConcurrencyMax = 4
+	compactionDebtMemTableCount     = 4
+	// Darwin implements Pebble's range SyncTo as a full-file fsync. A wider
+	// interval avoids turning large SSTable compactions into hundreds of full
+	// syncs while retaining bounded dirty-data smoothing.
+	darwinBytesPerSync = 16 << 20
 )
 
 // Options controls Pebble engine tuning.
@@ -20,15 +32,30 @@ type Options struct {
 	CacheSize int64
 	// MemTableSize configures Pebble memtable bytes.
 	MemTableSize int64
+	// CompactionDebtConcurrencyBytes configures the compaction-debt bytes that
+	// permit each additional compaction. Values <= 0 derive four memtables.
+	CompactionDebtConcurrencyBytes int64
 	// ReadOnly opens the engine without allowing writes or background compactions.
 	ReadOnly bool
 	// Logger receives structured Pebble diagnostics; routine recovery details are debug-only.
 	Logger wklog.Logger
+	// DiskSlowThreshold reports disk operations slower than this duration into
+	// DiskSlow metrics. Zero keeps Pebble's built-in 5s health-check threshold.
+	DiskSlowThreshold time.Duration
 }
 
 // DB wraps a Pebble database without exposing Pebble types to domain packages.
 type DB struct {
 	pdb *pebble.DB
+	// sealMu serializes sequence-certified writes only when recovery sealing is enabled.
+	sealMu sync.Mutex
+	seal   *recoverySeal
+	// stalls aggregates Pebble write stalls for MetricsSnapshot.
+	stalls *stallRecorder
+	// disk aggregates Pebble slow-disk reports for MetricsSnapshot.
+	disk *diskSlowRecorder
+	// diskHealth stops the owned health-check FS when a custom threshold is set.
+	diskHealth io.Closer
 }
 
 // Open opens a Pebble-backed engine at path.
@@ -36,11 +63,23 @@ func Open(path string, opts Options) (*DB, error) {
 	if path == "" {
 		return nil, dberrors.ErrInvalidArgument
 	}
-	pdb, err := pebble.Open(path, pebbleOptions(opts))
+	stalls := newStallRecorder(time.Now)
+	disk := newDiskSlowRecorder()
+	popts := pebbleOptions(opts, stalls)
+	popts.EventListener.DiskSlow = disk.observe
+	var diskHealth io.Closer
+	if opts.DiskSlowThreshold > 0 {
+		// Setting FS bypasses Pebble's default 5s wrapper, so this FS is the only health checker.
+		popts.FS, diskHealth = vfs.WithDiskHealthChecks(vfs.Default, opts.DiskSlowThreshold, nil, disk.observe)
+	}
+	pdb, err := pebble.Open(path, popts)
 	if err != nil {
+		if diskHealth != nil {
+			_ = diskHealth.Close()
+		}
 		return nil, err
 	}
-	return &DB{pdb: pdb}, nil
+	return &DB{pdb: pdb, stalls: stalls, disk: disk, diskHealth: diskHealth}, nil
 }
 
 // Close closes the underlying engine.
@@ -50,7 +89,18 @@ func (e *DB) Close() error {
 	}
 	pdb := e.pdb
 	e.pdb = nil
-	return pdb.Close()
+	err := pdb.Close()
+	if e.diskHealth != nil {
+		err = errors.Join(err, e.diskHealth.Close())
+		e.diskHealth = nil
+	}
+	return err
+}
+
+// IsClosed reports whether this handle can still serve storage reads. Like the
+// other engine methods, its caller owns the surrounding lifecycle fence.
+func (e *DB) IsClosed() bool {
+	return e == nil || e.pdb == nil
 }
 
 // Get returns a copied value for key.
@@ -74,7 +124,19 @@ func (e *DB) NewBatch() *Batch {
 	if e == nil || e.pdb == nil {
 		return &Batch{}
 	}
-	return &Batch{batch: e.pdb.NewBatch()}
+	return &Batch{batch: e.pdb.NewBatch(), db: e}
+}
+
+// NewBatchWithSize reserves a bounded encoded write buffer, avoiding repeated
+// growth while installing large snapshots. Size is an allocation hint only.
+func (e *DB) NewBatchWithSize(size int) *Batch {
+	if e == nil || e.pdb == nil {
+		return &Batch{}
+	}
+	if size <= 0 {
+		return e.NewBatch()
+	}
+	return &Batch{batch: e.pdb.NewBatchWithSize(size), db: e}
 }
 
 // NewIter creates an iterator over span.
@@ -100,12 +162,15 @@ func pebbleIterOptions(span Span, _ IterOptions) *pebble.IterOptions {
 	return options
 }
 
-func pebbleOptions(opts Options) *pebble.Options {
+func pebbleOptions(opts Options, stalls *stallRecorder) *pebble.Options {
 	if opts.CacheSize <= 0 {
 		opts.CacheSize = defaultCacheSize
 	}
 	if opts.MemTableSize <= 0 {
 		opts.MemTableSize = defaultMemTableSize
+	}
+	if opts.CompactionDebtConcurrencyBytes <= 0 {
+		opts.CompactionDebtConcurrencyBytes = opts.MemTableSize * compactionDebtMemTableCount
 	}
 	popts := &pebble.Options{
 		CacheSize:                   opts.CacheSize,
@@ -113,11 +178,42 @@ func pebbleOptions(opts Options) *pebble.Options {
 		MemTableStopWritesThreshold: 4,
 		L0CompactionThreshold:       8,
 		L0StopWritesThreshold:       24,
-		ReadOnly:                    opts.ReadOnly,
+		// Keep one baseline compaction and let Pebble add up to three more only as
+		// L0 read amplification or compaction debt crosses successive pressure
+		// thresholds. This preserves idle efficiency while preventing sustained
+		// message writes from reaching the L0 write-stop boundary.
+		CompactionConcurrencyRange: func() (int, int) {
+			return 1, defaultCompactionConcurrencyMax
+		},
+		ReadOnly:     opts.ReadOnly,
+		BytesPerSync: platformBytesPerSync(),
+	}
+	// Permit extra compactions at L0 depths 6, 12, and 18 so the fourth slot has
+	// six sublevels of recovery headroom before the write-stop depth of 24. Also
+	// open one slot per configured compaction-debt step (four memtables by
+	// default). The upper bound keeps this recovery capacity finite.
+	popts.Experimental.L0CompactionConcurrency = defaultL0CompactionConcurrency
+	popts.Experimental.CompactionDebtConcurrency =
+		uint64(opts.CompactionDebtConcurrencyBytes)
+	if stalls != nil {
+		popts.EventListener = &pebble.EventListener{
+			WriteStallBegin: stalls.begin,
+			WriteStallEnd:   stalls.end,
+		}
 	}
 	if opts.Logger != nil {
 		popts.Logger = wklog.NewDependencyLogger(opts.Logger, "pebble")
 	}
-	popts.Levels[0].FilterPolicy = bloom.FilterPolicy(10)
+	for i := range popts.Levels {
+		popts.Levels[i].FilterPolicy = bloom.FilterPolicy(10)
+	}
 	return popts
+}
+
+func platformBytesPerSync() int {
+	if runtime.GOOS == "darwin" {
+		return darwinBytesPerSync
+	}
+	// Zero lets Pebble retain its platform-appropriate upstream default.
+	return 0
 }

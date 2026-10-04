@@ -13,7 +13,6 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/runtime/pluginhook"
 	messageusecase "github.com/WuKongIM/WuKongIM/internal/usecase/message"
 	pluginusecase "github.com/WuKongIM/WuKongIM/internal/usecase/plugin"
-	userusecase "github.com/WuKongIM/WuKongIM/internal/usecase/user"
 	pluginhost "github.com/WuKongIM/WuKongIM/pkg/plugin/pluginhost"
 )
 
@@ -82,22 +81,23 @@ func (a *App) wirePluginSubsystem(nodeID uint64) error {
 		Logger:     pluginLogger,
 	})
 	pluginOptions := pluginusecase.Options{
-		Runtime:          pluginRuntimeAdapter{runtime: runtime, sandboxDir: a.cfg.Plugin.SandboxDir},
-		Invoker:          invoker,
-		DesiredStore:     pluginDesiredStoreAdapter{store: store},
-		Messages:         pluginMessageSender{app: a},
-		DefaultSenderUID: userusecase.DefaultSystemUID,
-		SystemUIDs:       a.users,
-		FailOpen:         a.cfg.Plugin.FailOpen,
-		Observer:         a.pluginUsecaseObserver(),
-		Logger:           pluginLogger,
-		NodeID:           nodeID,
+		CommandChannelSuffix: a.cfg.Message.CMDChannelSuffix,
+		Runtime:              pluginRuntimeAdapter{runtime: runtime, sandboxDir: a.cfg.Plugin.SandboxDir},
+		Invoker:              invoker,
+		DesiredStore:         pluginDesiredStoreAdapter{store: store},
+		Messages:             pluginMessageSender{app: a},
+		DefaultSenderUID:     a.cfg.Message.SystemUID,
+		SystemUIDs:           a.users,
+		FailOpen:             a.cfg.Plugin.FailOpen,
+		Observer:             a.pluginUsecaseObserver(),
+		Logger:               pluginLogger,
+		NodeID:               nodeID,
 	}
 	if bindingNode, ok := a.cluster.(clusterinfra.PluginBindingNode); ok {
 		pluginOptions.ReceiveBindings = clusterinfra.NewPluginBindingReader(bindingNode)
 	}
 	if readNode, ok := a.cluster.(clusterinfra.ChannelMessageReadNode); ok {
-		pluginOptions.MessageReader = clusterinfra.NewChannelMessageReader(readNode)
+		pluginOptions.MessageReader = messageusecase.NewPageReader(clusterinfra.NewCommittedMessageReader(readNode))
 	}
 	if clusterNode, ok := a.cluster.(clusterinfra.PluginClusterNode); ok {
 		pluginOptions.ClusterReader = clusterinfra.NewPluginClusterReader(clusterNode)
@@ -168,7 +168,7 @@ func (a pluginRuntimeAdapter) MarkClosed(_ context.Context, pluginNo string) err
 	}
 	plugin, ok := a.runtime.Registry().Get(pluginNo)
 	if !ok {
-		plugin = pluginhost.ObservedPlugin{No: pluginNo}
+		return nil
 	}
 	plugin.Status = pluginhost.StatusOffline
 	a.runtime.Registry().Upsert(plugin)

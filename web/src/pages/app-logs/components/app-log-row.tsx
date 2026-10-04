@@ -1,123 +1,62 @@
-import { ChevronDown, ChevronRight, Copy } from "lucide-react"
-import { useState } from "react"
+import { ChevronRight } from "lucide-react"
 import { useIntl } from "react-intl"
 import { Link } from "react-router-dom"
 
-import { Button } from "@/components/ui/button"
 import type { ManagerApplicationLogEntry } from "@/lib/manager-api.types"
-import {
-  compactFieldLabel,
-  displayLogLevel,
-  formatFields,
-  importantLogFields,
-  logLevelClassName,
-} from "@/pages/app-logs/log-format"
+import { compactFieldLabel, displayLogLevel, importantLogFields, logLevelClassName, redactLogText } from "../log-format"
+import { LogCopyButton } from "./log-copy-button"
+import { LogHighlight } from "./log-highlight"
 
 type AppLogRowProps = {
   entry: ManagerApplicationLogEntry
+  keyword: string
+  selected: boolean
+  onSelect: () => void
 }
 
-function copyText(value: string) {
-  if (!navigator.clipboard) {
-    return
-  }
-  void navigator.clipboard.writeText(value)
-}
-
-export function AppLogRow({ entry }: AppLogRowProps) {
+export function AppLogRow({ entry, keyword, selected, onSelect }: AppLogRowProps) {
   const intl = useIntl()
-  const [expanded, setExpanded] = useState(false)
+  const message = redactLogText(entry.message || entry.raw)
+  const error = typeof entry.fields?.error === "string" ? redactLogText(entry.fields.error) : ""
+  // Bound summary text independently of the full event retained for details and copying.
+  const summary = message.length > 500 ? message.slice(0, 500) + "…" : message
   const fields = importantLogFields(entry)
-  const details = formatFields(entry.fields)
   const slot = entry.fields?.slot_id
-  const slotLabel = slot === undefined || slot === null ? null : String(slot)
-  const seq = entry.seq
+  const level = displayLogLevel(entry.level) === "STACK"
+    ? intl.formatMessage({ id: "appLogs.level.stack" }) : displayLogLevel(entry.level)
 
   return (
-    <article
-      className="grid gap-2 border-b border-white/5 px-3 py-2 last:border-b-0 md:grid-cols-[9.5rem_4.5rem_minmax(0,1fr)_auto]"
-      data-app-log-row="compact"
-    >
-      <div className="whitespace-nowrap text-slate-500">{entry.time || "-"}</div>
-      <div
-        className={`h-fit max-w-[4.5rem] overflow-hidden truncate rounded border px-1.5 py-0.5 text-[11px] font-semibold leading-none ${logLevelClassName(entry.level)}`}
-        title={entry.level || displayLogLevel(entry.level)}
+    <article className={`flex items-start gap-1 border-b border-white/5 px-3 py-2 last:border-b-0 hover:bg-white/[0.03] ${selected ? "bg-white/5" : ""}`} data-app-log-row="compact">
+      <button
+        aria-label={intl.formatMessage({ id: "appLogs.showDetailsAria" }, { seq: entry.seq })}
+        aria-haspopup="dialog"
+        className="grid min-w-0 flex-1 cursor-pointer grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-sky-400 md:grid-cols-[10rem_4.25rem_minmax(0,1fr)]"
+        onClick={onSelect}
+        type="button"
       >
-        {displayLogLevel(entry.level)}
-      </div>
-      <div className="min-w-0">
-        <div className="flex flex-wrap items-center gap-2">
-          {entry.module ? <span className="text-slate-400">{entry.module}</span> : null}
-          <span className="break-all text-slate-100">{entry.message || entry.raw}</span>
-        </div>
-        <div
-          className="mt-1 flex flex-wrap gap-1.5 break-all text-[11px] text-slate-400"
-          data-system-log-entry="metadata"
-        >
-          {entry.caller ? <span className="break-all">{entry.caller}</span> : null}
-          {fields.map(([key, value]) => (
-            <span
-              className="rounded-sm border border-white/10 px-1.5 py-0.5"
-              key={`${entry.seq}-${key}`}
-            >
-              {compactFieldLabel(key, value)}
+        <span className="whitespace-nowrap text-slate-400">{entry.time || "—"}</span>
+        <span className={`w-fit self-start rounded border px-1.5 py-0.5 text-[10px] font-semibold leading-none ${logLevelClassName(entry.level)}`}>{level}</span>
+        <span className="col-span-2 min-w-0 md:col-span-1">
+          <span className="line-clamp-2 whitespace-pre-wrap break-all text-slate-100">
+            {entry.module ? <span className="mr-2 text-slate-400">{entry.module}</span> : null}
+            <LogHighlight text={summary} keyword={keyword} />
+          </span>
+          {error && error !== message ? (
+            <span className="mt-1 line-clamp-2 whitespace-pre-wrap break-all text-xs text-amber-200/90" data-system-log-entry="error">
+              <LogHighlight text={error.length > 500 ? error.slice(0, 500) + "…" : error} keyword={keyword} />
             </span>
-          ))}
-          {slotLabel ? (
-            <Link
-              className="rounded-sm border border-white/10 px-1.5 py-0.5 text-sky-300 hover:text-sky-200"
-              to={`/cluster/slots?tab=logs&slot_id=${encodeURIComponent(slotLabel)}`}
-            >
-              {intl.formatMessage({ id: "appLogs.openSlot" }, { slot: slotLabel })}
-            </Link>
           ) : null}
-        </div>
-        {expanded ? (
-          <div className="mt-2 space-y-1 text-slate-500" data-app-log-row="details">
-            <pre
-              className="whitespace-pre-wrap break-all text-slate-500"
-              data-system-log-entry="raw"
-            >
-              {entry.raw}
-            </pre>
-            {details ? (
-              <pre className="whitespace-pre-wrap break-words text-slate-400">{details}</pre>
-            ) : null}
-            <Button
-              aria-label={intl.formatMessage({ id: "appLogs.copyRawAria" }, { seq })}
-              onClick={() => copyText(entry.raw)}
-              size="sm"
-              type="button"
-              variant="outline"
-            >
-              <Copy />
-              {intl.formatMessage({ id: "appLogs.copyRaw" })}
-            </Button>
-          </div>
-        ) : null}
-      </div>
-      <div className="flex items-start gap-1">
-        <Button
-          aria-label={intl.formatMessage({ id: "appLogs.copyMessageAria" }, { seq })}
-          onClick={() => copyText(entry.message || entry.raw)}
-          size="icon"
-          type="button"
-          variant="ghost"
-        >
-          <Copy />
-        </Button>
-        <Button
-          aria-label={intl.formatMessage(
-            { id: expanded ? "appLogs.hideDetailsAria" : "appLogs.showDetailsAria" },
-            { seq },
-          )}
-          onClick={() => setExpanded((value) => !value)}
-          size="icon"
-          type="button"
-          variant="ghost"
-        >
-          {expanded ? <ChevronDown /> : <ChevronRight />}
-        </Button>
+          {fields.length ? (
+            <span className="mt-1 flex flex-wrap gap-x-3 gap-y-1 break-all text-[11px] text-slate-400" data-system-log-entry="metadata">
+              {fields.map(([key, value]) => <span key={key}>{redactLogText(compactFieldLabel(key, value)).slice(0, 160)}</span>)}
+            </span>
+          ) : null}
+        </span>
+      </button>
+      <div className="flex shrink-0 items-center gap-1">
+        {slot !== undefined && slot !== null ? <Link className="hidden text-[11px] text-sky-300 hover:underline sm:inline" to={`/cluster/slots?tab=logs&slot_id=${encodeURIComponent(String(slot))}`}>{intl.formatMessage({ id: "appLogs.openSlot" }, { slot: String(slot) })}</Link> : null}
+        <LogCopyButton compact label={intl.formatMessage({ id: "appLogs.copyMessageAria" }, { seq: entry.seq })} value={message} />
+        <ChevronRight aria-hidden className="size-3 text-slate-500" />
       </div>
     </article>
   )

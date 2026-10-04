@@ -9,8 +9,9 @@ import (
 )
 
 type dispatcher struct {
-	handler      gatewaytypes.Handler
-	batchHandler gatewaytypes.SendBatchHandler
+	handler         gatewaytypes.Handler
+	batchHandler    gatewaytypes.SendBatchHandler
+	deferredHandler gatewaytypes.DeferredSendBatchHandler
 }
 
 func newDispatcher(handler gatewaytypes.Handler) dispatcher {
@@ -18,6 +19,7 @@ func newDispatcher(handler gatewaytypes.Handler) dispatcher {
 	if batchHandler, ok := handler.(gatewaytypes.SendBatchHandler); ok {
 		dispatcher.batchHandler = batchHandler
 	}
+	dispatcher.deferredHandler, _ = handler.(gatewaytypes.DeferredSendBatchHandler)
 	return dispatcher
 }
 
@@ -29,6 +31,11 @@ func (d dispatcher) listenerError(listener string, err error) {
 }
 
 func (d dispatcher) sessionOpen(state *sessionState) error {
+	if h := state.packetHandler(); h != nil {
+		return callPacketCallback(func() error {
+			return h.OnSessionOpen(d.context(state, "", state.closeReason(), d.requestContext(state)))
+		})
+	}
 	if d.handler == nil {
 		return nil
 	}
@@ -54,6 +61,12 @@ func (d dispatcher) canSendBatch() bool {
 }
 
 func (d dispatcher) sessionError(state *sessionState, reason gatewaytypes.CloseReason, err error) {
+	if h := state.packetHandler(); h != nil {
+		if err != nil {
+			_ = callPacketCallback(func() error { h.OnSessionError(d.context(state, "", reason, nil), err); return nil })
+		}
+		return
+	}
 	if d.handler == nil || err == nil {
 		return
 	}
@@ -61,6 +74,9 @@ func (d dispatcher) sessionError(state *sessionState, reason gatewaytypes.CloseR
 }
 
 func (d dispatcher) sessionClose(state *sessionState) error {
+	if h := state.packetHandler(); h != nil {
+		return callPacketCallback(func() error { return h.OnSessionClose(d.context(state, "", state.closeReason(), nil)) })
+	}
 	if d.handler == nil {
 		return nil
 	}
@@ -87,6 +103,7 @@ func (d dispatcher) context(state *sessionState, replyToken string, reason gatew
 		KickSessionFn: func(control frame.Frame, timeout time.Duration, kickErr error) (gatewaytypes.KickResult, error) {
 			return state.server.kickSession(state, control, timeout, kickErr)
 		},
+		TransportCloser: state,
 	}
 }
 

@@ -7,12 +7,12 @@ Usage: scripts/wkdb-export-roundtrip-smoke.sh [--work-dir DIR] [--hash-slot-coun
 
 Builds a seed node with scripts/wkdb-import-smoke.sh, exports that node with
 wkdb export, validates the exported WKDB Import Bundle v1, imports it into a
-second fresh node data directory, and verifies copied rows with wkdb query.
+second fresh node data directory, and verifies copied rows with wkcli db query.
 
 Environment:
-  WKDB_BIN  Path to a prebuilt wkdb binary. If unset, the script runs
-            "go run ./cmd/wkdb" with GOWORK=off.
-  GO        Go executable used when WKDB_BIN is unset. Defaults to "go".
+  WK_CLI_BIN  Path to a prebuilt wkcli binary. If unset, the script runs
+            "go run ./cmd/wkcli db" with GOWORK=off.
+  GO        Go executable used when WK_CLI_BIN is unset. Defaults to "go".
   WKDB_SMOKE_VERBOSE=1 prints wkdb stderr from successful commands.
 USAGE
 }
@@ -61,8 +61,8 @@ if [[ "$hash_slot_count" != "256" ]]; then
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-if [[ ! -d "$repo_root/cmd/wkdb" ]]; then
-  echo "must run from a WuKongIM checkout with cmd/wkdb" >&2
+if [[ ! -d "$repo_root/cmd/wkcli" ]]; then
+  echo "must run from a WuKongIM checkout with cmd/wkcli" >&2
   exit 2
 fi
 
@@ -88,10 +88,10 @@ summary_file="$work_dir/summary.md"
 rm -rf "$seed_work_dir" "$export_dir" "$roundtrip_dir"
 mkdir -p "$work_dir"
 
-if [[ -n "${WKDB_BIN:-}" ]]; then
-  wkdb_cmd=("$WKDB_BIN")
+if [[ -n "${WK_CLI_BIN:-}" ]]; then
+  wkdb_cmd=("$WK_CLI_BIN" db)
 else
-  wkdb_cmd=("${GO:-go}" run ./cmd/wkdb)
+  wkdb_cmd=("${GO:-go}" run ./cmd/wkcli db)
 fi
 
 run_wkdb() {
@@ -123,7 +123,7 @@ assert_contains() {
 }
 
 seed_output=""
-if ! seed_output="$(cd "$repo_root" && WKDB_BIN="${WKDB_BIN:-}" GO="${GO:-go}" scripts/wkdb-import-smoke.sh --work-dir "$seed_work_dir" --hash-slot-count "$hash_slot_count")"; then
+if ! seed_output="$(cd "$repo_root" && WK_CLI_BIN="${WK_CLI_BIN:-}" GO="${GO:-go}" scripts/wkdb-import-smoke.sh --work-dir "$seed_work_dir" --hash-slot-count "$hash_slot_count")"; then
   echo "$seed_output" >&2
   exit 1
 fi
@@ -150,12 +150,15 @@ echo "roundtrip import ok"
 
 user_json="$(capture_wkdb --data-dir "$roundtrip_dir" --hash-slot-count "$hash_slot_count" --format json query "select * from meta.user where uid='smoke-u1'")"
 channel_json="$(capture_wkdb --data-dir "$roundtrip_dir" --hash-slot-count "$hash_slot_count" --format json query "select * from meta.channel where channel_id='smoke-g1'")"
-conversation_json="$(capture_wkdb --data-dir "$roundtrip_dir" --hash-slot-count "$hash_slot_count" --format json query "select * from meta.conversation where uid='smoke-u1'")"
+membership_json="$(capture_wkdb --data-dir "$roundtrip_dir" --hash-slot-count "$hash_slot_count" --format json query "select * from meta.user_channel_membership where uid='smoke-u1'")"
+cmd_membership_json="$(capture_wkdb --data-dir "$roundtrip_dir" --hash-slot-count "$hash_slot_count" --format json query "select * from meta.user_cmd_channel_membership where uid='smoke-u1'")"
 message_json="$(capture_wkdb --data-dir "$roundtrip_dir" --format json query "select * from message.message where channel_key='smoke-g1:2' limit 10")"
 
 assert_contains "$user_json" "smoke-token"
 assert_contains "$channel_json" '"subscriber_count": 1'
-assert_contains "$conversation_json" '"read_seq": 1'
+assert_contains "$membership_json" '"read_seq": 1'
+assert_contains "$membership_json" '"activated_at": 1710000000001'
+assert_contains "$cmd_membership_json" '"ack_seq": 1'
 assert_contains "$message_json" '"message_seq": 1'
 assert_contains "$message_json" '"message_id": 1001'
 assert_contains "$message_json" '"server_timestamp_ms": 1710000000003'
@@ -174,7 +177,8 @@ echo "query ok"
   echo "- roundtrip_import: $roundtrip_output"
   echo "- user_query: ok"
   echo "- channel_query: ok"
-  echo "- conversation_query: ok"
+  echo "- membership_query: ok"
+  echo "- cmd_membership_query: ok"
   echo "- message_query: ok"
 } > "$summary_file"
 

@@ -12,6 +12,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/channel/worker"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/control"
 	controller "github.com/WuKongIM/WuKongIM/pkg/controller"
+	"github.com/WuKongIM/WuKongIM/pkg/dataformat"
 	messagedb "github.com/WuKongIM/WuKongIM/pkg/db/message"
 	gorutine "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 	"github.com/WuKongIM/WuKongIM/pkg/slot/multiraft"
@@ -23,6 +24,9 @@ const (
 	minDefaultChannelReactorCount      = 4
 	defaultChannelRPCWorkers           = worker.DefaultRPCWorkers
 	defaultCommitCoordinatorShardCount = channelstore.DefaultCommitShards
+	// defaultStorageDiskSlowThreshold sits below the 5s client ACK timeout so
+	// slow WAL syncs are visible before they surface as SENDACK timeouts.
+	defaultStorageDiskSlowThreshold = time.Second
 )
 
 // Config contains cluster runtime configuration.
@@ -33,6 +37,8 @@ type Config struct {
 	ListenAddr string
 	// DataDir is the root directory for cluster data files.
 	DataDir string
+	// CreatedBy records the initializing binary; it is not user configuration.
+	CreatedBy dataformat.Build
 	// Control contains Controller adapter configuration.
 	Control ControlConfig
 	// Join contains dynamic data-node join bootstrap settings.
@@ -53,6 +59,8 @@ type Config struct {
 	Transport TransportConfig
 	// MessageEvent contains message event projection observation hooks.
 	MessageEvent MessageEventConfig
+	// MembershipObserver receives successful UID-directory mutation proposal rows.
+	MembershipObserver MembershipMutationObserver
 	// Timeouts contains lifecycle timeout budgets.
 	Timeouts TimeoutConfig
 	// Goroutines is the optional goroutine registry for lifecycle tracking across all cluster subsystems.
@@ -70,6 +78,22 @@ type Config struct {
 // reusable cluster package.
 type RestoreMaintenanceObserver interface {
 	RestoreMaintenanceChanged(bool)
+}
+
+// MembershipMutationObservation describes successfully proposed UID-directory rows.
+type MembershipMutationObservation struct {
+	// Directory is ordinary or cmd.
+	Directory string
+	// Operation is the bounded mutation kind within the directory.
+	Operation string
+	// Rows is the number of rows carried by the successful proposal.
+	Rows int
+}
+
+// MembershipMutationObserver receives actual cluster membership mutation proposals.
+type MembershipMutationObserver interface {
+	// ObserveMembershipMutation records one successful bounded proposal.
+	ObserveMembershipMutation(MembershipMutationObservation)
 }
 
 // ControlConfig contains Controller adapter configuration.
@@ -179,10 +203,10 @@ type ChannelConfig struct {
 	StoreAppendBatchMaxWait time.Duration
 	// StoreApplyWorkers caps blocking follower apply store workers. Zero keeps the Channel runtime default.
 	StoreApplyWorkers int
-	// RPCWorkers caps blocking Channel replication RPC workers. Zero uses the QPS-validated default of 160.
+	// RPCWorkers caps blocking Channel replication RPC workers. Zero uses the QPS-validated default of 96.
 	RPCWorkers int
 	// RPCBatchMaxItems caps same-target Channel Pull or PullHint items in one
-	// blocking transport call. Zero uses the Channel worker default of 16.
+	// blocking transport call. Zero uses the Channel worker default of 8.
 	RPCBatchMaxItems int
 	// MailboxSize bounds each Channel reactor mailbox.
 	MailboxSize int
@@ -248,6 +272,16 @@ type HealthReportConfig struct {
 
 // StorageConfig contains node-local store tuning for cluster-owned runtimes.
 type StorageConfig struct {
+	// MQTTNodeBytes and MQTTClusterBytes fund protected originals and future
+	// replay replicas before new durable publication. Zero disables this port
+	// for embedding callers; product composition always supplies finite limits.
+	MQTTNodeBytes    uint64
+	MQTTClusterBytes uint64
+	// MQTTStorageObserver samples fixed aggregate reservation evidence only.
+	MQTTStorageObserver interface {
+		ObserveMQTTStorage(uint64, uint64, uint64, uint64)
+		ObserveMQTTStorageEvent(string)
+	}
 	// CommitFlushWindow is the maximum delay for grouping adjacent channel append commits.
 	CommitFlushWindow time.Duration
 	// CommitMaxRequests caps logical append requests in one grouped physical commit.
@@ -256,10 +290,13 @@ type StorageConfig struct {
 	CommitMaxRecords int
 	// CommitMaxBytes caps approximate payload bytes in one grouped physical commit.
 	CommitMaxBytes int
-	// CommitShards routes message DB commit requests across independent coordinators. Zero uses four partition-hashed coordinators.
+	// CommitShards routes message DB commit requests across independent coordinators. Zero uses one coordinator per physical message DB.
 	CommitShards int
 	// CommitObserver receives message DB group-commit measurements.
 	CommitObserver messagedb.CommitCoordinatorObserver
+	// DiskSlowThreshold reports message DB disk operations slower than this
+	// duration into slow-disk metrics. Zero uses defaultStorageDiskSlowThreshold.
+	DiskSlowThreshold time.Duration
 }
 
 // TransportConfig contains default cluster node-to-node transport observation.
@@ -388,6 +425,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Storage.CommitShards == 0 {
 		c.Storage.CommitShards = defaultCommitCoordinatorShardCount
+	}
+	if c.Storage.DiskSlowThreshold == 0 {
+		c.Storage.DiskSlowThreshold = defaultStorageDiskSlowThreshold
 	}
 	c.applyControlDefaults()
 	c.applySlotDefaults()
@@ -543,6 +583,9 @@ func (c Config) validate() error {
 		return ErrInvalidConfig
 	}
 	if c.Storage.CommitShards < 0 {
+		return ErrInvalidConfig
+	}
+	if c.Storage.DiskSlowThreshold < 0 {
 		return ErrInvalidConfig
 	}
 	if c.Channel.AppendBatchMaxRecords < 0 {

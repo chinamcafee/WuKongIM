@@ -12,15 +12,21 @@ import (
 type Runtime struct {
 	opts Options
 
-	mu        sync.RWMutex
-	closed    bool
-	slots     map[SlotID]*slot
+	mu     sync.RWMutex
+	closed bool
+	slots  map[SlotID]*slot
+	// opening reserves identities before a constructor may mutate durable data.
+	opening   map[SlotID]struct{}
+	openWG    sync.WaitGroup
 	scheduler *scheduler
 	apply     *applyPipeline
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
 	inflight  atomic.Int64
-	tickSlots []*slot
+	// inflightObservationMu linearizes absolute inflight publications. A delayed
+	// older worker reloads the latest physical count before it reaches the sink.
+	inflightObservationMu sync.Mutex
+	tickSlots             []*slot
 }
 
 func New(opts Options) (*Runtime, error) {
@@ -41,6 +47,7 @@ func New(opts Options) (*Runtime, error) {
 	rt := &Runtime{
 		opts:      opts,
 		slots:     make(map[SlotID]*slot),
+		opening:   make(map[SlotID]struct{}),
 		scheduler: newScheduler(opts.Observer),
 		apply:     newApplyPipeline(opts.Workers, opts.Goroutines, opts.Observer),
 		stopCh:    make(chan struct{}),
@@ -75,11 +82,13 @@ func (r *Runtime) runWorker() {
 			return
 		case slotID := <-r.scheduler.ch:
 			r.scheduler.begin(slotID)
-			r.observeSchedulerInflight(int(r.inflight.Add(1)))
+			r.inflight.Add(1)
+			r.observeSchedulerInflight()
 			started := time.Now()
 			requeue := r.processSlot(slotID)
 			r.observeSchedulerTask("process_slot", time.Since(started))
-			r.observeSchedulerInflight(int(r.inflight.Add(-1)))
+			r.inflight.Add(-1)
+			r.observeSchedulerInflight()
 			if r.scheduler.done(slotID) || requeue {
 				r.scheduler.requeue(slotID)
 			}
@@ -171,9 +180,11 @@ func (r *Runtime) processSlot(slotID SlotID) bool {
 	return false
 }
 
-func (r *Runtime) observeSchedulerInflight(inflight int) {
+func (r *Runtime) observeSchedulerInflight() {
 	if r != nil && r.opts.Observer != nil {
-		r.opts.Observer.SetSchedulerInflight(inflight)
+		r.inflightObservationMu.Lock()
+		defer r.inflightObservationMu.Unlock()
+		r.opts.Observer.SetSchedulerInflight(int(r.inflight.Load()))
 	}
 }
 

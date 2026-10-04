@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/WuKongIM/WuKongIM/internal/observability/diagnostics"
+	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/gin-gonic/gin"
 )
 
@@ -37,7 +38,16 @@ func (s *Server) handleDebugCluster(c *gin.Context) {
 		writeDebugJSONError(c, http.StatusNotFound, "not found")
 		return
 	}
-	c.JSON(http.StatusOK, s.debugCluster())
+	snapshot, err := s.debugCluster(c.Request.Context())
+	if err != nil {
+		s.httpLogger().Warn("debug cluster snapshot failed",
+			wklog.Event("internal.access.api.debug_cluster_snapshot_failed"),
+			wklog.Error(err),
+		)
+		writeDebugJSONError(c, http.StatusServiceUnavailable, "cluster snapshot unavailable")
+		return
+	}
+	c.JSON(http.StatusOK, snapshot)
 }
 
 func (s *Server) handleDebugGoroutines(c *gin.Context) {

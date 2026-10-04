@@ -6,7 +6,7 @@ export type MessageReceiptListener = ((channel:Channel,message: Message[]) => vo
 export class ReceiptManager {
     private static instance: ReceiptManager
     listeners: MessageReceiptListener[] = new Array(); // 回执监听
-    private timer!:NodeJS.Timeout | null | number
+    private timer!:ReturnType<typeof setInterval> | null
     public static shared(flushInterval:number = 2000) {
         if (!this.instance) {
             this.instance = new ReceiptManager();

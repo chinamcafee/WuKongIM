@@ -1697,7 +1697,7 @@
     "/conversations/setUnread": {
       "post": {
         "summary": "Set Conversation Unread",
-        "description": "Set unread count for a conversation",
+        "description": "Monotonically advance the membership badge baseline so unread is capped at the requested count",
         "tags": ["Conversation"],
         "requestBody": {
           "required": true,
@@ -1726,7 +1726,7 @@
     "/conversations/delete": {
       "post": {
         "summary": "Delete Conversation",
-        "description": "Delete a conversation",
+        "description": "Hide currently visible history while preserving channel membership",
         "tags": ["Conversation"],
         "requestBody": {
           "required": true,
@@ -1752,30 +1752,82 @@
         }
       }
     },
+    "/conversation/list": {
+      "post": {
+        "summary": "List Membership-Backed Conversations",
+        "description": "Reads Leader-persisted messages without runtime activation. Failed SENDs may appear. Any read error fails the page; retry the original cursor.",
+        "tags": [
+          "Conversation"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConversationListRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Membership candidates scanned and conversations constructed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationListResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Channel or storage read failed; no partial page or cursor is returned.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "msg": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Maintenance, page admission exhaustion, or deadline exceeded; retry the original page."
+          }
+        }
+      }
+    },
     "/conversation/sync": {
       "post": {
-        "summary": "Sync User Conversation",
-        "description": "Synchronize user conversations",
+        "summary": "Sync Conversations (Legacy)",
+        "description": "Legacy heads and recents read current-Leader persisted storage without runtime activation. Failed SENDs may appear. Any read failure aborts the request; retry the original request. Legacy fields, filters and cursor rules remain unchanged. List and sync share 16 active requests and a five-second deadline. Sync allows up to 1,000 candidates, 200 Channels per batch, 10,000 requested recent messages and 32 MiB of base/stream payloads; exhausted budgets fail without partial data.",
         "tags": ["Conversation"],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ConversationSyncRequest"
+                "$ref": "#/components/schemas/LegacyConversationSyncRequest"
               }
             }
           }
         },
         "responses": {
           "200": {
-            "description": "Conversations synchronized",
+            "description": "Legacy conversation synchronization result",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/components/schemas/ConversationResponse"
+                    "$ref": "#/components/schemas/LegacyConversationSyncItem"
                   }
                 }
               }
@@ -1784,31 +1836,28 @@
         }
       }
     },
-    "/conversation/syncMessages": {
+    "/conversations/activate": {
       "post": {
-        "summary": "Sync Recent Messages",
-        "description": "Synchronize recent messages for conversations",
+        "summary": "Activate Conversation",
+        "description": "Prioritize a valid membership in future directory pages",
         "tags": ["Conversation"],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SyncRecentMessagesRequest"
+                "$ref": "#/components/schemas/DeleteConversationRequest"
               }
             }
           }
         },
         "responses": {
           "200": {
-            "description": "Recent messages synchronized successfully",
+            "description": "Conversation activated successfully",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/ChannelRecentMessagesResponse"
-                  }
+                  "$ref": "#/components/schemas/SuccessResponse"
                 }
               }
             }
@@ -1816,72 +1865,6 @@
         }
       }
     },
-    "/conversation/channels": {
-      "post": {
-        "summary": "Get Conversation Channels",
-        "description": "Get channel collection for recent conversations",
-        "tags": ["Conversation"],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ConversationChannelsRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Conversation channels retrieved successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/ChannelResponse"
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/conversation/syncByChannels": {
-      "post": {
-        "summary": "Sync Conversations By Channels",
-        "description": "Synchronize conversation data by specified channel collection",
-        "tags": ["Conversation"],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SyncConversationByChannelsRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Conversations synchronized successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/ConversationResponse"
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-
-
     "/connz": {
       "get": {
         "summary": "Get Connection Information",
@@ -3592,7 +3575,33 @@
           }
         }
       },
-      "ConversationSyncRequest": {
+      "ConversationListRequest": {
+        "type": "object",
+        "required": ["uid"],
+        "properties": {
+          "uid": {
+            "type": "string",
+            "description": "User ID",
+            "example": "user123"
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque membership directory cursor"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200,
+            "description": "Maximum membership candidates scanned"
+          },
+          "completed_coverage": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Coverage timestamp from the client's last completed directory pass"
+          }
+        }
+      },
+      "LegacyConversationSyncRequest": {
         "type": "object",
         "required": ["uid"],
         "properties": {
@@ -3604,40 +3613,46 @@
           "version": {
             "type": "integer",
             "format": "int64",
-            "example": 1640995200000000000,
-            "description": "Version timestamp for incremental sync"
+            "description": "Legacy sync version. A positive value resumes from the effective read position when no channel cursor is supplied."
           },
           "last_msg_seqs": {
             "type": "string",
-            "description": "Client's last message sequences for all conversations. Format: channelID:channelType:last_msg_seq|channelID:channelType:last_msg_seq",
-            "example": "user1:1:100|group1:2:200"
+            "description": "Legacy per-channel cursors encoded as channel_id:channel_type:last_message_seq entries separated by |.",
+            "example": "group123:2:100|user456:1:20"
           },
           "msg_count": {
             "type": "integer",
-            "format": "int64",
-            "example": 10,
-            "description": "Number of recent messages to include per conversation"
+            "description": "Maximum recent messages returned per conversation.",
+            "example": 20
           },
           "only_unread": {
             "type": "integer",
             "format": "uint8",
-            "description": "Only return unread conversations (1=only unread, 0=all)",
             "enum": [0, 1],
-            "default": 0
+            "description": "Return unread conversations and channels explicitly present in last_msg_seqs."
           },
           "exclude_channel_types": {
             "type": "array",
+            "description": "Legacy channel types to exclude unless explicitly present in last_msg_seqs.",
             "items": {
               "type": "integer",
               "format": "uint8"
-            },
-            "description": "Array of channel types to exclude from results",
-            "example": [3, 4]
+            }
+          },
+          "page": {
+            "type": "integer",
+            "description": "Legacy one-based page number. Zero disables pagination."
+          },
+          "page_size": {
+            "type": "integer",
+            "maximum": 500,
+            "description": "Legacy page size. Values at or below zero default to 100 when page is positive."
           }
         }
       },
-      "ConversationResponse": {
+      "ConversationListKey": {
         "type": "object",
+        "required": ["channel_id", "channel_type"],
         "properties": {
           "channel_id": {
             "type": "string",
@@ -3647,6 +3662,93 @@
             "type": "integer",
             "format": "int8",
             "example": 2
+          }
+        }
+      },
+      "ConversationLastMessage": {
+        "type": "object",
+        "properties": {
+          "message_id": {
+            "type": "integer",
+            "format": "int64",
+            "example": 1001
+          },
+          "message_idstr": {
+            "type": "string",
+            "example": "1001"
+          },
+          "message_seq": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "from_uid": {
+            "type": "string",
+            "example": "user123"
+          },
+          "client_msg_no": {
+            "type": "string"
+          },
+          "server_timestamp_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "payload": {
+            "type": "string",
+            "format": "byte"
+          }
+        }
+      },
+      "ConversationListItem": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ConversationListKey"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "active_at": {"type": "integer", "format": "int64"},
+              "read_seq": {"type": "integer", "format": "int64"},
+              "deleted_to_seq": {"type": "integer", "format": "int64"},
+              "unread": {"type": "integer", "format": "int64"},
+              "last_message": {
+                "nullable": true,
+                "allOf": [
+                  {"$ref": "#/components/schemas/ConversationLastMessage"}
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ConversationListResponse": {
+        "type": "object",
+        "required": ["conversations", "deletes", "done", "coverage", "tombstones_retained_since", "reset_required"],
+        "properties": {
+          "conversations": {
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/ConversationListItem"}
+          },
+          "deletes": {
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/ConversationListKey"}
+          },
+          "next_cursor": {"type": "string"},
+          "done": {"type": "boolean"},
+          "coverage": {"type": "integer", "format": "int64"},
+          "tombstones_retained_since": {"type": "integer", "format": "int64"},
+          "reset_required": {"type": "boolean"}
+        }
+      },
+      "LegacyConversationSyncItem": {
+        "type": "object",
+        "required": ["channel_id", "channel_type", "unread", "timestamp", "last_msg_seq", "last_client_msg_no", "offset_msg_seq", "readed_to_msg_seq", "version", "recents"],
+        "properties": {
+          "channel_id": {
+            "type": "string"
+          },
+          "channel_type": {
+            "type": "integer",
+            "format": "uint8"
           },
           "unread": {
             "type": "integer",
@@ -3656,26 +3758,27 @@
           "timestamp": {
             "type": "integer",
             "format": "int64",
-            "example": 1640995200
+            "description": "Last returned message timestamp in Unix seconds."
           },
           "last_msg_seq": {
             "type": "integer",
-            "format": "int32",
-            "example": 1001
+            "format": "uint64"
           },
           "last_client_msg_no": {
-            "type": "string",
-            "example": "client_msg_123"
+            "type": "string"
+          },
+          "offset_msg_seq": {
+            "type": "integer",
+            "format": "int64"
           },
           "readed_to_msg_seq": {
             "type": "integer",
-            "format": "int32",
-            "example": 996
+            "format": "uint64"
           },
           "version": {
             "type": "integer",
             "format": "int64",
-            "example": 1640995200000000000
+            "description": "Last returned message timestamp expressed as Unix nanoseconds."
           },
           "recents": {
             "type": "array",
@@ -4271,7 +4374,7 @@
           },
           "unread": {
             "type": "integer",
-            "description": "Unread count to set",
+            "description": "Maximum unread count; the stored read_seq never moves backward",
             "example": 5
           }
         }
@@ -4294,120 +4397,6 @@
             "type": "integer",
             "description": "Channel type (1=person, 2=group)",
             "enum": [1, 2]
-          }
-        }
-      },
-      "SyncRecentMessagesRequest": {
-        "type": "object",
-        "required": ["uid", "channels"],
-        "properties": {
-          "uid": {
-            "type": "string",
-            "description": "User ID",
-            "example": "user123"
-          },
-          "channels": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ChannelRecentMessageRequest"
-            },
-            "description": "List of channels to sync messages for"
-          },
-          "msg_count": {
-            "type": "integer",
-            "description": "Number of messages to retrieve per channel",
-            "example": 15,
-            "default": 15
-          },
-          "order_by_last": {
-            "type": "integer",
-            "description": "Whether to order by last message (1=yes, 0=no)",
-            "enum": [0, 1],
-            "default": 0
-          }
-        }
-      },
-      "ChannelRecentMessageRequest": {
-        "type": "object",
-        "required": ["channel_id", "channel_type"],
-        "properties": {
-          "channel_id": {
-            "type": "string",
-            "description": "Channel ID",
-            "example": "channel456"
-          },
-          "channel_type": {
-            "type": "integer",
-            "description": "Channel type (1=person, 2=group)",
-            "enum": [1, 2]
-          }
-        }
-      },
-      "ChannelRecentMessagesResponse": {
-        "type": "object",
-        "properties": {
-          "channel_id": {
-            "type": "string",
-            "description": "Channel ID",
-            "example": "channel456"
-          },
-          "channel_type": {
-            "type": "integer",
-            "description": "Channel type",
-            "example": 2
-          },
-          "messages": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/MessageResponse"
-            }
-          }
-        }
-      },
-      "ConversationChannelsRequest": {
-        "type": "object",
-        "required": ["uid"],
-        "properties": {
-          "uid": {
-            "type": "string",
-            "description": "User ID",
-            "example": "user123"
-          }
-        }
-      },
-      "SyncConversationByChannelsRequest": {
-        "type": "object",
-        "required": ["uid", "channels"],
-        "properties": {
-          "uid": {
-            "type": "string",
-            "description": "User ID",
-            "example": "user123"
-          },
-          "channels": {
-            "type": "array",
-            "description": "Channel collection to sync",
-            "items": {
-              "type": "object",
-              "properties": {
-                "channel_id": {
-                  "type": "string",
-                  "description": "Channel ID",
-                  "example": "user456"
-                },
-                "channel_type": {
-                  "type": "integer",
-                  "format": "int8",
-                  "description": "Channel type (1: person, 2: group)",
-                  "example": 1
-                }
-              }
-            }
-          },
-          "msg_count": {
-            "type": "integer",
-            "description": "Number of recent messages to return per conversation",
-            "example": 15
           }
         }
       },

@@ -1,0 +1,89 @@
+// Run as an external caller of unmodified SourceCommit, with a new output dir.
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
+	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
+	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
+)
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+func main() {
+	dir := os.Args[1]
+	must(os.Mkdir(dir, 0700))
+	open := func() wkdb.DB {
+		db := wkdb.NewWukongDB(wkdb.NewOptions(wkdb.WithDir(filepath.Join(dir, "db")), wkdb.WithNodeId(1), wkdb.WithShardNum(2)))
+		must(db.Open())
+		return db
+	}
+	db := open()
+	at := time.Unix(1700000000, 0).UTC()
+	for _, id := range []struct {
+		ID   string
+		Type uint8
+	}{{"zero-version", 1}, {"type-zero", 0}, {"", 0}} {
+		must(db.SaveChannelClusterConfig(wkdb.ChannelClusterConfig{ChannelId: id.ID, ChannelType: id.Type, LeaderId: 1, Term: 1, ReplicaMaxCount: 3, Replicas: []uint64{1, 2, 3}, ConfVersion: 0, CreatedAt: &at}))
+	}
+	_, err := db.AddChannel(wkdb.ChannelInfo{ChannelId: "", ChannelType: 0, CreatedAt: &at})
+	must(err)
+	// Reopen to bypass write-populated caches and exercise original column reads.
+	must(db.Close())
+	db = open()
+	result := map[string]any{}
+	for _, id := range []struct {
+		Name, ID string
+		Type     uint8
+	}{{"zero_version", "zero-version", 1}, {"type_zero", "type-zero", 0}, {"empty", "", 0}} {
+		cfg, err := db.GetChannelClusterConfig(id.ID, id.Type)
+		if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
+			panic(err)
+		}
+		result[id.Name] = map[string]any{"found": err == nil, "version": cfg.ConfVersion, "leader": cfg.LeaderId, "term": cfg.Term, "channel_type": cfg.ChannelType, "empty": wkdb.IsEmptyChannelClusterConfig(cfg)}
+	}
+	info, err := db.GetChannel("", 0)
+	must(err)
+	exists, err := db.ExistChannel("", 0)
+	must(err)
+	listed, err := db.SearchChannels(wkdb.ChannelSearchReq{Limit: 100})
+	must(err)
+	listedEmpty := false
+	for _, row := range listed {
+		if row.ChannelId == "" {
+			listedEmpty = true
+		}
+	}
+	result["empty_channel_info"] = map[string]any{"physical_id_nonzero": info.Id != 0, "empty": wkdb.IsEmptyChannelInfo(info), "exists": exists, "search_lists_empty": listedEmpty}
+	listedCfg, err := db.GetChannelClusterConfigs(0, 100)
+	must(err)
+	listedEmpty = false
+	for _, row := range listedCfg {
+		if row.ChannelId == "" {
+			listedEmpty = true
+		}
+	}
+	result["config_directory_lists_empty"] = listedEmpty
+	must(db.Close())
+	n := raft.NewNode(0, types.RaftState{}, raft.NewOptions(raft.WithNodeId(1), raft.WithKey("zero-version-1")))
+	cfg := types.Config{Version: 0, Term: 1, Leader: 1, Replicas: []uint64{1, 2, 3}, Role: types.RoleLeader}
+	must(n.Step(types.Event{Type: types.ConfChange, Config: cfg}))
+	result["raft_zero_version"] = map[string]any{"leader": n.IsLeader(), "version": n.Config().Version, "term": n.Config().Term}
+	cfg.Version = 5
+	must(n.Step(types.Event{Type: types.ConfChange, Config: cfg}))
+	cfg.Version = 0
+	err = n.Step(types.Event{Type: types.ConfChange, Config: cfg})
+	result["raft_downgrade"] = map[string]any{"step_returns_error": err != nil, "retained_version": n.Config().Version}
+	data, err := json.MarshalIndent(result, "", "  ")
+	must(err)
+	must(os.WriteFile(filepath.Join(dir, "observations.json"), append(data, '\n'), 0600))
+}

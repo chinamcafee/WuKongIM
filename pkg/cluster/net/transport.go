@@ -12,7 +12,7 @@ import (
 
 const defaultTransportQueueSize = 4096
 const defaultTransportPoolSize = 16
-const defaultTransportWriteBatchMaxWait = 100 * time.Microsecond
+const defaultTransportWriteBatchMaxWait time.Duration = 0
 const defaultTransportServiceConcurrency = 128
 const defaultTransportForegroundWriteServiceConcurrency = 512
 const orderedRaftServiceConcurrency = 1
@@ -43,7 +43,9 @@ type TransportServiceConfig struct {
 	QueueSize int
 	// MaxQueueBytes is the queued payload byte budget for each typed RPC service. Non-positive values use the cluster default.
 	MaxQueueBytes int64
-	// Timeout bounds one handler invocation for each typed RPC service. Zero disables service-level handler timeouts.
+	// Timeout bounds one handler invocation. Zero selects the service default:
+	// 30s ordinarily, 1m for profiling, 5m for repository probes, and 48h for
+	// complete backup/restore operations. It does not disable the budget.
 	Timeout time.Duration
 }
 
@@ -137,18 +139,34 @@ func NewTransportClient(cfg TransportClientConfig) *TransportClient {
 		discovery = emptyTransportDiscovery{}
 	}
 	limits := normalizeTransportLimits(cfg.Limits, cfg.QueueSize)
+	observer := cfg.Observer
+	if observer != nil {
+		observer = transportClientObserver{next: observer}
+	}
 	client, err := transport.NewClient(transport.ClientConfig{
-		NodeID:      transport.NodeID(cfg.NodeID),
-		Discovery:   discovery,
-		PoolSize:    cfg.PoolSize,
-		DialTimeout: cfg.DialTimeout,
-		Limits:      limits,
-		Observer:    cfg.Observer,
+		NodeID:         transport.NodeID(cfg.NodeID),
+		RequestBudgets: true,
+		Discovery:      discovery,
+		PoolSize:       cfg.PoolSize,
+		DialTimeout:    cfg.DialTimeout,
+		Limits:         limits,
+		Observer:       observer,
 	})
 	if err != nil {
 		panic(fmt.Sprintf("cluster/net: create transport client: %v", err))
 	}
 	return &TransportClient{client: client, poolSize: cfg.PoolSize, limits: limits}
+}
+
+// transportClientObserver keeps client/server service labels identical for
+// dashboard filtering. It runs behind the transport's bounded observer drain.
+type transportClientObserver struct{ next transport.Observer }
+
+func (o transportClientObserver) ObserveTransport(event transport.Event) {
+	if event.Name == "client_rpc" && event.ServiceID <= 255 {
+		event.ServiceAlias = transportServiceAlias(uint8(event.ServiceID))
+	}
+	o.next.ObserveTransport(event)
 }
 
 // Call invokes serviceID on nodeID.
@@ -313,6 +331,30 @@ func (s *TransportServer) serviceOptions(serviceID uint8) transport.ServiceOptio
 	}
 	opts := normalizeTransportServiceOptions(cfg, s.cfg.MaxPayload)
 	opts.Alias = transportServiceAlias(serviceID)
+	opts.QueueTimeout = 5 * time.Second
+	if opts.Timeout == 0 {
+		opts.Timeout = 30 * time.Second
+	}
+	if s.cfg.Service.Timeout == 0 {
+		switch serviceID {
+		case RPCOpsMCP:
+			// CPU capture permits 30s plus authorization, startup and analysis.
+			opts.Timeout = time.Minute
+		case RPCScheduledBackupMessages, RPCScheduledBackupSlot, RPCScheduledBackupRestore:
+			// These RPCs stream complete snapshots or restore stages. Backup and
+			// restore jobs permit up to 48h; rate limiting may span many minutes.
+			// Recovery keeps its independent context after the job deadline.
+			opts.Timeout = 48 * time.Hour
+		case RPCScheduledBackupRepositoryProbe:
+			opts.Timeout = 5 * time.Minute
+		}
+	}
+	// Mutations and mixed-purpose services keep running after caller cancellation;
+	// these read-only services may cooperatively stop once their caller is gone.
+	switch serviceID {
+	case RPCChannelLastVisible, RPCChannelConversationHeads, RPCChannelCommittedReads, RPCSlotStatus, RPCNodeSendPermissions, RPCSlotMQTTMetadata, RPCChannelMQTTConsumerRead, RPCChannelWillReceipt, RPCChannelMQTTOriginals:
+		opts.CancelRunning = true
+	}
 	return opts
 }
 
@@ -327,7 +369,7 @@ func isOrderedRaftService(serviceID uint8) bool {
 
 func isForegroundChannelMutationService(serviceID uint8) bool {
 	switch serviceID {
-	case RPCChannelAppend, RPCChannelAppendBatch, RPCChannelAuthoritySend, RPCMessageEventAppend:
+	case RPCChannelAppend, RPCChannelAppendBatch, RPCChannelAuthoritySend, RPCMessageEventAppend, RPCChannelQuorumExchange, RPCChannelMQTTSource, RPCChannelMQTTReplay, RPCChannelMQTTCopy, RPCChannelMQTTAnchor, RPCChannelMQTTPlan, RPCChannelMQTTRepair, RPCChannelMQTTRecovery, RPCChannelMQTTRetirement, RPCChannelMQTTRetirementSelection, RPCChannelMQTTConsumerRead, RPCChannelWillReceipt, RPCChannelMQTTOriginals:
 		return true
 	default:
 		return false
@@ -358,9 +400,6 @@ func normalizeTransportLimits(limits transport.Limits, queueSize int) transport.
 	}
 	if limits.WriteBatchMaxWait < 0 || limits.DialFailureCooldown < 0 || limits.WriteTimeout < 0 || limits.ReadIdleTimeout < 0 {
 		panic("cluster/net: negative transport timeout")
-	}
-	if limits.WriteBatchMaxWait == 0 {
-		limits.WriteBatchMaxWait = defaultTransportWriteBatchMaxWait
 	}
 	if limits.DialFailureCooldown == 0 {
 		limits.DialFailureCooldown = transport.DefaultLimits().DialFailureCooldown

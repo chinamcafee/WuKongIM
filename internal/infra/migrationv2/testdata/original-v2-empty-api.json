@@ -1,0 +1,35 @@
+[
+  {
+    "path": "/user/token",
+    "request": {
+      "uid": "emptyalice",
+      "token": "synthetic-emptyalice",
+      "device_flag": 1,
+      "device_level": 1
+    },
+    "response": {
+      "status": 200
+    }
+  },
+  {
+    "path": "/channel",
+    "request": {
+      "channel_id": "emptygroup",
+      "channel_type": 2,
+      "subscribers": [
+        "emptyalice"
+      ]
+    },
+    "response": {
+      "status": 200
+    }
+  },
+  {
+    "path": "/conversation/sync",
+    "request": {
+      "uid": "emptyalice",
+      "msg_count": 10
+    },
+    "response": []
+  }
+]

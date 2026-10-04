@@ -1,0 +1,47 @@
+---
+title: Error Responses
+description: Handle failures by HTTP status and protocol layer.
+---
+
+Check network and HTTP status first, then parse the endpoint-specific schema. Do not depend on one error field or exact error text.
+
+## HTTP handling
+
+| Result | Retry? | Action |
+| --- | --- | --- |
+| `400` | Endpoint-dependent | It may be an input error or a dependency/downstream failure; first decide whether that operation may already have written partial state |
+| `503 maintenance` | Yes, with bounded backoff | Wait for restore maintenance and observe `/readyz` |
+| Other `5xx` or network timeout | Conditional | Use exponential backoff, jitter, a cap, and cancellation |
+| `2xx` with a schema mismatch | No | Stop processing and inspect version or contract drift |
+
+Common error bodies:
+
+```json
+{"msg":"...","status":400}
+{"error":"maintenance","message":"restore maintenance is active"}
+```
+
+Error text is not a stable machine contract. Branch on HTTP status and schema.
+
+## HTTP 200 still requires a business-result check
+
+- `/message/send` requires checking `reason`; only a success Reason Code means the message was accepted.
+- `/channel/messagesyncbatch` requires checking every `items[].error`; an item failure still uses HTTP 200.
+- `/message/syncack` returns 200 when the handling process has no saved generation, but acknowledges nothing; `last_message_seq` is not used for the actual acknowledgement.
+- Several legacy delete or sign-out entries return 200 when the target is absent. Treat this as “the desired state holds,” not proof that this request deleted a record.
+
+## Partial writes and uncertain outcomes
+
+`/channel`, subscriber reset, allow/deny-list set, and device sign-out with `device_flag=-1` execute in stages. If a 400, 5xx, disconnect, or timeout occurs partway through, earlier stages may already be committed. Do not blindly reverse the operation. Persist the product-side desired version, re-read observable state, and idempotently replay the desired state.
+
+WuKongIM HTTP API currently has only the legacy full read for an ordinary allowlist; it has no symmetric readback for ordinary subscribers, the denylist, or temporary subscribers. For strict coordination, keep the product database as the desired-state source and use the protected Manager query for bounded verification.
+
+## Protocol boundary
+
+HTTP success does not prove CONNECT, SENDACK, realtime delivery, or read success. Handle CONNACK and SENDACK separately using their packet type and [Reason Code](/en/api/dictionaries/reason-codes); stop and report unknown values.
+
+## Log safety
+
+- Record method, path, HTTP status, and a separate request ID.
+- Do not log tokens, Authorization, cookies, UIDs, message bodies, or complete raw errors.
+- Bound retry count, duration, and concurrency.

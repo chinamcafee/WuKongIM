@@ -1,0 +1,91 @@
+# External HTTP harness for the unmodified a888f895 original product binary.
+# Usage: python3 generate_ordinary.py.txt /absolute/original-binary /absolute/new-output
+import pathlib,socket,subprocess,time,signal,json,urllib.request,tarfile,gzip,sys,tempfile,hashlib,os
+binary=pathlib.Path(sys.argv[1]).resolve();root=pathlib.Path(sys.argv[2]).resolve();root.mkdir(exist_ok=False)
+held=[];ports=[]
+for _ in range(4):
+ s=socket.socket();s.bind(('127.0.0.1',0));ports.append(s.getsockname()[1]);held.append(s)
+socket_root=tempfile.TemporaryDirectory(prefix='wk-v2-ordinary-')
+config=f'''mode: debug
+rootDir: {root}
+dataDir: {root}/data
+addr: tcp://127.0.0.1:{ports[0]}
+httpAddr: 127.0.0.1:{ports[1]}
+wsAddr: ws://127.0.0.1:{ports[2]}
+manager:
+  on: false
+demo:
+  on: false
+logger:
+  level: 2
+  dir: {root}/logs
+plugin:
+  socketPath: {socket_root.name}/p.sock
+cluster:
+  nodeId: 1
+  addr: tcp://127.0.0.1:{ports[3]}
+  serverAddr: 127.0.0.1:{ports[3]}
+  apiUrl: http://127.0.0.1:{ports[1]}
+  slotCount: 4
+  slotReplicaCount: 1
+  channelReplicaCount: 1
+db:
+  shardNum: 2
+'''
+(root/'source.yaml').write_text(config)
+for s in held:s.close()
+trace=[];log=(root/'process.log').open('wb');p=subprocess.Popen([str(binary),'--config',str(root/'source.yaml')],stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+try:
+ deadline=time.monotonic()+45
+ while 'server started successfully' not in (root/'process.log').read_text():
+  if p.poll() is not None or time.monotonic()>deadline:raise RuntimeError('source readiness failed')
+  time.sleep(.2)
+ def call(path,data=None):
+  req=urllib.request.Request(f'http://127.0.0.1:{ports[1]}'+path,data=json.dumps(data).encode() if data is not None else None,headers={'Content-Type':'application/json'})
+  with urllib.request.urlopen(req,timeout=10) as r:res=json.load(r)
+  trace.append({'path':path,'request':data,'response':res});(root/'api.json').write_text(json.dumps(trace,indent=2));return res
+ # The startup banner precedes source Slot creation; wait for the persisted configuration first.
+ deadline=time.monotonic()+20
+ while True:
+  path=root/'data/cluster/config/remote.json'
+  cfg=json.loads(path.read_text()) if path.exists() else {}
+  if len(cfg.get('slots',[]))==4 and all(x.get('leader')==1 for x in cfg['slots']) and all(x.get('apiServerAddr') for x in cfg.get('nodes',[])):break
+  if time.monotonic()>deadline:raise RuntimeError('original cluster configuration not ready')
+  time.sleep(.2)
+ for uid in ['migrationalice','migrationbob']:
+  assert call('/user/token',{'uid':uid,'token':'synthetic-'+uid,'device_flag':1,'device_level':1})['status']==200
+ assert call('/channel',{'channel_id':'migrationgroup','channel_type':2,'subscribers':['migrationalice','migrationbob']})['status']==200
+ for i in range(3):
+  assert call('/message/send',{'header':{'red_dot':1},'from_uid':'migrationalice','channel_id':'migrationgroup','channel_type':2,'client_msg_no':'ordinary-source-'+str(i),'payload':'aGVsbG8='})['status']==200
+ deadline=time.monotonic()+10
+ while True:
+  rows=call('/channel/messagesync',{'login_uid':'migrationbob','channel_id':'migrationgroup','channel_type':2,'start_message_seq':0,'end_message_seq':0,'limit':100,'pull_mode':1})['messages']
+  if len(rows)==3 and [r['message_seq'] for r in rows]==[1,2,3]:break
+  if time.monotonic()>deadline:raise RuntimeError('original forward history did not expose all three acknowledged messages')
+  time.sleep(.2)
+ assert all(r['payload']=='aGVsbG8=' and r['expire']==0 and r['setting']==0 for r in rows)
+ call('/conversation/sync',{'uid':'migrationbob','msg_count':10})
+ deadline=time.monotonic()+20
+ while True:
+  slots=[call('/cluster/slots/'+str(n)+'/localReplica') for n in range(4)]
+  if all(s['applied_index']==s['committed_index']==s['last_log_seq'] for s in slots):break
+  if time.monotonic()>deadline:raise RuntimeError('original slots not converged')
+  time.sleep(.2)
+finally:
+ if p.poll() is None:p.send_signal(signal.SIGINT)
+ try:p.wait(timeout=20)
+ except subprocess.TimeoutExpired:
+  os.killpg(p.pid,signal.SIGKILL);p.wait();raise RuntimeError('source failed normal shutdown; do not publish fixture')
+ log.close();socket_root.cleanup()
+assert p.returncode==0,'source did not exit normally'
+archive=root/'original-v2-ordinary.tar.gz'
+with archive.open('wb') as out:
+ with gzip.GzipFile(fileobj=out,mode='wb',mtime=0) as gz:
+  with tarfile.open(fileobj=gz,mode='w') as tar:
+   for f in sorted((root/'data').rglob('*')):
+    info=tar.gettarinfo(str(f),arcname=str(f.relative_to(root/'data')));info.uid=info.gid=0;info.uname=info.gname='';info.mtime=0
+    if f.is_file():
+     with f.open('rb') as source:tar.addfile(info,source)
+    else:tar.addfile(info)
+(root/'provenance.json').write_text(json.dumps({'source_commit':'a888f89533d0e7d1b2030e06504ca97f1ad891d4','binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),'fixture_sha256':hashlib.sha256(archive.read_bytes()).hexdigest(),'source_nodes':1,'source_slots':4,'business_shards':2,'message_rows':3,'normal_shutdown':True,'source_code_modified':False,'data_written_through_original_http':True,'synthetic_only':True},indent=2)+'\n')
+print('original single-node cluster ordinary fixture generated through HTTP and normal shutdown')

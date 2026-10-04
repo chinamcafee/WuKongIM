@@ -1,294 +1,148 @@
+---
+scope: package
+summary: Adapts product, benchmark, debug, and compatibility HTTP requests to internal use cases.
+---
+
 # internal/access/api Flow
 
 ## Responsibility
 
-`internal/access/api` exposes the HTTP target surface needed to benchmark the
-phase-1 `SEND -> SENDACK` skeleton plus compatible channel and user management
-surfaces migrated from `internal/access/api`. The same listener serves the
-embedded chat Demo under `/demo/`, allowing it to call product APIs on the
-same origin. It owns HTTP routing,
-request/response DTOs, and entry validation, but it does not mutate message,
-conversation, channel, user, or management business state directly. Channel
-management requests forward to the channel usecase supplied by the composition
-root, `/user*` requests forward to the user usecase, and compatible message
-send and channel-message sync requests forward to the message usecase.
-`/v3/message/commands/sync` and `/v3/message/commands/ack` expose restart-safe,
-signed internal command batches. Deprecated `/message/sync` and
-`/message/syncack` are intentionally not registered.
-`/conversation/list` and `/conversation/sync` requests forward to the
-conversation usecase and keep ordering, cursor rules, sync candidate selection,
-and message reads out of the HTTP layer. When the composition root provides a
-benchmark data writer,
-`/bench/v1/channels`, `/bench/v1/channels/subscribers`, and
-`/bench/v1/channels/subscribers/remove` forward setup or churn membership
-mutations through that writer; for `cmd/wukongim` delivery benchmarks the
-writer persists real cluster Slot metadata.
-When `bench.api_token` is configured, every `/bench/v1/*` request must carry
-the exact `Authorization: Bearer <token>` capability; health, readiness,
-metrics, debug, and product routes remain outside that middleware.
+This package owns the product HTTP listener, route registration, request and
+response DTOs, CORS, entry validation, legacy-compatible envelopes, and the
+embedded Demo interfaces. It adapts HTTP requests to entry-independent use cases and
+runtime ports; it does not own message, membership, conversation, channel, or
+user business state. Legacy plugin HTTP routes invoke the existing plugin usecase.
 
-Controller restore maintenance places a node-local middleware in front of all
-product, route-discovery, and benchmark endpoints. It returns HTTP `503` with
-the stable `maintenance` error before any business handler runs. Health,
-readiness, metrics, debug, top, and embedded Demo assets remain reachable for
-operations and diagnosis while the data plane is fenced.
+## Boundaries
 
-## Routes
+The composition root supplies message, CMD sync, conversation, channel, user,
+benchmark, terminal-fence, top, diagnostics, metrics, and debug ports. Optional capabilities
+remain explicit: their routes are absent or fail closed when the matching port
+is not wired. Business ordering, cursor semantics, durable writes, Channel
+authority, and compatibility decisions below the HTTP envelope stay in the
+corresponding use case or runtime.
+
+## Main Flows
 
 ```text
-GET  /healthz
-GET  /readyz
-GET  /demo/                           (embedded chat Demo)
-HEAD /demo/                           (embedded chat Demo)
-GET  /metrics                         (optional, when MetricsHandler is configured)
-GET  /debug/config                    (optional, when DebugAPIEnabled is configured)
-GET  /debug/cluster                   (optional, when DebugAPIEnabled is configured)
-GET  /debug/goroutines                (optional, when DebugAPIEnabled is configured)
-GET  /debug/pprof/*                   (optional, when DebugAPIEnabled is configured)
-GET  /debug/diagnostics/trace/:trace_id (optional, when DebugAPIEnabled and Diagnostics are configured)
-GET  /debug/diagnostics/message       (optional, when DebugAPIEnabled and Diagnostics are configured)
-GET  /debug/diagnostics/events        (optional, when DebugAPIEnabled and Diagnostics are configured)
-GET  /route
-POST /route/batch
-GET  /top/v1/snapshot
-GET  /bench/v1/capabilities
-GET  /bench/v1/capacity-target
-GET  /bench/v1/snapshot
-GET  /bench/v1/presence/snapshot
-GET  /bench/v1/channel-runtime/snapshot
-POST /bench/v1/channel-runtime/probe
-POST /bench/v1/channel-runtime/evict
-POST /bench/v1/users/tokens
-POST /bench/v1/channels
-POST /bench/v1/channels/subscribers
-POST /bench/v1/channels/subscribers/remove
-POST /message/send
-POST /message/event
-POST /v3/message/commands/sync
-POST /v3/message/commands/ack
-POST /conversation/list
-POST /conversation/sync
-POST /conversations/clearUnread
-POST /conversations/setUnread
-POST /conversations/delete
-POST /channel
-POST /channel/messagesync
-POST /channel/info
-POST /channel/delete
-POST /channel/expire
-POST /channel/subscriber_add
-POST /channel/subscriber_remove
-POST /channel/subscriber_remove_all
-POST /tmpchannel/subscriber_set
-POST /channel/blacklist_add
-POST /channel/blacklist_set
-POST /channel/blacklist_remove
-POST /channel/blacklist_remove_all
-POST /channel/whitelist_add
-POST /channel/whitelist_set
-POST /channel/whitelist_remove
-POST /channel/whitelist_remove_all
-GET  /channel/whitelist
-POST /user/token
-POST /user/device_quit
-POST /user/onlinestatus
-POST /user/systemuids_add
-POST /user/systemuids_remove
-GET  /user/systemuids
-POST /user/systemuids_add_to_cache
-POST /user/systemuids_remove_from_cache
+product HTTP request
+  -> maintenance and request-shape gates
+  -> legacy/canonical DTO mapping
+  -> message, CMD, conversation, channel, or user use case
+  -> stable HTTP envelope
+
+legacy /conversation/sync
+  -> decode v2.2 pagination, per-Channel cursors, unread, and exclusion fields
+  -> conversation legacy-sync use case
+  -> raw legacy conversation array with embedded recent messages
+
+bench or debug request
+  -> feature-enabled and bearer-capability gates
+  -> bounded runtime/read-model port or strict terminal-fence prepare
+  -> low-cardinality response, opaque grant, or stable failure
+
+/demos/* and the six Demo bundles
+  -> embedded immutable asset or revalidated index
+  -> same-origin product APIs and /route discovery
 ```
 
-The `/bench/v1/*` routes are enabled only when the composition root passes
-`BenchEnabled=true`. When `bench.api_token` is non-empty they require the exact
-bearer capability described above; an empty token retains the explicit local
-benchmark compatibility mode and must be used only in controlled environments.
+## Invariants and Failure Semantics
 
-`GET /top/v1/snapshot` is a read-only, node-local operations snapshot used by
-`wkcli top`. It is independent of Prometheus metrics and remains disabled unless
-the composition root passes a Top provider; without that provider the route
-returns `404`. Each node reports its own process CPU, RSS/VMS memory,
-goroutine, and thread usage through gopsutil in this snapshot so multi-node
-`wkcli top` can compare node-local resource pressure without requiring SSH or
-Prometheus. The response also includes sticky node-local `alerts` for active
-and recently resolved readiness, pressure, and sendack-error signals so
-operators do not miss short-lived warnings between CLI refreshes. Alert entries
-carry low-cardinality `evidence` key/value facts, such as pressure score,
-queue depth/capacity, thresholds, ready part, or sendack error rate, so detail
-views can explain why the alert fired without scraping Prometheus metrics.
+- Controller restore maintenance rejects product, route-discovery, and bench
+  handlers with stable `503 maintenance` before business work. Health,
+  readiness, metrics, debug, top, and Demo assets remain available.
+- A configured `bench.api_token` protects every `/bench/v1/*` and enabled
+  `/debug/*` route. An empty token is controlled-environment compatibility, not
+  a production authentication claim.
+- `POST /messages` maps bounded exact ID, sequence and client-number selectors
+  to the message use case; its legacy envelope preserves integer identity.
+- CMD bind/unbind accept bounded single, source-recipient batch, or exact
+  request-subscriber forms; the use case resolves the scope and shared tail.
+- `/message/eventsync` maps the original projected-event envelope to the narrow
+  event-sync use case; sequence selection and visibility policy stay below HTTP.
+- `/plugins/:plugin_no/*path` preserves the business-backend plugin route with a
+  bounded body and timeout, safe response framing, and the same maintenance gate.
+  Plugin execution and eligibility remain below the HTTP adapter.
+- `/route`, legacy channel/user/message/CMD/conversation routes, and their
+  response envelopes remain compatibility surfaces independent of bench mode.
+- Default external `/route` and `/route/batch` complete listener-derived wildcard
+  hosts from the request Host and disable caching for the completed response.
+  Explicit published addresses, concrete listener hosts, intranet requests and
+  node selectors stay unchanged; proxy headers never infer hosts, ports or TLS.
+- `/message/send` resolves its sender as `from_uid`, then the legacy
+  `sender_uid` alias, then the configured system UID when both are empty.
+  Omitted or blank client numbers receive one generated legacy-compatible key
+  before submission; the send result returns that same key for later retries.
+- Business rejection codes 128–255 pass through /message/send reason unchanged.
+- Person-channel IDs are normalized only at the entry boundary; durable
+  membership, opaque cursors, badge floors, and Channel reads stay below it.
+- Benchmark channel mutations use the supplied benchmark data port. Token
+  batches use the user use case and acknowledge only persisted device updates;
+  a failed batch can leave a durable prefix and must be retried as an upsert.
+  Missing mutation capability returns an explicit unsupported result.
+- `/bench/v1/terminal-fence/prepare` exists only with the complete controller
+  and a non-empty bearer token; it has no unauthenticated compatibility mode.
+  Capability and benchmark identities never enter logs or error responses.
+- Debug failures and observations never expose raw requested identities or
+  unbounded internal errors. Cluster-snapshot failures retain only the fixed
+  diagnostic event plus the private source cause. Metrics must not add UID or
+  Channel labels.
+- The adapter never writes storage, resolves distributed authority, or performs
+  post-commit effects directly.
+- `/conversation/list` exposes persisted previews with whole-page errors and
+  no unresolved array. The former `/conversation/retry` route is removed.
+- Conversation-list serialization borrows the usecase-owned immutable payload
+  only for the synchronous response write; it does not retain it afterward.
+- `/conversation/sync` preserves the old raw-array envelope and person-channel
+  projection, including system-UID hiding and full stream-event fields. Its
+  business pagination, filters, cursor floors, and whole-request failure policy
+  remain owned by the conversation use case. Heads and recents read persisted
+  messages without loading Channel runtimes.
 
-All `/debug...` routes are enabled only when the composition root passes
-`DebugAPIEnabled=true`. In `cmd/wukongim`, that switch is
-`WK_DEBUG_API_ENABLE`. Diagnostics debug routes also require a diagnostics reader
-and query the node-local bounded diagnostics store for controlled performance and
-troubleshooting runs.
+- Legacy history, CMD, exact lookup and conversation previews share stable read-only aliases for old empty client numbers; serialization never rewrites committed records.
 
-`GET /demo` and `HEAD /demo` permanently redirect to `/demo/`. The `/demo/*`
-surface serves the production Vite bundle embedded at Go build time; exact
-content-hashed assets use immutable caching, while `index.html` and public root
-assets require revalidation. Missing assets remain `404`, and product routes
-such as `/route`, `/user/token`, and `/channel/messagesync` always use their
-registered API handlers. The Demo defaults its API base to the page origin and
-uses `/route` to discover the configured client WebSocket address.
+- Message editing uses separate `/message/update` and single-channel `/channel/messageupdates` routes with bounded bodies and decimal-string edit identities/versions. Existing message and both conversation responses expose edited versions without changing their envelopes. Selected read responses include `X-WK-Content-Epoch` for SDK cache invalidation after restore. A supplied local transition fence rejects overlapping restore cycles before committing successful JSON, without a second Controller read; restore-capable embeddings must supply this port.
 
-The compatible `/route` and `/route/batch` routes are registered regardless of
-bench mode. They keep the legacy address response envelopes and select public
-or intranet gateway addresses from composition-root configuration based on
-`intranet=1`. When `node_id`, `nodeId`, or `nodeID` is supplied, the adapter
-returns the node-specific address set derived by the composition root from the
-static cluster voters. Invalid or unknown node IDs return the legacy
-`{"status":400,"msg":"节点参数有误！"}` envelope, and `/route/batch` only
-accepts a JSON array of UID strings.
+- `/messages`, single-channel `/channel/messagesync`, `/conversation/list` and
+  `/conversation/sync` return `503` with `code: unavailable` and legacy `msg`/`status`
+  fields for known temporary read failures. Runtime classification preserves typed
+  local causes and exact RPC cause identities; unknown errors retain the prior
+  envelope/status. Errors publish no partial rows or next cursor. CMD and batch
+  responses are unchanged.
 
-The compatible `/channel*` routes are registered regardless of bench mode. They
-keep the existing request and response envelopes, including `{"status":200}`
-mutation success responses and `{"status":400,"msg":"..."}` validation errors.
-If the composition root does not provide a channel usecase, the routes fail
-closed with the same error envelope.
+- `/streamdemo/*` serves a separate embedded EasySDK demo bundle with the same immutable-asset/index-revalidation policy as the chat demo. It remains reachable during maintenance.
+- `/` redirects to the read-only `/demos/` catalog; it lists six existing Demo
+  entrances without starting sessions or models. Both remain available during maintenance.
+- `/agentdemo/*` serves the task assistant UI with the same read-only bundle
+  policy. Tool approvals, task control and model calls stay in the separate
+  loopback Demo business process.
+- `/supportdemo/*` serves the customer support UI with the same read-only bundle
+  policy. Its session ownership, model calls and handoff remain in the separate
+  loopback Demo business process; these are not Product HTTP endpoints.
+- `/mqttdemo/*` serves the smart-store UI. Browser clients connect directly to
+  the MQTT WebSocket listener; identity and group provisioning stay in the
+  separate loopback Demo process. The static bundle remains available in maintenance.
+- `/livedemo/*` serves the live-room UI; browser SDK clients send transient
+  interactions, while the loopback Demo process owns identities, room snapshots
+  and moderation. Static assets remain available during maintenance.
 
-`POST /channel/expire` accepts an absolute Unix-seconds `expire_at`; zero or an
-omitted value removes the expiry. Personal requests that provide `channel_id`
-and `to_uid` are normalized to the shared canonical person channel before the
-channel usecase is called, and a missing personal channel may be created by the
-usecase.
+- User/channel send-ban POST and GET routes expose policy values and decimal
+  CAS versions through the existing management boundary. Strict bounded bodies
+  reject missing/invalid flags; legacy channel-info DTOs distinguish an omitted
+  send_ban from an explicit zero. Audit attribution labels backend writes with
+  an unknown operator and the actual socket peer, without trusting headers.
 
-The compatible `/user*` routes are registered regardless of bench mode. They
-keep the existing request and response envelopes: token mutations use
-`{"status":200}` on success and `{"status":400,"msg":"..."}` on failure,
-online-status empty UID lists return `{"status":200}`, non-empty status queries
-return the legacy array response, and system UID routes preserve their mutation
-and list shapes. If the composition root does not provide a user usecase, these
-routes fail closed with the legacy error envelope.
+## Read First
 
-The compatible message routes are registered regardless of bench mode.
-`/message/send` accepts the legacy base64 payload request, maps `sender_uid` to
-`from_uid`, forwards `subscribers` as an explicit request-scoped command, and
-returns the legacy `{"message_id","message_seq","reason"}` response with
-protocol reason codes. `/message/event` accepts the legacy message-scoped event
-append request, forwards raw JSON payload bytes to `internal/usecase/message`,
-and returns the legacy `{"status":200,"data":...}` envelope with the projected
-stream status and `msg_event_seq` when the event has reached durable projection.
-In-flight `stream.open`, `stream.delta`, and `stream.snapshot` cache responses
-may return `msg_event_seq=0` until a terminal stream event is proposed.
-The v3 command routes forward durable CMD message sync and ACK requests to
-`internal/usecase/cmdsync`. They return durable command messages plus a deterministic
-`batch_id`, explicit per-command-channel `ack_channels`, and `more`. ACK
-revalidates a digest that includes UID, device flag, and cursors, then advances
-only that device flag's monotonic cursor. Both routes require the internal HMAC
-headers `X-LinkU-UID`, `X-LinkU-Device-Flag`, `X-LinkU-Login-Session-ID`,
-`X-LinkU-Credential-Version`, timestamp, nonce, and signature. Middleware hashes
-the exact body bytes, enforces the replay window/nonce namespace, and places the
-verified principal in request context. UID, device flag, session ID, and version
-are rejected when supplied in the body. The usecase then rechecks the signed
-fence against the current durable ACTIVE, unexpired Device row. Unsigned,
-tampered, stale-session, stale-version, and replayed requests fail closed.
-Deprecated `/message/sync` and `/message/syncack` return 404.
-`/channel/messagesync` keeps the legacy response shape, converts canonical
-person-channel IDs back to the peer UID for the logged-in user, and maps message
-event summaries to the legacy `event_meta`, `event_sync_hint`, and stream fields
-when the usecase provides them. Fine-grained `/message/eventsync` is intentionally
-not registered in this phase. If the composition root does not provide the
-corresponding message or CMD sync usecase, these routes fail closed using their
-legacy envelopes.
+- [server.go](server.go)
+- [conversation_list.go](conversation_list.go)
+- [conversation_sync_legacy.go](conversation_sync_legacy.go)
+- [bench_runtime.go](bench_runtime.go)
+- [debug.go](debug.go)
 
-Durable `/message/send` requests require a non-empty `client_msg_no`. Internal
-callers may set `wait_for_persist=1` with a bounded `persist_timeout_ms` from
-100 through 10000 milliseconds (default 3000). Durable request-scoped
-`subscribers + sync_once` sends may also wait for their derived command-channel
-commit. Only no-persist sends are rejected from wait mode. The v3 send usecase already
-returns after the configured Channel commit boundary, so this option reuses the
-same synchronous result and only adds a request deadline plus the durable
-receipt envelope. A matching retry returns the original id/sequence with
-`deduplicated=1`; conflicting key reuse returns HTTP 409
-`idempotency_conflict`, and a deadline returns HTTP 504 `persist_timeout`.
+## Update Triggers
 
-The conversation list, sync, and mutation routes are registered regardless of bench mode.
-`/conversation/list` accepts `uid`, `limit`, and an optional sorted conversation
-cursor based on `active_at`, `channel_id`, and `channel_type`. It delegates
-ordering, cursor application, active-page reads, and current-page last-message
-loads to `internal/usecase/conversation`, then returns `conversations`,
-`next_cursor`, and `more`. Each conversation item contains the active row
-fields plus `unread`; `last_message` is `null` when the usecase found no visible
-durable message for that row. The access adapter converts canonical
-person-channel IDs back to the peer UID for the requesting user. The underlying
-usecase/infra path reads `ConversationKindNormal` rows and ordinary message
-hydration skips `SyncOnce` or command-channel rows, so CMD activity cannot
-replace the ordinary `last_message` or recent-message list. If the composition
-root does not provide a conversation usecase, the route fails closed with the
-compatible JSON error envelope. Each request emits a
-low-cardinality conversation-list observation containing result, latency,
-returned item count, sparse item count, last-message load count, last-message
-error count, active-index stale skip count, and whether another active page is
-available.
-`/conversation/sync` accepts the legacy request fields `uid`, `version`,
-`last_msg_seqs`, `msg_count`, `only_unread`, `exclude_channel_types`, and
-`limit`. The adapter parses `last_msg_seqs`, normalizes person-channel peer IDs
-to canonical channel IDs before calling the usecase, and returns the legacy
-array response with `recents` when requested. Canonical person-channel IDs in
-conversation rows and recent messages are converted back to the peer UID for
-the requesting user. If the composition root does not provide a conversation
-usecase, the route fails closed with the compatible JSON error envelope. The
-adapter records one low-cardinality sync observation for each request path,
-including invalid JSON, invalid `last_msg_seqs`, missing usecase, usecase
-errors, and successful responses. Observation labels never include UID, channel
-ID, device, message ID, or error text.
-`/conversations/clearUnread`, `/conversations/setUnread`, and
-`/conversations/delete` preserve the legacy mutation envelopes. The adapter
-validates only request shape, normalizes personal peer IDs to canonical
-conversation IDs, and delegates read-cursor or delete-barrier writes to the
-conversation usecase. The usecase and infra adapter keep those writes on the
-UID-owned Slot metadata path; the HTTP layer does not write conversation state
-directly.
-
-## Phase-1 Semantics
-
-All routes inherit open browser CORS handling from the HTTP adapter. The
-middleware echoes a request `Origin` when present, falls back to `*` when no
-origin is supplied, and answers preflight `OPTIONS` requests with `204` before
-business handlers run.
-
-The user-token mutation route is intentionally restricted to setup
-acknowledgments for black-box `wkbench` compatibility. The current
-`wukongim` gateway does not enable token authentication, so this route does
-not prove user-token persistence.
-
-The bench channel and subscriber mutation routes require a benchmark data
-writer from the composition root. Without that writer, capabilities do not
-advertise channel mutation support and mutation requests fail closed with
-`501`. With a writer, they inject real channel metadata and add or remove
-subscriber rows through the composition root. Subscriber reset requests remain
-unsupported.
-
-`/bench/v1/presence/snapshot` is a read-only diagnostic route. It reports
-owner-local route counts and authority-side virtual route counts for wkbench
-reports, but it does not expose or mutate concrete gateway sessions.
-
-Compatible channel and user management are adapters only. The channel adapter
-validates JSON fields, defaults `/channel/subscriber_add` with missing
-`channel_type` to group, rejects personal-channel subscriber mutations, and
-delegates durable metadata and member-list behavior to
-`internal/usecase/channel`. Subscriber cache refresh for channelappend runtime
-state is triggered by the composition root through the channel usecase observer,
-not by the HTTP adapter directly. The user adapter maps JSON into
-`internal/usecase/user` commands and does not access storage or presence
-directly. The message adapter decodes legacy HTTP payloads and trace headers
-but leaves send orchestration, request-scoped command-channel derivation, and
-channel message reads to `internal/usecase/message`.
-The CMD sync adapter validates request shape, UID presence, non-negative
-limits, legacy non-zero `last_message_seq`, v3 SHA-256 batch IDs, and bounded
-explicit ACK cursor arrays; CMD row selection,
-message ordering, command suffix stripping, and read-cursor writes over
-`ConversationKindCMD` stay in `internal/usecase/cmdsync`.
-The conversation adapter validates only request shape and UID presence; active
-index ordering, active cursor application, sync candidate filtering,
-read/delete cursor mutation, and ordinary `ConversationKindNormal` message
-reads stay in `internal/usecase/conversation`. The adapter observes
-successful and failed list requests without adding UID or channel labels, so
-performance triage can inspect list cost without increasing metrics
-cardinality.
-
-Link-U device credential mutations use the exact internal v3 apply/revoke
-paths. The adapter authenticates method, exact path, timestamp, nonce, and body
-digest with HMAC before JSON binding, rejects replay from a bounded nonce cache,
-caps payload and item counts, and delegates per-item policy validation to the
-user usecase. Tokens must never be written to request or response logs.
+- Route registration, compatibility envelopes, or entry validation change.
+- Maintenance, bench/debug authentication, or optional-capability gates change.
+- Person-channel conversion, cursor projection, or error mapping moves layers.
+- The adapter gains a new state mutation or distributed-authority dependency.

@@ -1,0 +1,34 @@
+---
+title: Flutter
+description: Use Dart to connect wukongimfluttersdk and manage connections, messages, conversations, and channel profiles.
+---
+
+`wukongimfluttersdk` is the full WuKongIM SDK for Flutter. It manages the persistent connection, message delivery, local sqflite data, conversation list, and channel profiles for Flutter apps that own their chat UI.
+
+These guides target `wukongimfluttersdk 1.7.9` and use Dart throughout. The package depends on `dart:io` and sqflite, so it is not for Flutter Web.
+
+## Before you start
+
+Prepare:
+
+- a reachable WuKongIM service;
+- two test users, such as `alice` and `bob`;
+- a `uid`, `token`, and `host:port` returned by your application server;
+- a Flutter project with its Android or iOS native configuration complete.
+
+<Callout type="info" title="Where does the token come from?">
+  Your application server should create the token and return it to an authenticated user. Never put a WuKongIM admin secret in the app or let the app call an admin API to create tokens.
+</Callout>
+
+## Recommended order
+
+<Cards>
+  <Card title="Quickstart" description="Install the SDK, connect a user, and send the first online text message." href="/en/sdk/flutter/quickstart" />
+  <Card title="Connection" description="Understand setup, synchronization states, disconnect, and logout." href="/en/sdk/flutter/connection" />
+  <Card title="Messages" description="Send, receive, query, and update message states." href="/en/sdk/flutter/messages" />
+  <Card title="Conversations" description="Build the chat list and maintain unread counts." href="/en/sdk/flutter/conversations" />
+  <Card title="Channels" description="Load user, group, and group-member profiles." href="/en/sdk/flutter/channels" />
+  <Card title="Advanced" description="Add custom content, media upload, and remote history." href="/en/sdk/flutter/advanced" />
+</Cards>
+
+Read [Core Concepts](/en/sdk/wukongim/concepts) first if “channel” or “conversation” is unfamiliar. Open the [API Reference](/en/sdk/flutter/api-reference) when you only need a method name.

@@ -1,0 +1,306 @@
+// Package quorumlog defines the storage-neutral identity of durable replicated
+// log proposals and entries.
+package quorumlog
+
+import (
+	"crypto/sha256"
+	"encoding/binary"
+)
+
+// ProposalManifestVersion preserves the original non-expiring entry format.
+const ProposalManifestVersion uint16 = 1
+
+// ExpirationProposalManifestVersion additionally binds the immutable lifetime.
+// Old v1 proposals retain their original digest, including legacy lifetimes
+// that were stored but not covered by the v1 entry digest.
+const ExpirationProposalManifestVersion uint16 = 2
+
+// PublicationProposalManifestVersion binds optional publication metadata as
+// well as lifetime. It requires compatible replicas and recovery tooling.
+const PublicationProposalManifestVersion uint16 = 3
+
+// SupportedProposalVersion accepts only fully specified digest formats.
+func SupportedProposalVersion(version uint16) bool {
+	return version == ProposalManifestVersion || version == ExpirationProposalManifestVersion || version == PublicationProposalManifestVersion || version == MQTTSourceProposalManifestVersion || version == MQTTReplayAnchorProposalManifestVersion || version == MQTTReplayRetirementProposalManifestVersion || version == RecoveryBarrierProposalManifestVersion
+}
+
+// VersionForRecords chooses a format for a newly created proposal, never for
+// verification of a persisted manifest supplied by another node.
+func VersionForRecords(records []Record) uint16 {
+	version := ProposalManifestVersion
+	for _, record := range records {
+		if len(record.PublicationMetadata) != 0 {
+			return PublicationProposalManifestVersion
+		}
+		if record.Expire != 0 {
+			version = ExpirationProposalManifestVersion
+		}
+	}
+	return version
+}
+
+// CommandID is the retry-stable identity of one immutable proposal.
+type CommandID [sha256.Size]byte
+
+// EntryDigest is the SHA-256 identity of one durable log entry.
+type EntryDigest [sha256.Size]byte
+
+// ProposalManifest binds one contiguous proposal to its authority, preceding
+// entry, command, range, and final entry digest.
+type ProposalManifest struct {
+	// Version is the persisted manifest format version.
+	Version uint16
+	// ChannelEpoch fences identities from an older Channel generation.
+	ChannelEpoch uint64
+	// LeaderTerm is the authoritative term that created every proposal entry.
+	LeaderTerm uint64
+	// FenceVersion is the authoritative write-fence version.
+	FenceVersion uint64
+	// CommandID is stable across exact retries and unique within the Channel.
+	CommandID CommandID
+	// BaseOffset is the durable entry index immediately before this proposal.
+	BaseOffset uint64
+	// LastOffset is the final entry index in this proposal.
+	LastOffset uint64
+	// PreviousTerm is the term of the entry at BaseOffset, or zero at genesis.
+	PreviousTerm uint64
+	// PreviousIndex equals BaseOffset and makes the predecessor explicit.
+	PreviousIndex uint64
+	// PreviousDigest is the digest at BaseOffset, or zero at genesis.
+	PreviousDigest EntryDigest
+	// Digest is the derived digest of the entry at LastOffset.
+	Digest EntryDigest
+}
+
+// EntryIdentity is the complete durable identity persisted beside one message
+// row and certified by follower durability acknowledgements.
+type EntryIdentity struct {
+	// Version is the persisted entry identity format version.
+	Version uint16
+	// ChannelEpoch fences identities from an older Channel generation.
+	ChannelEpoch uint64
+	// LeaderTerm is the authority term that created this entry.
+	LeaderTerm uint64
+	// FenceVersion is the authority write-fence version.
+	FenceVersion uint64
+	// Index is the 1-based durable log offset.
+	Index uint64
+	// PreviousTerm is the authority term of the preceding entry.
+	PreviousTerm uint64
+	// PreviousIndex is the preceding durable log offset.
+	PreviousIndex uint64
+	// CommandID identifies the immutable proposal containing this entry.
+	CommandID CommandID
+	// PreviousDigest is the digest of the preceding entry.
+	PreviousDigest EntryDigest
+	// Digest binds this identity and the immutable record semantics.
+	Digest EntryDigest
+}
+
+// Record is the storage-neutral semantic content bound into an entry digest.
+type Record struct {
+	// ID is the stable message identity.
+	ID uint64
+	// Index is the 1-based durable log offset.
+	Index uint64
+	// Epoch must equal the proposal Channel epoch.
+	Epoch uint64
+	// Setting carries the immutable message setting bits.
+	Setting uint8
+	// Expire is the immutable message lifetime in seconds, bound by format v2.
+	Expire uint32
+	// FromUID is the immutable sender identity.
+	FromUID string
+	// ClientMsgNo is the immutable client idempotency identity.
+	ClientMsgNo string
+	// ServerTimestampMS is the positive server append timestamp.
+	ServerTimestampMS int64
+	// SyncOnce marks one-shot command-sync content.
+	SyncOnce bool
+	// Payload is the immutable message body.
+	Payload []byte
+	// PublicationMetadata is the complete immutable, bounded publication value.
+	// This generic hash contract binds bytes; the publication/store boundaries
+	// validate their content. Formats 1 and 2 must reject nonempty metadata.
+	PublicationMetadata []byte
+}
+
+// StructurallyValid reports whether a manifest has a complete authority,
+// command, range, predecessor, and tail identity.
+func (m ProposalManifest) StructurallyValid() bool {
+	if InternalProposalVersion(m.Version) && m.LastOffset-m.BaseOffset != 1 {
+		return false
+	}
+	if !SupportedProposalVersion(m.Version) || m.ChannelEpoch == 0 || m.LeaderTerm == 0 || m.FenceVersion == 0 ||
+		m.CommandID == (CommandID{}) || m.Digest == (EntryDigest{}) ||
+		m.LastOffset <= m.BaseOffset || m.PreviousIndex != m.BaseOffset {
+		return false
+	}
+	if m.BaseOffset == 0 {
+		return m.PreviousTerm == 0 && m.PreviousDigest == (EntryDigest{})
+	}
+	return m.PreviousTerm != 0 && m.PreviousDigest != (EntryDigest{})
+}
+
+// ValidFor reports whether the manifest describes exactly recordCount entries
+// following expectedBase.
+func (m ProposalManifest) ValidFor(expectedBase uint64, recordCount int) bool {
+	return m.StructurallyValid() && recordCount > 0 && uint64(recordCount) <= ^uint64(0)-expectedBase &&
+		m.BaseOffset == expectedBase && m.LastOffset == expectedBase+uint64(recordCount)
+}
+
+// DeriveProposalEntries constructs the entry-by-entry hash chain for records.
+// recordAt must return immutable semantic records in proposal order.
+func DeriveProposalEntries(manifest ProposalManifest, recordCount int, recordAt func(int) Record) ([]EntryIdentity, bool) {
+	if InternalProposalVersion(manifest.Version) && recordCount != 1 {
+		return nil, false
+	}
+	if recordAt == nil || recordCount <= 0 || uint64(recordCount) > ^uint64(0)-manifest.BaseOffset ||
+		!SupportedProposalVersion(manifest.Version) || manifest.ChannelEpoch == 0 || manifest.LeaderTerm == 0 || manifest.FenceVersion == 0 ||
+		manifest.CommandID == (CommandID{}) || manifest.LastOffset != manifest.BaseOffset+uint64(recordCount) ||
+		manifest.PreviousIndex != manifest.BaseOffset {
+		return nil, false
+	}
+	if manifest.BaseOffset == 0 {
+		if manifest.PreviousTerm != 0 || manifest.PreviousDigest != (EntryDigest{}) {
+			return nil, false
+		}
+	} else if manifest.PreviousTerm == 0 || manifest.PreviousDigest == (EntryDigest{}) {
+		return nil, false
+	}
+	entries := make([]EntryIdentity, 0, recordCount)
+	previousTerm := manifest.PreviousTerm
+	previousIndex := manifest.PreviousIndex
+	previousDigest := manifest.PreviousDigest
+	for offset := 0; offset < recordCount; offset++ {
+		index := manifest.BaseOffset + uint64(offset) + 1
+		record := recordAt(offset)
+		if manifest.Version == MQTTSourceProposalManifestVersion && !validMQTTSourceRecord(record) {
+			return nil, false
+		}
+		if manifest.Version == MQTTReplayAnchorProposalManifestVersion && !validMQTTReplayAnchorRecord(record, index) {
+			return nil, false
+		}
+		if manifest.Version == MQTTReplayRetirementProposalManifestVersion && !validMQTTReplayRetirementRecord(record, index) {
+			return nil, false
+		}
+		if manifest.Version == RecoveryBarrierProposalManifestVersion && !validRecoveryBarrierRecord(record, manifest.ChannelEpoch, manifest.LeaderTerm, manifest.FenceVersion) {
+			return nil, false
+		}
+		if record.ID == 0 || (record.Index != 0 && record.Index != index) || record.Epoch != manifest.ChannelEpoch || record.ServerTimestampMS <= 0 ||
+			manifest.Version < PublicationProposalManifestVersion && len(record.PublicationMetadata) != 0 {
+			return nil, false
+		}
+		entry := EntryIdentity{
+			Version: manifest.Version, ChannelEpoch: manifest.ChannelEpoch,
+			LeaderTerm: manifest.LeaderTerm, FenceVersion: manifest.FenceVersion,
+			Index: index, PreviousTerm: previousTerm, PreviousIndex: previousIndex,
+			CommandID: manifest.CommandID, PreviousDigest: previousDigest,
+		}
+		entry.Digest = digestProposalEntry(entry, record)
+		entries = append(entries, entry)
+		previousTerm = entry.LeaderTerm
+		previousIndex = entry.Index
+		previousDigest = entry.Digest
+	}
+	return entries, true
+}
+
+// SealProposalManifest derives and assigns the proposal's final entry digest.
+func SealProposalManifest(manifest ProposalManifest, records []Record) (ProposalManifest, []EntryIdentity, bool) {
+	manifest.Digest = EntryDigest{}
+	entries, ok := DeriveProposalEntries(manifest, len(records), func(index int) Record { return records[index] })
+	if !ok {
+		return ProposalManifest{}, nil, false
+	}
+	manifest.Digest = entries[len(entries)-1].Digest
+	return manifest, entries, true
+}
+
+// VerifyEntry reports whether record is the semantic content certified by
+// entry's authority, predecessor, command, index, and digest.
+func VerifyEntry(entry EntryIdentity, record Record) bool {
+	if entry.Version == MQTTSourceProposalManifestVersion && !validMQTTSourceRecord(record) {
+		return false
+	}
+	if entry.Version == MQTTReplayAnchorProposalManifestVersion && !validMQTTReplayAnchorRecord(record, entry.Index) {
+		return false
+	}
+	if entry.Version == MQTTReplayRetirementProposalManifestVersion && !validMQTTReplayRetirementRecord(record, entry.Index) {
+		return false
+	}
+	if entry.Version == RecoveryBarrierProposalManifestVersion && !validRecoveryBarrierRecord(record, entry.ChannelEpoch, entry.LeaderTerm, entry.FenceVersion) {
+		return false
+	}
+	if !SupportedProposalVersion(entry.Version) || entry.ChannelEpoch == 0 || entry.LeaderTerm == 0 || entry.FenceVersion == 0 ||
+		entry.Index == 0 || entry.CommandID == (CommandID{}) || entry.Digest == (EntryDigest{}) ||
+		entry.PreviousIndex+1 != entry.Index || record.ID == 0 || (record.Index != 0 && record.Index != entry.Index) ||
+		record.Epoch != entry.ChannelEpoch || record.ServerTimestampMS <= 0 ||
+		entry.Version < PublicationProposalManifestVersion && len(record.PublicationMetadata) != 0 {
+		return false
+	}
+	if entry.PreviousIndex == 0 {
+		if entry.PreviousTerm != 0 || entry.PreviousDigest != (EntryDigest{}) {
+			return false
+		}
+	} else if entry.PreviousTerm == 0 || entry.PreviousDigest == (EntryDigest{}) {
+		return false
+	}
+	return digestProposalEntry(entry, record) == entry.Digest
+}
+
+func digestProposalEntry(entry EntryIdentity, record Record) EntryDigest {
+	hash := sha256.New()
+	if entry.Version == RecoveryBarrierProposalManifestVersion {
+		_, _ = hash.Write([]byte("wukongim/channel-entry/v7\x00"))
+	} else if entry.Version == MQTTReplayRetirementProposalManifestVersion {
+		_, _ = hash.Write([]byte("wukongim/channel-entry/v6\x00"))
+	} else if entry.Version == MQTTReplayAnchorProposalManifestVersion {
+		_, _ = hash.Write([]byte("wukongim/channel-entry/v5\x00"))
+	} else if entry.Version == MQTTSourceProposalManifestVersion {
+		_, _ = hash.Write([]byte("wukongim/channel-entry/v4\x00"))
+	} else if entry.Version == PublicationProposalManifestVersion {
+		_, _ = hash.Write([]byte("wukongim/channel-entry/v3\x00"))
+	} else if entry.Version == ExpirationProposalManifestVersion {
+		_, _ = hash.Write([]byte("wukongim/channel-entry/v2\x00"))
+	} else {
+		_, _ = hash.Write([]byte("wukongim/channel-entry/v1\x00"))
+	}
+	var encoded [8]byte
+	writeUint64 := func(value uint64) {
+		binary.BigEndian.PutUint64(encoded[:], value)
+		_, _ = hash.Write(encoded[:])
+	}
+	writeUint64(entry.ChannelEpoch)
+	writeUint64(entry.LeaderTerm)
+	writeUint64(entry.FenceVersion)
+	writeUint64(entry.Index)
+	writeUint64(entry.PreviousTerm)
+	writeUint64(entry.PreviousIndex)
+	_, _ = hash.Write(entry.CommandID[:])
+	_, _ = hash.Write(entry.PreviousDigest[:])
+	writeUint64(record.ID)
+	if entry.Version >= ExpirationProposalManifestVersion {
+		writeUint64(uint64(record.Expire))
+	}
+	_, _ = hash.Write([]byte{record.Setting})
+	if record.SyncOnce {
+		_, _ = hash.Write([]byte{1})
+	} else {
+		_, _ = hash.Write([]byte{0})
+	}
+	writeUint64(uint64(record.ServerTimestampMS))
+	writeBytes := func(value []byte) {
+		writeUint64(uint64(len(value)))
+		_, _ = hash.Write(value)
+	}
+	writeBytes([]byte(record.FromUID))
+	writeBytes([]byte(record.ClientMsgNo))
+	writeBytes(record.Payload)
+	if entry.Version >= PublicationProposalManifestVersion {
+		writeBytes(record.PublicationMetadata)
+	}
+	var digest EntryDigest
+	copy(digest[:], hash.Sum(nil))
+	return digest
+}

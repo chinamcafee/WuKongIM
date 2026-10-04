@@ -15,6 +15,8 @@ This domain owns black-box multi-node cluster lifecycle coverage for
 
 ## Scenario Catalog
 
+- `startup_recovery`: a 256-hash-slot single-node cluster preserves snapshot and committed-suffix device credentials across restarts and exports recovery progress evidence; three fresh three-node generations retain the 30-second readiness/convergence deadline with 12 physical Slots and emit `WK_E2E_STARTUP_READINESS_REPORT`. Run the whole package with `-timeout=8m`, or `TestThreeNodeFreshStartupReadiness` alone with `-timeout=3m -p=1`.
+
 - `dynamic_node_join`: dynamic data-node seed join, activation, delivery,
   onboarding, scale-in drain, safety gates, negative join/activation paths, and
   concurrent task guards.
@@ -30,10 +32,14 @@ This domain owns black-box multi-node cluster lifecycle coverage for
 - `dynamic_node_faults`: opt-in gofail-backed dynamic-node join, onboarding,
   scale-in, and remove fault recovery through public manager and WKProto
   entrypoints.
-- `goroutine_monitor`: real three-node Manager fan-out of current process,
-  module, and task goroutine ownership with selected-node filtering.
 
   ```bash
   scripts/build-gofail-binary.sh --cmd ./cmd/wukongim --package internal/usecase/management --package pkg/controller --package pkg/cluster/tasks --package pkg/cluster/net --out /tmp/wukongim-gofail
   WK_E2E_BINARY=/tmp/wukongim-gofail WK_E2E_GOFAIL_DYNAMIC_NODE=1 GOWORK=off go test -tags=e2e ./test/e2e/cluster/dynamic_node_faults -count=1 -timeout 15m -p=1
   ```
+- `goroutine_monitor`: real three-node Manager fan-out of current process,
+  module, and task goroutine ownership with selected-node filtering.
+- `manager_browser_smoke`: opt-in Chromium validation of the production
+  Manager bundle against a real three-node cluster with Gateway Token auth
+  enabled and all-node HTTP readiness, including authenticated
+  desktop routes, localized copy, not-found handling, and mobile navigation.

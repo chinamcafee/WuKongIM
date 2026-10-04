@@ -112,7 +112,8 @@ type Meta struct {
 	// LeaderEpoch fences leader changes within an epoch.
 	LeaderEpoch uint64
 	// RouteGeneration is the authoritative version of the complete routing record.
-	// It is a cache/version fence and is not part of the Channel state machine.
+	// The reactor also uses it as the durable-quorum fence version; the pure
+	// Channel state machine does not own this routing record.
 	RouteGeneration uint64
 	// Leader is the authoritative leader node.
 	Leader NodeID
@@ -134,14 +135,18 @@ type Meta struct {
 
 // Message is the v0 client-visible message model.
 type Message struct {
+	// Version and UpdatedAtMS describe a transient latest-content read; they are not append or replication fields.
+	Version     uint64
+	UpdatedAtMS int64
 	MessageID   uint64
 	MessageSeq  uint64
 	ChannelID   string
 	ChannelType uint8
 	// Setting carries legacy message setting bits needed by compatible readers.
+	// Expire is the original message lifetime in seconds; zero disables expiry.
+	Expire      uint32
 	Setting     uint8
 	Topic       string
-	Expire      uint32
 	RedDot      bool
 	FromUID     string
 	ClientMsgNo string
@@ -153,7 +158,10 @@ type Message struct {
 	ChannelKey string
 	// SyncOnce marks one-shot command-sync messages in the durable channel log.
 	SyncOnce bool
-	Payload  []byte
+	// RedDot preserves the protocol unread-badge flag through storage and replication.
+	Payload []byte
+	// PublicationMetadata is optional bounded immutable publication content.
+	PublicationMetadata []byte
 }
 
 // OpID identifies an asynchronous operation inside one channel generation.
@@ -194,7 +202,9 @@ type Record struct {
 	SyncOnce bool
 	// Payload is the encoded message body in v0 memory and store adapters.
 	Payload []byte
-	// SizeBytes is used by batching and read budgets.
+	// PublicationMetadata follows Payload through every replica and recovery copy.
+	PublicationMetadata []byte
+	// SizeBytes counts Payload plus PublicationMetadata for batching/read budgets.
 	SizeBytes int
 }
 
@@ -210,6 +220,9 @@ type AppendRequest struct {
 	CommitMode           CommitMode
 	ExpectedChannelEpoch uint64
 	ExpectedLeaderEpoch  uint64
+	// ExpectedRouteGeneration binds optional preparation to exact durable authority.
+	// Nonzero requires both epochs and quorum commit; zero preserves ordinary append.
+	ExpectedRouteGeneration uint64
 }
 
 // AppendResult is the committed result for one append.
@@ -223,6 +236,11 @@ type AppendResult struct {
 type AppendBatchRequest struct {
 	ChannelID ChannelID
 	Messages  []Message
+	// PayloadsImmutable lets an adapter transfer payload buffers that it owns and
+	// promises never to mutate. False keeps the public borrowed-buffer behavior
+	// and makes the Channel runtime clone content at admission. This promise
+	// includes both payload and publication metadata buffers.
+	PayloadsImmutable bool
 
 	// TraceID correlates diagnostics events for this append batch.
 	TraceID string
@@ -234,7 +252,12 @@ type AppendBatchRequest struct {
 	CommitMode           CommitMode
 	ExpectedChannelEpoch uint64
 	ExpectedLeaderEpoch  uint64
-	OmitResultPayload    bool
+	// ExpectedRouteGeneration has the same exact-authority contract as AppendRequest.
+	ExpectedRouteGeneration uint64
+	OmitResultPayload       bool
+	// ServerAllocatedMessageIDs proves all message IDs came from a node-scoped globally unique allocator.
+	// Stores may skip only the existing-message-ID lookup when this is true.
+	ServerAllocatedMessageIDs bool
 }
 
 // AppendBatchResult aligns per-message append results with the request order.

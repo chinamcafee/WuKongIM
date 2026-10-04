@@ -1,0 +1,268 @@
+---
+title: Synchronize one Channel's committed messages
+full: true
+_openapi:
+  preload:
+    - wukongim-product-http-complete-beta-en
+  method: POST
+  webhook: false
+  toc:
+    - depth: 2
+      title: Request Body
+      url: '#request-body'
+    - depth: 2
+      title: Response Body
+      url: '#response-body'
+  structuredData:
+    headings:
+      - content: Synchronize one Channel's committed messages
+        id: synchronize-one-channels-committed-messages
+    contents:
+      - content: Checks membership visibility and returns an ascending page; limit is
+          100 by default and capped at 10000.
+        heading: synchronize-one-channels-committed-messages
+      - content: >-
+          POST /channel/messagesync
+
+          syncQuickstartChannelMessages
+
+          Synchronize one Channel's committed messages
+
+          Checks membership visibility and returns an ascending page; limit is
+          100 by default and capped at 10000.
+
+          ChannelMessageSyncRequest
+
+          Single-Channel committed-message synchronization parameters.
+
+          additionalProperties true
+
+          login_uid `string` minLength: 1; pattern: `\S` User identity
+          performing the read and required to own the corresponding Channel
+          membership.
+
+          channel_id `string` minLength: 1; pattern: `\S` Logical identifier of
+          the target Channel; for a person Channel this is normally the other
+          UID.
+
+          channel_type `integer:uint8` 1–255 Numeric Channel type; 1 is a person
+          Channel, 2 is a group Channel, and other values are extension types.
+
+          start_message_seq `integer:uint64` 0–∞; default: `0` Inclusive Channel
+          message-sequence starting boundary; 0 selects the open end, and newer
+          reads also raise it to the membership visibility floor.
+
+          end_message_seq `integer:uint64` 0–∞; default: `0` Exclusive Channel
+          message-sequence ending boundary; 0 selects the open end.
+
+          limit `integer` default: `100` Maximum messages returned by this read;
+          values at or below 0 use 100 and values above 10000 are capped at
+          10000.
+
+          pull_mode `integer:uint8` 0–255; default: `0` Pull direction; 1 reads
+          toward newer messages and every other uint8 value uses the
+          compatibility branch for older messages.
+
+          include_event_meta `integer` default: `0` Message-event summary
+          switch; a non-zero value requests event metadata and defaults an empty
+          event_summary_mode to full.
+
+          event_summary_mode `string` default: `""` Event-summary mode; empty
+          disables enrichment, full includes snapshots, and any other non-empty
+          value returns the basic summary without snapshots.
+
+          200 One committed-message page
+
+          ChannelMessageSyncResponse
+
+          Message synchronization page for one Channel.
+
+          additionalProperties false
+
+          start_message_seq `integer:uint64` 0–∞ Starting message sequence of
+          the effective range for this page.
+
+          end_message_seq `integer:uint64` 0–∞ Ending message sequence of the
+          effective range for this page.
+
+          more `integer` enum: `0`, `1` 1 means another page may exist in the
+          same direction; 0 means the current range is exhausted.
+
+          messages array<`LegacyMessage`> — Messages are returned in ascending
+          message_seq order regardless of pull direction.
+
+          LegacyMessage
+
+          Legacy message projection used by WuKongIM HTTP API synchronization.
+
+          header `LegacyMessageHeader` additionalProperties: `false` Legacy
+          message header.
+
+          setting `integer:uint8` 0–255 WKProto Setting bitset.
+
+          message_id `integer:int64` — Server int64 message ID.
+
+          message_idstr `string` — Decimal string mirror of message_id only; it
+          is not a replacement for message_seq.
+
+          client_msg_no `string` — Original client number, or the stable
+          read-only alias wk3-legacy-<message_id> for an old empty-number record
+          with a message ID. The alias supports /messages lookup; it is not a
+          SEND idempotency or event mutation key. Stored records are unchanged.
+
+          end `integer:uint8` 0–255 Stream-message terminal compatibility flag.
+
+          end_reason `integer:uint8` 0–255 Stream-message terminal Reason Code.
+
+          error `string` — Stream-message error description.
+
+          stream_data `string | null` encoding: base64 Base64-encoded stream
+          data; it may be null.
+
+          event_meta `LegacyMessageEventMeta` additionalProperties: `false`
+          Optional message-event summary.
+
+          event_sync_hint `LegacyMessageEventSyncHint` additionalProperties:
+          `false` Optional message-event continuation hint.
+
+          message_seq `integer:uint64` 0–∞ uint64 sequence of the message within
+          this Channel.
+
+          from_uid `string` — Message sender UID.
+
+          channel_id `string` — Channel ID containing the message.
+
+          channel_type `integer:uint8` 0–255 Channel type containing the
+          message.
+
+          topic `string` — Optional message topic.
+
+          expire `integer:uint32` 0–∞ Message expiration in seconds; 0 means
+          unset.
+
+          timestamp `integer:int32` — Legacy server timestamp in seconds.
+
+          payload `string | null` encoding: base64 Base64-encoded message
+          payload; it may be null.
+
+          version `string` pattern: `^[0-9]+$` Edited content version; absent
+          means zero in the same content epoch.
+
+          updated_at_ms `integer:int64` 0–∞ Server edit time in Unix
+          milliseconds; original ordering is unchanged.
+
+          LegacyMessageHeader
+
+          Legacy message header.
+
+          no_persist `integer` enum: `0`, `1` 1 means the message is
+          non-durable.
+
+          red_dot `integer` enum: `0`, `1` 1 means the client should show a
+          red-dot indicator.
+
+          sync_once `integer` enum: `0`, `1` 1 means a one-shot command message.
+
+          LegacyMessageEventMeta
+
+          Optional message-event summary.
+
+          has_events `boolean` — Whether events exist.
+
+          completed `boolean` — Whether all known event lanes have completed.
+
+          event_version `integer:uint64` 0–∞ Event-summary version.
+
+          last_msg_event_seq `integer:uint64` 0–∞ Latest event sequence across
+          all lanes.
+
+          event_count `integer` 0–∞ Total event count.
+
+          open_event_count `integer` 0–∞ Number of event lanes still open.
+
+          events array<`LegacyMessageEventKeyMeta`> — Per-lane event summaries.
+
+          LegacyMessageEventKeyMeta
+
+          Summary of one event lane.
+
+          event_key `string` — Event lane key.
+
+          status `string` — Current state of the lane.
+
+          last_msg_event_seq `integer:uint64` 0–∞ Latest known event sequence
+          for the lane.
+
+          snapshot `unknown` — Arbitrary JSON snapshot in full summary mode.
+
+          end_reason `integer:uint8` 0–255 Event-stream terminal Reason Code.
+
+          error `string` — Event-stream error description.
+
+          LegacyMessageEventSyncHint
+
+          Optional message-event continuation hint.
+
+          client_msg_no `string` — Client message number of the target message.
+
+          from_msg_event_seq `integer:uint64` 0–∞ Starting sequence for the next
+          event synchronization.
+
+          400 Input, validation, dependency, or downstream error
+
+          CompatibilityError
+
+          HTTP 400 error body shared by multiple legacy entries.
+
+          msg `string` — Human-readable error text with no stability guarantee;
+          do not branch on it.
+
+          status `integer` const: `400` Application-level status fixed at 400.
+
+          503 Temporary read failure or restore maintenance; retry the same
+          query with bounded backoff.
+
+          MaintenanceError
+
+          503 error body returned while cluster restore maintenance is active.
+
+          error `string` const: `"maintenance"` Stable maintenance error
+          category.
+
+          message `string` const: `"restore maintenance is active"` Current
+          restore-maintenance message.
+
+          MessageUpdateError
+
+          Edit or transient read failure; no partial results.
+
+          status `integer` — HTTP status.
+
+          code `string` — Stable rejection code; uncertain writes retain their
+          exact retry identity.
+
+          msg `string` — Optional legacy diagnostic message.
+---
+
+<Callout type="warn" title="Operation boundary">
+
+- **Caller**: Trusted backend only
+- **Scope**: The login_uid must have an ordinary membership before reading; join_seq and deleted_to_seq establish the lowest visible sequence. Returned messages are always ordered by ascending message_seq.
+- **Success**: pull_mode=1 reads [start_message_seq, end_message_seq); other values read older messages in (end_message_seq, start_message_seq]. A zero boundary selects the open end.
+- **Recovery**: Page reads include latest edits; retry the original query on 503 unavailable. Reset cached version comparisons after a content epoch increase.
+
+</Callout>
+
+{/* This file was generated by Fumadocs. Do not edit this file directly. Any changes should be made by running the generation command again. */}
+
+export default function Layout(props) {
+  const { APIPage, OpenAPIPage } = props.components ?? {};
+  // "APIPage" is the old name from v10, this allows both for backward compatibility
+  const Comp = OpenAPIPage ?? APIPage;
+  return (
+    <>
+      {props.children}
+      <Comp document="wukongim-product-http-complete-beta-en" operations={[{"path":"/channel/messagesync","method":"post"}]} showDescription />
+    </>
+  );
+}

@@ -35,11 +35,13 @@ func (n *Node) startWatchLoop() {
 			select {
 			case <-ctx.Done():
 				return
-			case ev, ok := <-watch:
+			case _, ok := <-watch:
 				if !ok {
 					return
 				}
-				_ = n.applySnapshot(ctx, ev.Snapshot)
+				// Watch events are wakeups: task reconciliation can outlast many
+				// Controller commits, so queued payloads may already be obsolete.
+				_ = n.refreshControlSnapshot(ctx)
 			}
 		}
 	})
@@ -111,6 +113,16 @@ func (n *Node) reportNodeHealth(ctx context.Context, reporter *observe.Reporter)
 	}
 	if n.channelDataPlaneLease != nil && report.RuntimeReady {
 		n.channelDataPlaneLease.MarkVisible(attemptStartedAt)
+	}
+	// Preserve the health budget and skip competing restore/snapshot ownership.
+	// Capacity maintenance has its own bounded context and no additional goroutine.
+	if n.controlApplyMu.TryLock() {
+		if !n.stopping.Load() && !n.maintenance.Load() && n.defaultChannelStore != nil {
+			capacityCtx, done := context.WithTimeout(ctx, min(2*time.Second, healthReportTimeout(n.cfg.HealthReport.Interval, n.cfg.HealthReport.TTL)/3))
+			_ = n.defaultChannelStore.MaintainMQTTStorage(capacityCtx)
+			done()
+		}
+		n.controlApplyMu.Unlock()
 	}
 	return nil
 }
@@ -190,6 +202,12 @@ func (n *Node) startTaskReconcileLoop() {
 	}
 	fastInterval := n.taskReconcileFastInterval()
 	idleInterval := taskReconcileIdleInterval(fastInterval)
+	n.mu.Lock()
+	if n.taskReconcileWake == nil {
+		n.taskReconcileWake = make(chan struct{}, 1)
+	}
+	wake := n.taskReconcileWake
+	n.mu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
 	n.taskReconcileCancel = cancel
 	n.taskReconcileWG.Add(1)
@@ -201,33 +219,50 @@ func (n *Node) startTaskReconcileLoop() {
 			select {
 			case <-ctx.Done():
 				return
+			case <-wake:
 			case <-timer.C:
-				nextInterval := idleInterval
-				snapshot, err := n.control.LocalSnapshot(ctx)
-				if err != nil {
-					n.recordTaskReconcileError("snapshot", err)
-					if n.hasCachedControlTasks() {
-						nextInterval = fastInterval
-					}
-					timer.Reset(nextInterval)
-					continue
-				}
-				if len(snapshot.Tasks) != 0 {
+			}
+			timer.Stop()
+			nextInterval := idleInterval
+			snapshot, err := n.control.LocalSnapshot(ctx)
+			if err != nil {
+				n.recordTaskReconcileError("snapshot", err)
+				if n.hasCachedControlTasks() {
 					nextInterval = fastInterval
-				} else {
-					n.clearTaskReconcileError()
-					timer.Reset(nextInterval)
-					continue
-				}
-				if err := n.reconcileTasks(ctx, snapshot); err != nil {
-					n.recordTaskReconcileError("reconcile", err)
-				} else {
-					n.clearTaskReconcileError()
 				}
 				timer.Reset(nextInterval)
+				continue
 			}
+			if len(snapshot.Tasks) != 0 {
+				nextInterval = fastInterval
+			} else {
+				n.clearTaskReconcileError()
+				timer.Reset(nextInterval)
+				continue
+			}
+			if err := n.reconcileTasks(ctx, snapshot); err != nil {
+				n.recordTaskReconcileError("reconcile", err)
+			} else {
+				n.clearTaskReconcileError()
+			}
+			timer.Reset(nextInterval)
 		}
 	})
+}
+
+// requestTaskReconcile wakes the existing owner; the owner reads current
+// Controller state after it finishes any executing task, never a queued payload.
+func (n *Node) requestTaskReconcile() {
+	if n == nil || n.stopping.Load() {
+		return
+	}
+	n.mu.RLock()
+	wake := n.taskReconcileWake
+	n.mu.RUnlock()
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
 }
 
 func (n *Node) taskReconcileFastInterval() time.Duration {
@@ -554,6 +589,8 @@ func (n *Node) startChannelMigrationLoop() {
 		Meta:      metaReader,
 		Observer:  migrationObserver,
 		TaskLimit: n.cfg.ChannelMigration.TaskLimit,
+		// Complete ready tasks at the scanner admission rate without sleeping between durable phases.
+		FailoverPhaseLimit: 8,
 	})
 	scanner := channelwrapper.NewRepairScanner(channelwrapper.RepairScannerConfig{
 		Enabled:         true,
@@ -563,6 +600,7 @@ func (n *Node) startChannelMigrationLoop() {
 		TickInterval:    interval,
 		Observer:        repairObserver,
 	}, n, store)
+	diagnostics := channelMigrationDiagnostics{logger: namedLogger(n.cfg.Logger, "channel_migration")}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	n.channelMigrationCancel = cancel
@@ -576,8 +614,11 @@ func (n *Node) startChannelMigrationLoop() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_ = executor.RunOnce(ctx)
-				_, _ = scanner.RunOnce(ctx)
+				executorErr := executor.RunOnce(ctx)
+				result, scannerErr := scanner.RunOnce(ctx)
+				if ctx.Err() == nil {
+					diagnostics.report(time.Now(), result, executorErr, scannerErr)
+				}
 			}
 		}
 	})

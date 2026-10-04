@@ -15,7 +15,6 @@ work that remains before production.
 - Docker
 - Linux
 - Multi-node Cluster
-- Production Checklist
 
 Every route above has matching Chinese and English MDX and is included in
 search, sitemap, LLM outputs, and per-page Markdown. Kubernetes (Beta) remains
@@ -51,9 +50,9 @@ planned.
 - Configuration follows `wukongim.toml.example` and the loader contract:
   explicit `-config` is preferred, `WK_*` values override TOML, and list
   environment values replace the complete list as JSON.
-- Product HTTP APIs, Manager, metrics, debug, benchmark, diagnostics, and node
+- WuKongIM HTTP API endpoints, Manager, metrics, debug, benchmark, diagnostics, and node
   transport require separate exposure policies. The application does not
-  provide production TLS termination or make the product HTTP API a trusted
+  provide production TLS termination or make the WuKongIM HTTP API a trusted
   public boundary.
 - Persistent state belongs on independent durable storage per node. Backup,
   restore, online scale-in, upgrades, and disaster recovery remain separate
@@ -62,7 +61,7 @@ planned.
 
 ## Validation
 
-- The navigation test freezes the six newly published routes and requires
+- The navigation test freezes the five published routes and requires
   matching Chinese and English MDX.
 - Static-output validation confirms every published route appears in sitemap,
   search, LLM outputs, and per-page Markdown while Kubernetes stays excluded
@@ -82,6 +81,8 @@ planned.
   changes, or production cutover.
 - Full monitoring, backup/restore, scaling, upgrade, migration, or
   troubleshooting procedures.
+- A standalone production-checklist page. Its former bilingual routes redirect
+  to the deployment overview; each owning topic keeps its own production guidance.
 - Capacity numbers that are not backed by a workload-specific benchmark.
 - Raster deployment diagrams; topology and lifecycle visuals remain
   maintainable text.

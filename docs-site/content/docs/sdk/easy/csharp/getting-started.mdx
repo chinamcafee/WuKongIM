@@ -1,0 +1,166 @@
+---
+title: C# 快速接入
+description: 按准备、安装、连接、收发和清理顺序完成首次接入。
+---
+
+使用 .NET 8+ 和 NuGet **WK_EASYSDK_CSHARP_VERSION**，让两个独立控制台客户端完成在线收发。
+
+## 1. 准备接入
+
+- 准备 .NET 8 或更新版本，以及 Windows、Linux 或 macOS 开发环境。当前目标框架为 `net8.0`，不包含 Unity、.NET Framework 和浏览器 WebAssembly 支持。
+- 启动 `/readyz` 健康的 WuKongIM 单节点集群或多节点集群，确认客户端可以访问 WebSocket Gateway。单节点集群同样遵循集群语义，默认使用 256 Hash Slots。
+- 业务后端为 Alice 和 Bob 分别返回 `uid`、`token` 和 `websocketUrl`。客户端不调用 `/user/token` 或 `/route` 等 WuKongIM HTTP API 管理接口。
+- C# 默认使用 PC/Desktop `2`。后端签发 Token 的 `device_flag` 必须与客户端一致；APP 为 `0`，Web 为 `1`。
+
+先阅读 [身份与 Token](/zh/guide/integration/authentication)。生产环境使用 HTTPS/WSS，不关闭证书验证，不把 Token 放入 URL、日志或源码。
+
+登录业务系统后，通过受保护的业务接口取得：
+
+```json
+{
+  "uid": "alice",
+  "token": "backend-issued-desktop-token",
+  "websocketUrl": "wss://im.example.com/ws"
+}
+```
+
+下面的控制台示例从 `WUKONGIM_WS_URL`、`WUKONGIM_UID`、`WUKONGIM_TOKEN` 环境变量读取这些值；桌面应用可以改为读取登录响应。它们是本示例的变量，不是服务端的 `WK_` 配置项。
+
+服务端、测试账号与地址的公共准备步骤见[运行官方示例](/zh/sdk/easy/examples)。准备完成后，继续下面的安装步骤。
+
+## 2. 安装 SDK
+
+```bash
+dotnet new console -n MyChat --framework net8.0
+dotnet add MyChat/MyChat.csproj package WuKongEasySDK --version WK_EASYSDK_CSHARP_VERSION --source https://api.nuget.org/v3/index.json
+```
+
+## 3. 连接与监听
+
+用下面代码替换 `MyChat/Program.cs`。启动前设置当前账号的三个环境变量，通过命令行参数传入对方 UID。
+
+```csharp
+using WuKongEasySDK;
+
+static string Required(string name) =>
+    Environment.GetEnvironmentVariable(name)
+    ?? throw new InvalidOperationException($"Missing {name}");
+
+if (args.Length != 1)
+    throw new ArgumentException("Pass the peer UID as the first argument.");
+
+await using var im = new WKIM(Required("WUKONGIM_WS_URL"), new AuthOptions
+{
+    Uid = Required("WUKONGIM_UID"),
+    Token = Required("WUKONGIM_TOKEN"),
+    DeviceFlag = DeviceFlag.Desktop
+}, new WKIMOptions
+{
+    ConnectTimeout = TimeSpan.FromSeconds(10),
+    RequestTimeout = TimeSpan.FromSeconds(15)
+});
+
+Action<RecvMessage> onMessage = message =>
+{
+    // 按 MessageId 去重，并把 Payload 交给应用状态。
+    // WinForms/WPF 等 UI 需切回 UI 线程；不要打印完整消息。
+    Console.WriteLine("Message received.");
+};
+im.Message += onMessage;
+im.Connected += _ => Console.WriteLine("Connected.");
+im.Disconnected += _ => Console.WriteLine("Disconnected.");
+im.Error += _ => Console.WriteLine("SDK operation failed.");
+im.CustomEvent += notification =>
+{
+    // 按 notification.Type 分发 notification.Data。
+};
+
+try
+{
+    await im.ConnectAsync();
+    Console.WriteLine("Start the peer, then press Enter to send.");
+    Console.ReadLine();
+    var result = await im.SendAsync(args[0], ChannelType.Person,
+        new { type = 1, content = "Hello from C# 👋" });
+    if (!result.IsSuccess)
+        Console.WriteLine($"SEND rejected: {(int)result.ReasonCode}");
+    else
+        Console.WriteLine("Server accepted SEND.");
+    Console.WriteLine("Press Enter after checking both directions to exit.");
+    Console.ReadLine();
+}
+finally
+{
+    im.Message -= onMessage;
+    await im.DisconnectAsync();
+}
+```
+
+两个终端分别使用 Alice/Bob 的连接材料，运行 `dotnet run --project MyChat -- bob` 和 `dotnet run --project MyChat -- alice`。异常会通过异步方法返回给调用者，后台错误也会触发 `Error`；应用应为认证失败、超时和业务拒绝分别提供处理界面。
+
+库默认没有日志。只有显式设置 `WKIMOptions.DebugLogger` 才输出固定运行状态文本，不包含 Token、Payload、原始帧或服务端错误正文。
+
+## 4. 收发第一条消息
+
+两端都连接成功后，Alice 向 `bob` 发送，Bob 在消息回调中核对发送者和正文；再由 Bob 向 `alice` 回发。发送结果表示服务端接受请求，不能代替对端接收或已读。
+
+群聊使用 `ChannelType.Group` 和业务后端管理的群 ID；成员关系和权限仍由服务端判定。可传入 `SendOptions` 设置 `ClientMsgNo`、`Header`、`Setting` 和 `Topic`。默认 Header 为 `RedDot = true`，显式传入的 Header 不会被 SDK 覆盖。
+
+`ReasonCode.Success` 为 **1**。`SendResult.IsSuccess` 表示服务端接受了发送，不代表 Bob 已收到、已展示或已读。`128–255` 等业务拒绝码保留在结果中；JSON-RPC 错误抛出 `WKIMRpcException`，通过数字 `Code` 判定。
+
+消息 ID 使用 `string`，数字形式的 ID 不经过浮点转换。`MessageSeq` 与 `NodeId` 为 `ulong`。消息 `Timestamp` 单位为 Unix **秒**，自定义事件 `Timestamp` 为 Unix **毫秒**。
+
+`RecvMessage.Payload` 和 `EventNotification.Data` 为拥有独立生命周期的 `JsonElement`。接收 Payload 支持 JSON 对象和 Base64 JSON；无法解码的字符串保留原值。自定义事件的 JSON 字符串会解析为 JSON 值，普通字符串保持不变。
+
+## 5. 清理连接
+
+| 行为 | C# SDK 约定 |
+| --- | --- |
+| 实例所有权 | `new WKIM` / `WKIM.Init` 创建独立实例，无隐式全局单例 |
+| 并发连接 | 多个 `ConnectAsync` 共享尝试；取消某个调用只停止其等待 |
+| 停止共享连接 | 等待 `DisconnectAsync` 后才再次连接 |
+| 初次失败 | 建连与认证共用 10 秒预算，失败直接返回 |
+| 已连接后断线 | 默认最多重试 5 次，间隔 1、2、4、8、16 秒；成功后重置 |
+| 停止自动重连 | 认证拒绝、服务端断开/踢下线、主动断开或释放 |
+| 最终清理 | 在应用生命周期代码中等待 `DisposeAsync`，或使用 `await using` |
+
+Token 更新或账号切换时，释放旧实例，再使用新的业务凭据创建客户端。需要跨进程保留设备 ID 时显式设置 `AuthOptions.DeviceId`。
+
+事件在后台按顺序派发，回调必须尽快返回，不应阻塞等待 SDK 的异步操作或在回调内等待释放。单个监听器抛异常不会中断其他监听器和自动 ACK。已经入队的回调可能在移除监听或断开后继续执行；`DisposeAsync` 会等待它们结束。
+
+RECVACK 表示消息进入 SDK 接收队列，不是业务处理确认。默认最多保留 256 个待完成请求、128 个待派发事件，单个完整 JSON-RPC 帧上限为 1 MiB。请求超限抛出 `WKIMBackpressureException`；事件队列满会关闭连接，不确认无法入队的消息。应用可以通过 `WKIMOptions` 调整这些边界。
+
+SDK 不缓存离线消息，也不自动重发 SEND。请求超时、取消或断线时，发送可能已经成功。应用应先核对业务状态，需要重试同一条逻辑消息时复用 `SendOptions.ClientMsgNo`。离线恢复、会话、未读数、推送与业务回执由应用自行维护。
+
+## 6. 常见问题
+
+**断线后是否自动切换地址？** 每个实例重连到固定地址。由业务后端选择新的可用入口，等待旧实例 `DisposeAsync`，再用新地址创建实例。完整三节点故障恢复仍存在[已知服务端问题](https://github.com/WuKongIM/WuKongIM/issues/927)，不要据单节点收发推断集群故障期间连续可用。
+
+**发送超时能否重试？** 结果可能未知；先对账，再按 `ClientMsgNo` 幂等约定处理。
+
+**UI 更新报线程错误？** 事件从后台派发，WinForms/WPF 必须切回 UI 线程。
+
+## 其他安装方式：源码与本地包
+
+```bash
+git clone https://github.com/WuKongIM/WuKongEasySDK-CSharp.git
+git -C WuKongEasySDK-CSharp checkout WK_EASYSDK_CSHARP_SOURCE_REF
+dotnet new console -n MyChat --framework net8.0
+dotnet add MyChat/MyChat.csproj reference WuKongEasySDK-CSharp/src/WuKongEasySDK/WuKongEasySDK.csproj
+```
+
+两个目录处于同一级。将确切源码 revision 记录到构建配置，或通过固定 commit 的子模块维护引用。
+
+如需本地 NuGet 安装，先在这个固定 checkout 中生成包：
+
+```bash
+cd WuKongEasySDK-CSharp
+dotnet pack src/WuKongEasySDK -c Release -o artifacts
+dotnet add ../MyChat/MyChat.csproj package WuKongEasySDK --version WK_EASYSDK_CSHARP_VERSION --source ./artifacts
+```
+
+公共包、项目引用和本地包三选一，不要同时引用。此处的 `--source ./artifacts` 指向你刚生成的本地源。
+
+## 下一步
+
+继续阅读[消息收发](/zh/guide/integration/messaging)与[上线检查](/zh/guide/integration/acceptance)。需要离线恢复、会话、未读或推送时，先查看 [SDK 选择](/zh/sdk)。[版本与验证记录](https://github.com/WuKongIM/WuKongIM/blob/main/docs/superpowers/reports/2026-09-08-easysdk-validation-history.md#csharp)保留各次验证的完整环境和范围。

@@ -1,6 +1,7 @@
 package message
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -103,7 +104,8 @@ func inspectChannelCatalogPage(ctx context.Context, db *MessageDB, req InspectMe
 		if err != nil {
 			return nil, 0, false, err
 		}
-		if req.AfterChannelKey != "" && string(key) <= req.AfterChannelKey {
+		// Encoded catalog order is length-prefixed, not raw string order.
+		if req.AfterChannelKey != "" && string(key) == req.AfterChannelKey {
 			continue
 		}
 		scannedRows++
@@ -123,7 +125,7 @@ func inspectChannelCatalogPoint(ctx context.Context, db *MessageDB, channelKey s
 	if err := ctx.Err(); err != nil {
 		return nil, 0, false, err
 	}
-	if afterChannelKey != "" && channelKey <= afterChannelKey {
+	if afterChannelKey != "" && bytes.Compare(encodeCatalogKey(ChannelKey(channelKey)), encodeCatalogKey(ChannelKey(afterChannelKey))) <= 0 {
 		return nil, 0, true, nil
 	}
 	value, ok, err := db.engine.Get(encodeCatalogKey(ChannelKey(channelKey)))
@@ -207,7 +209,7 @@ func inspectChannelRow(entry ChannelCatalogEntry) InspectMessageRow {
 
 func inspectMessageRow(msg Message) InspectMessageRow {
 	payload := append([]byte(nil), msg.Payload...)
-	return InspectMessageRow{
+	row := InspectMessageRow{
 		"message_seq":         msg.MessageSeq,
 		"message_id":          msg.MessageID,
 		"client_msg_no":       msg.ClientMsgNo,
@@ -217,4 +219,8 @@ func inspectMessageRow(msg Message) InspectMessageRow {
 		"payload_size":        uint64(len(payload)),
 		"payload":             payload,
 	}
+	if len(msg.PublicationMetadata) != 0 {
+		row["publication_metadata"] = append([]byte(nil), msg.PublicationMetadata...)
+	}
+	return row
 }

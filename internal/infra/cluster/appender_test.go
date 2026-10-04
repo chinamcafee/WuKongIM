@@ -11,6 +11,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/cluster"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/propose"
 	"github.com/WuKongIM/WuKongIM/pkg/observability/sendtrace"
+	"github.com/WuKongIM/WuKongIM/pkg/transport"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 )
 
@@ -56,14 +57,16 @@ func TestChannelAppenderMapsAppendBatchRequestAndResult(t *testing.T) {
 	appender := NewChannelAppender(node)
 
 	res, err := appender.AppendBatch(context.Background(), channelappend.AppendBatchRequest{
-		ChannelID:           channelappend.ChannelID{ID: "room", Type: 1},
-		ExpectedEpoch:       12,
-		ExpectedLeaderEpoch: 34,
-		TraceID:             "trace-request",
-		ChannelKey:          "channel/key-request",
-		Attempt:             4,
-		CommitMode:          channelappend.CommitModeQuorum,
-		OmitResultPayload:   true,
+		ChannelID:                 channelappend.ChannelID{ID: "room", Type: 1},
+		ExpectedEpoch:             12,
+		ExpectedLeaderEpoch:       34,
+		ExpectedRouteGeneration:   56,
+		TraceID:                   "trace-request",
+		ChannelKey:                "channel/key-request",
+		Attempt:                   4,
+		CommitMode:                channelappend.CommitModeQuorum,
+		OmitResultPayload:         true,
+		ServerAllocatedMessageIDs: true,
 		Messages: []channelappend.Message{
 			{
 				MessageID:         10,
@@ -112,6 +115,9 @@ func TestChannelAppenderMapsAppendBatchRequestAndResult(t *testing.T) {
 	if req.ExpectedLeaderEpoch != 34 {
 		t.Fatalf("ExpectedLeaderEpoch = %d, want 34", req.ExpectedLeaderEpoch)
 	}
+	if req.ExpectedRouteGeneration != 56 {
+		t.Fatalf("ExpectedRouteGeneration = %d, want 56", req.ExpectedRouteGeneration)
+	}
 	if req.CommitMode != channelruntime.CommitModeQuorum {
 		t.Fatalf("CommitMode = %v, want %v", req.CommitMode, channelruntime.CommitModeQuorum)
 	}
@@ -120,6 +126,9 @@ func TestChannelAppenderMapsAppendBatchRequestAndResult(t *testing.T) {
 	}
 	if !req.OmitResultPayload {
 		t.Fatalf("OmitResultPayload = false, want true")
+	}
+	if !req.ServerAllocatedMessageIDs {
+		t.Fatal("ServerAllocatedMessageIDs = false, want true")
 	}
 	if len(req.Messages) != 2 {
 		t.Fatalf("len(Messages) = %d, want 2", len(req.Messages))
@@ -294,6 +303,28 @@ func TestChannelAppenderLogsAppendChannelBatchError(t *testing.T) {
 	requireLogField(t, entry.fields, "error", channelruntime.ErrNotReady)
 }
 
+func TestChannelAppenderDefersGenericAppendFailureLoggingUntilRecoveryOutcome(t *testing.T) {
+	logger := &recordingClusterLogger{}
+	appender := NewChannelAppender(&recordingNode{
+		err: errors.New("db: conflict: idempotency key already stored at seq 7"),
+	}, logger)
+
+	_, err := appender.AppendBatch(context.Background(), channelappend.AppendBatchRequest{
+		ChannelID: channelappend.ChannelID{ID: "room", Type: 2},
+		Messages: []channelappend.Message{{
+			MessageID:   10,
+			FromUID:     "u1",
+			ClientMsgNo: "client-retry",
+		}},
+	})
+	if !errors.Is(err, channelappend.ErrAppendFailed) {
+		t.Fatalf("AppendBatch() error = %v, want append failed", err)
+	}
+	if entry, ok := logger.find("ERROR", "internal.infra.cluster.channel_append_batch_failed"); ok {
+		t.Fatalf("generic append failure logged before idempotency recovery outcome: %#v", entry)
+	}
+}
+
 func TestChannelAppenderDoesNotRecordChannelAppendTraceWithoutTraceIDOrSink(t *testing.T) {
 	sink := &recordingSendtraceSink{}
 	restore := sendtrace.SetSink(sink)
@@ -359,6 +390,9 @@ func TestChannelAppenderClonesPayloadsBothDirections(t *testing.T) {
 	if got := string(node.last.Messages[0].Payload); got != "source" {
 		t.Fatalf("sent payload = %q, want cloned source", got)
 	}
+	if !node.last.PayloadsImmutable {
+		t.Fatal("sent payload ownership = borrowed, want adapter-owned immutable payloads")
+	}
 	if got := string(res.Items[0].Message.Payload); got != "accepted" {
 		t.Fatalf("result payload = %q, want cloned accepted", got)
 	}
@@ -422,6 +456,9 @@ func TestChannelAppenderMapsTypedErrors(t *testing.T) {
 		{name: "backpressured", err: channelruntime.ErrBackpressured, want: channelappend.ErrBackpressured},
 		{name: "cluster route not ready", err: cluster.ErrRouteNotReady, want: channelappend.ErrRouteNotReady},
 		{name: "cluster no slot leader", err: cluster.ErrNoSlotLeader, want: channelappend.ErrRouteNotReady},
+		{name: "forwarded authority unavailable", err: fmt.Errorf("%w: connection refused", transport.ErrDialFailed), want: channelappend.ErrRouteNotReady},
+		{name: "authority transport stopped", err: transport.ErrStopped, want: channelappend.ErrRouteNotReady},
+		{name: "authority node absent", err: transport.ErrNodeNotFound, want: channelappend.ErrRouteNotReady},
 		{name: "channelruntime not ready", err: channelruntime.ErrNotReady, want: channelappend.ErrRouteNotReady},
 		{name: "channelruntime write fenced", err: channelruntime.ErrWriteFenced, want: channelappend.ErrRouteNotReady},
 		{name: "channelruntime placement candidates unavailable", err: fmt.Errorf("%w: channel replica candidates 2 below replica count 3", channelruntime.ErrInvalidConfig), want: channelappend.ErrRouteNotReady},

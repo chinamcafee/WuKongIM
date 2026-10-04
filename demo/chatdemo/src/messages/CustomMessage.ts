@@ -1,3 +1,4 @@
+import { t } from '../i18n'
 import { MessageContent } from "wukongimjssdk";
 
 export const orderMessage = 56; // 自定义消息类型，这里随便定义一个数字，不要和已有的消息类型冲突，1000-2000 之间是预设的系统消息类型，不要使用这个范围内的数字
@@ -43,7 +44,7 @@ export class CustomMessage extends MessageContent {
     // 重写 conversationDigest，这个是现实在最近会话列表的消息摘要
     get conversationDigest() {
 
-        return "[订单消息]"
+        return t('orderDigest')
     }
   
 }

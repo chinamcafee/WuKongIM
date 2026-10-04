@@ -6,11 +6,12 @@ import (
 	"errors"
 	"fmt"
 
+	clusternet "github.com/WuKongIM/WuKongIM/pkg/cluster/net"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 	"github.com/WuKongIM/WuKongIM/pkg/slot/multiraft"
 )
 
-const identityRPCServiceID uint8 = 4
+const identityRPCServiceID uint8 = clusternet.RPCSlotIdentityMetadata
 
 const (
 	identityRPCGetUser       = "get_user"
@@ -116,6 +117,23 @@ func (s *Store) handleIdentityRPC(ctx context.Context, body []byte) ([]byte, err
 		return nil, err
 	}
 
+	return s.handleIdentityRequest(ctx, req)
+}
+
+// handleDeviceIdentityRPC exposes only the credential lookup needed by the default runtime.
+// Reject other identity operations before routing or accessing metadata.
+func (s *Store) handleDeviceIdentityRPC(ctx context.Context, body []byte) ([]byte, error) {
+	req, err := decodeIdentityRPCRequest(body)
+	if err != nil {
+		return nil, err
+	}
+	if req.Op != identityRPCGetDevice {
+		return nil, metadb.ErrInvalidArgument
+	}
+	return s.handleIdentityRequest(ctx, req)
+}
+
+func (s *Store) handleIdentityRequest(ctx context.Context, req identityRPCRequest) ([]byte, error) {
 	slotID := multiraft.SlotID(req.SlotID)
 	if statusBody, handled, err := s.handleAuthoritativeRPC(slotID, func(status string, leaderID uint64) ([]byte, error) {
 		return encodeIdentityRPCResponse(identityRPCResponse{

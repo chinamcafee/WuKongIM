@@ -1,17 +1,22 @@
 ---
-title: SDK
-description: 在不同客户端平台接入 WuKongIM。
+title: 选择 SDK
+description: 在完整版 WuKongIMSDK 与轻量 WuKongEasySDK 之间快速做出选择。
 ---
 
-SDK 文档集中维护跨平台公共流程以及各客户端平台的专属接入说明。
-
-## 从这里开始
+WuKongIM 提供两套客户端 SDK。先看你的应用需要由 SDK 管理多少客户端状态，再进入对应文档。
 
 <Cards>
-  <Card title="选择 SDK" description="根据平台、框架和运行环境选择客户端。" href="/zh/sdk/choose-sdk" />
-  <Card title="版本与兼容性" description="核对 SDK、系统和服务端版本。" href="/zh/sdk/compatibility" />
-  <Card title="公共指南" description="了解身份、连接、消息、会话和异常处理。" href="/zh/sdk/common-guides" />
-  <Card title="Android" description="查看 Android SDK 的规划结构。" href="/zh/sdk/android" />
-  <Card title="iOS" description="查看 iOS SDK 的规划结构。" href="/zh/sdk/ios" />
-  <Card title="JavaScript / Web" description="查看浏览器 SDK 的规划结构。" href="/zh/sdk/javascript" />
+  <Card title="WuKongIMSDK" description="完整 SDK：管理连接、消息、本地会话、未读数和离线数据。" href="/zh/sdk/wukongim" />
+  <Card title="WuKongEasySDK" description="轻量 SDK：更少的接口，适合只需要在线连接和消息收发的应用。" href="/zh/sdk/easy" />
 </Cards>
+
+## 怎么选
+
+| 你的需求 | 推荐 |
+| --- | --- |
+| SDK 需要维护本地消息与聊天列表 | WuKongIMSDK |
+| 需要未读数、历史消息和离线恢复 | WuKongIMSDK |
+| 只需要在线连接、发送和接收 | WuKongEasySDK |
+| 希望用尽量少的 API 完成集成 | WuKongEasySDK |
+
+如果你正在开发完整聊天产品，从 [WuKongIMSDK](/zh/sdk/wukongim) 开始。如果只是给现有产品增加轻量实时通信，从 [WuKongEasySDK](/zh/sdk/easy) 开始。

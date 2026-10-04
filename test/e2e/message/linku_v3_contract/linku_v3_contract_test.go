@@ -3,14 +3,20 @@
 package linku_v3_contract
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -173,16 +179,17 @@ func TestThreeNodeLinkUV3ReadinessTokenAuthAndOutboxGate(t *testing.T) {
 
 func contractNodeOverrides(webhookURL string) map[string]string {
 	return map[string]string{
-		tokenAuthConfigKey:                      "true",
-		"WK_WEBHOOK_HTTP_ADDR":                  webhookURL,
-		"WK_WEBHOOK_FOCUS_EVENTS":               `["msg.notify","msg.offline"]`,
-		"WK_WEBHOOK_QUEUE_SIZE":                 "64",
-		"WK_WEBHOOK_WORKERS":                    "1",
-		"WK_WEBHOOK_REQUEST_TIMEOUT":            "2s",
-		"WK_WEBHOOK_RETRY_MAX_ATTEMPTS":         "2",
-		"WK_WEBHOOK_OUTBOX_MAX_ENTRIES":         "1000",
-		"WK_WEBHOOK_OUTBOX_MAX_BYTES":           "10485760",
-		"WK_WEBHOOK_OUTBOX_DISPATCH_BATCH_SIZE": "32",
+		tokenAuthConfigKey:                       "true",
+		"WK_API_INTERNAL_CREDENTIAL_HMAC_SECRET": "linku-merge-e2e-secret-32-byte-key-for-local-tests",
+		"WK_WEBHOOK_HTTP_ADDR":                   webhookURL,
+		"WK_WEBHOOK_FOCUS_EVENTS":                `["msg.notify","msg.offline"]`,
+		"WK_WEBHOOK_QUEUE_SIZE":                  "64",
+		"WK_WEBHOOK_WORKERS":                     "1",
+		"WK_WEBHOOK_REQUEST_TIMEOUT":             "2s",
+		"WK_WEBHOOK_RETRY_MAX_ATTEMPTS":          "2",
+		"WK_WEBHOOK_OUTBOX_MAX_ENTRIES":          "1000",
+		"WK_WEBHOOK_OUTBOX_MAX_BYTES":            "10485760",
+		"WK_WEBHOOK_OUTBOX_DISPATCH_BATCH_SIZE":  "32",
 	}
 }
 
@@ -204,16 +211,35 @@ func requireHealthAndReadiness(t *testing.T, ctx context.Context, node suite.Sta
 
 func registerToken(t *testing.T, ctx context.Context, node suite.StartedNode, uid, token string) {
 	t.Helper()
-	requireManagementStatus(t, ctx, node, "/user/token", map[string]any{
-		"uid": uid, "token": token, "device_flag": frame.APP, "device_level": frame.DeviceLevelMaster,
-	})
+	const path = "/internal/v3/device-credentials:apply-batch"
+	body, err := json.Marshal(map[string]any{"items": []map[string]any{{"uid": uid, "token": token, "deviceFlag": frame.APP, "credentialStatus": "ACTIVE", "credentialVersion": 1, "loginSessionId": uid + "-session", "expiresAt": time.Now().Add(time.Hour).UnixMilli(), "operationId": uuid.NewString(), "operationKind": "LOGIN_TAKEOVER", "replacementCause": "SAME_DEVICE_FAMILY_LOGIN"}}})
+	require.NoError(t, err)
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	nonce := uuid.NewString()
+	digest := sha256.Sum256(body)
+	mac := hmac.New(sha256.New, []byte("linku-merge-e2e-secret-32-byte-key-for-local-tests"))
+	fmt.Fprintf(mac, "PUT\n%s\n%s\n%s\n%s", path, timestamp, nonce, hex.EncodeToString(digest[:]))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://"+node.APIAddr()+path, bytes.NewReader(body))
+	require.NoError(t, err)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-LinkU-Timestamp", timestamp)
+	request.Header.Set("X-LinkU-Nonce", nonce)
+	request.Header.Set("X-LinkU-Signature", hex.EncodeToString(mac.Sum(nil)))
+	response, err := http.DefaultClient.Do(request)
+	require.NoError(t, err, node.DumpDiagnostics())
+	defer response.Body.Close()
+	raw, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	require.Equal(t, 200, response.StatusCode, string(raw))
+	require.Contains(t, string(raw), `"credentialOutcome":"APPLIED"`)
+
 }
 
 func mustConnect(t *testing.T, node suite.StartedNode, uid, token string) *suite.WKProtoClient {
 	t.Helper()
 	client, err := suite.NewWKProtoClient()
 	require.NoError(t, err)
-	connack, err := client.ConnectWithTokenContext(context.Background(), node.GatewayAddr(), uid, uid+"-device", token, frame.APP)
+	connack, err := client.ConnectWithTokenContext(context.Background(), node.GatewayAddr(), uid, uid+"-device", token)
 	require.NoError(t, err, node.DumpDiagnostics())
 	require.Equal(t, uint8(frame.LatestVersion), connack.ServerVersion)
 	require.Equal(t, frame.ReasonSuccess, connack.ReasonCode)
@@ -234,7 +260,7 @@ func postOrdinaryMessageContract(t *testing.T, ctx context.Context, node suite.S
 	var response map[string]json.RawMessage
 	_, err := suite.PostJSON(ctx, "http://"+node.APIAddr()+"/message/send", request, &response)
 	require.NoError(t, err, node.DumpDiagnostics())
-	require.Equal(t, []string{"message_id", "message_seq", "reason"}, sortedKeys(response))
+	require.Equal(t, []string{"client_msg_no", "message_id", "message_seq", "reason"}, sortedKeys(response))
 	var reason uint8
 	require.NoError(t, json.Unmarshal(response["reason"], &reason))
 	require.Equal(t, uint8(frame.ReasonSuccess), reason)

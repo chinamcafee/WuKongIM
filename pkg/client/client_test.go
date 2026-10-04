@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -79,6 +80,52 @@ func TestClientConnectSendsConnectPacketAndStartsLoops(t *testing.T) {
 	}
 }
 
+func TestClientInboundQueueSnapshotReportsCurrentBoundedState(t *testing.T) {
+	c, _ := newConnectedPipeClientOrFatal(t, Config{InboundFrameBufferSize: 1})
+	c.enqueueRecv(&frame.RecvPacket{MessageID: 1}, nil)
+
+	snapshot := c.InboundQueueSnapshot()
+
+	if snapshot.Depth != 1 || snapshot.Capacity != 1 {
+		t.Fatalf("inbound queue = %d/%d, want saturated 1/1", snapshot.Depth, snapshot.Capacity)
+	}
+	typ := reflect.TypeOf(snapshot)
+	for i := 0; i < typ.NumField(); i++ {
+		switch typ.Field(i).Type.Kind() {
+		case reflect.Chan, reflect.Map, reflect.Pointer, reflect.Slice:
+			t.Fatalf("InboundQueueSnapshot field %s exposes mutable state through %s", typ.Field(i).Name, typ.Field(i).Type)
+		}
+	}
+}
+
+func TestClientReadFrameLeaseKeepsDequeuedReceiveOwnedUntilRelease(t *testing.T) {
+	c, err := New(Config{Addr: "127.0.0.1:5100", InboundFrameBufferSize: 1})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	c.mu.Lock()
+	c.conn = left
+	c.recvNotify = make(chan struct{})
+	c.mu.Unlock()
+	c.enqueueRecv(&frame.RecvPacket{MessageID: 7}, left)
+
+	got, lease, err := c.ReadFrameWithLease(context.Background())
+	if err != nil || got.(*frame.RecvPacket).MessageID != 7 || lease == nil {
+		t.Fatalf("ReadFrameWithLease() = %#v, %v, %v", got, lease, err)
+	}
+	if snapshot := c.InboundQueueSnapshot(); snapshot.Depth != 0 || snapshot.Handoffs != 1 {
+		t.Fatalf("dequeued snapshot = %+v, want depth=0 handoffs=1", snapshot)
+	}
+	lease.Release()
+	lease.Release()
+	if snapshot := c.InboundQueueSnapshot(); snapshot.Handoffs != 0 {
+		t.Fatalf("released snapshot = %+v, want no handoff", snapshot)
+	}
+}
+
 func TestClientConnectAcceptsUnencryptedSuccessConnack(t *testing.T) {
 	c, serverConn := newPipeClientServerOrFatal(t, Config{Token: "cfg-token"})
 
@@ -107,6 +154,586 @@ func TestClientConnectAcceptsUnencryptedSuccessConnack(t *testing.T) {
 	}
 	if ack.NodeId != 202 {
 		t.Fatalf("Connect() ack node id = %d, want 202", ack.NodeId)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestClientSealIngressRequiresExactRemoteEventAckAndQuiescesWrites(t *testing.T) {
+	c, serverConn := newConnectedPipeClientOrFatal(t, Config{})
+	grant := frame.TerminalFenceGrant{Epoch: 44, Capability: "test-capability"}
+	requestRead := make(chan frame.TerminalFenceRequest, 1)
+	recvackRead := make(chan struct{})
+	serverErr := runTestServer(func() error {
+		f, err := readTestFrame(serverConn)
+		if err != nil {
+			return err
+		}
+		event, ok := f.(*frame.EventPacket)
+		if !ok {
+			return fmt.Errorf("server read %T, want terminal EVENT", f)
+		}
+		cut, err := frame.ParseTerminalFenceRequest(event)
+		if err != nil {
+			return err
+		}
+		if !cut.AuthorizedBy(grant) {
+			return errors.New("terminal request was not authorized by the exact grant")
+		}
+		requestRead <- cut
+		ack, err := cut.AckEvent()
+		if err != nil {
+			return err
+		}
+		if err := writeTestFrame(serverConn, ack); err != nil {
+			return err
+		}
+		f, err = readTestFrame(serverConn)
+		if err != nil {
+			return err
+		}
+		if _, ok := f.(*frame.RecvackPacket); !ok {
+			return fmt.Errorf("server read %T after fence, want RECVACK", f)
+		}
+		close(recvackRead)
+		return nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := c.SealIngressWithFence(ctx, grant); err != nil {
+		t.Fatalf("SealIngressWithFence() error = %v", err)
+	}
+	cut := <-requestRead
+	if cut.Epoch != grant.Epoch {
+		t.Fatalf("terminal request epoch = %d, want %d", cut.Epoch, grant.Epoch)
+	}
+	if err := c.Ping(ctx); !errors.Is(err, ErrTerminalFenceActive) {
+		t.Fatalf("Ping() after terminal ACK = %v, want %v", err, ErrTerminalFenceActive)
+	}
+	if _, err := c.SendAsync(ctx, Message{ChannelID: "ch", ChannelType: frame.ChannelTypeGroup, Payload: []byte("late")}); !errors.Is(err, ErrTerminalFenceActive) {
+		t.Fatalf("SendAsync() after terminal ACK = %v, want %v", err, ErrTerminalFenceActive)
+	}
+	if err := c.RecvAck(ctx, 10, 11); err != nil {
+		t.Fatalf("RecvAck() after terminal ACK error = %v", err)
+	}
+	select {
+	case <-recvackRead:
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive allowed post-fence RECVACK")
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestClientSealIngressRejectsMismatchedAckNonce(t *testing.T) {
+	c, serverConn := newConnectedPipeClientOrFatal(t, Config{})
+	grant := frame.TerminalFenceGrant{Epoch: 45, Capability: "test-capability"}
+	serverErr := runTestServer(func() error {
+		f, err := readTestFrame(serverConn)
+		if err != nil {
+			return err
+		}
+		request, err := frame.ParseTerminalFenceRequest(f.(*frame.EventPacket))
+		if err != nil {
+			return err
+		}
+		if !request.AuthorizedBy(grant) {
+			return errors.New("request grant mismatch")
+		}
+		wrongEvent, err := frame.NewTerminalFenceRequest(
+			frame.TerminalFenceGrant{Epoch: request.Epoch, Capability: "other-capability"},
+			frame.TerminalFenceNonce{99},
+		)
+		if err != nil {
+			return err
+		}
+		wrongRequest, err := frame.ParseTerminalFenceRequest(wrongEvent)
+		if err != nil {
+			return err
+		}
+		ack, err := wrongRequest.AckEvent()
+		if err != nil {
+			return err
+		}
+		return writeTestFrame(serverConn, ack)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := c.SealIngressWithFence(ctx, grant); !errors.Is(err, ErrTerminalFenceProtocol) {
+		t.Fatalf("SealIngressWithFence() error = %v, want %v", err, ErrTerminalFenceProtocol)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestClientTerminalFenceRejectsPingDuringAckWaitButAllowsRecvack(t *testing.T) {
+	c, serverConn := newConnectedPipeClientOrFatal(t, Config{})
+	grant := frame.TerminalFenceGrant{Epoch: 46, Capability: "test-capability"}
+	requestRead := make(chan struct{})
+	recvackRead := make(chan struct{})
+	releaseAck := make(chan struct{})
+	serverErr := runTestServer(func() error {
+		f, err := readTestFrame(serverConn)
+		if err != nil {
+			return err
+		}
+		request, err := frame.ParseTerminalFenceRequest(f.(*frame.EventPacket))
+		if err != nil || !request.AuthorizedBy(grant) {
+			return errors.New("invalid terminal request")
+		}
+		close(requestRead)
+		f, err = readTestFrame(serverConn)
+		if err != nil {
+			return err
+		}
+		if _, ok := f.(*frame.RecvackPacket); !ok {
+			return fmt.Errorf("server read %T, want allowed RECVACK", f)
+		}
+		close(recvackRead)
+		<-releaseAck
+		ack, err := request.AckEvent()
+		if err != nil {
+			return err
+		}
+		return writeTestFrame(serverConn, ack)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	sealDone := make(chan error, 1)
+	go func() { sealDone <- c.SealIngressWithFence(ctx, grant) }()
+	select {
+	case <-requestRead:
+	case <-time.After(time.Second):
+		t.Fatal("server did not read terminal request")
+	}
+	pingDone := make(chan error, 1)
+	go func() { pingDone <- c.Ping(ctx) }()
+	if err := c.RecvAck(ctx, 20, 21); err != nil {
+		t.Fatalf("RecvAck() during terminal wait error = %v", err)
+	}
+	select {
+	case <-recvackRead:
+	case <-time.After(time.Second):
+		t.Fatal("server did not read RECVACK during terminal wait")
+	}
+
+	var pingErr error
+	pingPrompt := true
+	select {
+	case pingErr = <-pingDone:
+	case <-time.After(50 * time.Millisecond):
+		pingPrompt = false
+	}
+	close(releaseAck)
+	if !pingPrompt {
+		pingErr = <-pingDone
+	}
+	if err := <-sealDone; err != nil {
+		t.Fatalf("SealIngressWithFence() error = %v", err)
+	}
+	if !pingPrompt || !errors.Is(pingErr, ErrTerminalFenceActive) {
+		t.Fatalf("Ping() during terminal wait = %v (prompt=%t), want prompt %v", pingErr, pingPrompt, ErrTerminalFenceActive)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestClientTerminalFenceRejectsEOFBeforeAck(t *testing.T) {
+	c, serverConn := newConnectedPipeClientOrFatal(t, Config{})
+	grant := frame.TerminalFenceGrant{Epoch: 47, Capability: "test-capability"}
+	serverErr := runTestServer(func() error {
+		f, err := readTestFrame(serverConn)
+		if err != nil {
+			return err
+		}
+		request, err := frame.ParseTerminalFenceRequest(f.(*frame.EventPacket))
+		if err != nil || !request.AuthorizedBy(grant) {
+			return errors.New("invalid terminal request")
+		}
+		return serverConn.Close()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := c.SealIngressWithFence(ctx, grant); !errors.Is(err, ErrTerminalFenceProtocol) {
+		t.Fatalf("SealIngressWithFence() error = %v, want %v", err, ErrTerminalFenceProtocol)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestClientTerminalFenceRejectsBusinessFrameAfterAck(t *testing.T) {
+	c, serverConn := newConnectedPipeClientOrFatal(t, Config{})
+	grant := frame.TerminalFenceGrant{Epoch: 48, Capability: "test-capability"}
+	releaseBusinessFrame := make(chan struct{})
+	serverErr := runTestServer(func() error {
+		f, err := readTestFrame(serverConn)
+		if err != nil {
+			return err
+		}
+		request, err := frame.ParseTerminalFenceRequest(f.(*frame.EventPacket))
+		if err != nil || !request.AuthorizedBy(grant) {
+			return errors.New("invalid terminal request")
+		}
+		ack, err := request.AckEvent()
+		if err != nil {
+			return err
+		}
+		if err := writeTestFrame(serverConn, ack); err != nil {
+			return err
+		}
+		<-releaseBusinessFrame
+		return writeTestFrame(serverConn, &frame.RecvPacket{
+			Setting:   frame.SettingNoEncrypt,
+			MessageID: 9001,
+			Payload:   []byte("late"),
+		})
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := c.SealIngressWithFence(ctx, grant); err != nil {
+		t.Fatalf("SealIngressWithFence() error = %v", err)
+	}
+	close(releaseBusinessFrame)
+	if _, err := c.ReadFrame(ctx); !errors.Is(err, ErrTerminalFenceProtocol) {
+		t.Fatalf("ReadFrame() after terminal ACK error = %v, want %v", err, ErrTerminalFenceProtocol)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestClientTerminalFenceRejectsFrameCoalescedAfterAckBeforeReportingSuccess(t *testing.T) {
+	c, serverConn := newConnectedPipeClientOrFatal(t, Config{})
+	grant := frame.TerminalFenceGrant{Epoch: 4801, Capability: "test-capability"}
+	serverErr := runTestServer(func() error {
+		f, err := readTestFrame(serverConn)
+		if err != nil {
+			return err
+		}
+		request, err := frame.ParseTerminalFenceRequest(f.(*frame.EventPacket))
+		if err != nil || !request.AuthorizedBy(grant) {
+			return errors.New("invalid terminal request")
+		}
+		ack, err := request.AckEvent()
+		if err != nil {
+			return err
+		}
+		ackBytes := encodeClientTestFrameOrFatal(t, ack)
+		lateBytes := encodeClientTestFrameOrFatal(t, &frame.RecvPacket{
+			Setting:   frame.SettingNoEncrypt,
+			MessageID: 9002,
+			Payload:   []byte("coalesced-late"),
+		})
+		joined := append(ackBytes, lateBytes...)
+		n, err := serverConn.Write(joined)
+		if err != nil {
+			return err
+		}
+		if n != len(joined) {
+			return io.ErrShortWrite
+		}
+		return nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := c.SealIngressWithFence(ctx, grant); !errors.Is(err, ErrTerminalFenceProtocol) {
+		t.Fatalf("SealIngressWithFence() coalesced post-ACK error = %v, want %v", err, ErrTerminalFenceProtocol)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestClientTerminalFencePublishesAckOnlyAfterCurrentReadBatchBoundary(t *testing.T) {
+	grant := frame.TerminalFenceGrant{Epoch: 4802, Capability: "test-capability"}
+	nonce := frame.TerminalFenceNonce{1}
+	requestEvent, err := frame.NewTerminalFenceRequest(grant, nonce)
+	if err != nil {
+		t.Fatalf("NewTerminalFenceRequest() error = %v", err)
+	}
+	request, err := frame.ParseTerminalFenceRequest(requestEvent)
+	if err != nil {
+		t.Fatalf("ParseTerminalFenceRequest() error = %v", err)
+	}
+	ack, err := request.AckEvent()
+	if err != nil {
+		t.Fatalf("AckEvent() error = %v", err)
+	}
+	done := make(chan struct{})
+	c := &Client{
+		terminalFence:      terminalFenceAwaitingAck,
+		terminalFenceEpoch: grant.Epoch,
+		terminalFenceNonce: nonce,
+		terminalFenceDone:  done,
+	}
+
+	if err := c.acceptTerminalFenceAck(ack, nil); err != nil {
+		t.Fatalf("acceptTerminalFenceAck() error = %v", err)
+	}
+	select {
+	case <-done:
+		t.Fatal("terminal ACK was published before its current read batch completed")
+	default:
+	}
+	if err := c.completeTerminalFenceReadBatch(nil, 0); err != nil {
+		t.Fatalf("completeTerminalFenceReadBatch() error = %v", err)
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("terminal ACK was not published at an empty read-batch boundary")
+	}
+	if err := c.currentTerminalFenceError(grant.Epoch, nonce); err != nil {
+		t.Fatalf("currentTerminalFenceError() = %v, want success", err)
+	}
+}
+
+func TestClientTerminalFenceRejectsTrailingBytesInAckReadBatch(t *testing.T) {
+	grant := frame.TerminalFenceGrant{Epoch: 4803, Capability: "test-capability"}
+	nonce := frame.TerminalFenceNonce{1}
+	requestEvent, err := frame.NewTerminalFenceRequest(grant, nonce)
+	if err != nil {
+		t.Fatalf("NewTerminalFenceRequest() error = %v", err)
+	}
+	request, err := frame.ParseTerminalFenceRequest(requestEvent)
+	if err != nil {
+		t.Fatalf("ParseTerminalFenceRequest() error = %v", err)
+	}
+	ack, err := request.AckEvent()
+	if err != nil {
+		t.Fatalf("AckEvent() error = %v", err)
+	}
+	done := make(chan struct{})
+	c := &Client{
+		terminalFence:      terminalFenceAwaitingAck,
+		terminalFenceEpoch: grant.Epoch,
+		terminalFenceNonce: nonce,
+		terminalFenceDone:  done,
+	}
+
+	if err := c.acceptTerminalFenceAck(ack, nil); err != nil {
+		t.Fatalf("acceptTerminalFenceAck() error = %v", err)
+	}
+	if err := c.completeTerminalFenceReadBatch(nil, 1); !errors.Is(err, ErrTerminalFenceProtocol) {
+		t.Fatalf("completeTerminalFenceReadBatch() error = %v, want %v", err, ErrTerminalFenceProtocol)
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("trailing bytes did not complete the terminal failure")
+	}
+}
+
+func TestClientTerminalFenceWaitsForPreviouslyAdmittedSendack(t *testing.T) {
+	c, serverConn := newConnectedPipeClientOrFatal(t, Config{})
+	grant := frame.TerminalFenceGrant{Epoch: 49, Capability: "test-capability"}
+	sendRead := make(chan struct{})
+	startNoRequestProbe := make(chan struct{})
+	serverErr := runTestServer(func() error {
+		f, err := readTestFrame(serverConn)
+		if err != nil {
+			return err
+		}
+		send, ok := f.(*frame.SendPacket)
+		if !ok {
+			return fmt.Errorf("server read %T, want SEND", f)
+		}
+		close(sendRead)
+		<-startNoRequestProbe
+
+		type frameResult struct {
+			frame frame.Frame
+			err   error
+		}
+		next := make(chan frameResult, 1)
+		go func() {
+			f, err := readTestFrame(serverConn)
+			next <- frameResult{frame: f, err: err}
+		}()
+		select {
+		case got := <-next:
+			return fmt.Errorf("read %T before matching SENDACK: %v", got.frame, got.err)
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		if err := writeTestFrame(serverConn, &frame.SendackPacket{
+			ClientSeq:   send.ClientSeq,
+			ClientMsgNo: send.ClientMsgNo,
+			MessageID:   7001,
+			MessageSeq:  71,
+			ReasonCode:  frame.ReasonSuccess,
+		}); err != nil {
+			return err
+		}
+		got := <-next
+		if got.err != nil {
+			return got.err
+		}
+		request, err := frame.ParseTerminalFenceRequest(got.frame.(*frame.EventPacket))
+		if err != nil || !request.AuthorizedBy(grant) {
+			return errors.New("invalid terminal request after SENDACK")
+		}
+		ack, err := request.AckEvent()
+		if err != nil {
+			return err
+		}
+		return writeTestFrame(serverConn, ack)
+	})
+
+	future, err := c.SendAsync(context.Background(), Message{
+		ClientMsgNo: "before-fence",
+		ChannelID:   "ch",
+		ChannelType: frame.ChannelTypeGroup,
+		Payload:     []byte("before"),
+	})
+	if err != nil {
+		t.Fatalf("SendAsync() error = %v", err)
+	}
+	select {
+	case <-sendRead:
+	case <-time.After(time.Second):
+		t.Fatal("server did not read admitted SEND")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	sealDone := make(chan error, 1)
+	go func() { sealDone <- c.SealIngressWithFence(ctx, grant) }()
+	close(startNoRequestProbe)
+	if err := <-sealDone; err != nil {
+		t.Fatalf("SealIngressWithFence() error = %v", err)
+	}
+	if _, err := future.Wait(ctx); err != nil {
+		t.Fatalf("future.Wait() error = %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestClientTerminalFenceFailsWithoutRequestWhenPriorSendackTimesOut(t *testing.T) {
+	c, serverConn := newConnectedPipeClientOrFatal(t, Config{AckTimeout: 30 * time.Millisecond})
+	grant := frame.TerminalFenceGrant{Epoch: 50, Capability: "test-capability"}
+	sendRead := make(chan struct{})
+	serverErr := runTestServer(func() error {
+		f, err := readTestFrame(serverConn)
+		if err != nil {
+			return err
+		}
+		if _, ok := f.(*frame.SendPacket); !ok {
+			return fmt.Errorf("server read %T, want SEND", f)
+		}
+		close(sendRead)
+		if err := serverConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+			return err
+		}
+		f, err = codec.New().DecodePacketWithConn(serverConn, frame.LatestVersion)
+		if err == nil {
+			return fmt.Errorf("server read unexpected frame %T after SENDACK timeout", f)
+		}
+		return nil
+	})
+
+	future, err := c.SendAsync(context.Background(), Message{
+		ClientMsgNo: "timeout-before-fence",
+		ChannelID:   "ch",
+		ChannelType: frame.ChannelTypeGroup,
+		Payload:     []byte("before"),
+	})
+	if err != nil {
+		t.Fatalf("SendAsync() error = %v", err)
+	}
+	select {
+	case <-sendRead:
+	case <-time.After(time.Second):
+		t.Fatal("server did not read admitted SEND")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := c.SealIngressWithFence(ctx, grant); !errors.Is(err, ErrTerminalFenceProtocol) {
+		t.Fatalf("SealIngressWithFence() error = %v, want %v", err, ErrTerminalFenceProtocol)
+	}
+	if _, err := future.Wait(ctx); !errors.Is(err, ErrAckTimeout) {
+		t.Fatalf("future.Wait() error = %v, want %v", err, ErrAckTimeout)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestClientTerminalFenceIgnoresStaleReaderFailureAndFrames(t *testing.T) {
+	c, serverConn := newConnectedPipeClientOrFatal(t, Config{})
+	grant := frame.TerminalFenceGrant{Epoch: 51, Capability: "test-capability"}
+	requestRead := make(chan struct{})
+	releaseAck := make(chan struct{})
+	serverErr := runTestServer(func() error {
+		f, err := readTestFrame(serverConn)
+		if err != nil {
+			return err
+		}
+		request, err := frame.ParseTerminalFenceRequest(f.(*frame.EventPacket))
+		if err != nil || !request.AuthorizedBy(grant) {
+			return errors.New("invalid terminal request")
+		}
+		close(requestRead)
+		<-releaseAck
+		ack, err := request.AckEvent()
+		if err != nil {
+			return err
+		}
+		return writeTestFrame(serverConn, ack)
+	})
+
+	oldClientConn, oldServerConn := net.Pipe()
+	defer oldClientConn.Close()
+	defer oldServerConn.Close()
+	oldPending := newPendingTracker()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	sealDone := make(chan error, 1)
+	go func() { sealDone <- c.SealIngressWithFence(ctx, grant) }()
+	select {
+	case <-requestRead:
+	case <-time.After(time.Second):
+		t.Fatal("server did not read terminal request")
+	}
+	c.failRead(oldClientConn, oldPending, io.EOF)
+	staleRequestEvent, err := frame.NewTerminalFenceRequest(grant, frame.TerminalFenceNonce{99})
+	if err != nil {
+		t.Fatalf("NewTerminalFenceRequest() error = %v", err)
+	}
+	staleRequest, err := frame.ParseTerminalFenceRequest(staleRequestEvent)
+	if err != nil {
+		t.Fatalf("ParseTerminalFenceRequest() error = %v", err)
+	}
+	staleAck, err := staleRequest.AckEvent()
+	if err != nil {
+		t.Fatalf("AckEvent() error = %v", err)
+	}
+	if err := c.routeInboundFrameWithPending(staleAck, oldPending, nil, oldClientConn); err != nil {
+		t.Fatalf("stale terminal ACK error = %v", err)
+	}
+	close(releaseAck)
+	if err := <-sealDone; err != nil {
+		t.Fatalf("SealIngressWithFence() after stale EOF error = %v", err)
+	}
+	if err := c.routeInboundFrameWithPending(&frame.PongPacket{}, oldPending, nil, oldClientConn); err != nil {
+		t.Fatalf("stale post-ACK frame error = %v", err)
+	}
+	if err := c.SealIngressWithFence(ctx, grant); err != nil {
+		t.Fatalf("idempotent SealIngressWithFence() after stale frame error = %v", err)
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatalf("server error = %v", err)
@@ -567,6 +1194,14 @@ func TestClientSendAsyncCopiesPayloadBeforeQueue(t *testing.T) {
 	if result.MessageID != 303 {
 		t.Fatalf("MessageID = %d, want 303", result.MessageID)
 	}
+	if result.PendingStartedAt.IsZero() || result.WriteStartedAt.IsZero() || result.ObservedAt.IsZero() {
+		t.Fatalf("send timing = pending:%v write:%v observed:%v, want complete local timeline",
+			result.PendingStartedAt, result.WriteStartedAt, result.ObservedAt)
+	}
+	if result.WriteStartedAt.Before(result.PendingStartedAt) || result.ObservedAt.Before(result.WriteStartedAt) {
+		t.Fatalf("send timing is out of order: pending:%v write:%v observed:%v",
+			result.PendingStartedAt, result.WriteStartedAt, result.ObservedAt)
+	}
 	if err := <-serverErr; err != nil {
 		t.Fatalf("server error = %v", err)
 	}
@@ -641,6 +1276,44 @@ func TestClientSendAsyncHonorsMaxInflight(t *testing.T) {
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestClientTrySendAsyncRejectsMaxInflightWithoutWaiting(t *testing.T) {
+	c, _ := newConnectedPipeClientOrFatal(t, Config{
+		MaxInflight: 1,
+		AckTimeout:  time.Second,
+	})
+
+	if _, err := c.SendAsync(context.Background(), Message{
+		ClientMsgNo: "first-try-inflight",
+		ChannelID:   "ch-try-inflight",
+		ChannelType: frame.ChannelTypeGroup,
+		Payload:     []byte("first"),
+	}); err != nil {
+		t.Fatalf("SendAsync(first) error = %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.TrySendAsync(Message{
+			ClientMsgNo: "second-try-inflight",
+			ChannelID:   "ch-try-inflight",
+			ChannelType: frame.ChannelTypeGroup,
+			Payload:     []byte("second"),
+		})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrSendQueueFull) {
+			t.Fatalf("TrySendAsync(second) error = %v, want %v", err, ErrSendQueueFull)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("TrySendAsync waited for inflight capacity")
+	}
+	if n := pendingEntryCount(c.pending); n != 1 {
+		t.Fatalf("pending entries after rejected try = %d, want first request only", n)
 	}
 }
 
@@ -871,16 +1544,34 @@ func TestClientReaderPreservesPartialFrameBytes(t *testing.T) {
 	}
 }
 
-func TestRouteInboundRecvEnqueuesWithBoundedOverwriteOldest(t *testing.T) {
-	c, err := New(Config{
-		Addr:                   "pipe",
-		InboundFrameBufferSize: 2,
+func TestClientReaderRejectsTruncatedFrameAtEOF(t *testing.T) {
+	c, serverConn := newConnectedPipeClientOrFatal(t, Config{})
+	defer c.Close()
+	payload := encodeClientTestFrameOrFatal(t, &frame.RecvPacket{
+		Setting: frame.SettingNoEncrypt, MessageID: 42, MessageSeq: 7,
+		ChannelID: "u1", ChannelType: frame.ChannelTypePerson, Payload: []byte("truncated"),
 	})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
+	cut := len(payload) / 2
+	if cut == 0 || cut == len(payload) {
+		t.Fatalf("encoded frame length = %d, cannot truncate", len(payload))
+	}
+	if _, err := serverConn.Write(payload[:cut]); err != nil {
+		t.Fatalf("server Write(partial) error = %v", err)
+	}
+	if err := serverConn.Close(); err != nil {
+		t.Fatalf("server Close() error = %v", err)
 	}
 
-	for i := int64(1); i <= 3; i++ {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := c.ReadFrame(ctx); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("ReadFrame(truncated EOF) error = %v, want %v", err, io.ErrUnexpectedEOF)
+	}
+}
+
+func TestRouteInboundRecvBackpressuresWithBoundedWireOrder(t *testing.T) {
+	c, _ := newConnectedPipeClientOrFatal(t, Config{InboundFrameBufferSize: 2})
+	for i := int64(1); i <= 2; i++ {
 		if err := c.routeInboundFrame(&frame.RecvPacket{
 			Setting:   frame.SettingNoEncrypt,
 			MessageID: i,
@@ -889,11 +1580,87 @@ func TestRouteInboundRecvEnqueuesWithBoundedOverwriteOldest(t *testing.T) {
 			t.Fatalf("routeInboundFrame(RECV %d) error = %v", i, err)
 		}
 	}
+	if snapshot := c.InboundQueueSnapshot(); snapshot.Depth != 2 || snapshot.Capacity != 2 {
+		t.Fatalf("inbound queue = %d/%d, want saturated 2/2", snapshot.Depth, snapshot.Capacity)
+	}
+	thirdStarted := make(chan struct{})
+	thirdDone := make(chan error, 1)
+	go func() {
+		close(thirdStarted)
+		thirdDone <- c.routeInboundFrame(&frame.RecvPacket{
+			Setting:   frame.SettingNoEncrypt,
+			MessageID: 3,
+			Payload:   []byte{3},
+		})
+	}()
+	waitForClientTestSignal(t, thirdStarted, "third RECV publisher start")
+	select {
+	case err := <-thirdDone:
+		t.Fatalf("third RECV completed before queue drain: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
 
 	first := <-c.recvCh
+	if first.MessageID != 1 {
+		t.Fatalf("first queued MessageID = %d, want 1", first.MessageID)
+	}
+	select {
+	case err := <-thirdDone:
+		if err != nil {
+			t.Fatalf("routeInboundFrame(RECV 3) error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("third RECV did not resume after queue drain")
+	}
 	second := <-c.recvCh
-	if first.MessageID != 2 || second.MessageID != 3 {
-		t.Fatalf("queued MessageIDs = %d,%d, want 2,3", first.MessageID, second.MessageID)
+	third := <-c.recvCh
+	if second.MessageID != 2 || third.MessageID != 3 {
+		t.Fatalf("queued MessageIDs = %d,%d, want 2,3", second.MessageID, third.MessageID)
+	}
+}
+
+func TestClientDiscardInboundRecvKeepsReaderAvailableForSendack(t *testing.T) {
+	c, serverConn := newConnectedPipeClientOrFatal(t, Config{
+		InboundFrameBufferSize: 1,
+		DiscardInboundRecv:     true,
+	})
+	entry, err := c.pending.add(pendingKey{ClientSeq: 7, ClientMsgNo: "after-recv"}, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("pending.add() error = %v", err)
+	}
+
+	wire := append(
+		encodeClientTestFrameOrFatal(t, &frame.RecvPacket{
+			Setting:   frame.SettingNoEncrypt,
+			MessageID: 1,
+			Payload:   []byte("first"),
+		}),
+		encodeClientTestFrameOrFatal(t, &frame.RecvPacket{
+			Setting:   frame.SettingNoEncrypt,
+			MessageID: 2,
+			Payload:   []byte("second"),
+		})...,
+	)
+	wire = append(wire, encodeClientTestFrameOrFatal(t, &frame.SendackPacket{
+		ClientSeq:   7,
+		ClientMsgNo: "after-recv",
+		MessageID:   7007,
+		MessageSeq:  77,
+		ReasonCode:  frame.ReasonSuccess,
+	})...)
+	if _, err := serverConn.Write(wire); err != nil {
+		t.Fatalf("server Write() error = %v", err)
+	}
+
+	outcome := readPendingOutcomeOrFatal(t, entry)
+	if outcome.err != nil {
+		t.Fatalf("pending err = %v", outcome.err)
+	}
+	if outcome.result.MessageID != 7007 {
+		t.Fatalf("MessageID = %d, want 7007", outcome.result.MessageID)
+	}
+	if snapshot := c.InboundQueueSnapshot(); snapshot.Depth != 0 || snapshot.Capacity != 1 {
+		t.Fatalf("inbound queue = %d/%d, want empty 0/1", snapshot.Depth, snapshot.Capacity)
 	}
 }
 
@@ -1399,54 +2166,96 @@ func TestClientRecvReturnsOnConnectionReadFailure(t *testing.T) {
 	}
 }
 
-func TestEnqueueRecvConcurrentOverwriteDoesNotBlock(t *testing.T) {
-	c, err := New(Config{
-		Addr:                   "pipe",
-		InboundFrameBufferSize: 1,
-	})
+func TestClientPendingSendClassifiesSessionReadFailureAndPreservesCause(t *testing.T) {
+	c, serverConn := newConnectedPipeClientOrFatal(t, Config{})
+	entry, err := c.pending.add(pendingKey{ClientSeq: 1, ClientMsgNo: "read-failure"}, time.Second)
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("pending.add() error = %v", err)
 	}
-	c.enqueueRecv(&frame.RecvPacket{MessageID: 1}, nil)
-
-	var wg sync.WaitGroup
-	done := make(chan struct{})
-	for i := int64(2); i <= 16; i++ {
-		wg.Add(1)
-		go func(messageID int64) {
-			defer wg.Done()
-			c.enqueueRecv(&frame.RecvPacket{MessageID: messageID}, nil)
-		}(i)
+	if err := serverConn.Close(); err != nil {
+		t.Fatalf("server Close() error = %v", err)
 	}
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
 
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("concurrent enqueueRecv calls blocked")
+	outcome := readPendingOutcomeOrFatal(t, entry)
+	if !IsSessionReadError(outcome.err) {
+		t.Fatalf("pending error = %T %[1]v, want session read classification", outcome.err)
+	}
+	if !errors.Is(outcome.err, io.EOF) {
+		t.Fatalf("pending error = %v, want preserved EOF cause", outcome.err)
 	}
 }
 
-func TestEnqueueRecvZeroCapacityDoesNotBlock(t *testing.T) {
-	c, err := New(Config{Addr: "pipe"})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	c.recvCh = make(chan *frame.RecvPacket)
+func TestEnqueueRecvBackpressuresAndPreservesOrder(t *testing.T) {
+	c, _ := newConnectedPipeClientOrFatal(t, Config{InboundFrameBufferSize: 1})
+	c.enqueueRecv(&frame.RecvPacket{MessageID: 1}, nil)
 
+	started := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
-		c.enqueueRecv(&frame.RecvPacket{MessageID: 1}, nil)
+		close(started)
+		c.enqueueRecv(&frame.RecvPacket{MessageID: 2}, nil)
 		close(done)
 	}()
+	waitForClientTestSignal(t, started, "second RECV publisher start")
+	if snapshot := c.InboundQueueSnapshot(); snapshot.Depth != 1 || snapshot.Capacity != 1 {
+		t.Fatalf("inbound queue = %d/%d, want saturated 1/1", snapshot.Depth, snapshot.Capacity)
+	}
+	select {
+	case <-done:
+		t.Fatal("second RECV publisher completed before queue drain")
+	case <-time.After(20 * time.Millisecond):
+	}
 
+	first := <-c.recvCh
+	if first.MessageID != 1 {
+		t.Fatalf("first queued RECV message id = %d, want 1", first.MessageID)
+	}
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("enqueueRecv blocked on zero-capacity channel")
+		t.Fatal("second RECV publisher did not resume after queue drain")
+	}
+	second := <-c.recvCh
+	if second.MessageID != 2 {
+		t.Fatalf("second queued RECV message id = %d, want 2", second.MessageID)
+	}
+}
+
+func TestEnqueueRecvZeroCapacityUnblocksOnClose(t *testing.T) {
+	c, _ := newConnectedPipeClientOrFatal(t, Config{})
+	c.mu.Lock()
+	c.recvCh = make(chan *frame.RecvPacket)
+	c.mu.Unlock()
+
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		close(started)
+		c.enqueueRecv(&frame.RecvPacket{MessageID: 1}, nil)
+		close(done)
+	}()
+	waitForClientTestSignal(t, started, "zero-capacity RECV publisher start")
+	select {
+	case <-done:
+		t.Fatal("zero-capacity RECV publisher completed before Close")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("enqueueRecv did not unblock after Close")
+	}
+}
+
+func waitForClientTestSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", description)
 	}
 }
 
@@ -1498,6 +2307,8 @@ func TestClientReaderUsesSessionCryptoSnapshot(t *testing.T) {
 	c.crypto.mu.Unlock()
 	c.mu.Lock()
 	c.conn = clientConn
+	c.recvNotify = make(chan struct{})
+	c.recvErr = nil
 	c.startLoops(clientConn, c.pending, oldSession)
 	c.mu.Unlock()
 
@@ -1846,6 +2657,9 @@ func TestNormalizeConfigAppliesToolingDefaults(t *testing.T) {
 	}
 	if cfg.InboundFrameBufferSize != 1024 {
 		t.Fatalf("InboundFrameBufferSize = %d, want 1024", cfg.InboundFrameBufferSize)
+	}
+	if cfg.DiscardInboundRecv {
+		t.Fatal("DiscardInboundRecv default = true, want false")
 	}
 	if cfg.GenerateClientMsgNo {
 		t.Fatal("GenerateClientMsgNo default = true, want false")

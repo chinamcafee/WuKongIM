@@ -3,7 +3,7 @@ title: Next Steps
 description: Choose the next reading path for integration, configuration, deployment, or operations.
 ---
 
-If readiness succeeds, both test UIDs connect, and messages flow in both directions, you have completed the local development loop.
+If readiness succeeds, both test UIDs connect, and messages flow in both directions, you have completed the quick verification.
 
 ## Choose a path
 
@@ -11,11 +11,10 @@ If readiness succeeds, both test UIDs connect, and messages flow in both directi
   <Card title="Core Concepts" description="Learn channel ordering, message commits, users, devices, conversations, nodes, and Slots." href="/en/guide/core-concepts" />
   <Card title="Integration" description="Divide product responsibilities and design authentication, messaging, and webhooks." href="/en/guide/integration" />
   <Card title="Tutorials" description="Continue with direct chat, group chat, and 100,000-member group paths." href="/en/guide/tutorials" />
-  <Card title="Deployment" description="Choose Docker or Linux, plan a multi-node cluster, and complete production checks." href="/en/server/deployment" />
-  <Card title="Basic Configuration" description="Understand TOML, configuration search order, WK_ environment variables, and development credentials." href="/en/server/configuration" />
-  <Card title="Choose an SDK" description="Plan client integration by platform and access method." href="/en/sdk" />
-  <Card title="API & Protocols" description="Review the remaining server API, client protocol, and shared-dictionary plan." href="/en/api" />
-  <Card title="Server" description="Continue to configuration, operations, tooling, and architecture menus." href="/en/server" />
+  <Card title="Deployment" description="Start with topology and runtime medium, then complete configuration, verification, and production gates." href="/en/server/deployment" />
+  <Card title="Choose an SDK" description="Choose by platform and access method, then follow its installation, capabilities, API, and upgrade path." href="/en/sdk" />
+  <Card title="API & Protocols" description="Reference published APIs, the client-protocol core, and shared dictionaries." href="/en/api" />
+  <Card title="Server Reference" description="Open configuration, operations, tooling, and architecture when needed." href="/en/server" />
 </Cards>
 
 ## Frequently asked questions
@@ -30,11 +29,11 @@ No. At minimum, replace fixed credentials, plan TLS and access control, place da
 
 ### Why does data remain after a restart?
 
-The example stores node data in `./data/wukongim-single-node-data`. Stopping the process does not delete that directory.
+The Linux package stores node data in `/var/lib/wukongim/data`. Stopping the systemd service does not delete that directory.
 
 ### How do I change ports?
 
-After copying `wukongim.toml.example`, edit the API, Manager, Gateway, and cluster listeners in the local `wukongim.toml`, then restart the node. Do not store machine-specific changes in the example template.
+Edit `/etc/wukongim/wukongim.toml`, run `sudo wukongim config validate --config /etc/wukongim/wukongim.toml`, then run `sudo systemctl restart wukongim`.
 
 ### Why must production clients not call `/user/token`?
 
@@ -43,7 +42,3 @@ It is a demo identity endpoint. A trusted business backend must issue or update 
 ### Where is the three-node environment?
 
 The repository-root `docker-compose.yml` provides a three-node development environment. It exposes development credentials and benchmark capabilities, so it is not a production template either.
-
-<Callout type="info" title="Documentation status">
-  The sidebar still shows planned pages. A page enters search, sitemap, and LLM outputs only after both language versions are complete and pass publication checks.
-</Callout>

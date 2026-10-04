@@ -62,19 +62,28 @@ func (a *ChannelAppender) AppendBatch(ctx context.Context, req channelappend.App
 		attempt = channelAppendDefaultAttempt
 	}
 	res, err := a.node.AppendChannelBatch(ctx, channelruntime.AppendBatchRequest{
-		ChannelID:            channelruntime.ChannelID{ID: req.ChannelID.ID, Type: req.ChannelID.Type},
-		ExpectedChannelEpoch: req.ExpectedEpoch,
-		ExpectedLeaderEpoch:  req.ExpectedLeaderEpoch,
-		Messages:             toChannelMessages(req.Messages),
-		TraceID:              req.TraceID,
-		ChannelKey:           req.ChannelKey,
-		Attempt:              attempt,
-		CommitMode:           toChannelCommitMode(req.CommitMode),
-		OmitResultPayload:    req.OmitResultPayload,
+		ChannelID:                 channelruntime.ChannelID{ID: req.ChannelID.ID, Type: req.ChannelID.Type},
+		ExpectedChannelEpoch:      req.ExpectedEpoch,
+		ExpectedLeaderEpoch:       req.ExpectedLeaderEpoch,
+		ExpectedRouteGeneration:   req.ExpectedRouteGeneration,
+		Messages:                  toChannelMessages(req.Messages),
+		PayloadsImmutable:         true,
+		TraceID:                   req.TraceID,
+		ChannelKey:                req.ChannelKey,
+		Attempt:                   attempt,
+		CommitMode:                toChannelCommitMode(req.CommitMode),
+		OmitResultPayload:         req.OmitResultPayload,
+		ServerAllocatedMessageIDs: req.ServerAllocatedMessageIDs,
 	})
 	if err != nil {
 		mappedErr := mapAppendError(err)
-		a.logAppendChannelBatchError(req, err, mappedErr)
+		// A generic append failure can still be recovered by the channelappend
+		// runtime through a durable idempotency lookup. That runtime owns the
+		// final recovered/unresolved outcome, so logging ERROR here would report
+		// successful retries as failures.
+		if !errors.Is(mappedErr, channelappend.ErrAppendFailed) {
+			a.logAppendChannelBatchError(req, err, mappedErr)
+		}
 		if traceEnabled {
 			recordChannelAppendTrace(req, nil, mappedErr, sendtrace.Elapsed(startedAt, time.Now()))
 		}
@@ -124,21 +133,22 @@ func toChannelMessages(in []channelappend.Message) []channelruntime.Message {
 	out := make([]channelruntime.Message, 0, len(in))
 	for _, msg := range in {
 		out = append(out, channelruntime.Message{
-			MessageID:         msg.MessageID,
-			MessageSeq:        msg.MessageSeq,
-			ChannelID:         msg.ChannelID,
-			ChannelType:       msg.ChannelType,
-			Setting:           msg.Setting,
-			Topic:             msg.Topic,
-			Expire:            msg.Expire,
-			RedDot:            msg.RedDot,
-			FromUID:           msg.FromUID,
-			ClientMsgNo:       msg.ClientMsgNo,
-			TraceID:           msg.TraceID,
-			ChannelKey:        msg.ChannelKey,
-			Payload:           append([]byte(nil), msg.Payload...),
-			SyncOnce:          msg.SyncOnce,
-			ServerTimestampMS: msg.ServerTimestampMS,
+			MessageID:           msg.MessageID,
+			MessageSeq:          msg.MessageSeq,
+			ChannelID:           msg.ChannelID,
+			ChannelType:         msg.ChannelType,
+			Setting:             msg.Setting,
+			FromUID:             msg.FromUID,
+			ClientMsgNo:         msg.ClientMsgNo,
+			TraceID:             msg.TraceID,
+			ChannelKey:          msg.ChannelKey,
+			Payload:             append([]byte(nil), msg.Payload...),
+			PublicationMetadata: append([]byte(nil), msg.PublicationMetadata...),
+			SyncOnce:            msg.SyncOnce,
+			RedDot:              msg.RedDot,
+			Expire:              msg.Expire,
+			ServerTimestampMS:   msg.ServerTimestampMS,
+			Topic:               msg.Topic,
 		})
 	}
 	return out
@@ -166,21 +176,22 @@ func fromChannelAppendResult(res channelruntime.AppendBatchResult) channelappend
 
 func fromChannelMessage(msg channelruntime.Message) channelappend.Message {
 	return channelappend.Message{
-		MessageID:         msg.MessageID,
-		MessageSeq:        msg.MessageSeq,
-		ChannelID:         msg.ChannelID,
-		ChannelType:       msg.ChannelType,
-		Setting:           msg.Setting,
-		Topic:             msg.Topic,
-		Expire:            msg.Expire,
-		RedDot:            msg.RedDot,
-		FromUID:           msg.FromUID,
-		ClientMsgNo:       msg.ClientMsgNo,
-		TraceID:           msg.TraceID,
-		ChannelKey:        msg.ChannelKey,
-		Payload:           append([]byte(nil), msg.Payload...),
-		SyncOnce:          msg.SyncOnce,
-		ServerTimestampMS: msg.ServerTimestampMS,
+		MessageID:           msg.MessageID,
+		MessageSeq:          msg.MessageSeq,
+		ChannelID:           msg.ChannelID,
+		ChannelType:         msg.ChannelType,
+		Setting:             msg.Setting,
+		FromUID:             msg.FromUID,
+		ClientMsgNo:         msg.ClientMsgNo,
+		TraceID:             msg.TraceID,
+		ChannelKey:          msg.ChannelKey,
+		Payload:             append([]byte(nil), msg.Payload...),
+		PublicationMetadata: append([]byte(nil), msg.PublicationMetadata...),
+		SyncOnce:            msg.SyncOnce,
+		RedDot:              msg.RedDot,
+		Expire:              msg.Expire,
+		ServerTimestampMS:   msg.ServerTimestampMS,
+		Topic:               msg.Topic,
 	}
 }
 

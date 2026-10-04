@@ -2,7 +2,7 @@
 
 ## 适用范围
 
-`wkdb` 是一个节点本地离线 CLI，用于查看、导出或导入 WuKongIM 某个节点的数据目录里的 metadata 和 message 存储。
+`wkcli db` 是一个节点本地离线 CLI，用于查看、导出或导入 WuKongIM 某个节点的数据目录里的 metadata 和 message 存储。
 
 它包含三类命令：
 
@@ -35,23 +35,23 @@
 
 不要把一个节点的本地扫描结果当成全局集群事实。涉及集群决策时，需要结合其他节点结果或 manager/cluster API。
 
-执行 `wkdb export` 时，如果需要精确一致的源数据，建议对已停止节点、文件系统快照或节点目录副本执行。当前 export 不做在线一致性快照，不聚合多个节点的数据。
+执行 `wkcli db export` 时，如果需要精确一致的源数据，建议对已停止节点、文件系统快照或节点目录副本执行。当前 export 不做在线一致性快照，不聚合多个节点的数据。
 
-执行 `wkdb import` 时，建议目标目录是 fresh/offline target。当前 import 不支持在线导入，不支持把 bundle merge 到已有数据目录，也不提供事务回滚。
+执行 `wkcli db import` 时，建议目标目录是 fresh/offline target。当前 import 不支持在线导入，不支持把 bundle merge 到已有数据目录，也不提供事务回滚。
 
 ## 构建与运行
 
 在仓库根目录直接运行：
 
 ```bash
-GOWORK=off go run ./cmd/wkdb --data-dir ./data/node-1 query "show tables"
+GOWORK=off go run ./cmd/wkcli db --data-dir ./data/node-1 query "show tables"
 ```
 
 构建二进制：
 
 ```bash
-go build -o ./bin/wkdb ./cmd/wkdb
-./bin/wkdb --data-dir ./data/node-1 query "show tables"
+go build -o ./bin/wkcli ./cmd/wkcli
+./bin/wkcli --data-dir ./data/node-1 query "show tables"
 ```
 
 ## 路径解析
@@ -59,7 +59,7 @@ go build -o ./bin/wkdb ./cmd/wkdb
 最常用方式是传 `--data-dir`：
 
 ```bash
-wkdb --data-dir ./data/node-1 query "show tables"
+wkcli db --data-dir ./data/node-1 query "show tables"
 ```
 
 它会派生：
@@ -70,14 +70,14 @@ wkdb --data-dir ./data/node-1 query "show tables"
 也可以显式传存储路径：
 
 ```bash
-wkdb --meta-path ./data/node-1/slotmeta query "describe meta.user"
-wkdb --message-path ./data/node-1/messages query "select * from message.channels limit 20"
+wkcli db --meta-path ./data/node-1/slotmeta query "describe meta.user"
+wkcli db --message-path ./data/node-1/messages query "select * from message.channels limit 20"
 ```
 
 或者从 `wukongim.toml` 读取：
 
 ```bash
-wkdb --config ./wukongim.toml query "show tables"
+wkcli db --config ./wukongim.toml query "show tables"
 ```
 
 相关配置键：
@@ -98,13 +98,13 @@ wkdb --config ./wukongim.toml query "show tables"
 执行单条查询：
 
 ```bash
-wkdb --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.user where uid='u1'"
+wkcli db --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.user where uid='u1'"
 ```
 
 进入简单 REPL：
 
 ```bash
-wkdb --data-dir ./data/node-1 --hash-slot-count 256 repl
+wkcli db --data-dir ./data/node-1 --hash-slot-count 256 repl
 ```
 
 退出 REPL：
@@ -122,32 +122,32 @@ quit
 离线校验 import bundle：
 
 ```bash
-wkdb --data-dir ./node-new --hash-slot-count 256 import --input ./wkdb-dump --dry-run
+wkcli db --data-dir ./node-new --hash-slot-count 256 import --input ./wkdb-dump --dry-run
 ```
 
 真实离线导入：
 
 ```bash
-wkdb --data-dir ./node-new --hash-slot-count 256 import --input ./wkdb-dump --require-empty
+wkcli db --data-dir ./node-new --hash-slot-count 256 import --input ./wkdb-dump --require-empty
 ```
 
 离线导出当前节点本地数据：
 
 ```bash
-wkdb --data-dir ./data/node-1 --hash-slot-count 256 export --output ./wkdb-dump
+wkcli db --data-dir ./data/node-1 --hash-slot-count 256 export --output ./wkdb-dump
 ```
 
 覆盖已有导出目录：
 
 ```bash
-wkdb --data-dir ./data/node-1 --hash-slot-count 256 export --output ./wkdb-dump --overwrite
+wkcli db --data-dir ./data/node-1 --hash-slot-count 256 export --output ./wkdb-dump --overwrite
 ```
 
-注意：`wkdb` 的全局 flags 必须放在 command 前面，例如 `--data-dir`、`--hash-slot-count`、`--config`；子命令自己的 flags 放在子命令后面，例如 `import --input`、`import --dry-run`、`import --require-empty`、`export --output`、`export --overwrite`。
+注意：`wkcli db` 的全局 flags 必须放在 command 前面，例如 `--data-dir`、`--hash-slot-count`、`--config`；子命令自己的 flags 放在子命令后面，例如 `import --input`、`import --dry-run`、`import --require-empty`、`export --output`、`export --overwrite`。
 
 ## 离线 export
 
-`wkdb export` 用于把一个节点本地当前数据库导出成 WKDB Import Bundle v1。输出目录可以直接作为 `wkdb import --input` 使用。
+`wkcli db export` 用于把一个节点本地当前数据库导出成 WKDB Import Bundle v1。输出目录可以直接作为 `wkcli db import --input` 使用。
 
 安全边界：
 
@@ -160,13 +160,13 @@ wkdb --data-dir ./data/node-1 --hash-slot-count 256 export --output ./wkdb-dump 
 基本命令：
 
 ```bash
-wkdb --data-dir ./data/node-1 --hash-slot-count 256 export --output ./wkdb-dump
+wkcli db --data-dir ./data/node-1 --hash-slot-count 256 export --output ./wkdb-dump
 ```
 
 `--output` 目录默认必须不存在或为空；如果要覆盖已有目录，显式传 `--overwrite`：
 
 ```bash
-wkdb --data-dir ./data/node-1 --hash-slot-count 256 export --output ./wkdb-dump --overwrite
+wkcli db --data-dir ./data/node-1 --hash-slot-count 256 export --output ./wkdb-dump --overwrite
 ```
 
 可选分页参数：
@@ -190,7 +190,7 @@ exported=9 messages=1 subscribers=1 channels=1 files=9 bytes=1234
 
 ## 离线 import
 
-`wkdb import` 用于把 WKDB Import Bundle v1 写入一个离线目标目录。它是本工具当前唯一会写 WKDB 存储的命令。
+`wkcli db import` 用于把 WKDB Import Bundle v1 写入一个离线目标目录。它是本工具当前唯一会写 WKDB 存储的命令。
 
 安全边界：
 
@@ -202,7 +202,7 @@ exported=9 messages=1 subscribers=1 channels=1 files=9 bytes=1234
 Dry-run 只校验 bundle，不打开可写 NodeStore，也不需要 `--data-dir`、`--meta-path` 或 `--message-path` 这类 storage path：
 
 ```bash
-wkdb --hash-slot-count 256 import --input ./wkdb-dump --dry-run
+wkcli db --hash-slot-count 256 import --input ./wkdb-dump --dry-run
 ```
 
 如果传了 `--hash-slot-count`，dry-run 会校验目标 hash-slot 数与 manifest 一致；如果不传，则使用 manifest 的 `hash_slot_count` 做 bundle 内部校验。
@@ -210,7 +210,7 @@ wkdb --hash-slot-count 256 import --input ./wkdb-dump --dry-run
 真实导入必须传 `--require-empty`，并且必须能解析出 metadata 和 message 两个存储路径：
 
 ```bash
-wkdb --data-dir ./node-new --hash-slot-count 256 import --input ./wkdb-dump --require-empty
+wkcli db --data-dir ./node-new --hash-slot-count 256 import --input ./wkdb-dump --require-empty
 ```
 
 可选批量参数：
@@ -227,18 +227,18 @@ validated=5 written=4 messages=1 subscribers=1 channels=1 files=5 bytes=1234
 
 ## 离线 diff/verify
 
-`wkdb diff` 用于迁移后核对两个节点本地数据目录是否保留了 WKDB Import Bundle v1 覆盖的数据。典型用法是：旧库按 bundle v1 导出，新库离线导入后，用 diff 对旧节点目录和新节点目录做只读比对。
+`wkcli db diff` 用于迁移后核对两个节点本地数据目录是否保留了 WKDB Import Bundle v1 覆盖的数据。典型用法是：旧库按 bundle v1 导出，新库离线导入后，用 diff 对旧节点目录和新节点目录做只读比对。
 
 基本命令：
 
 ```bash
-wkdb --hash-slot-count 256 diff --source-data-dir ./node-old --target-data-dir ./node-new
+wkcli db --hash-slot-count 256 diff --source-data-dir ./node-old --target-data-dir ./node-new
 ```
 
 更严格的 payload 字节比对：
 
 ```bash
-wkdb --hash-slot-count 256 diff --source-data-dir ./node-old --target-data-dir ./node-new --mode full
+wkcli db --hash-slot-count 256 diff --source-data-dir ./node-old --target-data-dir ./node-new --mode full
 ```
 
 路径 flags：
@@ -327,7 +327,7 @@ manifest 规则：
 - `meta.channels`
 - `meta.subscribers`
 - `meta.user_channel_memberships`
-- `meta.conversations`
+- `meta.user_cmd_channel_memberships`
 - `meta.channel_latest`
 - `message.channels`
 - `message.messages`
@@ -340,8 +340,8 @@ record 字段如下。未特别说明时，数值字段缺省为 0，字符串�
 - `meta.devices`：`hash_slot`, `uid`, `device_flag`, `token`, `device_level`。
 - `meta.channels`：`hash_slot`, `channel_id`, `channel_type`, `ban`, `disband`, `send_ban`, `allow_stranger`, `large`, `subscriber_mutation_version`。
 - `meta.subscribers`：`hash_slot`, `channel_id`, `channel_type`, `uid`。
-- `meta.user_channel_memberships`：`hash_slot`, `uid`, `channel_id`, `channel_type`, `join_seq`, `updated_at_ms`。
-- `meta.conversations`：`hash_slot`, `uid`, `kind`, `channel_id`, `channel_type`, `read_seq`, `deleted_to_seq`, `active_at`, `updated_at`, `sparse_active`。`kind` 只能是 `normal` 或 `cmd`。
+- `meta.user_channel_memberships`：`hash_slot`, `uid`, `channel_id`, `channel_type`, `join_seq`, `read_seq`, `deleted_to_seq`, `activated_at`, `tombstone`, `tombstone_at`, `source_version`, `updated_at_ms`。
+- `meta.user_cmd_channel_memberships`：`hash_slot`, `uid`, `command_channel_id`, `channel_type`, `start_seq`, `ack_seq`, `tombstone`, `tombstone_at`, `updated_at_ms`。
 - `meta.channel_latest`：`hash_slot`, `channel_id`, `channel_type`, `last_message_id`, `last_message_seq`, `last_at`, `from_uid`, `client_msg_no`, `last_payload_b64`, `updated_at`。当前实现要求字段名是 `last_payload_b64`。
 - `message.channels`：`channel_key`, `channel_id`, `channel_type`。
 - `message.messages`：`channel_key`, `message_seq`, `message_id`, `client_msg_no`, `from_uid`, `server_timestamp_ms`, `payload_b64`。
@@ -350,7 +350,7 @@ hash-slot 校验规则：
 
 - `meta.users` 和 `meta.devices` 按 `uid` 重算 `hash_slot`。
 - `meta.channels`、`meta.subscribers`、`meta.channel_latest` 按 `channel_id` 重算 `hash_slot`。
-- `meta.user_channel_memberships` 和 `meta.conversations` 按 `uid` 重算 `hash_slot`。
+- `meta.user_channel_memberships` 和 `meta.user_cmd_channel_memberships` 按 `uid` 重算 `hash_slot`。
 
 排序和引用规则：
 
@@ -393,10 +393,10 @@ select * from message.message where channel_key='g1:2' limit 50
 
 ## hash-slot 语义
 
-metadata 表按 hash-slot 分区。普通点查不建议手动传 `hash_slot`，而是传表的分区键，让 `wkdb` 自动计算 hash-slot：
+metadata 表按 hash-slot 分区。普通点查不建议手动传 `hash_slot`，而是传表的分区键，让 `wkcli db` 自动计算 hash-slot：
 
 ```bash
-wkdb --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.user where uid='u1'"
+wkcli db --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.user where uid='u1'"
 ```
 
 常见分区键：
@@ -406,14 +406,15 @@ wkdb --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.us
 - `meta.channel`：`channel_id`
 - `meta.channel_runtime_meta`：`channel_id`
 - `meta.subscriber`：`channel_id`
-- `meta.conversation`：`uid`（普通会话与 CMD 同步共用，通过 `kind` 区分）
+- `meta.user_channel_membership`：`uid`
+- `meta.user_cmd_channel_membership`：`uid`
 - `meta.plugin_binding`：`uid`
 - `meta.channel_migration`：`channel_id`
 
-如果 metadata 查询没有分区键，`wkdb` 会在当前节点文件内做有界本地扫描：
+如果 metadata 查询没有分区键，`wkcli db` 会在当前节点文件内做有界本地扫描：
 
 ```bash
-wkdb --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.user limit 100"
+wkcli db --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.user limit 100"
 ```
 
 本地有界扫描需要 `--hash-slot-count` 或 `WK_CLUSTER_HASH_SLOT_COUNT`。
@@ -421,7 +422,7 @@ wkdb --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.us
 如果确实要看某个具体分区，也可以显式传 `hash_slot`：
 
 ```bash
-wkdb --data-dir ./data/node-1 query "select * from meta.user where hash_slot=12 limit 20"
+wkcli db --data-dir ./data/node-1 query "select * from meta.user where hash_slot=12 limit 20"
 ```
 
 ## limit 与 cursor
@@ -431,7 +432,7 @@ wkdb --data-dir ./data/node-1 query "select * from meta.user where hash_slot=12 
 例如下面最多返回 100 行 user：
 
 ```bash
-wkdb --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.user limit 100"
+wkcli db --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.user limit 100"
 ```
 
 如果还有后续数据，输出 stats 会包含：
@@ -442,7 +443,7 @@ wkdb --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.us
 继续翻页：
 
 ```bash
-wkdb --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.user limit 100 cursor '<next_cursor>'"
+wkcli db --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.user limit 100 cursor '<next_cursor>'"
 ```
 
 cursor 与查询形状绑定。换表、换过滤条件、换投影列、换 limit、换 scan mode、换 message channel 后复用 cursor，会返回 cursor mismatch。
@@ -452,19 +453,19 @@ cursor 与查询形状绑定。换表、换过滤条件、换投影列、换 lim
 默认是 table：
 
 ```bash
-wkdb --data-dir ./data/node-1 query "show tables"
+wkcli db --data-dir ./data/node-1 query "show tables"
 ```
 
 JSON：
 
 ```bash
-wkdb --data-dir ./data/node-1 --format json query "select * from message.channels limit 5"
+wkcli db --data-dir ./data/node-1 --format json query "select * from message.channels limit 5"
 ```
 
 JSONL：
 
 ```bash
-wkdb --data-dir ./data/node-1 --format jsonl query "select * from message.channels limit 5"
+wkcli db --data-dir ./data/node-1 --format jsonl query "select * from message.channels limit 5"
 ```
 
 `jsonl` 每行输出一条 row，最后追加一条 stats 记录：
@@ -481,89 +482,89 @@ wkdb --data-dir ./data/node-1 --format jsonl query "select * from message.channe
 列出可排查表：
 
 ```bash
-wkdb --data-dir ./data/node-1 query "show tables"
+wkcli db --data-dir ./data/node-1 query "show tables"
 ```
 
 查看 user 表字段：
 
 ```bash
-wkdb --data-dir ./data/node-1 query "describe meta.user"
+wkcli db --data-dir ./data/node-1 query "describe meta.user"
 ```
 
 按 UID 查用户：
 
 ```bash
-wkdb --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.user where uid='u1'"
+wkcli db --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.user where uid='u1'"
 ```
 
 抽样查看当前节点本地 user：
 
 ```bash
-wkdb --data-dir ./data/node-1 --hash-slot-count 256 query "select uid, token from meta.user limit 100"
+wkcli db --data-dir ./data/node-1 --hash-slot-count 256 query "select uid, token from meta.user limit 100"
 ```
 
 查看 channel 元数据：
 
 ```bash
-wkdb --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.channel where channel_id='g1' limit 20"
+wkcli db --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.channel where channel_id='g1' limit 20"
 ```
 
 列出当前节点 message catalog 里的 channel：
 
 ```bash
-wkdb --data-dir ./data/node-1 query "select * from message.channels limit 20"
+wkcli db --data-dir ./data/node-1 query "select * from message.channels limit 20"
 ```
 
 读取某个 channel 的消息：
 
 ```bash
-wkdb --data-dir ./data/node-1 query "select * from message.message where channel_key='g1:2' limit 50"
+wkcli db --data-dir ./data/node-1 query "select * from message.message where channel_key='g1:2' limit 50"
 ```
 
 查某个消息序号：
 
 ```bash
-wkdb --data-dir ./data/node-1 query "select message_seq, message_id, from_uid, payload_size from message.message where channel_key='g1:2' and message_seq=100 limit 10"
+wkcli db --data-dir ./data/node-1 query "select message_seq, message_id, from_uid, payload_size from message.message where channel_key='g1:2' and message_seq=100 limit 10"
 ```
 
 查看 hash-slot 迁移状态：
 
 ```bash
-wkdb --data-dir ./data/node-1 query "select * from meta.hashslot_migration where hash_slot=17 limit 10"
+wkcli db --data-dir ./data/node-1 query "select * from meta.hashslot_migration where hash_slot=17 limit 10"
 ```
 
 ## Smoke Checklist
 
-用真实拷贝目录验收 `wkdb` 时，建议按这个顺序跑：
+用真实拷贝目录验收 `wkcli db` 时，建议按这个顺序跑：
 
 1. 验证表发现：
 
    ```bash
-   wkdb --data-dir ./data/node-1 query "show tables"
+   wkcli db --data-dir ./data/node-1 query "show tables"
    ```
 
 2. 验证 metadata schema：
 
    ```bash
-   wkdb --data-dir ./data/node-1 query "describe meta.user"
+   wkcli db --data-dir ./data/node-1 query "describe meta.user"
    ```
 
 3. 验证 metadata 有界扫描：
 
    ```bash
-   wkdb --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.user limit 5"
+   wkcli db --data-dir ./data/node-1 --hash-slot-count 256 query "select * from meta.user limit 5"
    ```
 
 4. 验证 message catalog 扫描：
 
    ```bash
-   wkdb --data-dir ./data/node-1 query "select * from message.channels limit 5"
+   wkcli db --data-dir ./data/node-1 query "select * from message.channels limit 5"
    ```
 
 5. 如果上一步返回了 `channel_key`，验证 message 扫描：
 
    ```bash
-   wkdb --data-dir ./data/node-1 query "select * from message.message where channel_key='<channel_key>' limit 5"
+   wkcli db --data-dir ./data/node-1 query "select * from message.message where channel_key='<channel_key>' limit 5"
    ```
 
 6. 如果 `has_more=true`，用返回的 `next_cursor` 验证 cursor 翻页。
@@ -611,7 +612,7 @@ inspect: invalid query
 `message.message` 必须带 `channel_key`：
 
 ```bash
-wkdb --data-dir ./data/node-1 query "select * from message.message where channel_key='g1:2' limit 50"
+wkcli db --data-dir ./data/node-1 query "select * from message.message where channel_key='g1:2' limit 50"
 ```
 
 ## 注意事项

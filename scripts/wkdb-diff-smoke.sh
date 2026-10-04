@@ -9,9 +9,9 @@ Builds a seed node with scripts/wkdb-import-smoke.sh, exports it, imports the
 export into a second node, and verifies both equal and mismatch wkdb diff exits.
 
 Environment:
-  WKDB_BIN  Path to a prebuilt wkdb binary. If unset, the script runs
-            "go run ./cmd/wkdb" with GOWORK=off.
-  GO        Go executable used when WKDB_BIN is unset. Defaults to "go".
+  WK_CLI_BIN  Path to a prebuilt wkcli binary. If unset, the script runs
+            "go run ./cmd/wkcli db" with GOWORK=off.
+  GO        Go executable used when WK_CLI_BIN is unset. Defaults to "go".
   WKDB_SMOKE_VERBOSE=1 prints wkdb stderr from successful commands.
 USAGE
 }
@@ -60,8 +60,8 @@ if [[ "$hash_slot_count" != "256" ]]; then
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-if [[ ! -d "$repo_root/cmd/wkdb" ]]; then
-  echo "must run from a WuKongIM checkout with cmd/wkdb" >&2
+if [[ ! -d "$repo_root/cmd/wkcli" ]]; then
+  echo "must run from a WuKongIM checkout with cmd/wkcli" >&2
   exit 2
 fi
 
@@ -89,10 +89,10 @@ summary_file="$work_dir/summary.md"
 rm -rf "$seed_work_dir" "$export_dir" "$target_dir" "$mismatch_bundle" "$mismatch_target_dir"
 mkdir -p "$work_dir"
 
-if [[ -n "${WKDB_BIN:-}" ]]; then
-  wkdb_cmd=("$WKDB_BIN")
+if [[ -n "${WK_CLI_BIN:-}" ]]; then
+  wkdb_cmd=("$WK_CLI_BIN" db)
 else
-  wkdb_cmd=("${GO:-go}" run ./cmd/wkdb)
+  wkdb_cmd=("${GO:-go}" run ./cmd/wkcli db)
 fi
 
 run_wkdb() {
@@ -148,7 +148,7 @@ rewrite_import_smoke_manifest() {
       meta/channels.jsonl \
       meta/subscribers.jsonl \
       meta/user_channel_memberships.jsonl \
-      meta/conversations.jsonl \
+      meta/user_cmd_channel_memberships.jsonl \
       meta/channel_latest.jsonl \
       message/channels.jsonl \
       message/messages-000001.jsonl
@@ -160,7 +160,7 @@ rewrite_import_smoke_manifest() {
         meta/channels.jsonl) kind="meta.channels" ;;
         meta/subscribers.jsonl) kind="meta.subscribers" ;;
         meta/user_channel_memberships.jsonl) kind="meta.user_channel_memberships" ;;
-        meta/conversations.jsonl) kind="meta.conversations" ;;
+        meta/user_cmd_channel_memberships.jsonl) kind="meta.user_cmd_channel_memberships" ;;
         meta/channel_latest.jsonl) kind="meta.channel_latest" ;;
         message/channels.jsonl) kind="message.channels" ;;
         message/messages-000001.jsonl) kind="message.messages" ;;
@@ -179,7 +179,7 @@ rewrite_import_smoke_manifest() {
 }
 
 seed_output=""
-if ! seed_output="$(cd "$repo_root" && WKDB_BIN="${WKDB_BIN:-}" GO="${GO:-go}" scripts/wkdb-import-smoke.sh --work-dir "$seed_work_dir" --hash-slot-count "$hash_slot_count")"; then
+if ! seed_output="$(cd "$repo_root" && WK_CLI_BIN="${WK_CLI_BIN:-}" GO="${GO:-go}" scripts/wkdb-import-smoke.sh --work-dir "$seed_work_dir" --hash-slot-count "$hash_slot_count")"; then
   echo "$seed_output" >&2
   exit 1
 fi
@@ -221,7 +221,7 @@ set +e
 diff_mismatch_output="$(run_wkdb --hash-slot-count "$hash_slot_count" diff --source-data-dir "$seed_data_dir" --target-data-dir "$mismatch_target_dir" --page-size 1 2>"$mismatch_err_file")"
 diff_mismatch_code=$?
 set -e
-if [[ -z "${WKDB_BIN:-}" && "$diff_mismatch_code" -eq 1 ]] && grep -q "exit status 2" "$mismatch_err_file"; then
+if [[ -z "${WK_CLI_BIN:-}" && "$diff_mismatch_code" -eq 1 ]] && grep -q "exit status 2" "$mismatch_err_file"; then
   diff_mismatch_code=2
 fi
 if [[ "$diff_mismatch_code" -ne 2 ]]; then

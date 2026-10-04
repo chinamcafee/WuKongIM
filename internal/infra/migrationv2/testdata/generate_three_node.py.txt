@@ -1,0 +1,105 @@
+import pathlib,json,socket,subprocess,time,urllib.request,signal,tarfile,gzip
+root=pathlib.Path('/tmp/wukongim-migration-original-three-four-slots');root.mkdir(exist_ok=False)
+ids=[1,2,3];nodes=[];reserved=[];processes=[];logs=[]
+for nid in ids:
+ ports=[]
+ for _ in range(4):
+  s=socket.socket();s.bind(('127.0.0.1',0));ports.append(s.getsockname()[1]);reserved.append(s)
+ nodes.append({'id':nid,'tcp':ports[0],'api':ports[1],'ws':ports[2],'cluster':ports[3]})
+(root/'nodes.json').write_text(json.dumps(nodes,indent=2))
+try:
+ for n in nodes:
+  d=root/str(n['id']);d.mkdir()
+  init='\n'.join(f'    - {m["id"]}@127.0.0.1:{m["cluster"]}' for m in nodes)
+  config=f'''mode: debug
+rootDir: {d}
+dataDir: {d}/data
+addr: tcp://127.0.0.1:{n['tcp']}
+httpAddr: 127.0.0.1:{n['api']}
+wsAddr: ws://127.0.0.1:{n['ws']}
+manager:
+  on: false
+demo:
+  on: false
+logger:
+  level: 2
+  dir: {d}/logs
+auth:
+  kind: none
+plugin:
+  socketPath: {d}/plugin.sock
+cluster:
+  nodeId: {n['id']}
+  addr: tcp://127.0.0.1:{n['cluster']}
+  serverAddr: 127.0.0.1:{n['cluster']}
+  apiUrl: http://127.0.0.1:{n['api']}
+  slotCount: 4
+  slotReplicaCount: 3
+  channelReplicaCount: 3
+  initNodes:
+{init}
+db:
+  shardNum: 2
+'''
+  (d/'source.yaml').write_text(config)
+ for s in reserved:s.close()
+ for n in nodes:
+  d=root/str(n['id']);log=(d/'process.log').open('wb');logs.append(log)
+  processes.append(subprocess.Popen(['/tmp/wukongim-v2-original-a888f895','--config',str(d/'source.yaml')],stdout=log,stderr=subprocess.STDOUT))
+ print('Started original v2 nodes',ids,flush=True)
+ deadline=time.monotonic()+55
+ while time.monotonic()<deadline:
+  if any(p.poll() is not None for p in processes):raise RuntimeError('source exited during startup')
+  if all('server started successfully' in (root/str(n['id'])/'process.log').read_text() for n in nodes):break
+  time.sleep(.2)
+ else:raise TimeoutError('source readiness timeout')
+ print('All original v2 nodes ready',flush=True)
+ trace=[]
+ def call(path,data=None,n=nodes[0]):
+  req=urllib.request.Request(f'http://127.0.0.1:{n["api"]}'+path,data=None if data is None else json.dumps(data).encode(),headers={'Content-Type':'application/json'})
+  with urllib.request.urlopen(req,timeout=15) as r:result=json.load(r)
+  trace.append({'node_id':n['id'],'path':path,'request':data,'response':result});(root/'api-baseline.json').write_text(json.dumps(trace,indent=2));return result
+ deadline=time.monotonic()+25
+ while time.monotonic()<deadline:
+  configs=[json.loads((root/str(n['id'])/'data/cluster/config/remote.json').read_text()) for n in nodes]
+  if len(set(json.dumps(c,sort_keys=True) for c in configs))==1 and all(n.get('apiServerAddr') for n in configs[0]['nodes']):break
+  time.sleep(.2)
+ else:raise TimeoutError('original configuration routes did not converge')
+ for uid in ['migrationalice','migrationbob']:
+  assert call('/user/token',{'uid':uid,'token':'synthetic-'+uid,'device_flag':1,'device_level':1})['status']==200
+ assert call('/channel',{'channel_id':'migrationgroup','channel_type':2,'subscribers':['migrationalice','migrationbob']})['status']==200
+ for i in range(3):assert call('/message/send',{'header':{'red_dot':1},'from_uid':'migrationalice','channel_id':'migrationgroup','channel_type':2,'client_msg_no':'multi-source-'+str(i),'payload':'aGVsbG8='})['status']==200
+ for n in nodes:call('/channel/messagesync',{'login_uid':'migrationbob','channel_id':'migrationgroup','channel_type':2,'limit':100},n)
+ deadline=time.monotonic()+30
+ while time.monotonic()<deadline:
+  all_slots=[]
+  good=True
+  for slot in range(4):
+   reports=[call(f'/cluster/slots/{slot}/localReplica',n=n) for n in nodes]
+   expected=reports[0]['last_log_seq']
+   if not all(r['applied_index']==r['committed_index']==r['last_log_seq']==expected for r in reports):good=False
+   all_slots.append(reports)
+  if good:break
+  time.sleep(.2)
+ else:raise TimeoutError('source Slots did not converge')
+ (root/'slot-api-baseline.json').write_text(json.dumps(all_slots,indent=2))
+ print('Original v2 data and Slot API baseline captured',flush=True)
+finally:
+ for p in processes:
+  if p.poll() is None:p.send_signal(signal.SIGINT)
+ for p in processes:
+  try:p.wait(timeout=15)
+  except subprocess.TimeoutExpired:p.kill();p.wait();print('source required forced termination',flush=True)
+ for f in logs:f.close()
+print('Original v2 source stopped',flush=True)
+for n in nodes:
+ d=root/str(n['id'])/'data'
+ with open(root/f'node-{n["id"]}.tar.gz','wb') as raw:
+  with gzip.GzipFile(fileobj=raw,mode='wb',mtime=0) as gz:
+   with tarfile.open(fileobj=gz,mode='w') as tar:
+    for p in sorted(d.rglob('*')):
+     info=tar.gettarinfo(str(p),arcname=str(p.relative_to(d)));info.uid=info.gid=0;info.uname=info.gname='';info.mtime=0
+     if p.is_file():
+      with p.open('rb') as f:tar.addfile(info,f)
+     else:tar.addfile(info)
+print('Saved stopped fixtures under',root,flush=True)

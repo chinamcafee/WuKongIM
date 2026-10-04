@@ -1,0 +1,125 @@
+---
+title: Python 快速接入
+description: 按准备、安装、连接、收发和清理顺序完成首次接入。
+---
+
+使用 Python 3.11+、asyncio 和 PyPI **WK_EASYSDK_PYTHON_VERSION** 完成在线收发。每个客户端属于一个事件循环。
+
+## 1. 准备接入
+
+按[认证与 Token](/zh/guide/integration/authentication)让受信业务后端分别提供两人的 `uid`、`token` 和 `websocketUrl`。客户端只连接 Gateway，不调用 WuKongIM HTTP API 管理接口。
+
+设备类别是 APP `0`、WEB `1`、PC/Desktop `2`。**Python 默认 Desktop `2`**，后端保存 Token 时必须使用相同设备类别。开发地址通常为 `ws://127.0.0.1:5200`；仅当 listener 或代理配置了 `/ws` 时使用 `ws://127.0.0.1:5200/ws`。生产使用 `wss://`，跨机器时使用客户端实际可达地址。
+
+想先看到实际收发效果，可按[运行官方示例](/zh/sdk/easy/examples#python)准备两端；下文说明如何接入自己的应用。
+
+## 2. 安装 SDK
+
+本文使用 [PyPI `wukong-easy-sdk==WK_EASYSDK_PYTHON_VERSION`](https://pypi.org/project/wukong-easy-sdk/WK_EASYSDK_PYTHON_VERSION/)，要求 Python 3.11+。分发名是 `wukong-easy-sdk`，导入名是 `wukong_easy_sdk`。
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --index-url https://pypi.org/simple "wukong-easy-sdk==WK_EASYSDK_PYTHON_VERSION"
+```
+
+Windows PowerShell 将激活命令替换为 `.venv\Scripts\Activate.ps1`。运行依赖为 `websockets>=15.0.1,<18`，仓库 `uv.lock` 固定开发与验证依赖。
+
+## 3. 连接与监听
+
+下面代码用环境中的身份向 `WKIM_PEER` 发送一条消息，并继续接收 10 秒；Bob 必须已经在线。实际应用应让客户端存活到应用退出。
+
+```python
+import asyncio
+import os
+
+from wukong_easy_sdk import AuthOptions, WKIM, WKIMChannelType, WKIMEvent
+
+
+async def main():
+    im = WKIM.init(
+        os.environ.get("WKIM_URL", "ws://127.0.0.1:5200"),
+        AuthOptions(uid=os.environ["WKIM_UID"], token=os.environ["WKIM_TOKEN"]),
+    )
+
+    def receive(message):
+        # 将 message["payload"] 交给应用 UI 或有界队列。
+        # 不要把完整消息或 Token 写入生产日志。
+        print("Message received")
+
+    listener = im.on(WKIMEvent.MESSAGE, receive)
+    im.on(WKIMEvent.ERROR, lambda error: print("EasySDK operation failed"))
+    async with im:
+        ack = await im.send(
+            os.environ["WKIM_PEER"], WKIMChannelType.PERSON,
+            {"type": 1, "content": "你好，Python！"},
+        )
+        assert ack["reasonCode"] == 1
+        await asyncio.sleep(10)
+    im.off(WKIMEvent.MESSAGE, listener)
+
+
+asyncio.run(main())
+```
+
+`async with im` 在进入时等待 CONNECT 鉴权，退出时执行 `destroy()`。群聊使用 `WKIMChannelType.GROUP`，Channel 与成员关系由业务后端预先建立。Payload 接受 JSON 对象或数组，按 UTF-8 JSON 编码为 Base64；接收兼容对象、JSON 文本和 Base64 JSON。
+
+Python 参数使用 snake_case，消息和结果字典保留 JS 的 camelCase：发送结果包含 `messageId`、`messageSeq`、`reasonCode`；接收还包含 `header`、`channelId`、`channelType`、`fromUid`、秒级 `timestamp` 和 `payload`。消息 ID 是字符串，序号保持完整整数精度。自定义事件通过 `WKIMEvent.CUSTOM_EVENT` 提供 `id`、`type`、毫秒级 `timestamp` 和 `data`。
+
+`send()` 支持 `client_msg_no`、`header`、`setting`、`topic` 关键字参数；默认 `header.redDot=true`，显式 false 会保留。可选消息标记与 Channel 类型仍取决于服务端支持。
+
+自动 RECVACK 表示消息已进入 SDK 分发队列，不代表业务处理完成或已读。发送成功、对端接收和业务处理的区别见[消息收发](/zh/guide/integration/messaging)。
+
+## 4. 收发第一条消息
+
+下载与安装包一致的示例源码，继续使用当前虚拟环境：
+
+```sh
+git clone --branch WK_EASYSDK_PYTHON_TAG --depth 1 https://github.com/WuKongIM/WuKongEasySDK-Python.git
+```
+
+两个终端分别设置自己的 `WKIM_UID`、`WKIM_TOKEN`、`WKIM_PEER` 和可选的 `WKIM_URL`，运行：
+
+```sh
+python WuKongEasySDK-Python/examples/chat.py
+```
+
+例如 Alice 的 `WKIM_UID=alice`、`WKIM_PEER=bob`；Bob 相反。Token 通过各自受信环境提供。两端都显示 `Connected` 后输入消息，再反向发送，输入 `/quit` 清理退出。示例主动展示聊天内容，SDK 自身默认静默。
+
+两端都连接成功后，Alice 向 `bob` 发送，Bob 在消息回调中核对发送者和正文；再由 Bob 向 `alice` 回发。发送结果表示服务端接受请求，不能代替对端接收或已读。
+
+## 5. 清理连接
+
+每个实例只属于一个 asyncio 事件循环，没有全局单例。同步与异步回调在独立任务中串行分发，异步回调可以 `await im.send(...)` 回复，也可以断开或销毁客户端。不要阻塞事件循环，或在回调中等待同一串行分发器上的后续事件。
+
+| 操作 | 语义 |
+| --- | --- |
+| `await im.connect()` | 并发调用共享一次鉴权；已连接时返回当前结果 |
+| `im.is_connected` | 当前连接已通过鉴权 |
+| `im.on(event, callback)` / `im.off(event, callback)` | 保存并移除原回调；已经开始执行的回调可能继续完成 |
+| `await im.ping()` | 等待同 ID 响应，包括有效的 `result: null` |
+| `await im.disconnect()` | 取消待处理请求、socket、心跳与重连；之后可重新连接 |
+| `await im.destroy()` | 永久关闭实例并释放监听器，可重复调用 |
+| 更换账号、Token 或地址 | 关闭旧实例，再创建新实例 |
+
+取消一个 `connect()` 等待者不会取消共享连接，需要停止时调用 `disconnect()`。取消或超时的发送会释放请求占用，但已到达服务端的消息仍可能提交。
+
+## 6. 常见问题
+
+`WKIMOptions` 的时间单位均为秒：连接总超时 10 秒、请求 15 秒、心跳间隔 25 秒、Pong 超时 10 秒、关闭超时 2 秒。成功鉴权后的意外断线最多重试 5 次，从 1 秒指数增长到最多 30 秒，附带 20% 抖动。首次连接失败、鉴权拒绝、服务端主动断开、协议错误、事件队列满、证书校验失败和手动退出停止自动重试。
+
+默认上限为 1,024 个待处理请求、4 MiB 序列化待处理请求、1 MiB 单条线路消息，以及 256 条事件、4 MiB 事件线路大小预算，包含当前执行事件；Python 对象开销另计。请求满返回 `ErrorCode.QUEUE_FULL`；事件队列满关闭连接，未进入队列的消息不被确认，过载时生命周期事件为尽力投递。保持回调短小并控制应用处理速度。
+
+SDK 不离线排队或自动重发。超时与丢失 SENDACK 可能导致提交结果未知，应保留 `client_msg_no` 通过业务后端对账，再决定是否重试。错误通过 `WKIMError.code` 保留服务端原因码或本地 `ErrorCode`，错误文本不回显敏感响应。
+
+WSS 默认验证证书链与主机名，最低 TLS 1.2。私有 CA 使用 `WKIMOptions(ca_file="/path/ca.pem")`，交互示例读取 `WKIM_CA_FILE`。不提供跳过校验的选项；不自动读取系统代理，直接使用传入的 Gateway/代理 URL。
+
+默认不输出日志；`WKIMOptions(debug_logging=True)` 只启用固定生命周期元数据，不记录 Token、Payload、URL、原始帧、服务端响应文本或底层异常对象。
+
+## 可选：群聊
+
+群聊使用 `WKIMChannelType.GROUP`，无需客户端订阅。由可信后端建立群、添加成员并管理权限；接收继续使用 `WKIMEvent.MESSAGE`。跨节点成员变更需要包含[成员缓存修复](https://github.com/WuKongIM/WuKongIM/commit/2a295e0d9881ef5356728a85d56b052c4b0d9c86)的服务端，只升级 Python 包无法修复旧服务端行为。Slot Leader 切换时在线路由需要恢复，不能保证切换期间连续投递。完整示例与版本条件见[群聊说明](https://github.com/WuKongIM/WuKongEasySDK-Python/blob/527f37c876326e7ad3cc48c89828c4c3ffed09fc/examples/group_chat.py)。
+
+## 下一步
+
+继续阅读[消息收发](/zh/guide/integration/messaging)与[上线检查](/zh/guide/integration/acceptance)。需要离线恢复、会话、未读或推送时，先查看 [SDK 选择](/zh/sdk)。[版本与验证记录](https://github.com/WuKongIM/WuKongIM/blob/main/docs/superpowers/reports/2026-09-08-easysdk-validation-history.md#python)保留各次验证的完整环境和范围。

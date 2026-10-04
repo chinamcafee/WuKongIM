@@ -1,0 +1,40 @@
+---
+title: HarmonyOS SDK
+description: Integrate the full @wukong/wkim 1.1.7 SDK into a HarmonyOS NEXT application.
+---
+
+`@wukong/wkim` is the full HarmonyOS NEXT SDK. It owns the persistent connection, message transport, local messages, conversations, and channel metadata. Your application owns login, tokens, routing, and application HTTP APIs.
+
+If `Channel`, `Conversation`, or provider is unfamiliar, begin with [Core concepts](/en/sdk/wukongim/concepts).
+
+<Cards>
+  <Card title="Quickstart" description="Install the SDK, connect two users, and send the first text message." href="/en/sdk/harmonyos/quickstart" />
+  <Card title="Connection" description="Configure identity and routing, then understand connection and sync states." href="/en/sdk/harmonyos/connection" />
+  <Card title="Messages" description="Send, receive, query, and display message send results." href="/en/sdk/harmonyos/messages" />
+  <Card title="Conversations" description="Build the chat list, unread counts, and multi-device sync." href="/en/sdk/harmonyos/conversations" />
+  <Card title="Channels" description="Read and refresh user and group metadata." href="/en/sdk/harmonyos/channels" />
+  <Card title="Advanced" description="Add custom payloads, media upload, and remote history." href="/en/sdk/harmonyos/advanced" />
+</Cards>
+
+## What the SDK and your application own
+
+| Capability | SDK | Your application |
+| --- | --- | --- |
+| Login identity | Connect with a UID and token | Authenticate with your backend and obtain the UID and token |
+| Persistent connection | Connection, heartbeat, reconnect, and protocol handling | Supply a reachable `host:port` |
+| Messages | Local persistence, sending, receiving, and state updates | Chat UI, application payloads, and failure handling |
+| Conversations | Store the chat list and unread counts | Supply the multi-device conversation API |
+| Channels | Cache user and group metadata | Supply user, group, and member APIs |
+| Media | Manage the media-message send flow | Upload files and return downloadable URLs |
+
+## Import paths
+
+The package root currently exports only `WKIM`:
+
+```typescript
+import { WKIM } from '@wukong/wkim'
+```
+
+`WKChannel`, state constants, and message payloads require imports from `@wukong/wkim/src/main/ets/...`. The following guides include the complete paths. Recompile those imports after an SDK upgrade to catch package-layout changes.
+
+The recommended path is Quickstart → Connection → Messages → Conversations → Channels → Advanced. Open the [API reference](/en/sdk/harmonyos/api-reference) when you need a method lookup.

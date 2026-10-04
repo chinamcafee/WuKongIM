@@ -63,3 +63,33 @@ func (f *fakeManagementNodeConfigNode) CallRPC(ctx context.Context, nodeID uint6
 	f.calledServiceID = serviceID
 	return f.handler(ctx, payload)
 }
+
+type localDocumentReaderStub struct {
+	localNodeConfigReaderStub
+	document managementusecase.NodeConfigDocument
+}
+
+func (r *localDocumentReaderStub) NodeConfigDocument(_ context.Context, id uint64) (managementusecase.NodeConfigDocument, error) {
+	r.nodeID = id
+	return r.document, nil
+}
+
+func TestManagementNodeConfigDocumentRoutesExactLocalAndRemoteNodes(t *testing.T) {
+	document := managementusecase.NodeConfigDocument{NodeID: 2, Source: managementusecase.NodeConfigSnapshotSourceEffectiveStartup,
+		TOML: "[node]\nid = 2\n", Fields: []managementusecase.NodeConfigDocumentField{{Path: "node.id", Line: 2}},
+	}
+	remote := &localDocumentReaderStub{document: document}
+	adapter := accessnode.New(accessnode.Options{ManagerNodeConfig: remote})
+	node := &fakeManagementNodeConfigNode{nodeID: 1, handler: adapter.HandleManagerNodeConfigDocumentRPC}
+	local := &localDocumentReaderStub{document: document}
+	local.document.NodeID = 1
+	reader := NewManagementNodeConfigReader(node, local)
+	got, err := reader.NodeConfigDocument(context.Background(), 1)
+	if err != nil || got.NodeID != 1 || node.called || local.nodeID != 1 {
+		t.Fatalf("local routing: %+v %v", got, err)
+	}
+	got, err = reader.NodeConfigDocument(context.Background(), 2)
+	if err != nil || got.NodeID != 2 || node.calledNodeID != 2 || node.calledServiceID != accessnode.ManagerNodeConfigDocumentRPCServiceID {
+		t.Fatalf("remote routing: %+v %v", got, err)
+	}
+}

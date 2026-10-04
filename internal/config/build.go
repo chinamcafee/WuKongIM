@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,6 +13,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/cluster"
 	"github.com/WuKongIM/WuKongIM/pkg/gateway"
 	"github.com/WuKongIM/WuKongIM/pkg/gateway/binding"
+	gatewaytypes "github.com/WuKongIM/WuKongIM/pkg/gateway/types"
 )
 
 const (
@@ -44,6 +44,11 @@ func missingRequiredConfigKeys(values map[string]string) []string {
 }
 
 func buildConfig(values map[string]string) (app.Config, error) {
+	// Accept deprecated tuning aliases without reviving the removed authority cache.
+	for _, key := range []string{"WK_CONVERSATION_MAX_LAST_MESSAGE_CONCURRENCY", "WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS_PER_UID", "WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS", "WK_CONVERSATION_AUTHORITY_LIST_DB_WINDOW_MAX", "WK_CONVERSATION_AUTHORITY_HANDOFF_TIMEOUT", "WK_CONVERSATION_AUTHORITY_ACTIVE_COOLDOWN", "WK_CONVERSATION_AUTHORITY_FLUSH_INTERVAL", "WK_CONVERSATION_AUTHORITY_FLUSH_TIMEOUT", "WK_CONVERSATION_AUTHORITY_FLUSH_BATCH_ROWS", "WK_CONVERSATION_AUTHORITY_ADMIT_BATCH_ROWS", "WK_CONVERSATION_AUTHORITY_ADMIT_CONCURRENCY"} {
+		_ = configValue(values, key)
+	}
+
 	cfg := app.Config{
 		Gateway: app.GatewayConfig{
 			Listeners:        defaultGatewayListeners(),
@@ -51,6 +56,7 @@ func buildConfig(values map[string]string) (app.Config, error) {
 			TokenAuthTimeout: defaultGatewayTokenAuthTimeout,
 			Session:          gateway.DefaultSessionOptions(),
 			Runtime:          gateway.DefaultRuntimeOptions(),
+			TokenAuthOn:      true,
 			Transport: gateway.TransportOptions{
 				Gnet: defaultGatewayGnetOptions(),
 			},
@@ -63,7 +69,9 @@ func buildConfig(values map[string]string) (app.Config, error) {
 			LargeGroupSubscriberThreshold: 500,
 		},
 		Message: app.MessageConfig{
-			SystemDeviceID: "____device",
+			CMDChannelSuffix: "____cmd",
+			SystemUID:        "____system",
+			SystemDeviceID:   "____device",
 		},
 		ChannelMessageRetention: app.ChannelMessageRetentionConfig{
 			ScanInterval:     time.Minute,
@@ -102,6 +110,16 @@ func buildConfig(values map[string]string) (app.Config, error) {
 		return app.Config{}, err
 	}
 	cfg.Cluster.ListenAddr = listenAddr
+	if raw := configValue(values, "WK_CLUSTER_START_TIMEOUT"); raw != "" {
+		timeout, err := parseDuration("WK_CLUSTER_START_TIMEOUT", raw)
+		if err != nil {
+			return app.Config{}, err
+		}
+		if timeout < 0 {
+			return app.Config{}, fmt.Errorf("parse WK_CLUSTER_START_TIMEOUT: value must be >= 0")
+		}
+		cfg.Cluster.Timeouts.Start = timeout
+	}
 
 	cfg.Cluster.Control.ClusterID = configValue(values, "WK_CLUSTER_ID")
 	if configKeyPresent(values, "WK_CLUSTER_JOIN_TOKEN") {
@@ -546,6 +564,16 @@ func buildConfig(values map[string]string) (app.Config, error) {
 		}
 		cfg.Cluster.Storage.CommitShards = shards
 	}
+	if raw := configValue(values, "WK_CLUSTER_STORAGE_DISK_SLOW_THRESHOLD"); raw != "" {
+		threshold, err := parseDuration("WK_CLUSTER_STORAGE_DISK_SLOW_THRESHOLD", raw)
+		if err != nil {
+			return app.Config{}, err
+		}
+		if threshold <= 0 {
+			return app.Config{}, fmt.Errorf("parse WK_CLUSTER_STORAGE_DISK_SLOW_THRESHOLD: value must be > 0")
+		}
+		cfg.Cluster.Storage.DiskSlowThreshold = threshold
+	}
 	cfg.API.ListenAddr = configValue(values, "WK_API_LISTEN_ADDR")
 	cfg.API.ExternalTCPAddr = configValue(values, "WK_EXTERNAL_TCPADDR")
 	cfg.API.ExternalWSAddr = configValue(values, "WK_EXTERNAL_WSADDR")
@@ -782,6 +810,13 @@ func buildConfig(values map[string]string) (app.Config, error) {
 		cfg.Observability.Diagnostics.DebugMatches = debugMatches
 	}
 	cfg.Observability.SetDiagnosticsExplicitFlags(diagnosticsEnabledSet, diagnosticsSampleRateSet, diagnosticsErrorSampleRateSet)
+	if raw := configValue(values, "WK_GATEWAY_TOKEN_AUTH_ON"); raw != "" {
+		tokenAuthOn, err := parseBool("WK_GATEWAY_TOKEN_AUTH_ON", raw)
+		if err != nil {
+			return app.Config{}, err
+		}
+		cfg.Gateway.SetTokenAuthOn(tokenAuthOn)
+	}
 	if raw := configValue(values, "WK_GATEWAY_LISTENERS"); raw != "" {
 		listeners, err := parseListeners(raw)
 		if err != nil {
@@ -795,6 +830,9 @@ func buildConfig(values map[string]string) (app.Config, error) {
 			return app.Config{}, err
 		}
 		cfg.Gateway.TokenAuthEnabled = enabled
+		if configValue(values, "WK_GATEWAY_TOKEN_AUTH_ON") == "" {
+			cfg.Gateway.SetTokenAuthOn(enabled)
+		}
 	}
 	if raw := configValue(values, "WK_GATEWAY_TOKEN_AUTH_TIMEOUT"); raw != "" {
 		timeout, err := parseDuration("WK_GATEWAY_TOKEN_AUTH_TIMEOUT", raw)
@@ -900,6 +938,12 @@ func buildConfig(values map[string]string) (app.Config, error) {
 			return app.Config{}, err
 		}
 		cfg.Message.PersonWhitelistEnabled = enabled
+	}
+	if raw := configValue(values, "WK_MESSAGE_CMD_CHANNEL_SUFFIX"); raw != "" {
+		cfg.Message.CMDChannelSuffix = raw
+	}
+	if raw := configValue(values, "WK_MESSAGE_SYSTEM_UID"); raw != "" {
+		cfg.Message.SystemUID = raw
 	}
 	if raw := configValue(values, "WK_MESSAGE_SYSTEM_DEVICE_ID"); raw != "" {
 		cfg.Message.SystemDeviceID = raw
@@ -1028,116 +1072,6 @@ func buildConfig(values map[string]string) (app.Config, error) {
 			return app.Config{}, fmt.Errorf("parse WK_PRESENCE_ROUTE_TTL: value must be >= 0")
 		}
 		cfg.Presence.RouteTTL = ttl
-	}
-	if raw := configValue(values, "WK_CONVERSATION_MAX_LAST_MESSAGE_CONCURRENCY"); raw != "" {
-		limit, err := parseInt("WK_CONVERSATION_MAX_LAST_MESSAGE_CONCURRENCY", raw)
-		if err != nil {
-			return app.Config{}, err
-		}
-		if limit < 0 {
-			return app.Config{}, fmt.Errorf("parse WK_CONVERSATION_MAX_LAST_MESSAGE_CONCURRENCY: value must be >= 0")
-		}
-		cfg.Conversation.MaxLastMessageConcurrency = limit
-	}
-	if raw := configValue(values, "WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS_PER_UID"); raw != "" {
-		limit, err := parseInt("WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS_PER_UID", raw)
-		if err != nil {
-			return app.Config{}, err
-		}
-		if limit <= 0 {
-			return app.Config{}, fmt.Errorf("parse WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS_PER_UID: value must be > 0")
-		}
-		cfg.Conversation.AuthorityCacheMaxRowsPerUID = limit
-	}
-	if raw := configValue(values, "WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS"); raw != "" {
-		limit, err := parseInt("WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS", raw)
-		if err != nil {
-			return app.Config{}, err
-		}
-		if limit <= 0 {
-			return app.Config{}, fmt.Errorf("parse WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS: value must be > 0")
-		}
-		cfg.Conversation.AuthorityCacheMaxRows = limit
-	}
-	if raw := configValue(values, "WK_CONVERSATION_AUTHORITY_LIST_DB_WINDOW_MAX"); raw != "" {
-		limit, err := parseInt("WK_CONVERSATION_AUTHORITY_LIST_DB_WINDOW_MAX", raw)
-		if err != nil {
-			return app.Config{}, err
-		}
-		if limit <= 0 {
-			return app.Config{}, fmt.Errorf("parse WK_CONVERSATION_AUTHORITY_LIST_DB_WINDOW_MAX: value must be > 0")
-		}
-		cfg.Conversation.AuthorityListDBWindowMax = limit
-	}
-	if raw := configValue(values, "WK_CONVERSATION_AUTHORITY_HANDOFF_TIMEOUT"); raw != "" {
-		timeout, err := parseDuration("WK_CONVERSATION_AUTHORITY_HANDOFF_TIMEOUT", raw)
-		if err != nil {
-			return app.Config{}, err
-		}
-		if timeout <= 0 {
-			return app.Config{}, fmt.Errorf("parse WK_CONVERSATION_AUTHORITY_HANDOFF_TIMEOUT: value must be > 0")
-		}
-		cfg.Conversation.AuthorityHandoffTimeout = timeout
-	}
-	if raw := configValue(values, "WK_CONVERSATION_AUTHORITY_ACTIVE_COOLDOWN"); raw != "" {
-		cooldown, err := parseDuration("WK_CONVERSATION_AUTHORITY_ACTIVE_COOLDOWN", raw)
-		if err != nil {
-			return app.Config{}, err
-		}
-		if cooldown <= 0 {
-			return app.Config{}, fmt.Errorf("parse WK_CONVERSATION_AUTHORITY_ACTIVE_COOLDOWN: value must be > 0")
-		}
-		cfg.Conversation.AuthorityActiveCooldown = cooldown
-	}
-	if raw := configValue(values, "WK_CONVERSATION_AUTHORITY_FLUSH_INTERVAL"); raw != "" {
-		interval, err := parseDuration("WK_CONVERSATION_AUTHORITY_FLUSH_INTERVAL", raw)
-		if err != nil {
-			return app.Config{}, err
-		}
-		if interval <= 0 {
-			return app.Config{}, fmt.Errorf("parse WK_CONVERSATION_AUTHORITY_FLUSH_INTERVAL: value must be > 0")
-		}
-		cfg.Conversation.AuthorityFlushInterval = interval
-	}
-	if raw := configValue(values, "WK_CONVERSATION_AUTHORITY_FLUSH_TIMEOUT"); raw != "" {
-		timeout, err := parseDuration("WK_CONVERSATION_AUTHORITY_FLUSH_TIMEOUT", raw)
-		if err != nil {
-			return app.Config{}, err
-		}
-		if timeout <= 0 {
-			return app.Config{}, fmt.Errorf("parse WK_CONVERSATION_AUTHORITY_FLUSH_TIMEOUT: value must be > 0")
-		}
-		cfg.Conversation.AuthorityFlushTimeout = timeout
-	}
-	if raw := configValue(values, "WK_CONVERSATION_AUTHORITY_FLUSH_BATCH_ROWS"); raw != "" {
-		rows, err := parseInt("WK_CONVERSATION_AUTHORITY_FLUSH_BATCH_ROWS", raw)
-		if err != nil {
-			return app.Config{}, err
-		}
-		if rows <= 0 {
-			return app.Config{}, fmt.Errorf("parse WK_CONVERSATION_AUTHORITY_FLUSH_BATCH_ROWS: value must be > 0")
-		}
-		cfg.Conversation.AuthorityFlushBatchRows = rows
-	}
-	if raw := configValue(values, "WK_CONVERSATION_AUTHORITY_ADMIT_BATCH_ROWS"); raw != "" {
-		rows, err := parseInt("WK_CONVERSATION_AUTHORITY_ADMIT_BATCH_ROWS", raw)
-		if err != nil {
-			return app.Config{}, err
-		}
-		if rows <= 0 {
-			return app.Config{}, fmt.Errorf("parse WK_CONVERSATION_AUTHORITY_ADMIT_BATCH_ROWS: value must be > 0")
-		}
-		cfg.Conversation.AuthorityAdmitBatchRows = rows
-	}
-	if raw := configValue(values, "WK_CONVERSATION_AUTHORITY_ADMIT_CONCURRENCY"); raw != "" {
-		concurrency, err := parseInt("WK_CONVERSATION_AUTHORITY_ADMIT_CONCURRENCY", raw)
-		if err != nil {
-			return app.Config{}, err
-		}
-		if concurrency <= 0 {
-			return app.Config{}, fmt.Errorf("parse WK_CONVERSATION_AUTHORITY_ADMIT_CONCURRENCY: value must be > 0")
-		}
-		cfg.Conversation.AuthorityAdmitConcurrency = concurrency
 	}
 	if raw := configValue(values, "WK_CHANNEL_LARGE_GROUP_SUBSCRIBER_THRESHOLD"); raw != "" {
 		threshold, err := parseInt("WK_CHANNEL_LARGE_GROUP_SUBSCRIBER_THRESHOLD", raw)
@@ -1284,6 +1218,26 @@ func buildConfig(values map[string]string) (app.Config, error) {
 		}
 		cfg.Webhook.Workers = workers
 	}
+	if raw := configValue(values, "WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_ITEMS"); raw != "" {
+		maxItems, err := parseInt("WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_ITEMS", raw)
+		if err != nil {
+			return app.Config{}, err
+		}
+		if maxItems < 0 {
+			return app.Config{}, fmt.Errorf("parse WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_ITEMS: value must be >= 0")
+		}
+		cfg.Webhook.NotifyBatchMaxItems = maxItems
+	}
+	if raw := configValue(values, "WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_WAIT"); raw != "" {
+		maxWait, err := parseDuration("WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_WAIT", raw)
+		if err != nil {
+			return app.Config{}, err
+		}
+		if maxWait < 0 {
+			return app.Config{}, fmt.Errorf("parse WK_WEBHOOK_MSG_NOTIFY_BATCH_MAX_WAIT: value must be >= 0")
+		}
+		cfg.Webhook.NotifyBatchMaxWait = maxWait
+	}
 	if raw := configValue(values, "WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_ITEMS"); raw != "" {
 		maxItems, err := parseInt("WK_WEBHOOK_ONLINE_STATUS_BATCH_MAX_ITEMS", raw)
 		if err != nil {
@@ -1384,6 +1338,30 @@ func buildConfig(values map[string]string) (app.Config, error) {
 		}
 		cfg.Webhook.OutboxDeliveredRetention = value
 	}
+	if raw := configValue(values, "WK_WEBHOOK_BEFORE_SEND_ENABLED"); raw != "" {
+		value, err := parseBool("WK_WEBHOOK_BEFORE_SEND_ENABLED", raw)
+		if err != nil {
+			return app.Config{}, err
+		}
+		cfg.Webhook.BeforeSend.Enabled = value
+	}
+	if raw := configValue(values, "WK_WEBHOOK_BEFORE_SEND_TIMEOUT"); raw != "" {
+		value, err := parseDuration("WK_WEBHOOK_BEFORE_SEND_TIMEOUT", raw)
+		if err != nil {
+			return app.Config{}, err
+		}
+		cfg.Webhook.BeforeSend.Timeout = value
+	}
+	if raw := configValue(values, "WK_WEBHOOK_BEFORE_SEND_MAX_IN_FLIGHT"); raw != "" {
+		value, err := parseInt("WK_WEBHOOK_BEFORE_SEND_MAX_IN_FLIGHT", raw)
+		if err != nil {
+			return app.Config{}, err
+		}
+		cfg.Webhook.BeforeSend.MaxInFlight = value
+	}
+	cfg.Webhook.BeforeSend.HTTPAddr = configValue(values, "WK_WEBHOOK_BEFORE_SEND_HTTP_ADDR")
+	cfg.Webhook.BeforeSend.OnTimeout = configValue(values, "WK_WEBHOOK_BEFORE_SEND_ON_TIMEOUT")
+	cfg.Webhook.BeforeSend.OnError = configValue(values, "WK_WEBHOOK_BEFORE_SEND_ON_ERROR")
 	cfg.Webhook, err = app.NormalizeWebhookConfig(cfg.Webhook)
 	if err != nil {
 		return app.Config{}, err
@@ -1453,6 +1431,9 @@ func buildConfig(values map[string]string) (app.Config, error) {
 		MaxTrimMessages:   cfg.ChannelMessageRetention.MaxTrimMessages,
 		MaxTrimBytes:      cfg.ChannelMessageRetention.MaxTrimBytes,
 	}
+	if cfg.MQTT, err = loadMQTTConfig(values); err != nil {
+		return app.Config{}, err
+	}
 	return cfg, nil
 }
 
@@ -1464,32 +1445,22 @@ func defaultGatewayListeners() []gateway.ListenerOptions {
 }
 
 func defaultGatewayGnetOptions() gateway.GnetTransportOptions {
-	loops := adaptiveGatewayGnetEventLoops(runtime.GOMAXPROCS(0))
 	return gateway.GnetTransportOptions{
-		Multicore:    loops > 1,
-		NumEventLoop: loops,
+		Multicore:    true,
+		NumEventLoop: 4,
 		ReusePort:    true,
 	}
-}
-
-func adaptiveGatewayGnetEventLoops(gomaxprocs int) int {
-	if gomaxprocs <= 2 {
-		return 1
-	}
-	loops := gomaxprocs / 2
-	if loops < 1 {
-		return 1
-	}
-	if loops > 4 {
-		return 4
-	}
-	return loops
 }
 
 func parseListeners(raw string) ([]gateway.ListenerOptions, error) {
 	var listeners []gateway.ListenerOptions
 	if err := json.Unmarshal([]byte(raw), &listeners); err != nil {
 		return nil, fmt.Errorf("parse WK_GATEWAY_LISTENERS as JSON: %w", err)
+	}
+	for _, listener := range listeners {
+		if _, err := gatewaytypes.ParseProxyProtocolTrustedCIDRs(listener.ProxyProtocolTrustedCIDRs); err != nil {
+			return nil, fmt.Errorf("parse WK_GATEWAY_LISTENERS listener %q: %w", listener.Name, err)
+		}
 	}
 	return listeners, nil
 }

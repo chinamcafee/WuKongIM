@@ -1,0 +1,34 @@
+{
+  "binding_count": 1,
+  "created_at_ns": 1700000000123456789,
+  "exists": true,
+  "plugin_no": "legacy-receive",
+  "rows": [
+    {
+      "Key": "FgEBACqhQw9nqthfFgE=",
+      "Value": "bGVnYWN5LXJlY2VpdmU="
+    },
+    {
+      "Key": "FgEBACqhQw9nqthfFgI=",
+      "Value": "Ym91bmQtdXNlcg=="
+    },
+    {
+      "Key": "FgEBACqhQw9nqthfFgM=",
+      "Value": "F5ec/j2FzRU="
+    },
+    {
+      "Key": "FgEBACqhQw9nqthfFgQ=",
+      "Value": "F5ec/j2FzRU="
+    },
+    {
+      "Key": "FgECABYBxbdOxW2DlLUqoUMPZ6rYXw==",
+      "Value": null
+    },
+    {
+      "Key": "FgECABYCgZ4Fk5cpYS4qoUMPZ6rYXw==",
+      "Value": null
+    }
+  ],
+  "uid": "bound-user",
+  "user_plugin_no_empty": true
+}

@@ -30,7 +30,6 @@ func TestFullBackupSnapshotDoesNotHideLaterCommittedAppends(t *testing.T) {
 			ID: 1, ClientMsgNo: "before", Payload: []byte("before"),
 			SizeBytes: len("before"),
 		}},
-		Sync: true,
 	})
 	require.NoError(t, err)
 
@@ -53,7 +52,6 @@ func TestFullBackupSnapshotDoesNotHideLaterCommittedAppends(t *testing.T) {
 			ID: 2, ClientMsgNo: "after", Payload: []byte("after"),
 			SizeBytes: len("after"),
 		}},
-		Sync: true,
 	})
 	require.NoError(t, err)
 
@@ -70,6 +68,61 @@ func TestMessageDBStoreAdapterContract(t *testing.T) {
 	cleanupFactory := cleanupChannelStoreFactory{t: t, Factory: factory}
 	testStoreContract(t, cleanupFactory)
 	testStoreCheckpointHWMonotonic(t, cleanupFactory)
+}
+
+func TestMessageDBStoreAdapterLoadsExactProposalByCommand(t *testing.T) {
+	ctx := context.Background()
+	factory := NewMessageDBFactory(t.TempDir())
+	t.Cleanup(func() { _ = factory.Close() })
+	id := ch.ChannelID{ID: "exact-command-lookup", Type: 1}
+	key := ch.ChannelKeyForID(id)
+	store, err := factory.ChannelStore(key, id)
+	require.NoError(t, err)
+	closeChannelStoreOnCleanup(t, store)
+	records := []ch.Record{{
+		ID: 71, Epoch: 3, Setting: 2, FromUID: "sender", ClientMsgNo: "client-71",
+		ServerTimestampMS: 91, SyncOnce: true, RedDot: true, Payload: []byte("payload"), SizeBytes: len("payload"),
+	}}
+	manifest, _, ok := ch.SealProposalManifest(ch.ProposalManifest{
+		Version: ch.ProposalManifestVersion, ChannelEpoch: 3, LeaderTerm: 5, FenceVersion: 7,
+		CommandID: ch.CommandID{31: 11}, BaseOffset: 0, LastOffset: 1,
+	}, records)
+	require.True(t, ok)
+	appended, err := store.AppendLeader(ctx, AppendLeaderRequest{
+		Records: records, ExactBaseOffset: true, ExpectedBaseOffset: 0, Proposal: manifest,
+	})
+	require.NoError(t, err)
+	require.True(t, appended.Outcome.Durable())
+	lookup, ok := store.(ExactProposalLookup)
+	require.True(t, ok)
+	loaded, found, err := lookup.LoadExactProposal(ctx, ExactProposalRequest{
+		CommandID: manifest.CommandID, MaxRecords: 16, MaxBytes: 64 << 10,
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, manifest, loaded.Manifest)
+	require.Len(t, loaded.Records, 1)
+	require.Equal(t, uint64(1), loaded.Records[0].Index)
+	require.Equal(t, records[0].Epoch, loaded.Records[0].Epoch)
+	require.Equal(t, records[0].Setting, loaded.Records[0].Setting)
+	require.Equal(t, records[0].FromUID, loaded.Records[0].FromUID)
+	require.Equal(t, records[0].ClientMsgNo, loaded.Records[0].ClientMsgNo)
+	require.Equal(t, records[0].ServerTimestampMS, loaded.Records[0].ServerTimestampMS)
+	require.Equal(t, records[0].SyncOnce, loaded.Records[0].SyncOnce)
+	require.True(t, loaded.Records[0].RedDot)
+	require.Equal(t, records[0].Payload, loaded.Records[0].Payload)
+
+	sealed, _, ok := ch.SealProposalManifest(loaded.Manifest, loaded.Records)
+	require.True(t, ok)
+	require.Equal(t, manifest, sealed)
+
+	pageReader, ok := store.(ExactRecoveryPageReader)
+	require.True(t, ok)
+	page, err := pageReader.ReadExactRecoveryPage(ctx, ExactRecoveryPageRequest{From: 1, Through: 1, MaxBytes: 64 << 10})
+	require.NoError(t, err)
+	require.Len(t, page.Records, 1)
+	require.Equal(t, records[0].Epoch, page.Records[0].Epoch)
+	require.True(t, page.Records[0].RedDot)
 }
 
 func TestMessageDBStoreAdapterCheckpointPreservesExistingFields(t *testing.T) {
@@ -103,7 +156,6 @@ func TestMessageDBTraceMetadataIsNotStoredInDBCompatibleMessage(t *testing.T) {
 
 	_, err = cs.AppendLeader(ctx, AppendLeaderRequest{
 		Records: []ch.Record{{ID: 10, Payload: []byte("payload"), SizeBytes: len("payload")}},
-		Sync:    true,
 	})
 	require.NoError(t, err)
 
@@ -133,18 +185,18 @@ func TestMessageDBStoreAdapterPreservesConversationDisplayFields(t *testing.T) {
 
 	_, err = cs.AppendLeader(ctx, AppendLeaderRequest{
 		Records: []ch.Record{{
-			ID:                10,
-			Setting:           2,
-			Topic:             "topic-a",
-			Expire:            3600,
-			RedDot:            true,
+			ID:      10,
+			Setting: 2,
+			Topic:   "topic-a",
+			Expire:  3600,
+			RedDot:  true,
+
 			FromUID:           "u1",
 			ClientMsgNo:       "client-1",
 			Payload:           []byte("payload"),
 			SizeBytes:         len("payload"),
 			ServerTimestampMS: 1234,
 		}},
-		Sync: true,
 	})
 	require.NoError(t, err)
 
@@ -157,6 +209,8 @@ func TestMessageDBStoreAdapterPreservesConversationDisplayFields(t *testing.T) {
 	require.Equal(t, "topic-a", committed.Messages[0].Topic)
 	require.Equal(t, uint32(3600), committed.Messages[0].Expire)
 	require.True(t, committed.Messages[0].RedDot)
+
+	require.Equal(t, uint32(3600), committed.Messages[0].Expire)
 	require.Equal(t, []byte("payload"), committed.Messages[0].Payload)
 	require.Equal(t, int64(1234), committed.Messages[0].ServerTimestampMS)
 
@@ -171,8 +225,61 @@ func TestMessageDBStoreAdapterPreservesConversationDisplayFields(t *testing.T) {
 	require.Equal(t, "topic-a", msg.Topic)
 	require.Equal(t, uint32(3600), msg.Expire)
 	require.True(t, msg.RedDot)
+
+	require.Equal(t, uint32(3600), msg.Expire)
 	require.Equal(t, []byte("payload"), msg.Payload)
 	require.Equal(t, int64(1234), msg.ServerTimestampMS)
+	latest, _, _, err := factory.ListLatestMessages(ctx, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, latest, 1)
+	require.Equal(t, uint32(3600), latest[0].Expire)
+}
+
+// Read results must remain independent across reads, rows, and lease closure
+// even when the adapter transfers decoded payloads without cloning them.
+func TestMessageDBReadPayloadOwnership(t *testing.T) {
+	ctx := context.Background()
+	factory := NewMessageDBFactory(t.TempDir())
+	t.Cleanup(func() { _ = factory.Close() })
+	id := ch.ChannelID{ID: "read-payload-ownership", Type: 2}
+	cs, err := factory.ChannelStore(ch.ChannelKeyForID(id), id)
+	require.NoError(t, err)
+	closeChannelStoreOnCleanup(t, cs)
+	_, err = cs.AppendLeader(ctx, AppendLeaderRequest{Records: []ch.Record{
+		{ID: 1, FromUID: "sender", ClientMsgNo: "one", Payload: []byte("payload")},
+		{ID: 2, FromUID: "sender", ClientMsgNo: "two", Payload: []byte("payload")},
+	}})
+	require.NoError(t, err)
+	for _, req := range []ReadCommittedRequest{
+		{FromSeq: 2, MaxSeq: 2, Limit: 1, MaxBytes: 1024, Reverse: true},
+		{FromSeq: 3, MaxSeq: 2, Limit: 2, MaxBytes: 1024, Reverse: true},
+		{FromSeq: 1, MaxSeq: 2, Limit: 2, MaxBytes: 1024},
+		{MessageID: 2, MinSeq: 1, MaxSeq: 2, Limit: 1, MaxBytes: 1024},
+		{ClientMsgNo: "two", MinSeq: 1, MaxSeq: 2, Limit: 1, MaxBytes: 1024},
+	} {
+		first, err := cs.ReadCommitted(ctx, req)
+		require.NoError(t, err)
+		require.NotEmpty(t, first.Messages)
+		second, err := cs.ReadCommitted(ctx, req)
+		require.NoError(t, err)
+		first.Messages[0].Payload[0] = 'X'
+		for _, msg := range second.Messages {
+			require.Equal(t, "payload", string(msg.Payload))
+		}
+		for _, msg := range first.Messages[1:] {
+			require.Equal(t, "payload", string(msg.Payload))
+		}
+		third, err := cs.ReadCommitted(ctx, req)
+		require.NoError(t, err)
+		require.Equal(t, second, third)
+	}
+	result, err := cs.ReadCommitted(ctx, ReadCommittedRequest{FromSeq: 1, MaxSeq: 2, Limit: 2, MaxBytes: 1024})
+	require.NoError(t, err)
+	require.NoError(t, cs.Close())
+	require.NoError(t, factory.Close())
+	for _, msg := range result.Messages {
+		require.Equal(t, "payload", string(msg.Payload))
+	}
 }
 
 func TestMessageDBStoreAdapterLookupIdempotency(t *testing.T) {
@@ -192,7 +299,6 @@ func TestMessageDBStoreAdapterLookupIdempotency(t *testing.T) {
 			Payload:     []byte("payload"),
 			SizeBytes:   len("payload"),
 		}},
-		Sync: true,
 	})
 	require.NoError(t, err)
 
@@ -213,6 +319,36 @@ func TestMessageDBStoreAdapterLookupIdempotency(t *testing.T) {
 	require.False(t, found)
 }
 
+func TestMessageDBStoreAdapterLooksUpLastCommittedSenderSequence(t *testing.T) {
+	ctx := context.Background()
+	factory := NewMessageDBFactory(t.TempDir())
+	t.Cleanup(func() { _ = factory.Close() })
+	id := ch.ChannelID{ID: "sender-sequence", Type: 2}
+	cs, err := factory.ChannelStore(ch.ChannelKeyForID(id), id)
+	require.NoError(t, err)
+	closeChannelStoreOnCleanup(t, cs)
+
+	_, err = cs.AppendLeader(ctx, AppendLeaderRequest{
+		Records: []ch.Record{
+			{ID: 10, FromUID: "u1", Payload: []byte("one")},
+			{ID: 11, FromUID: "u2", Payload: []byte("two")},
+			{ID: 12, FromUID: "u1", Payload: []byte("three"), SyncOnce: true},
+		},
+	})
+	require.NoError(t, err)
+
+	lookup, ok := cs.(SenderSequenceLookup)
+	require.True(t, ok)
+	seq, found, err := lookup.GetLastSenderMessageSeq(ctx, "u1", 2)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, uint64(1), seq)
+	seq, found, err = lookup.GetLastSenderMessageSeq(ctx, "u1", 3)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, uint64(1), seq)
+}
+
 func TestMessageDBStoreAdapterPreservesSyncOnceFlag(t *testing.T) {
 	ctx := context.Background()
 	factory := NewMessageDBFactory(t.TempDir())
@@ -229,7 +365,6 @@ func TestMessageDBStoreAdapterPreservesSyncOnceFlag(t *testing.T) {
 			SizeBytes: len("cmd"),
 			SyncOnce:  true,
 		}},
-		Sync: true,
 	})
 	require.NoError(t, err)
 
@@ -266,7 +401,6 @@ func TestChannelStoreAdapterRetentionAdoptAndTrim(t *testing.T) {
 			{ID: 22, Payload: []byte("two"), SizeBytes: len("two")},
 			{ID: 23, Payload: []byte("three"), SizeBytes: len("three")},
 		},
-		Sync: true,
 	})
 	require.NoError(t, err)
 
@@ -343,6 +477,9 @@ func TestMessageDBChannelStoreMethodsReturnErrClosedAfterClose(t *testing.T) {
 	idempotency := cs.(IdempotencyLookup)
 	_, _, err = idempotency.LookupIdempotency(ctx, "", "")
 	require.ErrorIs(t, err, ch.ErrClosed)
+	senderSequence := cs.(SenderSequenceLookup)
+	_, _, err = senderSequence.GetLastSenderMessageSeq(ctx, "u1", 1)
+	require.ErrorIs(t, err, ch.ErrClosed)
 	require.NoError(t, cs.Close())
 }
 
@@ -406,6 +543,8 @@ func TestMessageDBFactoryBatchesReleaseLeasesOnSuccess(t *testing.T) {
 	require.Len(t, appendResults, 2)
 	require.NoError(t, appendResults[0].Err)
 	require.NoError(t, appendResults[1].Err)
+	require.Equal(t, AppendOutcomeDurable, appendResults[0].Outcome)
+	require.Equal(t, AppendOutcomeDurable, appendResults[1].Outcome)
 	requireBatchKeysReclaimed(t, factory, appendKeys)
 
 	applyKeys := []ch.ChannelKey{"batch-apply-success-a:1", "batch-apply-success-b:1"}
@@ -447,6 +586,8 @@ func TestMessageDBFactoryBatchesReleaseLeasesOnCancellation(t *testing.T) {
 	})
 	require.ErrorIs(t, appendResults[0].Err, context.Canceled)
 	require.ErrorIs(t, appendResults[1].Err, context.Canceled)
+	require.Equal(t, AppendOutcomeDefinitelyNotWritten, appendResults[0].Outcome)
+	require.Equal(t, AppendOutcomeDefinitelyNotWritten, appendResults[1].Outcome)
 	requireBatchKeysReclaimed(t, factory, appendKeys)
 
 	applyKeys := []ch.ChannelKey{"batch-apply-cancel-a:1", "batch-apply-cancel-b:1"}
@@ -499,6 +640,7 @@ func TestMessageDBFactoryBatchAdmittedCancellationReclaimsAfterTerminalCommit(t 
 	}
 	require.Len(t, results, 1)
 	require.ErrorIs(t, results[0].Err, context.Canceled)
+	require.Equal(t, AppendOutcomeUnknown, results[0].Outcome)
 
 	_, err := factory.ChannelStore(key, ch.ChannelID{ID: "replacement-before-terminal", Type: 2})
 	require.Error(t, err, "background commit pin should retain the canonical identity")
@@ -662,11 +804,11 @@ func TestNewMessageDBFactoryWithOptionsConfiguresCommitCoordinatorTuning(t *test
 	require.Equal(t, 4, cfg.Shards)
 }
 
-func TestNewMessageDBFactoryUsesQPSValidatedCommitShardsByDefault(t *testing.T) {
+func TestNewMessageDBFactoryUsesOneCommitShardByDefault(t *testing.T) {
 	factory := NewMessageDBFactory(t.TempDir())
 	t.Cleanup(func() { _ = factory.Close() })
 
-	require.Equal(t, 4, factory.CommitCoordinatorConfig().Shards)
+	require.Equal(t, 1, factory.CommitCoordinatorConfig().Shards)
 }
 
 func TestMessageDBFactoryMetricsSnapshotReportsPhysicalStore(t *testing.T) {

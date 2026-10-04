@@ -10,42 +10,34 @@ Route: `/{lang}/guide`
 
 从认识 WuKongIM 到完成第一个业务集成。 / Learn WuKongIM and complete your first product integration.
 
-- **产品概览 / Product Overview** `/{lang}/guide/product-overview` — 建立产品定位、能力边界和适用场景的整体认识。 / Understand the product position, capability boundaries, and use cases.
-
-  - **WuKongIM 是什么 / What is WuKongIM?** `/{lang}/guide/product-overview/what-is-wukongim` — 介绍频道式消息模型、集群语义，以及它与网关和消息队列的区别。 / Introduces the channel model, cluster semantics, and how WuKongIM differs from gateways and queues.
-  - **核心能力 / Core Capabilities** `/{lang}/guide/product-overview/capabilities` — 概览高并发消息、超大群、持久化、多设备、故障转移和扩容能力。 / Surveys high-throughput messaging, large groups, persistence, multi-device, failover, and scaling.
-  - **适用场景 / Use Cases** `/{lang}/guide/product-overview/use-cases` — 说明聊天、推送、客服、直播、IoT、信令和 AI 通信等用途。 / Explains chat, push, support, live interaction, IoT, signaling, and AI communication use cases.
-
-- **快速开始 / Quick Start** `/{lang}/guide/quick-start` — 沿最短路径启动集群、发送消息并验证结果。 / Follow the shortest path to start a cluster, send a message, and verify the result.
-
-  - **环境准备 / Prerequisites** `/{lang}/guide/quick-start/prerequisites` — 列出 Git、Go、端口、本地目录和测试工具要求。 / Lists Git, Go, ports, local directories, and test tool requirements.
-  - **启动单节点集群 / Start a Single-node Cluster** `/{lang}/guide/quick-start/single-node-cluster` — 启动单节点集群并验证就绪状态与 Manager。 / Starts a single-node cluster and verifies readiness and Manager access.
+- **产品概览 / Product Overview** `/{lang}/guide/product-overview` — 判断 WuKongIM 是什么、是否适合你的产品，以及下一步如何验证。 / Decide what WuKongIM is, whether it fits your product, and how to validate it.
+  - **核心能力 / Core Capabilities** `/{lang}/guide/product-overview/capabilities` — 从产品结果理解实时接入、可靠消息、多设备、集群和运维能力。 / Explains real-time access, reliable messaging, multi-device, cluster, and operations outcomes.
+  - **适用场景 / Use Cases** `/{lang}/guide/product-overview/use-cases` — 判断聊天、通知、客服及扩展场景如何使用 WuKongIM。 / Maps chat, notifications, customer service, and extended scenarios to WuKongIM.
+- **快速开始 / Quick Start** `/{lang}/guide/quick-start` — 用 Docker 启动单节点集群，通过 Demo 验证消息，再选择 SDK。 / Start a single-node cluster with Docker, exchange messages in the Demo, then choose an SDK.
+  - **环境准备 / Prerequisites** `/{lang}/guide/quick-start/prerequisites` — 准备 Docker、浏览器与本机端口；Linux 安装作为可选路径。 / Prepare Docker, a browser, and local ports, with Linux installation as an alternative.
+  - **Linux 安装（可选） / Linux Installation (Optional)** `/{lang}/guide/quick-start/single-node-cluster` — 安装软件包并通过 systemd 启动单节点集群。 / Installs the package and starts a single-node cluster with systemd.
   - **发送第一条消息 / Send the First Message** `/{lang}/guide/quick-start/first-message` — 创建测试身份并完成一次最小消息收发。 / Creates test identities and completes a minimal message exchange.
-  - **运行聊天演示 / Run the Chat Demo** `/{lang}/guide/quick-start/chat-demo` — 使用内置聊天演示验证两个测试用户之间的通信。 / Uses the embedded chat demo to verify communication between two test users.
+  - **体验四个 Demo / Try the Four Demos** `/{lang}/guide/quick-start/chat-demo` — 一键启动聊天、流式回复、客服与 Agent，按场景体验。 / Launches chat, streaming, support, and Agent Demos together.
   - **下一步 / Next Steps** `/{lang}/guide/quick-start/next-steps` — 按接入、部署、运维和参考需求引导后续阅读。 / Routes readers to integration, deployment, operations, and reference material.
-
-- **核心概念 / Core Concepts** `/{lang}/guide/core-concepts` — 建立应用开发所需的统一业务术语。 / Establishes the shared product vocabulary needed by application developers.
-
-  - **集群与节点 / Clusters & Nodes** `/{lang}/guide/core-concepts/cluster-and-nodes` — 解释所有部署都是集群，以及节点、Slot、副本和 Leader 的关系。 / Explains cluster-only deployment semantics and the relationship among nodes, slots, replicas, and leaders.
-  - **消息 / Messages** `/{lang}/guide/core-concepts/messages` — 解释消息标识、序号、顺序、持久化、去重和离线生命周期。 / Explains identifiers, sequence, ordering, persistence, deduplication, and offline lifecycle.
-  - **频道 / Channels** `/{lang}/guide/core-concepts/channels` — 解释频道作为消息路由和存储核心单位的职责。 / Explains channels as the core unit for message routing and storage.
-  - **用户与设备 / Users & Devices** `/{lang}/guide/core-concepts/users-and-devices` — 区分用户、设备、连接、登录状态和多端在线。 / Distinguishes users, devices, connections, login state, and multi-device presence.
-  - **会话 / Conversations** `/{lang}/guide/core-concepts/conversations` — 解释会话列表、最近消息、未读数和状态同步。 / Explains conversation lists, latest messages, unread counts, and state synchronization.
-
+- **核心概念 / Core Concepts** `/{lang}/guide/core-concepts` — 用消息、频道、用户、设备和会话理解 WuKongIM 如何组织即时通信。 / Explains how WuKongIM organizes communication through messages, channels, users, devices, and conversations.
+  - **消息 / Message** `/{lang}/guide/core-concepts/messages` — 消息是什么、如何找到接收范围，以及发送成功、送达和已读的区别。 / Explains what a message is, how it finds recipients, and why sent, delivered, and read are different outcomes.
+  - **频道 / Channel** `/{lang}/guide/core-concepts/channels` — 频道如何表示单聊、群聊等消息目标，并组织参与者和消息历史。 / Explains how a Channel represents direct and group targets and organizes participants and message history.
+  - **用户 / User** `/{lang}/guide/core-concepts/users` — 用户如何通过稳定 UID 接入，以及 WuKongIM 与业务账号系统的职责边界。 / Explains how a stable UID enters WuKongIM and what remains the responsibility of the product account system.
+  - **设备 / Device** `/{lang}/guide/core-concepts/devices` — 设备、连接与多端在线的区别，以及哪些状态会跨设备共享。 / Separates devices from connections and explains multi-endpoint presence and shared state.
+  - **会话 / Conversation** `/{lang}/guide/core-concepts/conversations` — 会话如何把频道呈现为聊天列表，并管理未读和个人可见状态。 / Explains how a Conversation presents a Channel in a chat list with unread and personal visibility state.
 - **集成指南 / Integration** `/{lang}/guide/integration` — 从业务系统视角完成 WuKongIM 接入。 / Integrates WuKongIM from the perspective of an existing product system.
-
   - **集成架构 / Integration Architecture** `/{lang}/guide/integration/architecture` — 说明业务服务、WuKongIM 服务端和客户端 SDK 的职责与数据流。 / Defines responsibilities and data flow across the business service, WuKongIM server, and client SDK.
   - **身份认证 / Authentication** `/{lang}/guide/integration/authentication` — 说明身份、Token、设备标识、连接鉴权和撤销策略。 / Covers identities, tokens, device identifiers, connection authentication, and revocation.
   - **消息收发 / Messaging** `/{lang}/guide/integration/messaging` — 串联连接、发送、接收、确认、重连和离线补偿。 / Connects sending, receiving, acknowledgements, reconnects, and offline recovery.
   - **Webhook / Webhooks** `/{lang}/guide/integration/webhooks` — 介绍事件回调、签名、重试、幂等和失败处理。 / Introduces event callbacks, signatures, retries, idempotency, and failure handling.
   - **插件扩展 / Plugin Extensions** `/{lang}/guide/integration/plugins` — 说明插件的适用问题、生命周期和安全边界。 / Explains suitable plugin use cases, lifecycle, and security boundaries.
-
+  - **上线检查 / Release Checks** `/{lang}/guide/integration/acceptance` — 发布前检查身份、连接、消息、离线恢复、安全、容量和回滚。 / Checks identity, connection, messaging, offline recovery, security, capacity, and rollback before release.
 - **场景教程 / Tutorials** `/{lang}/guide/tutorials` — 提供面向典型业务场景的端到端方案。 / Provides end-to-end solutions for representative product scenarios.
-
   - **单聊 / Direct Chat** `/{lang}/guide/tutorials/direct-chat` — 实现用户、单聊频道、消息、未读数和多设备同步。 / Implements users, direct channels, messages, unread counts, and multi-device sync.
   - **群聊与超大群 / Groups & Large Groups** `/{lang}/guide/tutorials/large-groups` — 实现群成员维护和群消息，并说明十万级成员约束。 / Implements group membership and messaging with constraints for 100,000-member groups.
   - **消息推送 / Message Push** `/{lang}/guide/tutorials/push` — 实现通知、系统消息、离线设备处理和失败恢复。 / Implements notifications, system messages, offline-device handling, and recovery.
   - **AI 与 IoT 通信 / AI & IoT Communication** `/{lang}/guide/tutorials/ai-and-iot` — 展示流式 AI 回复、设备上报和服务端指令。 / Demonstrates streaming AI replies, device telemetry, and server commands.
+  - **MQTT 快速开始 / MQTT Quickstart** `/{lang}/guide/tutorials/mqtt` — 用 Node.js 和 MQTT.js 完成认证、订阅和双向消息验证。 / Authenticates, subscribes and verifies a two-way exchange using Node.js and MQTT.js.
 
 ## 服务端 / Server
 
@@ -53,42 +45,33 @@ Route: `/{lang}/server`
 
 部署、配置、运维和理解 WuKongIM 集群。 / Deploy, configure, operate, and understand a WuKongIM cluster.
 
-- **部署 / Deployment** `/{lang}/server/deployment` — 选择并实施适合环境的服务端部署方式。 / Choose and implement the server deployment method appropriate for the environment.
-
-  - **部署方式选择 / Choose a Deployment** `/{lang}/server/deployment/choosing` — 比较 Docker、Linux 二进制和 Kubernetes 的适用边界。 / Compares the suitability of Docker, Linux binaries, and Kubernetes.
-  - **Docker 部署 / Docker** `/{lang}/server/deployment/docker` — 使用镜像部署单节点集群或多节点集群。 / Deploys single-node clusters or multi-node clusters from container images.
-  - **Linux 部署 / Linux** `/{lang}/server/deployment/linux` — 使用二进制、配置文件和 systemd 运行服务。 / Runs the server with a binary, configuration file, and systemd.
-  - **Kubernetes 部署（Beta） / Kubernetes (Beta)** `/{lang}/server/deployment/kubernetes` — 说明持久化、服务发现、资源规划和 Beta 边界。 / Covers persistence, discovery, resource planning, and Beta limitations.
-  - **多节点集群 / Multi-node Cluster** `/{lang}/server/deployment/multi-node` — 规划并引导多节点集群完成启动和就绪检查。 / Plans and bootstraps a multi-node cluster through readiness verification.
-  - **生产检查清单 / Production Checklist** `/{lang}/server/deployment/production-checklist` — 汇总资源、磁盘、安全、监控、备份和容量检查。 / Checks resources, disks, security, monitoring, backups, and capacity.
-
+- **部署 / Deployment** `/{lang}/server/deployment` — 从 Docker、Linux 或多节点路径完成服务端部署。 / Deploy the server through the Docker, Linux, or multi-node path.
+  - **Docker 部署 / Docker** `/{lang}/server/deployment/docker` — 使用固定的官方镜像、显式配置和持久卷运行节点。 / Runs a node with a pinned official image, explicit configuration, and persistent storage.
+  - **Linux 部署 / Linux** `/{lang}/server/deployment/linux` — 从签名 APT/DNF Preview 软件源安装，并用安全配置和 systemd 运行服务。 / Installs from the signed APT/DNF preview repository and runs the service with secure configuration and systemd.
+  - **多节点集群 / Multi-node Cluster** `/{lang}/server/deployment/multi-node` — 规划成员、副本、故障域并验证集群就绪。 / Plans membership, replicas, failure domains, and cluster readiness.
 - **配置 / Configuration** `/{lang}/server/configuration` — 解释配置来源、覆盖规则和各领域配置。 / Explains configuration sources, override rules, and domain settings.
-
+  - **常用配置 / Common Configurations** `/{lang}/server/configuration/common-configurations` — 以表格解释高频配置项及其关键边界。 / Explains frequently used settings and their key boundaries in a table.
   - **节点与集群 / Nodes & Cluster** `/{lang}/server/configuration/cluster` — 节点身份、集群地址、Slot、副本和节点发现配置。 / Node identity, cluster addresses, slots, replicas, and discovery settings.
   - **网络与客户端接入 / Networking & Client Access** `/{lang}/server/configuration/networking` — TCP、WebSocket、HTTP、Manager 和节点通信监听配置。 / Listener settings for TCP, WebSocket, HTTP, Manager, and inter-node traffic.
   - **消息与存储 / Messages & Storage** `/{lang}/server/configuration/storage` — 消息保留、存储路径、队列、批处理和性能配置。 / Message retention, storage paths, queues, batching, and performance settings.
   - **安全与权限 / Security & Access** `/{lang}/server/configuration/security` — 认证、接口访问、Token、TLS 和敏感配置建议。 / Authentication, API access, tokens, TLS, and sensitive-setting guidance.
   - **日志与可观测性 / Logs & Observability** `/{lang}/server/configuration/observability` — 日志、指标、Prometheus、Top 和诊断接口配置。 / Logging, metrics, Prometheus, Top, and diagnostic endpoint settings.
-  - **配置参考 / Configuration Reference** `/{lang}/server/configuration/reference` — 列出 TOML 键、类型、环境变量、脱敏边界和约束。 / Lists TOML keys, types, environment variables, redaction boundaries, and constraints.
-
-- **运维 / Operations** `/{lang}/server/operations` — 管理、观察和安全变更生产集群。 / Manage, observe, and safely change production clusters.
-
-  - **Manager 管理后台 / Manager** `/{lang}/server/operations/manager` — 介绍后台权限、集群状态、业务查询和运维操作。 / Introduces permissions, cluster state, business queries, and operations.
-  - **健康检查与监控 / Health & Monitoring** `/{lang}/server/operations/health-and-monitoring` — 解释就绪状态、核心指标、Prometheus、Grafana 和告警。 / Explains readiness, key metrics, Prometheus, Grafana, and alerts.
-  - **扩容与缩容 / Scaling** `/{lang}/server/operations/scaling` — 说明节点加入、平衡、安全缩容和 Leader 迁移。 / Covers node joins, balancing, safe scale-in, and leader transfer.
-  - **备份与恢复 / Backup & Restore** `/{lang}/server/operations/backup-and-restore` — 说明备份计划、验证、恢复和灾难演练。 / Covers backup schedules, verification, restoration, and recovery drills.
-  - **升级与迁移 / Upgrade & Migration** `/{lang}/server/operations/upgrade-and-migration` — 说明兼容性、滚动升级、回滚和 v2 到 v3 迁移。 / Covers compatibility, rolling upgrades, rollback, and v2-to-v3 migration.
-  - **故障排查 / Troubleshooting** `/{lang}/server/operations/troubleshooting` — 按现象、指标、日志和诊断工具定位问题。 / Diagnoses issues through symptoms, metrics, logs, and diagnostic tools.
-
+  - **配置参考 / Configuration Reference** `/{lang}/server/configuration/reference` — 逐项说明全部公开 TOML、环境变量、关键默认值、约束和迁移方式。 / Explains every public TOML field, environment override, key default, constraint, and migration.
+- **运维 / Operations** `/{lang}/server/operations` — 从日常检查开始，安全地监控、备份、扩缩容和升级集群。 / Start with daily checks, then monitor, back up, scale, and upgrade the cluster safely.
+  - **Manager 管理后台 / Manager** `/{lang}/server/operations/manager` — 登录管理后台，看懂主要页面并安全执行操作。 / Sign in, understand the main pages, and perform administrative actions safely.
+  - **健康检查与监控 / Health & Monitoring** `/{lang}/server/operations/health-and-monitoring` — 判断进程是否存活、节点能否接流量，以及何时需要告警。 / Tell whether the process is alive, the node can accept traffic, and an alert is needed.
+  - **扩容与缩容 / Scaling** `/{lang}/server/operations/scaling` — 逐步增加节点，或安全排空并移除节点。 / Add a node step by step, or safely drain and remove one.
+  - **备份与恢复 / Backup & Restore** `/{lang}/server/operations/backup-and-restore` — 创建、测试和验证备份，并在维护窗口中恢复。 / Create, test, and verify backups, then restore during maintenance.
+  - **升级与迁移 / Upgrade & Migration** `/{lang}/server/operations/upgrade-and-migration` — 根据发布说明选择滚动升级或停机升级。 / Use release notes to choose a rolling or stopped upgrade.
+  - **v2 → v3 离线迁移 / v2 → v3 Offline Migration** `/{lang}/server/operations/v2-to-v3-migration` — 跟着单节点集群实例完成备份、迁移、启动和验收。 / Follow a single-node cluster example through backup, migration, startup, and acceptance.
+  - **v2 → v3 迁移参考 / v2 → v3 Migration Reference** `/{lang}/server/operations/v2-to-v3-migration-reference` — 按需查阅多节点计划、插件、兼容性策略与故障处理。 / Look up multi-node plans, plugins, compatibility policies, and troubleshooting.
+  - **故障排查 / Troubleshooting** `/{lang}/server/operations/troubleshooting` — 从故障现象开始，用低风险检查逐步定位问题。 / Start from the symptom and narrow the problem with low-risk checks.
 - **工具 / Tools** `/{lang}/server/tools` — 使用官方工具观察、验证和评估集群。 / Use official tools to inspect, verify, and evaluate clusters.
-
   - **wkcli / wkcli** `/{lang}/server/tools/wkcli` — 查看集群状态并执行受控运维操作。 / Inspects cluster state and performs controlled operations.
-  - **wkdb / wkdb** `/{lang}/server/tools/wkdb` — 执行本地只读存储诊断和离线导入导出。 / Performs node-local read-only storage diagnostics and offline import/export.
-  - **wkbench / wkbench** `/{lang}/server/tools/wkbench` — 执行黑盒压力测试、容量评估和回归验证。 / Runs black-box load tests, capacity evaluations, and regression checks.
+  - **wkcli db / wkcli db** `/{lang}/server/tools/wkdb` — 执行本地只读存储诊断和离线导入导出。 / Performs node-local read-only storage diagnostics and offline import/export.
+  - **wkcli bench / wkcli bench** `/{lang}/server/tools/wkbench` — 执行黑盒压力测试、容量评估和回归验证。 / Runs black-box load tests, capacity evaluations, and regression checks.
   - **诊断能力 / Diagnostics** `/{lang}/server/tools/diagnostics` — 选择日志、指标、Top、pprof 和只读 Operations MCP。 / Selects among logs, metrics, Top, pprof, and the read-only Operations MCP.
-
 - **架构 / Architecture** `/{lang}/server/architecture` — 从控制、元数据、消息和网络层理解系统。 / Understand the system through control, metadata, messaging, and network layers.
-
   - **Controller 控制层 / Controller Layer** `/{lang}/server/architecture/controller` — 解释集群元数据、节点管理、任务和一致性控制。 / Explains cluster metadata, node management, tasks, and consistency control.
   - **Slot 元数据层 / Slot Metadata Layer** `/{lang}/server/architecture/slots` — 解释默认 256 个 Hash Slot、归属、副本和 Leader 路由。 / Explains the default 256 hash slots, ownership, replicas, and leader routing.
   - **Channel 消息层 / Channel Messaging Layer** `/{lang}/server/architecture/channels` — 解释频道副本、消息日志、Leader 和故障切换。 / Explains channel replicas, message logs, leaders, and failover.
@@ -100,122 +83,172 @@ Route: `/{lang}/server`
 
 Route: `/{lang}/sdk`
 
-在不同客户端平台接入 WuKongIM。 / Integrate WuKongIM across supported client platforms.
+在不同客户端平台接入 WuKongIM。 / Integrate WuKongIM across client platforms.
 
-- **选择 SDK / Choose an SDK** `/{lang}/sdk/choose-sdk` — 根据应用平台、框架和运行环境选择客户端 SDK。 / Choose a client SDK by platform, framework, and runtime.
-
-- **版本与兼容性 / Versions & Compatibility** `/{lang}/sdk/compatibility` — 汇总 SDK 版本、服务端兼容范围、系统要求和维护状态。 / Lists SDK versions, server compatibility, system requirements, and maintenance status.
-
-- **公共指南 / Common Guides** `/{lang}/sdk/common-guides` — 统一说明所有客户端 SDK 共有的接入行为。 / Explains integration behavior shared by all client SDKs.
-
-  - **身份与 Token / Identity & Token** `/{lang}/sdk/common-guides/identity-and-token` — 说明用户、设备、Token 获取和失效处理。 / Explains users, devices, token acquisition, and invalidation.
-  - **初始化与连接 / Initialization & Connection** `/{lang}/sdk/common-guides/initialization-and-connection` — 说明 SDK 初始化、连接状态、生命周期和退出。 / Covers SDK initialization, connection state, lifecycle, and logout.
-  - **消息收发 / Messaging** `/{lang}/sdk/common-guides/messaging` — 解释发送、接收、确认、消息状态和错误处理。 / Explains send, receive, acknowledgement, message state, and error handling.
-  - **自定义消息 / Custom Messages** `/{lang}/sdk/common-guides/custom-messages` — 定义自定义消息的编码、注册、兼容和降级。 / Defines encoding, registration, compatibility, and fallback for custom messages.
-  - **会话与未读数 / Conversations & Unread Counts** `/{lang}/sdk/common-guides/conversations-and-unread` — 说明会话、最近消息、未读数和已读状态。 / Explains conversations, latest messages, unread counts, and read state.
-  - **离线消息与推送 / Offline Messages & Push** `/{lang}/sdk/common-guides/offline-and-push` — 区分离线同步和系统推送，并说明协作方式。 / Distinguishes offline synchronization from system push and explains how they cooperate.
-  - **多设备同步 / Multi-device Sync** `/{lang}/sdk/common-guides/multi-device` — 说明多端登录、消息同步和设备状态一致性。 / Explains multi-device login, message sync, and device-state consistency.
-  - **重连与异常处理 / Reconnect & Errors** `/{lang}/sdk/common-guides/reconnect-and-errors` — 说明断线、网络切换、超时、重试和常见错误。 / Covers disconnects, network changes, timeouts, retries, and common errors.
-
-- **Android / Android** `/{lang}/sdk/android` — Android SDK 的支持范围、系统要求和接入入口。 / Support scope, system requirements, and entry points for the Android SDK.
-
-  - **安装与配置 / Installation** `/{lang}/sdk/android/installation` — Android SDK 的依赖、权限和构建配置。 / Dependencies, permissions, and build configuration for the Android SDK.
-  - **快速接入 / Quickstart** `/{lang}/sdk/android/quickstart` — 在 Android 应用中完成首次连接和消息收发。 / Connect and exchange the first messages with the Android SDK.
-  - **平台专属能力 / Platform Capabilities** `/{lang}/sdk/android/platform-capabilities` — Android 平台的生命周期、后台运行和推送等差异。 / Lifecycle, background execution, push, and other Android-specific behavior.
-  - **API 参考 / API Reference** `/{lang}/sdk/android/api-reference` — Android SDK 的类、方法、事件、参数和错误定义。 / Classes, methods, events, parameters, and errors for the Android SDK.
-  - **升级指南 / Upgrade Guide** `/{lang}/sdk/android/upgrade` — Android SDK 的破坏性变更、迁移步骤和发布记录。 / Breaking changes, migration steps, and release history for the Android SDK.
-
-- **iOS / iOS** `/{lang}/sdk/ios` — iOS SDK 的支持范围、系统要求和接入入口。 / Support scope, system requirements, and entry points for the iOS SDK.
-
-  - **安装与配置 / Installation** `/{lang}/sdk/ios/installation` — iOS SDK 的依赖、权限和构建配置。 / Dependencies, permissions, and build configuration for the iOS SDK.
-  - **快速接入 / Quickstart** `/{lang}/sdk/ios/quickstart` — 在 iOS 应用中完成首次连接和消息收发。 / Connect and exchange the first messages with the iOS SDK.
-  - **平台专属能力 / Platform Capabilities** `/{lang}/sdk/ios/platform-capabilities` — iOS 平台的生命周期、后台运行和推送等差异。 / Lifecycle, background execution, push, and other iOS-specific behavior.
-  - **API 参考 / API Reference** `/{lang}/sdk/ios/api-reference` — iOS SDK 的类、方法、事件、参数和错误定义。 / Classes, methods, events, parameters, and errors for the iOS SDK.
-  - **升级指南 / Upgrade Guide** `/{lang}/sdk/ios/upgrade` — iOS SDK 的破坏性变更、迁移步骤和发布记录。 / Breaking changes, migration steps, and release history for the iOS SDK.
-
-- **JavaScript / Web / JavaScript / Web** `/{lang}/sdk/javascript` — JavaScript SDK 的浏览器支持范围和接入入口。 / Browser support and entry points for the JavaScript SDK.
-
-  - **安装与配置 / Installation** `/{lang}/sdk/javascript/installation` — JavaScript / Web SDK 的依赖、权限和构建配置。 / Dependencies, permissions, and build configuration for the JavaScript / Web SDK.
-  - **快速接入 / Quickstart** `/{lang}/sdk/javascript/quickstart` — 在 JavaScript / Web 应用中完成首次连接和消息收发。 / Connect and exchange the first messages with the JavaScript / Web SDK.
-  - **平台专属能力 / Platform Capabilities** `/{lang}/sdk/javascript/platform-capabilities` — JavaScript / Web 平台的生命周期、后台运行和推送等差异。 / Lifecycle, background execution, push, and other JavaScript / Web-specific behavior.
-  - **API 参考 / API Reference** `/{lang}/sdk/javascript/api-reference` — JavaScript / Web SDK 的类、方法、事件、参数和错误定义。 / Classes, methods, events, parameters, and errors for the JavaScript / Web SDK.
-  - **升级指南 / Upgrade Guide** `/{lang}/sdk/javascript/upgrade` — JavaScript / Web SDK 的破坏性变更、迁移步骤和发布记录。 / Breaking changes, migration steps, and release history for the JavaScript / Web SDK.
-
-- **Flutter / Flutter** `/{lang}/sdk/flutter` — Flutter SDK 的支持范围、系统要求和接入入口。 / Support scope, system requirements, and entry points for the Flutter SDK.
-
-  - **安装与配置 / Installation** `/{lang}/sdk/flutter/installation` — Flutter SDK 的依赖、权限和构建配置。 / Dependencies, permissions, and build configuration for the Flutter SDK.
-  - **快速接入 / Quickstart** `/{lang}/sdk/flutter/quickstart` — 在 Flutter 应用中完成首次连接和消息收发。 / Connect and exchange the first messages with the Flutter SDK.
-  - **平台专属能力 / Platform Capabilities** `/{lang}/sdk/flutter/platform-capabilities` — Flutter 平台的生命周期、后台运行和推送等差异。 / Lifecycle, background execution, push, and other Flutter-specific behavior.
-  - **API 参考 / API Reference** `/{lang}/sdk/flutter/api-reference` — Flutter SDK 的类、方法、事件、参数和错误定义。 / Classes, methods, events, parameters, and errors for the Flutter SDK.
-  - **升级指南 / Upgrade Guide** `/{lang}/sdk/flutter/upgrade` — Flutter SDK 的破坏性变更、迁移步骤和发布记录。 / Breaking changes, migration steps, and release history for the Flutter SDK.
-
-- **UniApp / UniApp** `/{lang}/sdk/uniapp` — UniApp SDK 的支持范围、平台差异和接入入口。 / Support scope, platform differences, and entry points for the UniApp SDK.
-
-  - **安装与配置 / Installation** `/{lang}/sdk/uniapp/installation` — UniApp SDK 的依赖、权限和构建配置。 / Dependencies, permissions, and build configuration for the UniApp SDK.
-  - **快速接入 / Quickstart** `/{lang}/sdk/uniapp/quickstart` — 在 UniApp 应用中完成首次连接和消息收发。 / Connect and exchange the first messages with the UniApp SDK.
-  - **平台专属能力 / Platform Capabilities** `/{lang}/sdk/uniapp/platform-capabilities` — UniApp 平台的生命周期、后台运行和推送等差异。 / Lifecycle, background execution, push, and other UniApp-specific behavior.
-  - **API 参考 / API Reference** `/{lang}/sdk/uniapp/api-reference` — UniApp SDK 的类、方法、事件、参数和错误定义。 / Classes, methods, events, parameters, and errors for the UniApp SDK.
-  - **升级指南 / Upgrade Guide** `/{lang}/sdk/uniapp/upgrade` — UniApp SDK 的破坏性变更、迁移步骤和发布记录。 / Breaking changes, migration steps, and release history for the UniApp SDK.
-
-- **HarmonyOS / HarmonyOS** `/{lang}/sdk/harmonyos` — HarmonyOS SDK 的支持范围、系统要求和接入入口。 / Support scope, system requirements, and entry points for the HarmonyOS SDK.
-
-  - **安装与配置 / Installation** `/{lang}/sdk/harmonyos/installation` — HarmonyOS SDK 的依赖、权限和构建配置。 / Dependencies, permissions, and build configuration for the HarmonyOS SDK.
-  - **快速接入 / Quickstart** `/{lang}/sdk/harmonyos/quickstart` — 在 HarmonyOS 应用中完成首次连接和消息收发。 / Connect and exchange the first messages with the HarmonyOS SDK.
-  - **平台专属能力 / Platform Capabilities** `/{lang}/sdk/harmonyos/platform-capabilities` — HarmonyOS 平台的生命周期、后台运行和推送等差异。 / Lifecycle, background execution, push, and other HarmonyOS-specific behavior.
-  - **API 参考 / API Reference** `/{lang}/sdk/harmonyos/api-reference` — HarmonyOS SDK 的类、方法、事件、参数和错误定义。 / Classes, methods, events, parameters, and errors for the HarmonyOS SDK.
-  - **升级指南 / Upgrade Guide** `/{lang}/sdk/harmonyos/upgrade` — HarmonyOS SDK 的破坏性变更、迁移步骤和发布记录。 / Breaking changes, migration steps, and release history for the HarmonyOS SDK.
+- **WuKongIMSDK / WuKongIMSDK** `/{lang}/sdk/wukongim` — 完整版客户端 SDK：管理连接、消息、本地会话、未读数与离线数据。 / Full client SDKs that manage connections, messages, local conversations, unread counts, and offline data.
+  - **核心概念 / Core Concepts** `/{lang}/sdk/wukongim/concepts` — 用简单语言理解 UID、Token、频道、消息状态、会话和 Provider。 / Understand UIDs, tokens, Channels, message states, Conversations, and providers in plain language.
+  - **Android / Android** `/{lang}/sdk/android` — 从快速开始到常用管理器，使用 WuKongIMAndroidSDK 1.5.5 完成清晰、可查找的 Android 接入。 / Integrate WuKongIMAndroidSDK 1.5.5 on Android through a clear quickstart and task-based manager guides.
+    - **快速开始 / Quickstart** `/{lang}/sdk/android/quickstart` — 安装 WuKongIMAndroidSDK 1.5.5，连接一个用户，并用 Java 完成第一条在线文本消息。 / Install WuKongIMAndroidSDK 1.5.5, connect one user, and exchange the first online text message in Java.
+    - **连接管理 / Connection** `/{lang}/sdk/android/connection` — 配置 UID、Token 与连接地址，监听连接状态，并正确处理断开和退出。 / Configure the UID, token, and endpoint; observe connection state; and disconnect or log out correctly.
+    - **消息管理 / Messages** `/{lang}/sdk/android/messages` — 发送、接收和查询消息，并理解发送中、发送成功与发送失败。 / Send, receive, and query messages while understanding sending, success, and failure states.
+    - **会话管理 / Conversations** `/{lang}/sdk/android/conversations` — 读取聊天列表、监听会话变化，并管理未读数。 / Read the chat list, observe conversation changes, and manage unread counts.
+    - **频道管理 / Channels** `/{lang}/sdk/android/channels` — 获取单聊或群聊资料，监听资料变化，并连接业务数据源。 / Load direct or group chat profiles, observe changes, and connect product data providers.
+    - **高级功能 / Advanced** `/{lang}/sdk/android/advanced` — 按当前平台确实提供的 API 学习自定义消息、媒体和离线能力。 / Use only the custom-content, media, and offline APIs actually provided by this platform.
+      - **自定义消息 / Custom Messages** `/{lang}/sdk/android/advanced/custom-messages` — 定义、注册并发送自己的业务消息类型。 / Define, register, and send product-specific message content.
+      - **媒体与历史消息 / Media & History** `/{lang}/sdk/android/advanced/media-and-history` — 接入媒体上传，并在本地消息不足时补齐历史消息。 / Connect media upload and fill message history when local data is incomplete.
+    - **API 参考 / API Reference** `/{lang}/sdk/android/api-reference` — 按管理器查找常用入口、监听器、Provider、模型和状态。 / Find common manager entry points, listeners, providers, models, and states.
+  - **iOS / iOS** `/{lang}/sdk/ios` — 从快速开始到常用管理器，使用 WuKongIMSDK 1.1.1 完成清晰、可查找的 iOS 接入。 / Integrate WuKongIMSDK 1.1.1 on iOS through a clear quickstart and task-based manager guides.
+    - **快速开始 / Quickstart** `/{lang}/sdk/ios/quickstart` — 安装 WuKongIMSDK 1.1.1，连接一个用户，并用 Objective-C 完成第一条在线文本消息。 / Install WuKongIMSDK 1.1.1, connect one user, and exchange the first online text message in Objective-C.
+    - **连接管理 / Connection** `/{lang}/sdk/ios/connection` — 配置 UID、Token 与连接地址，监听连接状态，并正确处理断开和退出。 / Configure the UID, token, and endpoint; observe connection state; and disconnect or log out correctly.
+    - **消息管理 / Messages** `/{lang}/sdk/ios/messages` — 发送、接收和查询消息，并理解发送中、发送成功与发送失败。 / Send, receive, and query messages while understanding sending, success, and failure states.
+    - **会话管理 / Conversations** `/{lang}/sdk/ios/conversations` — 读取聊天列表、监听会话变化，并管理未读数。 / Read the chat list, observe conversation changes, and manage unread counts.
+    - **频道管理 / Channels** `/{lang}/sdk/ios/channels` — 获取单聊或群聊资料，监听资料变化，并连接业务数据源。 / Load direct or group chat profiles, observe changes, and connect product data providers.
+    - **高级功能 / Advanced** `/{lang}/sdk/ios/advanced` — 按当前平台确实提供的 API 学习自定义消息、媒体和离线能力。 / Use only the custom-content, media, and offline APIs actually provided by this platform.
+      - **自定义消息 / Custom Messages** `/{lang}/sdk/ios/advanced/custom-messages` — 继承消息正文、注册类型并发送自己的业务消息。 / Subclass message content, register its type, and send product-specific messages.
+      - **媒体与历史消息 / Media & History** `/{lang}/sdk/ios/advanced/media-and-history` — 接入图片和语音上传，并在本地消息不足时同步历史消息。 / Connect image and voice upload and synchronize history when local messages are incomplete.
+    - **API 参考 / API Reference** `/{lang}/sdk/ios/api-reference` — 按管理器查找常用入口、监听器、Provider、模型和状态。 / Find common manager entry points, listeners, providers, models, and states.
+  - **JavaScript / Web / JavaScript / Web** `/{lang}/sdk/javascript` — 从快速开始到常用管理器，使用 wukongimjssdk 1.3.5 完成清晰、可查找的 JavaScript / Web 接入。 / Integrate wukongimjssdk 1.3.5 on JavaScript / Web through a clear quickstart and task-based manager guides.
+    - **快速开始 / Quickstart** `/{lang}/sdk/javascript/quickstart` — 安装 wukongimjssdk 1.3.5，连接一个用户，并用 TypeScript 完成第一条在线文本消息。 / Install wukongimjssdk 1.3.5, connect one user, and exchange the first online text message in TypeScript.
+    - **连接管理 / Connection** `/{lang}/sdk/javascript/connection` — 配置 UID、Token 与连接地址，监听连接状态，并正确处理断开和退出。 / Configure the UID, token, and endpoint; observe connection state; and disconnect or log out correctly.
+    - **消息管理 / Messages** `/{lang}/sdk/javascript/messages` — 发送、接收和查询消息，并理解发送中、发送成功与发送失败。 / Send, receive, and query messages while understanding sending, success, and failure states.
+    - **会话管理 / Conversations** `/{lang}/sdk/javascript/conversations` — 读取聊天列表、监听会话变化，并管理未读数。 / Read the chat list, observe conversation changes, and manage unread counts.
+    - **频道管理 / Channels** `/{lang}/sdk/javascript/channels` — 获取单聊或群聊资料，监听资料变化，并连接业务数据源。 / Load direct or group chat profiles, observe changes, and connect product data providers.
+    - **高级功能 / Advanced** `/{lang}/sdk/javascript/advanced` — 按当前平台确实提供的 API 学习自定义消息、媒体和离线能力。 / Use only the custom-content, media, and offline APIs actually provided by this platform.
+      - **自定义消息 / Custom Messages** `/{lang}/sdk/javascript/advanced/custom-messages` — 定义、注册并发送浏览器业务需要的消息正文。 / Define, register, and send message content required by the browser product.
+      - **离线恢复与 UniApp 迁移 / Offline Recovery & UniApp Migration** `/{lang}/sdk/javascript/advanced/offline-and-uniapp` — 接入离线消息同步，并把旧 UniApp SDK 迁移到 JavaScript SDK。 / Connect offline synchronization and migrate the retired UniApp SDK to the JavaScript SDK.
+    - **API 参考 / API Reference** `/{lang}/sdk/javascript/api-reference` — 按管理器查找常用入口、监听器、Provider、模型和状态。 / Find common manager entry points, listeners, providers, models, and states.
+  - **Flutter / Flutter** `/{lang}/sdk/flutter` — 从快速开始到常用管理器，使用 wukongimfluttersdk 1.7.9 完成清晰、可查找的 Flutter 接入。 / Integrate wukongimfluttersdk 1.7.9 on Flutter through a clear quickstart and task-based manager guides.
+    - **快速开始 / Quickstart** `/{lang}/sdk/flutter/quickstart` — 安装 wukongimfluttersdk 1.7.9，连接一个用户，并用 Dart 完成第一条在线文本消息。 / Install wukongimfluttersdk 1.7.9, connect one user, and exchange the first online text message in Dart.
+    - **连接管理 / Connection** `/{lang}/sdk/flutter/connection` — 配置 UID、Token 与连接地址，监听连接状态，并正确处理断开和退出。 / Configure the UID, token, and endpoint; observe connection state; and disconnect or log out correctly.
+    - **消息管理 / Messages** `/{lang}/sdk/flutter/messages` — 发送、接收和查询消息，并理解发送中、发送成功与发送失败。 / Send, receive, and query messages while understanding sending, success, and failure states.
+    - **会话管理 / Conversations** `/{lang}/sdk/flutter/conversations` — 读取聊天列表、监听会话变化，并管理未读数。 / Read the chat list, observe conversation changes, and manage unread counts.
+    - **频道管理 / Channels** `/{lang}/sdk/flutter/channels` — 获取单聊或群聊资料，监听资料变化，并连接业务数据源。 / Load direct or group chat profiles, observe changes, and connect product data providers.
+    - **高级功能 / Advanced** `/{lang}/sdk/flutter/advanced` — 按当前平台确实提供的 API 学习自定义消息、媒体和离线能力。 / Use only the custom-content, media, and offline APIs actually provided by this platform.
+      - **自定义消息 / Custom Messages** `/{lang}/sdk/flutter/advanced/custom-messages` — 定义、注册并发送 Flutter 业务消息类型。 / Define, register, and send product-specific Flutter message content.
+      - **媒体与历史消息 / Media & History** `/{lang}/sdk/flutter/advanced/media-and-history` — 接入媒体上传，并在本地消息不足时补齐历史消息。 / Connect media upload and fill message history when local data is incomplete.
+    - **API 参考 / API Reference** `/{lang}/sdk/flutter/api-reference` — 按管理器查找常用入口、监听器、Provider、模型和状态。 / Find common manager entry points, listeners, providers, models, and states.
+  - **HarmonyOS / HarmonyOS** `/{lang}/sdk/harmonyos` — 从快速开始到常用管理器，使用 @wukong/wkim 1.1.7 完成清晰、可查找的 HarmonyOS 接入。 / Integrate @wukong/wkim 1.1.7 on HarmonyOS through a clear quickstart and task-based manager guides.
+    - **快速开始 / Quickstart** `/{lang}/sdk/harmonyos/quickstart` — 安装 @wukong/wkim 1.1.7，连接一个用户，并用 ArkTS 完成第一条在线文本消息。 / Install @wukong/wkim 1.1.7, connect one user, and exchange the first online text message in ArkTS.
+    - **连接管理 / Connection** `/{lang}/sdk/harmonyos/connection` — 配置 UID、Token 与连接地址，监听连接状态，并正确处理断开和退出。 / Configure the UID, token, and endpoint; observe connection state; and disconnect or log out correctly.
+    - **消息管理 / Messages** `/{lang}/sdk/harmonyos/messages` — 发送、接收和查询消息，并理解发送中、发送成功与发送失败。 / Send, receive, and query messages while understanding sending, success, and failure states.
+    - **会话管理 / Conversations** `/{lang}/sdk/harmonyos/conversations` — 读取聊天列表、监听会话变化，并管理未读数。 / Read the chat list, observe conversation changes, and manage unread counts.
+    - **频道管理 / Channels** `/{lang}/sdk/harmonyos/channels` — 获取单聊或群聊资料，监听资料变化，并连接业务数据源。 / Load direct or group chat profiles, observe changes, and connect product data providers.
+    - **高级功能 / Advanced** `/{lang}/sdk/harmonyos/advanced` — 按当前平台确实提供的 API 学习自定义消息、媒体和离线能力。 / Use only the custom-content, media, and offline APIs actually provided by this platform.
+      - **自定义消息 / Custom Messages** `/{lang}/sdk/harmonyos/advanced/custom-messages` — 定义、注册并发送 HarmonyOS 业务消息类型。 / Define, register, and send product-specific HarmonyOS message content.
+      - **媒体与历史消息 / Media & History** `/{lang}/sdk/harmonyos/advanced/media-and-history` — 接入图片或语音消息，并在本地数据不足时补齐历史消息。 / Connect image or voice messages and fill history when local data is incomplete.
+    - **API 参考 / API Reference** `/{lang}/sdk/harmonyos/api-reference` — 按管理器查找常用入口、监听器、Provider、模型和状态。 / Find common manager entry points, listeners, providers, models, and states.
+  - **升级 SDK / Upgrade SDKs** `/{lang}/sdk/wukongim/upgrade` — 用一套简洁流程升级依赖、检查数据兼容并准备回滚。 / Upgrade dependencies, check data compatibility, and prepare rollback with one concise workflow.
+- **WuKongEasySDK / WuKongEasySDK** `/{lang}/sdk/easy` — 选择 iOS、Android、Flutter、Web、C#、C++、Rust 或 Python 快速接入，使用固定版本的 SDK完成在线双向消息。 / Choose an iOS, Android, Flutter, Web, C#, C++, Rust, or Python quickstart with pinned SDK versions for online bidirectional messaging.
+  - **运行官方示例 / Run Official Examples** `/{lang}/sdk/easy/examples` — 准备开发集群和两个账号，运行八个平台的示例并检查双向收发与退出清理。 / Prepare a development cluster and two accounts, run examples for eight platforms, and check messaging and cleanup.
+  - **iOS 快速接入 / iOS quickstart** `/{lang}/sdk/easy/ios/getting-started` — 精确安装 v1.1.1，完成单聊收发、监听清理和 Alice/Bob 双向消息。 / Install exactly v1.1.1 for person messaging, listener cleanup, and Alice/Bob messaging.
+  - **Android 快速接入 / Android quickstart** `/{lang}/sdk/easy/android/getting-started` — 精确安装 v1.0.5，处理单例、单聊收发、清理和 Alice/Bob 双向消息。 / Install exactly v1.0.5 for singleton ownership, person messaging, cleanup, and Alice/Bob messaging.
+  - **Flutter 快速接入 / Flutter quickstart** `/{lang}/sdk/easy/flutter/getting-started` — 精确安装并运行已验证的 v1.1.0 example，完成单聊收发、dispose 清理和 Alice/Bob 验收。 / Install and run the verified v1.1.0 example for person messaging, dispose cleanup, and Alice/Bob acceptance.
+  - **Web 快速接入 / Web quickstart** `/{lang}/sdk/easy/javascript/getting-started` — 精确安装 easyjssdk v2.0.5，在浏览器中通过业务后端完成 Alice/Bob 在线消息。 / Install exactly easyjssdk v2.0.5 for Alice/Bob browser messaging with credentials from your backend.
+  - **Agent 流式回复 / Agent Streaming Replies** `/{lang}/sdk/easy/agent-streaming` — 使用 EasySDK 与真实模型实现逐段回复、取消、失败和离线恢复。 / Build incremental replies with EasySDK and a real model, including cancellation, failures, and offline recovery.
+  - **Rust 快速接入 / Rust quickstart** `/{lang}/sdk/easy/rust/getting-started` — 安装 WuKongEasySDK-Rust 0.1.0 正式包，使用 Tokio 完成在线消息、有限重连和清理。 / Install WuKongEasySDK-Rust 0.1.0 for Tokio online messaging, bounded reconnect, and cleanup.
+  - **C# 快速接入 / C# quickstart** `/{lang}/sdk/easy/csharp/getting-started` — 安装 NuGet 1.0.0 正式包接入 .NET 8，完成异步连接、消息收发、重连和释放。 / Install NuGet 1.0.0 with .NET 8 for async connections, messaging, reconnect, and cleanup.
+  - **C++ 快速接入 / C++ quickstart** `/{lang}/sdk/easy/cpp/getting-started` — 通过预编译包或 vcpkg 引入 SDK，以 C++17 和 CMake 完成在线收发与线程管理。 / Use prebuilt archives or vcpkg with C++17 and CMake for messaging and thread management.
+  - **Python 快速接入 / Python quickstart** `/{lang}/sdk/easy/python/getting-started` — 安装 PyPI 0.1.0 正式包，用 asyncio 完成在线收发、重连和异步资源清理。 / Install PyPI 0.1.0 and use asyncio for online messaging, reconnect, and async cleanup.
 
 ## API 与协议 / API & Protocols
 
 Route: `/{lang}/api`
 
-查阅 HTTP API、Webhook 和客户端协议。 / Reference HTTP APIs, webhooks, and client protocols.
+查阅源码校准的 HTTP、Webhook、客户端协议与私有接口边界。 / Reference source-aligned HTTP, webhook, client-protocol, and private-interface boundaries.
 
-- **通用约定 / Conventions** `/{lang}/api/conventions` — 定义 Base URL、JSON、时间、ID、分页、幂等和响应结构。 / Defines base URLs, JSON, time, identifiers, pagination, idempotency, and response envelopes.
+- **通用约定 / Conventions** `/{lang}/api/conventions` — WuKongIM HTTP API 的地址、格式、标识和重试规则。 / WuKongIM HTTP API addressing, formats, identifiers, and retry rules.
 
-- **认证与安全 / Authentication & Security** `/{lang}/api/authentication` — 说明 API 凭证、Token、请求保护和生产安全要求。 / Explains API credentials, tokens, request protection, and production security.
+- **认证与安全 / Authentication & Security** `/{lang}/api/authentication` — WuKongIM HTTP API 与 Gateway 的鉴权边界。 / Authentication boundaries for WuKongIM HTTP API and Gateway.
 
-- **版本与兼容性 / Versions & Compatibility** `/{lang}/api/compatibility` — 说明 API、客户端协议与服务端版本的兼容规则。 / Defines compatibility among APIs, client protocols, and server versions.
+- **版本与兼容性 / Versions & Compatibility** `/{lang}/api/compatibility` — 查看构建快照和接口覆盖状态。 / View the build snapshot and API coverage status.
 
-- **产品 HTTP API / Product HTTP API** `/{lang}/api/product-http` — 面向稳定产品能力的规范驱动 HTTP 参考。 / Specification-driven HTTP reference for stable product capabilities.
+- **接口清单与信任边界 / Interface Inventory & Trust Boundaries** `/{lang}/api/interface-inventory` — 盘点 Manager、Node transport、MCP、插件与 Agent 私有合同。 / Inventories Manager, node transport, MCP, plugin, and agent-private contracts.
 
-  - **用户 / Users** `/{lang}/api/product-http/users` — Token、设备退出、在线状态和系统用户接口。 / Token, device logout, online status, and system-user endpoints.
-  - **频道 / Channels** `/{lang}/api/product-http/channels` — 频道、订阅者、黑名单、白名单和临时频道接口。 / Channel, subscriber, blacklist, whitelist, and temporary-channel endpoints.
-  - **消息 / Messages** `/{lang}/api/product-http/messages` — 消息发送、同步、确认和消息事件接口。 / Message send, sync, acknowledgement, and event endpoints.
-  - **会话 / Conversations** `/{lang}/api/product-http/conversations` — 会话列表、同步、未读数和删除接口。 / Conversation list, sync, unread-count, and deletion endpoints.
-  - **路由发现 / Route Discovery** `/{lang}/api/product-http/routing` — 获取目标节点 TCP 和 WebSocket 接入地址。 / Discovers TCP and WebSocket addresses for the target node.
+- **WuKongIM HTTP API / WuKongIM HTTP API** `/{lang}/api/product-http` — 浏览当前源码注册的全部 49 条 WuKongIM HTTP API 操作。 / Browse all 49 WuKongIM HTTP API operations registered by the current source.
+  - **用户 / Users** `/{lang}/api/product-http/users` — 设备 Token、在线状态与系统身份。 / Device tokens, presence, and system identities.
+    - **创建或更新设备 Token / Create or update a device token** **POST** `/{lang}/api/product-http/users/setQuickstartUserToken` — 链卿分支已禁用，返回 HTTP 404。请使用签名 v3 设备凭据和指令同步/ACK 接口。 / Disabled in the Link-U fork: returns HTTP 404. Use signed v3 device credentials and command sync/ACK endpoints.
+    - **退出用户设备 / Clear a user device token** **POST** `/{lang}/api/product-http/users/quitUserDevice` — 清空一个已存设备 Token 并调度 owner-local Session 关闭；device_flag=-1 选择 APP、Web 与 PC。 / Clears one stored device token and schedules owner-local Session closure; device_flag -1 selects APP, Web, and PC.
+    - **查询用户在线路由 / List active user routes** **POST** `/{lang}/api/product-http/users/listUserOnlineStatus` — 每条活跃权威路由返回一行；空 UID 数组返回旧式 status 对象而不是数组。 / Returns one row per active authority route; an empty UID array returns the legacy status object instead of an array.
+    - **添加系统 UID / Add system UIDs** **POST** `/{lang}/api/product-http/users/addSystemUIDs` — 持久化系统身份并加入当前进程缓存。 / Persists system identities and adds them to the current process cache.
+    - **移除系统 UID / Remove system UIDs** **POST** `/{lang}/api/product-http/users/removeSystemUIDs` — 移除持久化系统身份与当前进程缓存项。 / Removes persisted system identities and current-process cache entries.
+    - **列出全部系统 UID / List all system UIDs** **GET** `/{lang}/api/product-http/users/listSystemUIDs` — 把完整持久化系统 UID 集合聚合为一个无界响应。 / Aggregates the complete persisted system UID set into one unbounded response.
+    - **添加节点本地系统 UID 缓存 / Add node-local system UID cache entries** **POST** `/{lang}/api/product-http/users/addSystemUIDsToLocalCache` — 只修改当前进程缓存，不持久化也不复制该变更。 / Mutates only the current process cache and does not persist or replicate the change.
+    - **移除节点本地系统 UID 缓存 / Remove node-local system UID cache entries** **POST** `/{lang}/api/product-http/users/removeSystemUIDsFromLocalCache` — 只修改当前进程缓存，不改变持久化系统身份。 / Mutates only the current process cache and does not change durable system identities.
+    - **读取用户全局发送限制 / Read user send restriction** **GET** `/{lang}/api/product-http/users/getUserSendBan` — 读取当前 Slot 权威发送策略，不返回凭据。 / Read one current Slot-owned send policy without returning credentials.
+    - **设置用户全局发送限制 / Set user send restriction** **POST** `/{lang}/api/product-http/users/setUserSendBan` — 在 Slot 应用内原子变更发送策略，支持字符串 CAS；相同值保留版本。 / Atomically set one send policy with optional decimal-string CAS; unchanged values retain the version.
+  - **路由发现 / Route Discovery** `/{lang}/api/product-http/routing` — 客户端 Gateway 公网或内网地址。 / Public or intranet client Gateway addresses.
+    - **解析 Gateway 地址 / Resolve Gateway addresses** **GET** `/{lang}/api/product-http/routing/getQuickstartGatewayRoute` — 默认公网路由按请求 Host 补全通配监听主机名，显式地址优先；详见[地址规则](/zh/server/configuration/reference)。 / Default external routes complete wildcard listener hosts from Host; explicit addresses win. See [address rules](/en/server/configuration/reference).
+    - **批量解析 UID 地址组 / Resolve one address group for UIDs** **POST** `/{lang}/api/product-http/routing/getGatewayRoutesBatch` — 在一个地址组中回显无上限 UID 数组，仅为兼容保留；地址补全规则与 GET /route 相同。 / Echoes an unbounded UID array in one address group; retained for compatibility. Address completion follows GET /route.
+  - **消息 / Messages** `/{lang}/api/product-http/messages` — 消息恢复、事件与命令消息兼容接口。 / Message recovery, events, and command-message compatibility.
+    - **追加消息事件 / Append a message event** **POST** `/{lang}/api/product-http/messages/appendMessageEvent` — 校验并应用一次消息级事件投影；不支持非 null headers。 / Validates and applies one message-scoped event projection; non-null headers are unsupported.
+    - **同步消息事件当前投影 / Synchronize current message event projections** **POST** `/{lang}/api/product-http/messages/syncMessageEvents` — 按序号游标读取当前持久化事件投影，不重放完整事件日志。在有界读取后过滤私有事件。调用方身份与 include_private 没有鉴权，必须由受信后端保护。 / Reads current durable event projections after a sequence cursor, with filtering after a bounded read; not a replayable event log.
+    - **同步命令消息 / Synchronize command messages** **POST** `/{lang}/api/product-http/messages/syncCommandMessages` — 链卿分支已禁用，返回 HTTP 404。请使用签名 v3 设备凭据和指令同步/ACK 接口。 / Disabled in the Link-U fork: returns HTTP 404. Use signed v3 device credentials and command sync/ACK endpoints.
+    - **确认最新命令消息同步 / Acknowledge the latest command sync** **POST** `/{lang}/api/product-http/messages/ackCommandMessages` — 链卿分支已禁用，返回 HTTP 404。请使用签名 v3 设备凭据和指令同步/ACK 接口。 / Disabled in the Link-U fork: returns HTTP 404. Use signed v3 device credentials and command sync/ACK endpoints.
+    - **绑定命令 Channel 发现 / Bind command-channel discovery** **POST** `/{lang}/api/product-http/messages/bindCommandChannel` — 为有上限的接收者批次建立 CMD 发现关系，从同一已提交尾部之后生效。 / Starts bounded recipient discovery after one committed command tail.
+    - **解绑命令 Channel 发现 / Unbind command-channel discovery** **POST** `/{lang}/api/product-http/messages/unbindCommandChannel` — 为有上限的接收者批次写入发现关系墓碑，不删除 CMD 消息。 / Tombstones bounded recipient discovery without deleting command messages.
+    - **同步一个 Channel 的已提交消息 / Synchronize one Channel's committed messages** **POST** `/{lang}/api/product-http/messages/syncQuickstartChannelMessages` — 校验成员可见性并返回升序分页；limit 默认 100，最大 10000。 / Checks membership visibility and returns an ascending page; limit is 100 by default and capped at 10000.
+    - **同步最多 200 个 Channel / Synchronize up to 200 Channels** **POST** `/{lang}/api/product-http/messages/syncChannelMessagesBatch` — 批量读取前校验全部成员关系；单项失败嵌入 HTTP 200 响应。 / Validates all memberships before one aligned batch read; item failures are embedded in the HTTP-200 response.
+    - **精确查询已提交消息 / Look up exact committed messages** **POST** `/{lang}/api/product-http/messages/lookupMessages` — 按成员可见范围精确查询已提交消息；选择项、结果或索引检查超限时明确失败，不返回部分结果。 / Looks up exact committed messages within membership visibility; selector, result and scan limits fail without partial results.
+    - **修改消息内容 / Replace a message payload** **POST** `/{lang}/api/product-http/messages/updateMessage` — 按版本和恢复代数校验替换普通保留消息；CMD、流消息和非持久化消息不可修改。 / Replaces an ordinary retained payload with version and restore-epoch checks. CMD, stream and nonpersistent messages cannot be edited.
+    - **拉取单频道消息修改 / Pull edits for one channel** **POST** `/{lang}/api/product-http/messages/syncMessageUpdates` — 先用空游标获取基线，再加载历史；拉完 more 分页，在同一事务中合并版本并保存游标。此接口返回最新状态。 / Bootstrap with an empty cursor before loading history. Drain more pages and merge versions with the cursor atomically; this feed returns latest states.
+  - **消息发送 / Message Sending** `/{lang}/api/product-http/message-send` — 由受信后端提交消息。 / Submit messages from a trusted backend.
+    - **提交消息 / Submit a message** **POST** `/{lang}/api/product-http/message-send/sendChannelMessage` — 接受完整兼容 parser，包括旧别名、瞬时标志与请求级订阅者；HTTP 200 时仍需检查 reason。 / Accepts the complete compatibility parser, including legacy aliases, transient flags, and request-scoped subscribers; inspect reason on HTTP 200.
+  - **Channel / Channels** `/{lang}/api/product-http/channels` — Channel 元数据、订阅者与名单管理。 / Channel metadata, subscribers, and list administration.
+    - **创建或更新 Channel 元数据 / Create or update Channel metadata** **POST** `/{lang}/api/product-http/channels/upsertChannel` — 全量更新元数据标志并可重置订阅者；disband 为终态。 / Upserts all metadata flags and optionally resets subscribers; disband is terminal.
+    - **替换 Channel 元数据 / Replace Channel metadata** **POST** `/{lang}/api/product-http/channels/updateChannelInfo` — 字段省略时仍把零值完整记录交给 UpdateInfo；该接口仅为兼容保留。 / Passes the zero-valued full record to UpdateInfo when fields are omitted; retained for compatibility.
+    - **终态解散 Channel / Terminally disband a Channel** **POST** `/{lang}/api/product-http/channels/disbandChannel` — 设置持久化 disband 标志但不删除 Channel 身份；请求 Key 校验较弱。 / Sets the durable disband flag without deleting Channel identity; request-key validation is weak.
+    - **添加或替换持久订阅者 / Add or replace durable subscribers** **POST** `/{lang}/api/product-http/channels/addChannelSubscribers` — 添加非空白订阅者；channel_type=0 转为群组类型 2，reset=1 替换快照。 / Adds non-blank subscribers; channel_type 0 becomes group type 2 and reset=1 replaces the snapshot.
+    - **移除持久订阅者 / Remove durable subscribers** **POST** `/{lang}/api/product-http/channels/removeChannelSubscribers` — 移除非空白订阅者；与 subscriber_add 不同，channel_type=0 不会被归一化。 / Removes non-blank subscribers; unlike subscriber_add, channel_type 0 is not normalized.
+    - **移除全部持久订阅者 / Remove all durable subscribers** **POST** `/{lang}/api/product-http/channels/removeAllChannelSubscribers` — 通过内部有界分页清空普通订阅者；个人 Channel 会被拒绝。 / Clears ordinary subscribers through bounded internal pages; person Channels are rejected.
+    - **替换临时 Channel 订阅者 / Replace temporary Channel subscribers** **POST** `/{lang}/api/product-http/channels/setTemporaryChannelSubscribers` — 替换派生 Type-8 临时订阅者列表；入口适配器不校验 UID 元素。 / Replaces the derived Type-8 temporary subscriber list; UID elements are not validated by the entry adapter.
+    - **添加 Channel 拒绝列表成员 / Add Channel denylist members** **POST** `/{lang}/api/product-http/channels/addChannelDenylistMembers` — 把给定 UID 字符串加入派生 Channel 拒绝列表。 / Adds the supplied UID strings to the derived Channel denylist.
+    - **替换 Channel 拒绝列表 / Replace Channel denylist members** **POST** `/{lang}/api/product-http/channels/setChannelDenylistMembers` — 先移除旧列表再添加给定值；入口只校验 channel_id。 / Removes the old list before adding the supplied values; only channel_id is validated at entry.
+    - **移除 Channel 拒绝列表成员 / Remove Channel denylist members** **POST** `/{lang}/api/product-http/channels/removeChannelDenylistMembers` — 从派生 Channel 拒绝列表移除给定 UID 字符串。 / Removes the supplied UID strings from the derived Channel denylist.
+    - **移除全部 Channel 拒绝列表成员 / Remove all Channel denylist members** **POST** `/{lang}/api/product-http/channels/removeAllChannelDenylistMembers` — 通过内部有界遍历清空派生拒绝列表。 / Clears the derived denylist through bounded internal traversal.
+    - **添加 Channel 允许列表成员 / Add Channel allowlist members** **POST** `/{lang}/api/product-http/channels/addChannelAllowlistMembers` — 把非空白 UID 加入派生 Channel 允许列表。 / Adds non-blank UIDs to the derived Channel allowlist.
+    - **替换 Channel 允许列表 / Replace Channel allowlist members** **POST** `/{lang}/api/product-http/channels/setChannelAllowlistMembers` — 先移除旧列表再添加给定值；入口只校验 channel_id。 / Removes the old list before adding supplied values; only channel_id is validated at entry.
+    - **移除 Channel 允许列表成员 / Remove Channel allowlist members** **POST** `/{lang}/api/product-http/channels/removeChannelAllowlistMembers` — 从派生 Channel 允许列表移除非空白 UID。 / Removes non-blank UIDs from the derived Channel allowlist.
+    - **移除全部 Channel 允许列表成员 / Remove all Channel allowlist members** **POST** `/{lang}/api/product-http/channels/removeAllChannelAllowlistMembers` — 通过内部有界遍历清空派生允许列表。 / Clears the derived allowlist through bounded internal traversal.
+    - **列出全部 Channel 允许列表成员 / List all Channel allowlist members** **GET** `/{lang}/api/product-http/channels/listChannelAllowlistMembers` — 返回无界完整列表；channel_type 缺失或无效时会静默视为 0。 / Returns an unbounded full list; missing or invalid channel_type is silently treated as 0.
+    - **读取源 Channel发送限制 / Read channel send restriction** **GET** `/{lang}/api/product-http/channels/getChannelSendBan` — 读取当前 Slot 权威发送策略，不返回凭据。 / Read one current Slot-owned send policy without returning credentials.
+    - **设置源 Channel发送限制 / Set channel send restriction** **POST** `/{lang}/api/product-http/channels/setChannelSendBan` — 在 Slot 应用内原子变更发送策略，支持字符串 CAS；相同值保留版本。 / Atomically set one send policy with optional decimal-string CAS; unchanged values retain the version.
+    - **更新频道过期时间 / Update channel expiry** **POST** `/{lang}/api/product-http/channels/updateChannelExpiry` — 通过频道权威持久化过期时间；个人频道可按需创建。 / Persist expiry through Channel authority; personal channels may be created.
+  - **会话 / Conversations** `/{lang}/api/product-http/conversations` — 会话同步、未读、隐藏与激活状态。 / Conversation sync, unread, hide, and activation state.
+    - **同步一页会话 / Synchronize a Conversation page** **POST** `/{lang}/api/product-http/conversations/listConversations` — 读取 Leader 已落盘消息，不激活运行时；发送失败的消息也可显示。任一读取错误则整页失败，使用原请求和原游标重试。 / Reads Leader-persisted messages without runtime activation. Failed SENDs may appear. Any read error fails the page; retry the original cursor.
+    - **同步旧式会话 / Synchronize legacy Conversations** **POST** `/{lang}/api/product-http/conversations/syncConversationsLegacy` — 从当前 Leader 已落盘数据读取摘要和最近消息，不激活频道。发送失败的消息也可显示；读取失败则整次失败。保留旧式字段和游标规则。 / Read persisted heads and recents without Channel activation. Failed SENDs may appear; any read error fails the request. Legacy fields and cursors are preserved.
+    - **清除会话未读 / Clear Conversation unread** **POST** `/{lang}/api/product-http/conversations/clearConversationUnread` — 把 read_seq 推进到当前已提交 head；message_seq 等未知旧字段会被忽略。 / Advances read_seq to the current committed head; unknown legacy fields such as message_seq are ignored.
+    - **设置会话最大未读数 / Set maximum Conversation unread** **POST** `/{lang}/api/product-http/conversations/setConversationUnread` — 单调推进 read_seq，使剩余未读消息不超过 unread。 / Monotonically advances read_seq so no more than unread messages remain.
+    - **把会话隐藏到当前 head / Hide Conversation through the current head** **POST** `/{lang}/api/product-http/conversations/hideConversation` — 把 deleted_to_seq 推进到当前已提交 head，但不删除 Channel 成员关系。 / Advances deleted_to_seq to the current committed head without deleting Channel membership.
+    - **激活会话 / Activate a Conversation** **POST** `/{lang}/api/product-http/conversations/activateConversation` — 记录显式打开、切换或恢复动作以参与排序；消息路径不会隐式激活。 / Records an explicit open, switch, or resume action for ordering; message paths do not activate it.
   - **错误响应 / Error Responses** `/{lang}/api/product-http/errors` — 解释 HTTP 状态、业务状态和 Reason Code 的关系。 / Relates HTTP status, business status, and protocol reason codes.
-
-- **运维 HTTP API / Operations HTTP API** `/{lang}/api/operations-http` — 发布稳定且受支持的运维接口。 / Publishes stable and supported operations endpoints.
-
+- **运维 HTTP API / Operations HTTP API** `/{lang}/api/operations-http` — 发布四个运维观测接口，并逐项标明稳定性。 / Publishes four operations observation endpoints with per-operation stability.
   - **健康与就绪 / Health & Readiness** `/{lang}/api/operations-http/health-and-readiness` — 说明健康检查、就绪检查和负载均衡使用方式。 / Covers health checks, readiness checks, and load-balancer usage.
   - **Metrics / Metrics** `/{lang}/api/operations-http/metrics` — 说明 Prometheus 指标入口、访问控制和抓取建议。 / Explains the Prometheus endpoint, access control, and scrape guidance.
-  - **只读运维接口 / Read-only Operations** `/{lang}/api/operations-http/read-only` — 记录正式支持的节点状态和资源快照查询。 / Documents supported node-state and resource-snapshot queries.
+  - **只读运维接口 / Read-only Operations** `/{lang}/api/operations-http/read-only` — 记录节点本地 Top 快照以及条件启用的 Debug、Bench 清单。 / Documents node-local Top snapshots and conditional Debug and Bench inventories.
   - **接口稳定性 / API Stability** `/{lang}/api/operations-http/stability` — 标明稳定、实验性和条件启用的运维接口。 / Marks stable, experimental, and conditionally enabled operations endpoints.
-
 - **Webhook / Webhooks** `/{lang}/api/webhooks` — 说明服务端向业务系统投递事件的契约。 / Defines how the server delivers events to business systems.
-
   - **事件类型 / Event Types** `/{lang}/api/webhooks/events` — 列出消息、在线状态和其他受支持事件。 / Lists messages, presence, and other supported events.
-  - **请求结构 / Payloads** `/{lang}/api/webhooks/payloads` — 定义通用信封、事件负载和示例。 / Defines the common envelope, event payloads, and examples.
+  - **请求结构 / Payloads** `/{lang}/api/webhooks/payloads` — 定义三种事件负载，并明确请求体没有通用信封。 / Defines the three event payloads and the absence of a common envelope.
   - **安全与可靠性 / Security & Reliability** `/{lang}/api/webhooks/reliability-and-security` — 说明签名、重试、顺序、幂等和失败处理。 / Covers signatures, retries, ordering, idempotency, and failure handling.
-
-- **客户端协议 / Client Protocols** `/{lang}/api/client-protocols` — 说明 TCP 二进制协议与 WebSocket JSON-RPC。 / Documents the TCP binary protocol and WebSocket JSON-RPC.
-
-  - **连接生命周期 / Connection Lifecycle** `/{lang}/api/client-protocols/connection-lifecycle` — 说明 Connect、认证、心跳、断开和重连。 / Covers connect, authentication, heartbeat, disconnect, and reconnect.
+- **客户端协议 / Client Protocols** `/{lang}/api/client-protocols` — 说明 WKProto、JSON-RPC 和 MQTT 开发预览的接入契约。 / Documents WKProto, JSON-RPC and MQTT development-preview entry contracts.
+  - **连接生命周期 / Connection Lifecycle** `/{lang}/api/client-protocols/connection-lifecycle` — 说明 CONNECT 认证、CONNACK、心跳、关闭和恢复边界。 / Covers CONNECT authentication, CONNACK, heartbeat, close, and recovery boundaries.
+  - **数据包类型 / Packet Types** `/{lang}/api/client-protocols/packet-types` — 列出当前 Frame Type、方向、支持范围和版本差异。 / Lists current Frame Types, directions, support scope, and version differences.
   - **TCP 二进制协议 / TCP Binary Protocol** `/{lang}/api/client-protocols/tcp-binary` — 定义帧格式、编码、标志位和包边界。 / Defines frame format, encoding, flags, and packet boundaries.
   - **WebSocket JSON-RPC / WebSocket JSON-RPC** `/{lang}/api/client-protocols/json-rpc` — 定义方法、参数、结果、通知和请求关联。 / Defines methods, parameters, results, notifications, and request correlation.
-  - **数据包类型 / Packet Types** `/{lang}/api/client-protocols/packet-types` — 说明 Connect、Send、Recv、Ack 和 Ping/Pong 字段。 / Documents Connect, Send, Recv, Ack, and Ping/Pong fields.
   - **加密与安全 / Encryption & Security** `/{lang}/api/client-protocols/encryption` — 说明握手密钥、负载保护和协议安全约束。 / Covers handshake keys, payload protection, and protocol security constraints.
-
-- **公共数据字典 / Shared Dictionaries** `/{lang}/api/dictionaries` — 集中定义跨 API 和协议复用的常量。 / Centralizes constants shared across APIs and protocols.
-
-  - **Channel Type / Channel Type** `/{lang}/api/dictionaries/channel-types` — 定义单聊、群聊和其他频道类型。 / Defines direct, group, and other channel types.
-  - **Device Flag / Device Flag** `/{lang}/api/dictionaries/device-flags` — 定义 App、Web、System 等设备标识。 / Defines App, Web, System, and other device identifiers.
-  - **Message Flags / Message Flags** `/{lang}/api/dictionaries/message-flags` — 定义持久化、红点、回执和流式消息标志。 / Defines persistence, red-dot, receipt, and streaming-message flags.
-  - **Reason Code / Reason Code** `/{lang}/api/dictionaries/reason-codes` — 定义成功、鉴权失败、重试和拒绝等原因码。 / Defines success, authentication failure, retry, refusal, and other reason codes.
-
+  - **MQTT / MQTT** `/{lang}/api/client-protocols/mqtt` — MQTT 5 TCP 开发预览：认证、消息、会话、遗嘱和互通。 / MQTT 5 TCP development preview: authentication, messages, sessions, Wills and interop.
+    - **认证与 Topic / Authentication and Topics** `/{lang}/api/client-protocols/mqtt/authentication-and-topics` — 配置 UID、Token、设备标识与精确 Topic。 / Configures UIDs, tokens, device flags and exact topics.
+    - **消息契约 / Message Contract** `/{lang}/api/client-protocols/mqtt/messages` — 说明原始 payload、幂等、消息属性与提交确认。 / Defines raw payloads, idempotency, message properties and commit acknowledgements.
+    - **持久会话与 QoS / Persistent Sessions and QoS** `/{lang}/api/client-protocols/mqtt/sessions-and-qos` — 核对会话恢复、QoS、重复和背压。 / Checks session recovery, QoS, duplicates and backpressure.
+    - **遗嘱消息 / Will Messages** `/{lang}/api/client-protocols/mqtt/will` — 说明 Will 配置、触发、取消和当前授权。 / Explains Will setup, triggering, cancellation and current authorization.
+    - **HTTP / SDK 互通 / HTTP / SDK Interoperability** `/{lang}/api/client-protocols/mqtt/interop` — 共用 IM 消息，区分 Topic 与 payload 的编码。 / Shares IM messages and distinguishes topic from payload encoding.
+    - **部署与排障 / Operations and Troubleshooting** `/{lang}/api/client-protocols/mqtt/operations-and-troubleshooting` — 核对集群配置、逻辑配额和公开诊断信号。 / Checks cluster configuration, logical quotas and public diagnostic signals.
+- **公共数据字典 / Shared Dictionaries** `/{lang}/api/dictionaries` — 发布源码校准的 Channel、设备、消息标志与 Reason Code 字典。 / Publishes source-aligned Channel, device, message-flag, and Reason Code dictionaries.
+  - **Channel Type / Channel Type** `/{lang}/api/dictionaries/channel-types` — 列出当前 1–12 Channel Type，并标注基础、专用和旧类型边界。 / Lists current Channel Types 1–12 with baseline, specialized, and legacy boundaries.
+  - **Device Flag / Device Flag** `/{lang}/api/dictionaries/device-flags` — 列出 APP、WEB、PC、SYSTEM 与 Device Level 冲突策略。 / Lists APP, WEB, PC, SYSTEM, and Device Level conflict policies.
+  - **Message Flags / Message Flags** `/{lang}/api/dictionaries/message-flags` — 列出固定 Header 与 Setting 位，并解释持久化、红点、命令、回执和流语义。 / Lists fixed-header and Setting bits for persistence, red dots, commands, receipts, and streams.
+  - **Reason Code / Reason Code** `/{lang}/api/dictionaries/reason-codes` — 完整列出当前 0–29 协议枚举并标注使用阶段、重试和可达性。 / Lists the complete current 0–29 protocol enum with stage, retry, and reachability guidance.
 - **规范下载 / Specifications** `/{lang}/api/specifications` — 提供校准后、可机器读取的接口与协议规范。 / Provides aligned, machine-readable API and protocol specifications.
-
   - **OpenAPI / OpenAPI** `/{lang}/api/specifications/openapi` — 在线浏览并下载校准后的 v3 HTTP API 规范。 / Browse and download the aligned v3 HTTP API specification.
   - **JSON-RPC Schema / JSON-RPC Schema** `/{lang}/api/specifications/json-rpc-schema` — 浏览并下载 WebSocket JSON-RPC Schema。 / Browse and download the WebSocket JSON-RPC schema.
   - **协议变更记录 / Protocol Changelog** `/{lang}/api/specifications/protocol-changelog` — 记录破坏性变化、兼容范围和迁移方式。 / Records breaking changes, compatibility ranges, and migrations.

@@ -1,0 +1,54 @@
+// Run this harness against the unmodified v2 source commit documented in README.md.
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
+	wkproto "github.com/WuKongIM/WuKongIMGoProto"
+)
+
+func must(err error) { if err != nil { panic(err) } }
+
+func main() {
+	dir := os.Args[1]
+	db := wkdb.NewWukongDB(wkdb.NewOptions(wkdb.WithDir(filepath.Join(dir, "db")), wkdb.WithNodeId(1), wkdb.WithShardNum(2)))
+	must(db.Open())
+	at := time.Unix(1700000001, 123456789).UTC()
+	uid, channel := "用户:一", "群:一-2"
+	must(db.AddUser(wkdb.User{Uid: uid, CreatedAt: &at, UpdatedAt: &at}))
+	must(db.AddDevice(wkdb.Device{Id: 123456789, Uid: uid, Token: "fixture-only-凭据", DeviceFlag: 1, DeviceLevel: 1, CreatedAt: &at, UpdatedAt: &at}))
+	_, err := db.AddChannel(wkdb.ChannelInfo{ChannelId: channel, ChannelType: 2, SendBan: true, Large: true, CreatedAt: &at, UpdatedAt: &at})
+	must(err)
+	must(db.AddSubscribers(channel, 2, []wkdb.Member{{Uid: uid, CreatedAt: &at, UpdatedAt: &at}}))
+	must(db.AddDenylist(channel, 2, []wkdb.Member{{Uid: "denied", CreatedAt: &at, UpdatedAt: &at}}))
+	must(db.AddAllowlist(channel, 2, []wkdb.Member{{Uid: "allowed", CreatedAt: &at, UpdatedAt: &at}}))
+	must(db.SaveChannelClusterConfig(wkdb.ChannelClusterConfig{ChannelId: channel, ChannelType: 2, ReplicaMaxCount: 1, Replicas: []uint64{1}, LeaderId: 1, Term: 3, ConfVersion: 7, CreatedAt: &at, UpdatedAt: &at}))
+	must(db.AddSystemUids([]string{"system-fixture"}))
+	must(db.AddOrUpdateConversations([]wkdb.Conversation{{Id: 887766, Uid: uid, ChannelId: channel, ChannelType: 2, ReadToMsgSeq: 257, DeletedAtMsgSeq: 256, CreatedAt: &at, UpdatedAt: &at}}))
+	must(db.AppendMessages(channel, 2, []wkdb.Message{{
+		RecvPacket: wkproto.RecvPacket{
+			Framer: wkproto.Framer{RedDot: true, SyncOnce: true, DUP: true},
+			MessageID: 9007199254740999, MessageSeq: 257, ClientMsgNo: "client-一", Timestamp: 1700000001,
+			ChannelID: channel, ChannelType: 2, FromUID: uid, Payload: []byte{0, 1, 255, 0},
+			Expire: 3600, Topic: "topic-一", StreamNo: "stream-一",
+		}, Term: 3,
+	}}))
+	// The expected values come from original v2 public read methods, independently
+	// of the migration reader or its encoders.
+	expected := map[string]any{}
+	expected["user"], err = db.GetUser(uid); must(err)
+	expected["device"], err = db.GetDevice(uid, 1); must(err)
+	expected["channel"], err = db.GetChannel(channel, 2); must(err)
+	expected["subscribers"], err = db.GetSubscribers(channel, 2); must(err)
+	expected["denylist"], err = db.GetDenylist(channel, 2); must(err)
+	expected["allowlist"], err = db.GetAllowlist(channel, 2); must(err)
+	expected["messages"], err = db.LoadLastMsgs(channel, 2, 10); must(err)
+	expected["conversations"], err = db.GetConversations(uid); must(err)
+	b, err := json.MarshalIndent(expected, "", "  "); must(err)
+	must(os.WriteFile(filepath.Join(dir, "expected.json"), append(b, '\n'), 0600))
+	must(db.Close())
+}

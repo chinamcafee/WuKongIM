@@ -8,14 +8,11 @@ import (
 
 	backupcontract "github.com/WuKongIM/WuKongIM/internal/contracts/backup"
 	"github.com/WuKongIM/WuKongIM/internal/observability/diagnostics"
-	"github.com/WuKongIM/WuKongIM/internal/runtime/conversationactive"
 	runtimedelivery "github.com/WuKongIM/WuKongIM/internal/runtime/delivery"
 	authoritypresence "github.com/WuKongIM/WuKongIM/internal/runtime/presence"
-	conversationusecase "github.com/WuKongIM/WuKongIM/internal/usecase/conversation"
 	managementusecase "github.com/WuKongIM/WuKongIM/internal/usecase/management"
 	"github.com/WuKongIM/WuKongIM/internal/usecase/presence"
 	clusternet "github.com/WuKongIM/WuKongIM/pkg/cluster/net"
-	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 	"github.com/WuKongIM/WuKongIM/pkg/plugin/pluginproto"
 	"github.com/WuKongIM/WuKongIM/pkg/transport"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -30,18 +27,21 @@ const (
 	rpcStatusContextDeadlineExceeded = "context_deadline_exceeded"
 	rpcStatusNotFound                = "not_found"
 	rpcStatusInvalidArgument         = "invalid_argument"
+	rpcStatusBackpressured           = "backpressured"
 	rpcStatusRejected                = "rejected"
 
-	presenceOpRegisterRoute          = "register_route"
-	presenceOpCommitRoute            = "commit_route"
-	presenceOpAbortRoute             = "abort_route"
-	presenceOpUnregisterRoute        = "unregister_route"
-	presenceOpEndpointsByUID         = "endpoints_by_uid"
-	presenceOpEndpointsByTargets     = "endpoints_by_targets"
-	presenceOpTouchRoutes            = "touch_routes"
-	presenceOpApplyRouteAction       = "apply_route_action"
-	presenceOpAdvanceCredentialFence = "advance_credential_fence"
-	presenceOpAckCredentialAction    = "ack_credential_action"
+	presenceOpRegisterRoute            = "register_route"
+	presenceOpCommitRoute              = "commit_route"
+	presenceOpAbortRoute               = "abort_route"
+	presenceOpUnregisterRoute          = "unregister_route"
+	presenceOpEndpointsByUID           = "endpoints_by_uid"
+	presenceOpEndpointsByTargets       = "endpoints_by_targets"
+	presenceOpTouchRoutes              = "touch_routes"
+	presenceOpApplyRouteAction         = "apply_route_action"
+	presenceOpReadOwnerRoutes          = "read_owner_routes"
+	presenceOpReadOwnerRoutesByTargets = "read_owner_routes_by_targets"
+	presenceOpAdvanceCredentialFence   = "advance_credential_fence"
+	presenceOpAckCredentialAction      = "ack_credential_action"
 )
 
 // PresenceAuthorityRPCServiceID is the cluster RPC service for UID route authority calls.
@@ -96,20 +96,9 @@ type DeliveryOwnerPush interface {
 	Push(context.Context, runtimedelivery.PushCommand) (runtimedelivery.PushResult, error)
 }
 
-// ConversationAuthority handles UID-owned conversation active cache and durable hide requests.
-type ConversationAuthority interface {
-	AdmitPatches(context.Context, conversationusecase.RouteTarget, []conversationusecase.ActivePatch) error
-	// AdmitActiveBatch admits one already-routed channelappend active batch at the target authority.
-	AdmitActiveBatch(context.Context, conversationusecase.RouteTarget, conversationactive.ActiveBatch) error
-	// HideConversationsForTarget applies exact hide mutations at one fenced UID authority target.
-	HideConversationsForTarget(context.Context, conversationusecase.RouteTarget, []metadb.ConversationDelete) error
-	ListConversationActiveViewForTarget(context.Context, conversationusecase.RouteTarget, metadb.ConversationKind, string, metadb.ConversationActiveCursor, int) (conversationusecase.ActiveViewPage, error)
-	DrainAuthority(context.Context, conversationusecase.RouteTarget) (string, error)
-}
-
 // ManagerConnectionReader handles owner-local manager connection inventory requests.
 type ManagerConnectionReader interface {
-	ListConnections(context.Context, managementusecase.ListConnectionsRequest) ([]managementusecase.Connection, error)
+	ListConnections(context.Context, managementusecase.ListConnectionsRequest) (managementusecase.ListConnectionsResponse, error)
 	GetConnection(context.Context, managementusecase.GetConnectionRequest) (managementusecase.ConnectionDetail, error)
 	NodeRuntimeSummary(context.Context, uint64) (managementusecase.NodeRuntimeSummary, error)
 	SetNodeDrainMode(context.Context, managementusecase.SetNodeDrainModeRequest) (managementusecase.SetNodeDrainModeResponse, error)
@@ -254,16 +243,22 @@ type ScheduledBackupRestore interface {
 	) (backupcontract.RestoreNodeReceipt, error)
 }
 
+// ScheduledBackupStoreResolver resolves only an exact repository reference
+// from target-local Controller state; it must never fetch credentials over RPC.
+type ScheduledBackupStoreResolver interface {
+	ResolveBackupStore(context.Context, backupcontract.StoreReference) (backupcontract.StoreConfig, error)
+}
+
 // Options configures the internal node RPC adapter.
 type Options struct {
 	// Authority handles UID route authority requests after payload decoding.
 	Authority PresenceAuthority
 	// Owner handles owner-local session conflict actions after payload decoding.
 	Owner PresenceOwner
+	// OwnerRoutes serves bounded active-route reconstruction reads.
+	OwnerRoutes presence.OwnerRouteReader
 	// Delivery handles owner-local delivery push batches after payload decoding.
 	Delivery DeliveryOwnerPush
-	// ConversationAuthority handles UID conversation authority cache requests after payload decoding.
-	ConversationAuthority ConversationAuthority
 	// ManagerConnections handles owner-local manager connection inventory requests.
 	ManagerConnections ManagerConnectionReader
 	// ManagerLogs handles node-local manager distributed log page requests.
@@ -312,6 +307,8 @@ type Options struct {
 	ScheduledBackupProbe ScheduledBackupRepositoryProbe
 	// ScheduledRestore owns node-local staged restore files and storage changes.
 	ScheduledRestore ScheduledBackupRestore
+	// ScheduledBackupStores resolves exact repository credentials on this node.
+	ScheduledBackupStores ScheduledBackupStoreResolver
 	// Logger records node RPC adapter failures that are converted into statuses.
 	Logger wklog.Logger
 }
@@ -321,11 +318,11 @@ type Adapter struct {
 	// authority owns business decisions; Adapter only performs RPC adaptation.
 	authority PresenceAuthority
 	// owner mutates only owner-local real session state.
-	owner PresenceOwner
+	owner       PresenceOwner
+	ownerRoutes presence.OwnerRouteReader
 	// delivery pushes messages into owner-local delivery sessions.
 	delivery DeliveryOwnerPush
-	// conversation owns UID conversation active cache decisions.
-	conversation ConversationAuthority
+	// presence owns UID connection authority decisions.
 	// managerConnections reads owner-local connection inventory for manager pages.
 	managerConnections ManagerConnectionReader
 	// managerLogs reads node-local distributed logs for manager pages.
@@ -374,6 +371,8 @@ type Adapter struct {
 	scheduledBackupProbe ScheduledBackupRepositoryProbe
 	// scheduledRestore owns node-local staged restore files and storage changes.
 	scheduledRestore ScheduledBackupRestore
+	// scheduledBackupStores resolves repository references before effects execute.
+	scheduledBackupStores ScheduledBackupStoreResolver
 	// logger records adapter decode errors and rejected local operations.
 	logger wklog.Logger
 }
@@ -386,8 +385,8 @@ func New(opts Options) *Adapter {
 	return &Adapter{
 		authority:                opts.Authority,
 		owner:                    opts.Owner,
+		ownerRoutes:              opts.OwnerRoutes,
 		delivery:                 opts.Delivery,
-		conversation:             opts.ConversationAuthority,
 		managerConnections:       opts.ManagerConnections,
 		managerLogs:              opts.ManagerLogs,
 		managerControllerRaft:    opts.ManagerControllerRaft,
@@ -412,6 +411,7 @@ func New(opts Options) *Adapter {
 		scheduledBackup:          opts.ScheduledBackup,
 		scheduledBackupProbe:     opts.ScheduledBackupProbe,
 		scheduledRestore:         opts.ScheduledRestore,
+		scheduledBackupStores:    opts.ScheduledBackupStores,
 		logger:                   opts.Logger,
 	}
 }
@@ -573,6 +573,12 @@ func (a *Adapter) HandlePresenceOwnerRPC(ctx context.Context, payload []byte) ([
 			wklog.Error(err),
 		)
 		return nil, err
+	}
+	if req.Op == presenceOpReadOwnerRoutesByTargets {
+		return a.handleOwnerRoutesByTargets(ctx, req)
+	}
+	if req.Op == presenceOpReadOwnerRoutes {
+		return a.handleOwnerRoutes(ctx, req)
 	}
 	if a == nil || a.owner == nil {
 		return encodePresenceRPCResponseBinary(presenceRPCResponse{Status: rpcStatusRejected})

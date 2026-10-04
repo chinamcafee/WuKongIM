@@ -20,6 +20,14 @@ type messageSyncAckRequest struct {
 	LastMessageSeq uint64 `json:"last_message_seq"`
 }
 
+type messageCMDBindingRequest struct {
+	UIDs        []string `json:"uids"`
+	Subscribers []string `json:"subscribers"`
+	UID         string   `json:"uid"`
+	ChannelID   string   `json:"channel_id"`
+	ChannelType uint8    `json:"channel_type"`
+}
+
 func (s *Server) handleMessageSync(c *gin.Context) {
 	var req messageSyncRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -82,6 +90,54 @@ func (s *Server) handleMessageSyncAck(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK})
+}
+
+func (s *Server) handleMessageCMDBind(c *gin.Context) {
+	req, ok := s.bindMessageCMDBinding(c)
+	if !ok {
+		return
+	}
+	if err := s.cmdSync.Bind(c.Request.Context(), cmdsyncusecase.BindCommand{
+		UID: req.UID, UIDs: req.UIDs, Subscribers: req.Subscribers, ChannelID: req.ChannelID, ChannelType: req.ChannelType,
+	}); err != nil {
+		writeJSONError(c, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK})
+}
+
+func (s *Server) handleMessageCMDUnbind(c *gin.Context) {
+	req, ok := s.bindMessageCMDBinding(c)
+	if !ok {
+		return
+	}
+	if err := s.cmdSync.Unbind(c.Request.Context(), cmdsyncusecase.UnbindCommand{
+		UID: req.UID, UIDs: req.UIDs, Subscribers: req.Subscribers, ChannelID: req.ChannelID, ChannelType: req.ChannelType,
+	}); err != nil {
+		writeJSONError(c, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK})
+}
+
+func (s *Server) bindMessageCMDBinding(c *gin.Context) (messageCMDBindingRequest, bool) {
+	var req messageCMDBindingRequest
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 256*1024)
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeJSONError(c, "数据格式有误！")
+		return messageCMDBindingRequest{}, false
+	}
+	req.UID = strings.TrimSpace(req.UID)
+	req.ChannelID = strings.TrimSpace(req.ChannelID)
+	if len(req.UIDs) == 0 && len(req.Subscribers) == 0 && (req.UID == "" || req.ChannelID == "" || req.ChannelType == 0) {
+		writeJSONError(c, "uid、channel_id和channel_type不能为空！")
+		return messageCMDBindingRequest{}, false
+	}
+	if s == nil || s.cmdSync == nil {
+		writeJSONError(c, "cmd sync usecase not configured")
+		return messageCMDBindingRequest{}, false
+	}
+	return req, true
 }
 
 func cmdSyncMessageToLegacy(msg cmdsyncusecase.SyncedMessage) messageusecase.SyncedMessage {

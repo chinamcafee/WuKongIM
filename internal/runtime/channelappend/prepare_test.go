@@ -3,6 +3,7 @@ package channelappend
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sort"
 	"sync"
 	"testing"
@@ -118,8 +119,33 @@ func TestPrepareRequestScopedSendDerivesChannel(t *testing.T) {
 	if request.Messages[0].MessageID != 100 {
 		t.Fatalf("message id = %d, want 100", request.Messages[0].MessageID)
 	}
+	if !request.ServerAllocatedMessageIDs {
+		t.Fatal("ServerAllocatedMessageIDs = false, want true for allocator-issued ids")
+	}
 	if request.Messages[0].ServerTimestampMS != clock.now.UnixMilli() {
 		t.Fatalf("server timestamp = %d, want %d", request.Messages[0].ServerTimestampMS, clock.now.UnixMilli())
+	}
+}
+
+func TestPrepareDoesNotTrustCallerSuppliedMessageID(t *testing.T) {
+	ids := newSequenceIDsForPrepare(100)
+	group := newPreparedGroup(t, preparePortsForTest{ids: ids})
+
+	got := group.submitAndDrainPrepare(t, sendItemForPrepare(SendCommand{
+		FromUID:     "u1",
+		ChannelID:   "room",
+		ChannelType: 2,
+		MessageID:   777,
+		Payload:     []byte("payload"),
+	}))
+
+	requireAppendSuccess(t, got.Results, 0, 777, 1)
+	request := group.singleAppendRequest(t)
+	if request.ServerAllocatedMessageIDs {
+		t.Fatal("ServerAllocatedMessageIDs = true, want false for caller-supplied id")
+	}
+	if ids.allocatedCount() != 0 {
+		t.Fatalf("allocated ids = %d, want 0", ids.allocatedCount())
 	}
 }
 
@@ -144,6 +170,29 @@ func TestPrepareNormalizesPersonChannel(t *testing.T) {
 	request := group.singleAppendRequest(t)
 	if request.ChannelID.ID != want {
 		t.Fatalf("append channel id = %q, want normalized %q", request.ChannelID.ID, want)
+	}
+}
+
+func TestPreparePersistentSyncOnceAppendsToCommandChannel(t *testing.T) {
+	commandChannelID := runtimechannelid.ToCommandChannel("room")
+	group := newPreparedGroupWithOptions(t, Options{
+		LocalNodeID:         1,
+		AuthorityShardCount: 4,
+		MessageID:           newSequenceIDsForPrepare(200),
+	})
+
+	got := group.submitAndDrainPrepareToTarget(t, AuthorityTarget{
+		ChannelID:    ChannelID{ID: commandChannelID, Type: 2},
+		ChannelKey:   channelKey(ChannelID{ID: commandChannelID, Type: 2}),
+		LeaderNodeID: 1,
+	}, sendItemForPrepare(SendCommand{
+		FromUID: "u1", ChannelID: "room", ChannelType: 2, Payload: []byte("cmd"), SyncOnce: true,
+	}))
+
+	requireAppendSuccess(t, got.Results, 0, 200, 1)
+	request := group.singleAppendRequest(t)
+	if request.ChannelID.ID != commandChannelID || !request.Messages[0].SyncOnce {
+		t.Fatalf("append request = %+v", request)
 	}
 }
 
@@ -278,7 +327,12 @@ func TestPrepareIdempotencyHitBypassesAllocationAndPendingAppend(t *testing.T) {
 	idempotency := &recordingIdempotencyForPrepare{result: existing, ok: true}
 	group := newPreparedGroup(t, preparePortsForTest{ids: ids, idempotency: idempotency})
 
-	got := group.submitAndDrainPrepare(t, sendItemForPrepare(SendCommand{
+	got := group.submitAndDrainPrepareToTarget(t, AuthorityTarget{
+		ChannelID:    ChannelID{ID: "room", Type: 2},
+		ChannelKey:   channelKey(ChannelID{ID: "room", Type: 2}),
+		LeaderNodeID: 1,
+		WriteFenced:  true,
+	}, sendItemForPrepare(SendCommand{
 		FromUID:     "u1",
 		ClientMsgNo: "client-1",
 		ChannelID:   "room",
@@ -300,8 +354,33 @@ func TestPrepareIdempotencyHitBypassesAllocationAndPendingAppend(t *testing.T) {
 	}
 	if gotQueries := idempotency.queriesSnapshot(); len(gotQueries) != 1 {
 		t.Fatalf("idempotency queries = %d, want 1", len(gotQueries))
-	} else if gotQueries[0] != (IdempotencyQuery{FromUID: "u1", ClientMsgNo: "client-1", ChannelID: "room", ChannelType: 2, PayloadHash: idempotencyPayloadHash([]byte("payload"))}) {
+	} else if !reflect.DeepEqual(gotQueries[0], IdempotencyQuery{FromUID: "u1", ClientMsgNo: "client-1", ChannelID: "room", ChannelType: 2, PayloadHash: idempotencyPayloadHash([]byte("payload"))}) {
 		t.Fatalf("idempotency query = %#v, want canonical sender/client/channel", gotQueries[0])
+	}
+}
+
+func TestPrepareOrdinarySendDefersIdempotencyLookupToStorage(t *testing.T) {
+	ids := newSequenceIDsForPrepare(100)
+	idempotency := &recordingIdempotencyForPrepare{
+		result: SendResult{MessageID: 42, MessageSeq: 7, Reason: ReasonSuccess},
+		ok:     true,
+	}
+	group := newPreparedGroup(t, preparePortsForTest{ids: ids, idempotency: idempotency})
+
+	got := group.submitAndDrainPrepare(t, sendItemForPrepare(SendCommand{
+		FromUID:     "u1",
+		ClientMsgNo: "client-1",
+		ChannelID:   "room",
+		ChannelType: 2,
+		Payload:     []byte("payload"),
+	}))
+
+	requireAppendSuccess(t, got.Results, 0, 100, 1)
+	if gotQueries := idempotency.queriesSnapshot(); len(gotQueries) != 0 {
+		t.Fatalf("idempotency queries = %d, want 0 before ordinary storage append", len(gotQueries))
+	}
+	if ids.allocatedCount() != 1 {
+		t.Fatalf("allocated ids = %d, want 1", ids.allocatedCount())
 	}
 }
 
@@ -316,6 +395,7 @@ func TestPrepareIdempotencyUsesNormalizedPersonChannel(t *testing.T) {
 		ChannelID:    ChannelID{ID: wantChannelID, Type: 1},
 		ChannelKey:   channelKey(ChannelID{ID: wantChannelID, Type: 1}),
 		LeaderNodeID: 1,
+		WriteFenced:  true,
 	}, sendItemForPrepare(SendCommand{
 		FromUID:                "u1",
 		ClientMsgNo:            "client-1",
@@ -358,6 +438,7 @@ func TestPrepareIdempotencyNormalizedPersonTargetMismatchReturnsStaleRoute(t *te
 		ChannelID:    ChannelID{ID: "u2", Type: 1},
 		ChannelKey:   channelKey(ChannelID{ID: "u2", Type: 1}),
 		LeaderNodeID: 1,
+		WriteFenced:  true,
 	}
 
 	got := group.submitAndDrainPrepareToTarget(t, target, sendItemForPrepare(SendCommand{
@@ -406,6 +487,7 @@ func TestPrepareIdempotencyRequestScopedTargetMismatchReturnsStaleRoute(t *testi
 		ChannelID:    ChannelID{ID: "original", Type: 2},
 		ChannelKey:   channelKey(ChannelID{ID: "original", Type: 2}),
 		LeaderNodeID: 1,
+		WriteFenced:  true,
 	}
 
 	got := group.submitAndDrainPrepareToTarget(t, target, sendItemForPrepare(SendCommand{

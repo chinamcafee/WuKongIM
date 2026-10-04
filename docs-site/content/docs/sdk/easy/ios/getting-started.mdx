@@ -1,0 +1,206 @@
+---
+title: iOS 快速接入
+description: 安装固定版本 SDK，通过业务后端提供的连接材料完成在线双向收发和退出清理。
+---
+
+本教程使用 **WK_EASYSDK_IOS_VERSION**，让 Alice 与 Bob 在两个独立客户端中在线收发。连接由 WebSocket JSON-RPC CONNECT 完成鉴权。
+
+## 1. 准备接入
+
+准备以下条件：
+
+- iOS 部署目标使用 **iOS 15 或更高版本**。包清单声明 iOS 13，但 `v1.1.1` 的公开 `WuKongEasySDK` 类标记为 `@available(iOS 15.0, ...)`，因此本教程采用更保守的真实 API 下限；
+- 使用支持 Swift 5.7 Package 的 Xcode 工具链；
+- 一个 `/readyz` 正常、WebSocket Gateway 可从设备访问的 WuKongIM 单节点集群或多节点集群；
+- 业务后端能为 Alice 和 Bob 分别返回 `uid`、短期 `token` 与 `websocketUrl`。
+
+先阅读[身份与 Token](/zh/guide/integration/authentication)。不要把固定 Token 写进 App、源码仓库、日志或截图。
+
+想先看到实际收发效果，可按[运行官方示例](/zh/sdk/easy/examples#ios)准备两端；下文说明如何接入自己的应用。
+
+默认设备类别为 **APP `0`**；业务后端保存 Token 时使用相同的 `device_flag`。APP 为 `0`，WEB 为 `1`，PC 为 `2`。
+
+## 2. 安装 SDK
+
+### Swift Package Manager
+
+在 Xcode 中选择 **File → Add Package Dependencies**，输入：
+
+```text
+https://github.com/WuKongIM/WuKongEasySDK-iOS.git
+```
+
+Dependency Rule 选择 **Exact Version**，填写 `WK_EASYSDK_IOS_VERSION`。如果项目维护 `Package.swift`，使用精确规则：
+
+```swift
+dependencies: [
+    .package(
+        url: "https://github.com/WuKongIM/WuKongEasySDK-iOS.git",
+        exact: "WK_EASYSDK_IOS_VERSION"
+    )
+]
+```
+
+## 3. 连接与监听
+
+把业务后端响应映射到应用模型。真实实现应通过 HTTPS 获取，不要在客户端调用 WuKongIM HTTP API 管理接口：
+
+```swift
+struct IMBootstrap: Decodable {
+    let uid: String
+    let token: String
+    let websocketUrl: String
+}
+```
+
+`websocketUrl` 在本地开发可以是 `ws://`；生产环境应是由业务后端选择并返回的 `wss://` 地址。
+
+下面的对象先注册监听器，再连接；退出时使用创建监听器时返回的 `EventListener` 精确移除，避免页面重进后重复处理消息。
+
+```swift
+import Combine
+import Foundation
+import WuKongEasySDK
+
+@MainActor
+final class EasyChatClient: ObservableObject {
+    @Published private(set) var isConnected = false
+    @Published private(set) var messages: [Message] = []
+
+    private var sdk: WuKongEasySDK?
+    private var listeners: [EventListener] = []
+
+    func start(with bootstrap: IMBootstrap) async throws {
+        stop()
+
+        let config = try WuKongConfig(
+            serverUrl: bootstrap.websocketUrl,
+            uid: bootstrap.uid,
+            token: bootstrap.token,
+            connectionTimeout: 15,
+            requestTimeout: 15,
+            maxReconnectAttempts: 5,
+            enableDebugLogging: false,
+            logLevel: .error,
+            enableJsonLogging: false // 生产配置同时关闭 JSON 摘要。
+        )
+        let sdk = WuKongEasySDK(config: config)
+
+        listeners.append(sdk.onConnect { [weak self] _ in
+            Task { @MainActor in self?.isConnected = true }
+        })
+        listeners.append(sdk.onDisconnect { [weak self] _ in
+            Task { @MainActor in
+                self?.isConnected = false
+                print("WuKongEasySDK disconnected")
+            }
+        })
+        listeners.append(sdk.onMessage { [weak self] message in
+            Task { @MainActor in
+                guard self?.messages.contains(where: { $0.messageId == message.messageId }) == false
+                else { return }
+                self?.messages.append(message)
+                if let self, self.messages.count > 100 {
+                    self.messages.removeFirst(self.messages.count - 100)
+                }
+            }
+        })
+        listeners.append(sdk.onError { _ in
+            print("WuKongEasySDK operation failed")
+        })
+
+        self.sdk = sdk
+        do {
+            try await sdk.connect()
+        } catch {
+            stop() // 超时、认证或网络失败后释放 socket 与监听器。
+            throw error
+        }
+    }
+
+    func sendText(to uid: String, text: String) async throws -> SendResult {
+        guard let sdk, isConnected else { throw WuKongError.notConnected }
+
+        let payload: MessagePayload = [
+            "type": 1,
+            "version": 1,
+            "content": text
+        ]
+        return try await sdk.send(
+            channelId: uid,
+            channelType: .person,
+            payload: payload
+        )
+    }
+
+    func stop() {
+        if let sdk {
+            listeners.forEach { sdk.removeListener($0) }
+            sdk.disconnect()
+        }
+        listeners.removeAll()
+        messages.removeAll()
+        sdk = nil
+        isConnected = false
+    }
+
+    deinit {
+        // 视图或应用生命周期仍应主动调用 stop()。
+    }
+}
+```
+
+不要把 `onMessage` 的匿名闭包丢掉；`removeListener` 需要注册时返回的监听器对象。示例把连接与请求上限固定为 15 秒，失败后立即 `stop()`；自动重连最多 5 次，但 UI 仍要显示未就绪状态。SwiftUI 可以让一个上层 `@StateObject` 持有 `EasyChatClient`，在退出账号或应用根视图销毁时调用 `stop()`。
+
+## 4. 收发第一条消息
+
+`productAPI.fetchIMBootstrap()` 是你的业务登录接口，`chatClient` 是上一步创建的 `EasyChatClient`。此处是接入片段；可直接运行的完整 App 见[官方示例](/zh/sdk/easy/examples#ios)。
+
+设备标志与 Payload 已在当前服务端兼容；在用户完成产品登录后取得 Alice 的 `IMBootstrap` 并启动：
+
+```swift
+let aliceBootstrap = try await productAPI.fetchIMBootstrap()
+try await chatClient.start(with: aliceBootstrap)
+
+_ = try await chatClient.sendText(
+    to: "bob",
+    text: "Hello from iOS EasySDK"
+)
+print("SEND completed")
+```
+
+返回 `SendResult` 说明 Alice 获得了服务端发送结果。Bob 还必须在自己的 `onMessage` 回调中独立看到相同业务 Payload；不要仅凭本地列表插入判断对方已收到。
+
+1. 在两台设备或两个独立 App 进程中分别登录 Alice 与 Bob；
+2. 两端都等到 `onConnect` 后再启用发送按钮；
+3. Alice 向个人 Channel `bob` 发送消息，保存 `messageId` 与 `messageSeq`；
+4. Bob 在 `onMessage` 中核对 `fromUid == "alice"`、Channel 和 Payload；
+5. Bob 向 Alice 回发，再验证反向链路；
+6. 退出页面或账号，调用 `stop()`，确认没有重复监听和后台连接。
+
+## 5. 清理连接
+
+在退出账号或销毁连接所有者时调用 `chatClient.stop()`。它移除 `EventListener` 并 `disconnect()`；页面重新展示时不要重复创建应用级连接。示例只保留最近 100 条消息用于展示，不是持久消息库。
+
+## 6. 常见问题
+
+- **编译提示 API 仅 iOS 15 可用**：把部署目标提高到 iOS 15，不能只看 `Package.swift` 中较低的平台声明。
+- **连接或认证失败**：从设备网络访问后端返回的地址，检查 WSS、证书与代理 Upgrade，再刷新短期 Token；不要把容器内地址返回给手机。
+- **SEND 或 RECV 的 Payload 无法解析**：确认服务端包含 EasySDK JSON-RPC 兼容实现且代理没有改写消息；固定版本发送对象，服务端对对象与 Base64 做兼容并输出对象 RECV。
+- **设备类型不符合预期**：确认业务代码没有覆盖默认 `.app`，并按 APP `0`、WEB `1`、PC `2` 核对线路值，不要沿用旧整数。
+- **消息重复出现**：确认监听器只注册一次，并按 `messageId` 合并实时和后续同步结果。
+- **发送成功但 Bob 没收到**：分别检查 Alice 的发送结果、Bob 的实时连接以及产品后续的离线同步，不要自动重发一个已经提交的消息。
+
+## 其他安装方式：CocoaPods
+
+```ruby
+target 'YourApp' do
+  pod 'WuKongEasySDK', 'WK_EASYSDK_IOS_VERSION'
+end
+```
+
+然后运行 `pod install`，并从 `.xcworkspace` 打开项目。两种安装方式选择一种即可。
+
+## 下一步
+
+继续阅读[消息收发](/zh/guide/integration/messaging)与[上线检查](/zh/guide/integration/acceptance)。需要离线恢复、会话、未读或推送时，先查看 [SDK 选择](/zh/sdk)。[版本与验证记录](https://github.com/WuKongIM/WuKongIM/blob/main/docs/superpowers/reports/2026-09-08-easysdk-validation-history.md#ios)保留各次验证的完整环境和范围。

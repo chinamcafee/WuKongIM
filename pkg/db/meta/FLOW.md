@@ -1,132 +1,123 @@
-# pkg/db/meta Flow
+---
+scope: package
+summary: Owns Hash-Slot-scoped metadata tables, deterministic batches, membership directories, snapshots, restore, and cache invalidation.
+---
 
-`pkg/db/meta` owns hash-slot-scoped metadata storage on top of shared
-`pkg/db/internal` primitives.
+# Metadata Storage Flow
 
-Current flow:
+## Responsibility
+This package stores entity-owned metadata on shared DB primitives through stable `Shard` handles; it must not import Pebble directly.
+It does not own product business policy or expose engine-specific APIs.
 
-1. `MetaDB` wraps the metadata engine and returns stable `Shard` handles per
-   hash slot.
-2. Key helpers encode rows, indexes, and system state under the meta domain and
-   hash-slot partition.
-3. Ordinary metadata tables register a `TableSpec` in their `table_<name>.go`
-   file; the registry drives `Tables()`, row spans for snapshots, and common
-   primary/index runtime behavior.
-4. Schema descriptors define the durable metadata table catalog.
-5. Multi-hash-slot helpers lock shards in sorted order to avoid deadlocks.
-6. User, device, subscriber, channel runtime metadata, and plugin binding tables
-   use the table runtime for primary rows, key-aware values when needed, scans,
-   indexes, and ordinary batch staging.
-7. Channel ordinary CRUD and channel-ID reads use the table runtime, while
-   channel batch/cache orchestration remains custom so post-commit cache
-   publishing is unchanged.
-8. Channel reads populate an opportunistic in-memory cache, and channel
-   mutations invalidate the affected cache entry after commit. Channel rows
-   store status flags, the large-group marker, subscriber mutation version, the
-   ordinary subscriber count, and an absolute Unix-seconds channel expiry where
-   zero means no expiry.
-9. Subscriber mutations sort and de-duplicate UIDs, keep channel-owned
-   subscriber rows through the table runtime, update the channel subscriber
-   count and mutation version in the same commit, and invalidate the channel
-   cache. Counted batch mutations populate exact requested and changed counts
-   only while the same atomic commit evaluates set membership.
-   The shard mutation lock makes simultaneous additions of the same UID
-   idempotent: only the first creates a row and increments the count.
-10. User channel membership rows are UID-owned reverse membership records keyed
-    by `(uid, channel_id, channel_type)`, providing stable per-user channel
-    paging without touching rows on ordinary group message commits.
-11. Channel latest rows are channel-owned newest-message projections keyed by
-    `(channel_id, channel_type)`. Upserts only advance when the incoming
-    `last_message_seq` is newer, making committed-message retries and
-    out-of-order projection delivery idempotent.
-12. Message event projections are hash-slot scoped meta rows replicated by Slot
-   Raft and snapshotted with other meta rows. State rows are keyed by
-   `(channel_id, channel_type, client_msg_no, event_key)`, cursor rows are keyed
-   by `(channel_id, channel_type, client_msg_no)`, and applied-event rows are
-   keyed by `(channel_id, channel_type, client_msg_no, event_id)` so retries of
-   older events cannot advance the cursor or reapply reducer payloads. Storage
-   keeps reduced projection state and lean event idempotency records without raw
-   replay rows. `stream.open` starts the default open lane,
-   `stream.delta`/`stream.snapshot` update compact payload state, and terminal
-   event types leave an idempotent terminal projection.
-13. Channel runtime metadata stores routing, leadership, retention, and write
-   fence state with a runtime-backed primary row and key-aware rowcodec value;
-   typed methods keep monotonic upserts, guards, and retention semantics, while
-   page scans use runtime primary-key order and cursor bounds.
-14. Conversation state uses one kind-aware table for ordinary and CMD logical
-   views. Rows are keyed by `(uid, kind, channel_id, channel_type)`, active scans
-   use `(uid, kind, active_at desc, channel_id, channel_type)`, and `kind` stays
-   out of the encoded row value. Storage never infers ordinary versus CMD
-   semantics from channel-name suffixes; callers must pass the requested
-   `ConversationKind`. Typed methods keep merge, hide, clear, and read-advance
-   semantics isolated per kind. `SparseActive` marks rows whose `ActiveAt` is a
-   low-frequency ordering anchor, and active patches can carry monotonic
-   read/delete floors so activity advancement, sparse-active changes,
-   delete-barrier checks, and floor merges happen in one shard-locked mutation.
-15. Device-scoped CMD cursors are UID-owned rows keyed by
-   `(uid, device_flag, command_channel_id, channel_type)`. `ReadSeq`,
-   `DeletedToSeq`, `ActiveAt`, and `UpdatedAt` merge monotonically, keeping APP
-   and PC consumption independent without changing conversation read state.
-   Table ID 16 participates in inspect, hash-slot snapshots, portable transfer,
-   restart recovery, and Slot FSM batch application.
-16. Channel migration tasks use the table runtime for primary rows and terminal
-   indexes while keeping the active-task index custom because its legacy value
-   stores the active `task_id`; slot-scoped active-task reads page through that
-   active index instead of scanning the primary table. Guarded
-   task/runtime-meta mutations keep read-your-writes overlays before committing
-   both records atomically and advance `RouteGeneration` whenever the projected
-   runtime route changes; task owner claims are fenced so only the same
-   owner, an unowned task, or a task whose previous owner lease has expired at
-   the claim request's `now_ms` can take ownership.
-17. Hash-slot migration state uses the table runtime with a legacy primary key
-   that omits the family suffix; applied-delta dedup rows and outbox rows stay
-   as custom records under the same hash-slot partition, and typed values repeat
-   the hash slot only for self-description.
-18. `Batch` stages typed operations, locks all touched hash slots in sorted
-   order, uses table overlays for ordinary runtime tables, validates guards
-   against read-your-writes overlays for runtime metadata and channel migration
-   tasks, commits once, then publishes or invalidates channel cache entries.
-   Conditional channel create returns not-applied for an existing row, and the
-   business-flag patch returns not-applied for a missing row while preserving
-   every stored field except `Ban`, `Disband`, and `SendBan`.
-19. Hash-slot snapshots export row, index, and system spans for selected hash
-    slots into a checksummed payload; imports validate the payload, lock slots
-    in sorted order, replace existing spans, write entries in one sync commit,
-    and clear the channel cache.
-    Backup callers can open the same portable format from a pinned Pebble read
-    view; counting and encoding scan the stable view without accumulating the
-    full payload or blocking later metadata writes. The stream header exposes
-    the exact entry count, and header inspection returns a replacement reader
-    so publication can authenticate the count without consuming or rescanning
-    the payload.
-20. Preserving snapshot imports keep local hash-slot migration rows when they
-    already exist, while still importing incoming migration rows that are not
-    present locally.
-21. `DeleteHashSlotData` removes all row, index, and system spans for one hash
-    slot and clears the channel cache.
-22. Read-only inspect APIs expose stable diagnostic rows for known metadata
-    tables, supporting explicit hash-slot scans and bounded local scans across
-    hash slots without mutating storage.
-23. Slot FSM, proxy, cluster, runtime, access, and usecase callers use this
-    package through the compatibility `DB`, `ShardStore`, and `WriteBatch`
-    surface while the typed `MetaDB`/`Shard` APIs remain the new storage core.
-    Legacy `UserConversation*` compatibility methods map to
-    `ConversationKindNormal`, and legacy `CMDConversation*` compatibility
-    methods map to `ConversationKindCMD`; neither path registers or writes a
-    second conversation table.
+## Boundaries
 
-Restore-only target installation writes portable metadata snapshot rows into a
-fresh isolated database, applies strictly ordered Slot FSM commands, and can
-export the resulting hash-slot view in canonical key order. Production restore
-uses that export digest as the replica and final-verification fence; it never
-mutates a pre-existing nonempty generation.
+- Table specifications and the registry drive primary/index behavior, inspect,
+  snapshot, backup, restore, and deletion.
+- Multi-Hash-Slot batches lock shards in sorted order, commit once, then publish
+  cache invalidations. A neighboring logical rejection may cause one isolated
+  rebuild with fresh staged state while retaining the original locks.
+- Link-U keeps legacy conversation table 6 for historical cursor compatibility; table 7 remains reserved. Device CMD cursors retain table 16, and the new UID CMD membership table uses 29 to avoid collisions.
+- Historical version-zero device rows may be imported but cannot authorize Link-U CONNECT or downgrade versioned credentials; replicated credential CAS requires a complete signed credential shape.
 
-Storage code in this package must not import Pebble directly.
+## Main Flows
 
-Device rows use the required credential-v3 value codec and retain a monotonic
-version, business login session, operation ID/digest, ACTIVE or REVOKED status,
-expiry, update time, and termination cause. Conditional mutations compare and
-write under the hash-slot batch lock; equal versions are idempotent only when
-their operation/digest/fence identity matches, and REVOKED rows remain durable
-tombstones. Inspect, snapshots, restore invalidation, and transfer projection
-must preserve these fields.
+1. Typed tables store Channel policy, subscribers, latest state, runtime and
+   migration state, plus UID users, devices, memberships, plugins, and events.
+2. Ordinary conversation directory scans UID-owned
+   `user_channel_membership` by `(uid, activated_at desc, channel_id,
+   channel_type)` using encoded string order (length before bytes), and
+   returns the complete cursor and `done` flag. Legacy response string sorting
+   is a usecase concern, not this cursor index order.
+3. Snapshot and restore cover registered row, index, and system spans; restore
+   installs isolated portable metadata, replays ordered Slot FSM commands, and
+   verifies canonical digests.
+4. Active migration tasks expose bounded ID/type cursor pages over the existing
+   index, allowing fair executor scheduling without changing stored encodings.
+5. Business Channel point reads use a fixed 8,192-entry LRU. Mutations and
+   restore invalidate affected or complete cache state after durable commit.
+6. Runtime metadata point reads reuse owned decoded rows in an 8,192-entry,
+   8 MiB LRU. Typed mutations/snapshots and offline restore chunks disable cache
+   hits/fills while active, advancing Hash-Slot generations on entry and exit
+   even after failure. Late misses cannot fill a newer generation. Replica slices
+   are cloned on return, and authority/routing checks remain outside storage.
+7. MQTT sessions separate lifetime/owner generations, revision and deadline pages;
+   ended rows retain UID binding. Optional Session column 30 records child reclamation; bounded intent pages precede atomic cursor/accounting/inflight range deletion. Index 3 discovers ended generations only after bounded historical backfill certifies table-22 System-1 coverage; kind 23 pins and strictly checks candidates. Same-batch range masks preserve replay grouping independence; newer lifetimes, source tombstones and Will remain. Subscription writes fence owner/revision and
+   preserve generation on option replacement; child receipts prove exact retries.
+   Delivery cursors separate backlog accounting, window admission and completion.
+   Explicit cancellation Init and offline window release require closed intent; admission/ACK remain active-only and ordinary Init/Account keep their fences.
+   Qualified charge receipts use cursor System 1; append/debit and quota ending commit atomically.
+   Read kind 18 pins the head; consumption verifies head/successor before unlinking. The bounded inflight
+   list preserves earliest ACK gaps; exchange/cursor/session updates are atomic,
+   and recovery uses immutable references in original send order.
+   Source/UID bindings retain tombstones and discovery/recovery indexes; unknown boundaries block retention. UID-only optional drain columns 29–32 retain a separate monotonic closed-cursor scan; ordinary UID removal requires completed drain proof, while explicit lifetime ending remains separate.
+   Retention and candidate pages pin at most limit+1 strict primary/index witnesses, rejecting missing or stale entries.
+   Active-source discovery seeks retention-index prefixes; replay discovery also retains primary tombstones.
+   Each pinned scan checks at most 65 owner witnesses, skipping whole subscriber prefixes.
+   Tombstones keep cleanup discoverable without restoring consumer responsibility or proving GC.
+   Will records outlive Session replacement. Session transitions and quota endings
+   resolve old Will atomically; new ownership may install a new configuration.
+   Delays, execution leases and receipts are distinct; optional Will columns 35/36 retain Preparing/Prepared/Started and frozen hook output. Exact live executors advance phases; takeover preserves them. Rejected/Sealed alone may finish an expired exact Started tuple from trusted durable seal/current-denial proofs, without changing its frozen body. Terminal shapes are strict and bodies are bounded/redacted.
+   Bounded MQTT reads pin Session, children and indexes; kind 19 pins channel/member/sequence without the live channel cache.
+   Kind 20 scans stable UID directory primary keys, including hidden/tombstoned and non-person candidates; UID binding checkpoints share its 4096-byte ID bound.
+   Kind 21 pins person directory/runtime/admission progress; table 26 System 1 retains monotonic invalidations on runtime deletion. Kind 22 pins runtime plus table 3 System 1 retirement without live-cache reads. Private snapshots never replace writable shards; evidence grants no policy or redispatch authority.
+
+7. Startup-only snapshot installation validates the complete immutable stream
+   before deletion, writes at most 8 MiB or 65,536 records per batch (one larger
+   valid record may occupy its own batch), and fences incomplete installs with
+   a physical-Slot global marker. Completion atomically publishes the snapshot
+   applied index and removes the marker. The caller must keep the Slot absent
+   until installation succeeds; ordinary runtime replacement remains atomic.
+
+## Invariants and Failure Semantics
+
+- Recovery certificates share the FSM mutation batch and applied watermark.
+  Database incarnation, sequence seal and incomplete-install state fence reuse.
+  A stale live anchor cannot revive a certificate after an unclassified write.
+  Known disjoint FSM writes and fenced startup installs invalidate their own
+  certificate, preserving neighboring Slots even without a snapshot anchor.
+- Event sequence pages scan a pinned native iterator and retain a bounded heap,
+  so event-key order cannot truncate results before the sequence cursor.
+- Offline event import installs one exact historical projection, its last event
+  idempotency result and the full message cursor atomically. It never replays
+  reducers; exact retries succeed and changed or advanced target state fails.
+  Shared preflight validation rejects invalid projection/cursor combinations
+  and projections that cannot fit the bounded native sequence page.
+- Membership writes update obsolete/new activation index keys atomically;
+  ordinary SEND never touches membership.
+- Subscriber `source_version` fences stale cross-Slot writes. Rejoin resets
+  visibility from one captured Channel tail; personal read/hide/activation
+  preserves source version and rejects tombstones.
+- Command-channel membership is a separate UID table with start/ACK sequence
+  and no ordinary activation, read, or delete fields.
+- Subscriber rows, count, mutation version and join incarnations commit after UID sort/deduplication.
+  Re-add preserves incarnation; removal/rejoin allocates from table 5 System 1; deletion retains its high water.
+  Range tombstones fence staged/disk rows. Legacy empty rows mean 1; snapshots/JSONL preserve identity.
+- Person directory incarnation changes atomically advance the runtime append route, rejecting overflow. Runtime metadata, Channel latest sequence and event reducers stay monotonic
+  and idempotent; runtime deletion retains table 3 System 1 authority floors and atomically withdraws person-directory tasks/readiness. Only explicit create reopens a retired identity above its floor; cold callers must reread assigned versions. Create-only batches never overwrite existing rows.
+- MQTT session CAS cannot rebind UID or regress generations. Snapshot/inspection
+  includes the row and deadline index; storage CAS alone proves no owner fencing.
+  Product MQTT is default-off and opt-in as a development preview; full rollout qualification remains pending.
+  Offline `HasMQTTState` seeks whole registered MQTT row/index/system keyspaces,
+  including retained/orphan fences, independently of caller Slot ranges.
+- The Channel read cache is capacity-bounded, independently locked from shard
+  lookup, and exposes current entries and capacity through `MetricsSnapshot`.
+- An imported `conversation_hidden_through_seq` is list-only state. Optional
+  fixed-value tails preserve old rows; marked rows require matching binaries.
+  Same-generation projections preserve it, while a new source generation replaces it.
+
+- Channel-owned message-update tables store latest payload/index, head/incarnation and replica activation proof, idempotency results, and separate body-free pending checkpoints. CAS and notification progress use same-batch overlays. Pinned reads bind head/index/body; a bounded Slot group shares one request-scoped snapshot across its logical shards after the caller establishes its fresh authority/apply barrier; an update sequence of zero proves dependent rows empty only within that snapshot, allowing exact-ID reads to stop before unused point lookups; channel deletion removes every edit span, and bounded retention-index cleanup removes target payloads, requests and pending state after the original retention floor.
+
+Metadata table 28 stores the one bounded, body-free MQTT storage ledger. Encoded/decoded rows share a 256 KiB limit for at most 1,024 historical nodes; exact CAS results preserve bootstrap debt and membership revision. `mqtt_storage.go` owns ledger validation and transaction semantics.
+- User and source-Channel send policies have independent apply-time CAS versions.
+  Dedicated policy and optional Channel-info mutations return the previous policy
+  from atomic same-batch apply for audit, without changing persisted rows; they observe same-batch state;
+  ordinary user/channel upserts preserve policy. Permission snapshots return
+  policy-only user projections and point membership facts. Format 2 requires
+  matching binaries; offline transfers preserve exact policy values and versions.
+
+## Read First
+
+- [Metadata database](db.go), [Schema registry](schema.go), [Transaction helpers](tx_helpers.go), [Snapshots](snapshot.go)
+
+## Update Triggers
+Update when ownership, batches, memberships, indexes, source fences, runtime/event state, snapshots, restore or caches change.

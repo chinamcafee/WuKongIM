@@ -1,8 +1,14 @@
 package proxy
 
-import "strings"
+import (
+	"errors"
+	"strings"
+)
 
 var (
+	// ErrReadStaleRoute rejects read results assembled across authority changes.
+	// It is distinct from database/CAS conflicts and is safe for read retries.
+	ErrReadStaleRoute = errors.New("slot/proxy: stale read route")
 	// ErrNoLeader indicates that no Slot leader is currently available.
 	ErrNoLeader = &routeError{
 		message: "slot/proxy: no leader",
@@ -78,7 +84,7 @@ func routeErrorMatches(err error, sentinel *routeError) bool {
 	if err == nil || sentinel == nil {
 		return false
 	}
-	if err == sentinel || sentinel.Is(err) {
+	if errors.Is(err, sentinel) || sentinel.Is(err) {
 		return true
 	}
 	msg := err.Error()

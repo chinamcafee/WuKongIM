@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -45,7 +46,7 @@ func TestDebugGoroutinesRequiresDebugAPIEnable(t *testing.T) {
 func TestDebugSnapshotRoutesRequireDebugAPIEnable(t *testing.T) {
 	disabled := httptest.NewServer(New(Options{
 		DebugConfig:  func() any { return map[string]any{"node_id": 1} },
-		DebugCluster: func() any { return map[string]any{"cluster_id": "wk"} },
+		DebugCluster: func(context.Context) (any, error) { return map[string]any{"cluster_id": "wk"}, nil },
 	}).Handler())
 	t.Cleanup(disabled.Close)
 	resp, err := http.Get(disabled.URL + "/debug/config")
@@ -56,8 +57,8 @@ func TestDebugSnapshotRoutesRequireDebugAPIEnable(t *testing.T) {
 		DebugConfig: func() any {
 			return map[string]any{"node_id": 1}
 		},
-		DebugCluster: func() any {
-			return map[string]any{"cluster_id": "wk"}
+		DebugCluster: func(context.Context) (any, error) {
+			return map[string]any{"cluster_id": "wk"}, nil
 		},
 	}).Handler())
 	t.Cleanup(enabled.Close)
@@ -65,6 +66,60 @@ func TestDebugSnapshotRoutesRequireDebugAPIEnable(t *testing.T) {
 	requireStatus(t, resp, err, http.StatusOK)
 	resp, err = http.Get(enabled.URL + "/debug/cluster")
 	requireStatus(t, resp, err, http.StatusOK)
+}
+
+func TestDebugClusterSnapshotFailureLogsInternalCauseWithoutExposingIt(t *testing.T) {
+	logger := newRecordingAPILogger("internal.access.api")
+	internalCause := errors.New("debug cluster invalid Slot Raft status")
+	server := httptest.NewServer(New(Options{
+		DebugAPIEnabled: true,
+		DebugCluster: func(context.Context) (any, error) {
+			return nil, internalCause
+		},
+		Logger: logger,
+	}).Handler())
+	t.Cleanup(server.Close)
+
+	resp, err := http.Get(server.URL + "/debug/cluster")
+	requireStatus(t, resp, err, http.StatusServiceUnavailable)
+	entry := requireAPILogEntry(t, logger, "WARN", "internal.access.api.http", "internal.access.api.debug_cluster_snapshot_failed")
+	foundCause := false
+	for _, field := range entry.fields {
+		loggedErr, ok := field.Value.(error)
+		if field.Key == "error" && ok && errors.Is(loggedErr, internalCause) {
+			foundCause = true
+		}
+	}
+	if !foundCause {
+		t.Fatalf("log fields = %#v, want internal cause", entry.fields)
+	}
+}
+
+func TestDebugObservationUsesBenchBearerWhenConfigured(t *testing.T) {
+	const token = "formal-observer-token"
+	server := httptest.NewServer(New(Options{
+		BenchToken:      token,
+		DebugAPIEnabled: true,
+		DebugConfig:     func() any { return map[string]any{"node_id": 1} },
+		DebugCluster: func(context.Context) (any, error) {
+			return map[string]any{"node_id": 1, "slots": []any{}}, nil
+		},
+	}).Handler())
+	t.Cleanup(server.Close)
+
+	for _, path := range []string{"/debug/config", "/debug/cluster", "/debug/pprof/heap?gc=1"} {
+		request, err := http.NewRequest(http.MethodGet, server.URL+path, nil)
+		if err != nil {
+			t.Fatalf("NewRequest(%s) error = %v", path, err)
+		}
+		response, err := http.DefaultClient.Do(request)
+		requireStatus(t, response, err, http.StatusUnauthorized)
+
+		request, _ = http.NewRequest(http.MethodGet, server.URL+path, nil)
+		request.Header.Set("Authorization", "Bearer "+token)
+		response, err = http.DefaultClient.Do(request)
+		requireStatus(t, response, err, http.StatusOK)
+	}
 }
 
 func TestDiagnosticsDebugRoutesRequireEnable(t *testing.T) {

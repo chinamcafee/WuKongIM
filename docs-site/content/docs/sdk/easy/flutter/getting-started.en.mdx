@@ -1,0 +1,247 @@
+---
+title: Flutter quickstart
+description: Install the pinned SDK version, obtain credentials from your backend, exchange online messages, and clean up.
+---
+
+This tutorial uses **WK_EASYSDK_FLUTTER_VERSION** to exchange online messages between Alice and Bob in separate clients. WebSocket JSON-RPC CONNECT authenticates the connection.
+
+## 1. Prepare
+
+Prepare the following:
+
+- Flutter 3.0 or later.
+- Dart 3.0 or later.
+- A WuKongIM single-node cluster or multi-node cluster whose `/readyz` is healthy and whose WebSocket Gateway is reachable from the target device.
+- A product backend that returns `uid`, a short-lived `token`, and `websocketUrl` separately for Alice and Bob.
+
+Read [Identity & Token](/en/guide/integration/authentication) first. If the application builds for mobile, desktop, and Web, accept each target independently; evidence from one target does not prove all targets.
+
+To see messages first, follow [the official example](/en/sdk/easy/examples#flutter) with two clients. The steps below integrate the SDK into your application.
+
+The default device category is **APP `0`**. Store the Token with the same `device_flag` on your backend: APP is `0`, WEB is `1`, and PC is `2`.
+
+## 2. Install the SDK
+
+Add the exact version to `pubspec.yaml`:
+
+```yaml
+dependencies:
+  flutter:
+    sdk: flutter
+  wukong_easy_sdk: WK_EASYSDK_FLUTTER_VERSION
+```
+
+Then run:
+
+```bash
+flutter pub get
+```
+
+Commit the updated `pubspec.lock` so CI and developer machines install the same version.
+
+## 3. Connect and listen
+
+```dart
+class IMBootstrap {
+  const IMBootstrap({
+    required this.uid,
+    required this.token,
+    required this.websocketUrl,
+  });
+
+  final String uid;
+  final String token;
+  final String websocketUrl;
+}
+```
+
+The product backend validates product login before returning these fields. The client holds no WuKongIM HTTP API management credential, and production uses `wss://`.
+
+The following screen starts initialization once from `initState`. Each callback is stored in a field so the identical function reference can be passed back from `dispose`.
+
+```dart
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+import 'package:wukong_easy_sdk/wukong_easy_sdk.dart';
+
+class ChatPage extends StatefulWidget {
+  const ChatPage({required this.bootstrap, super.key});
+
+  final IMBootstrap bootstrap;
+
+  @override
+  State<ChatPage> createState() => _ChatPageState();
+}
+
+class _ChatPageState extends State<ChatPage> {
+  final easySDK = WuKongEasySDK.getInstance();
+  final messagesById = <String, Message>{};
+
+  late final WuKongEventListener<ConnectResult> connectListener;
+  late final WuKongEventListener<DisconnectInfo> disconnectListener;
+  late final WuKongEventListener<Message> messageListener;
+  late final WuKongEventListener<WuKongError> errorListener;
+
+  bool listenersRegistered = false;
+  bool connected = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _createListeners();
+    _start();
+  }
+
+  void _createListeners() {
+    connectListener = (result) {
+      if (!mounted) return;
+      setState(() => connected = true);
+      debugPrint('connected');
+    };
+    disconnectListener = (info) {
+      if (!mounted) return;
+      setState(() => connected = false);
+      debugPrint('disconnected');
+    };
+    messageListener = (message) {
+      if (!mounted) return;
+      setState(() {
+        messagesById[message.messageId] = message;
+        if (messagesById.length > 100) {
+          messagesById.remove(messagesById.keys.first);
+        }
+      });
+    };
+    errorListener = (error) {
+      debugPrint('EasySDK operation failed');
+    };
+  }
+
+  Future<void> _start() async {
+    final config = WuKongConfig(
+      serverUrl: widget.bootstrap.websocketUrl,
+      uid: widget.bootstrap.uid,
+      token: widget.bootstrap.token,
+      debugLogging: false,
+    );
+
+    try {
+      await easySDK.init(config);
+      if (!mounted) {
+        easySDK.dispose();
+        return;
+      }
+      _registerListeners();
+      await easySDK.connect().timeout(
+        const Duration(seconds: 20),
+        onTimeout: () {
+          easySDK.disconnect();
+          throw TimeoutException('EasySDK connect exceeded 20 seconds');
+        },
+      );
+    } catch (_) {
+      easySDK.disconnect();
+      debugPrint('EasySDK connect failed');
+    }
+  }
+
+  void _registerListeners() {
+    if (listenersRegistered) return;
+    easySDK.addEventListener(WuKongEvent.connect, connectListener);
+    easySDK.addEventListener(WuKongEvent.disconnect, disconnectListener);
+    easySDK.addEventListener(WuKongEvent.message, messageListener);
+    easySDK.addEventListener(WuKongEvent.error, errorListener);
+    listenersRegistered = true;
+  }
+
+  @override
+  void dispose() {
+    if (listenersRegistered) {
+      easySDK.removeEventListener(WuKongEvent.connect, connectListener);
+      easySDK.removeEventListener(WuKongEvent.disconnect, disconnectListener);
+      easySDK.removeEventListener(WuKongEvent.message, messageListener);
+      easySDK.removeEventListener(WuKongEvent.error, errorListener);
+    }
+    easySDK.disconnect();
+    easySDK.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text(connected ? 'Online' : 'Connecting')),
+      body: ListView(
+        children: messagesById.values
+            .map((message) => ListTile(title: Text(_displayPayload(message.payload))))
+            .toList(),
+      ),
+    );
+  }
+
+  String _displayPayload(dynamic payload) {
+    if (payload is String) {
+      try {
+        return utf8.decode(base64Decode(payload));
+      } catch (_) {
+        return payload; // Preserve an unknown/non-Base64 payload for fallback UI.
+      }
+    }
+    return jsonEncode(payload);
+  }
+}
+```
+
+`debugLogging: false` matches the SDK default and is written explicitly here so production configuration can be reviewed. Set it to `true` only during a controlled diagnostic window. When a `logHandler` is also supplied, it receives only SDK-sanitized operational metadata; application code must still avoid appending complete events, models, or payloads.
+
+Page-level `dispose()` is appropriate for the minimal example. `Future.timeout` bounds the complete connection wait at 20 seconds and disconnects after timeout or another failure; the page must not remain in Connecting forever. If a real application keeps the connection while navigating, let Provider, Riverpod, Bloc, or another application-level state owner hold the SDK. A page adds and removes only its own listeners; final logout performs `disconnect` and `dispose`.
+
+## 4. Exchange the first message
+
+Add this method to `_ChatPageState`:
+
+```dart
+Future<void> sendText(String targetUid, String text) async {
+  if (!connected) throw StateError('EasySDK is not connected');
+
+  await easySDK.send(
+    channelId: targetUid,
+    channelType: WuKongChannelType.person,
+    payload: {
+      'type': 1,
+      'version': 1,
+      'content': text,
+    },
+  );
+
+  debugPrint('SEND completed');
+}
+```
+
+After `sendText('bob', 'Hello from Flutter EasySDK')`, Alice records `SendResult`. Bob must independently see the message in his `messageListener`; send result and realtime receipt are different events.
+
+1. Start Alice and Bob on two devices, two simulators, or two independent browser contexts.
+2. Enable send only after both sides observe `WuKongEvent.connect`.
+3. Have Alice send to the person Channel `bob`, recording ID, sequence, and Reason Code.
+4. On Bob, verify `fromUid` and `channelId`, inspect `type` and `content` in the object payload, and deduplicate by `messageId`.
+5. Have Bob send to Alice and prove the reverse direction.
+6. Destroy and reopen the page, confirm no duplicate listener remains, then verify final resource release on logout.
+
+## 5. Clean up
+
+Page disposal removes listeners, calls `disconnect()`, and calls `dispose()`. To keep the connection across pages, move ownership into application state and release it on logout. The example displays at most the latest 100 messages.
+
+## 6. Troubleshooting
+
+- **Initialization or a UID switch leaves stale state:** wait for `easySDK.init(config)` before connecting. Before switching accounts, remove listeners, disconnect, and `dispose`, then clear product-local state.
+- **Messages duplicate after Widget rebuild:** never register listeners from `build`; retain callbacks and remove them from `dispose`.
+- **System logs still contain a token or payload:** first confirm the lockfile actually resolves `wukong_easy_sdk WK_EASYSDK_FLUTTER_VERSION`, then inspect application callbacks, `debugPrint`, a custom `logHandler`, and collectors for complete event or model logging. SDK diagnostics are off by default and should emit only sanitized operational metadata when explicitly enabled. Reproduce with the Release artifact and retain only low-sensitivity evidence before filing an issue.
+- **`message.payload` is a string:** the current server emits valid JSON objects as objects. If a string remains, confirm the server revision, then try Base64 → UTF-8 JSON and preserve unknown formats for fallback UI.
+- **A physical device cannot reach the local address:** `localhost` means the device itself; have the product backend return a device-reachable WSS ingress.
+- **Send succeeds but the peer message is absent from the UI:** inspect send result, realtime receipt, and offline recovery separately.
+
+## Next
+
+Continue with [messaging](/en/guide/integration/messaging) and [production checks](/en/guide/integration/acceptance). For offline recovery, conversations, unread counts, or push, see [SDK selection](/en/sdk). [Versions and validation records](https://github.com/WuKongIM/WuKongIM/blob/main/docs/superpowers/reports/2026-09-08-easysdk-validation-history.md#flutter) retain the exact environments and scope of past runs.

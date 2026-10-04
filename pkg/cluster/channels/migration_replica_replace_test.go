@@ -25,7 +25,8 @@ func TestReplicaReplaceExecutorRunsNonLeaderSourcePhaseOrder(t *testing.T) {
 		probes: map[uint64][]ch.RuntimeProbeChannel{
 			4: {
 				{ChannelID: id, ChannelEpoch: 11, LeaderEpoch: 20, Role: ch.RoleFollower, Status: ch.StatusActive, HW: 8, LEO: 8, CheckpointHW: 8},
-				{ChannelID: id, ChannelEpoch: 11, LeaderEpoch: 20, Role: ch.RoleFollower, Status: ch.StatusActive, HW: 9, LEO: 9, CheckpointHW: 9},
+				{ChannelID: id, ChannelEpoch: 11, LeaderEpoch: 20, Role: ch.RoleFollower, Status: ch.StatusActive, HW: 9, LEO: 9, CheckpointHW: 9, WriteFence: ch.WriteFence{Token: task.TaskID, Version: 1}},
+				{ChannelID: id, ChannelEpoch: 11, LeaderEpoch: 20, Role: ch.RoleFollower, Status: ch.StatusActive, HW: 9, LEO: 9, CheckpointHW: 9, WriteFence: ch.WriteFence{Token: task.TaskID, Version: 1}},
 				{
 					ChannelID: id, ChannelEpoch: 12, LeaderEpoch: 20, Role: ch.RoleFollower, Status: ch.StatusActive, HW: 9, LEO: 9, CheckpointHW: 9,
 					WriteFence: ch.WriteFence{Token: task.TaskID, Version: 1, Reason: ch.WriteFenceReasonReplicaReplace},
@@ -61,7 +62,7 @@ func TestReplicaReplaceExecutorRunsNonLeaderSourcePhaseOrder(t *testing.T) {
 		"promote_learner",
 		"clear_fence",
 	}, store.ops)
-	require.Equal(t, []string{"apply_meta:1", "apply_meta:4", "probe:4", "apply_meta:1", "apply_meta:4", "drain:1", "probe:4", "apply_meta:1", "apply_meta:4", "probe:4"}, runtime.ops)
+	require.Equal(t, []string{"apply_meta:1", "apply_meta:4", "probe:4", "apply_meta:1", "apply_meta:4", "drain:1", "probe:4", "probe:4", "apply_meta:1", "apply_meta:4", "probe:4"}, runtime.ops)
 	require.Equal(t, []uint64{1, 2, 4}, meta.Replicas)
 	require.Equal(t, []uint64{1, 2, 4}, meta.ISR)
 }
@@ -185,6 +186,65 @@ func TestReplicaReplaceExecutorAppliesFinalMetaBeforeVerifyMembership(t *testing
 	require.Equal(t, metadb.ChannelMigrationStatusCompleted, store.task.Status)
 	require.Equal(t, metadb.ChannelMigrationPhaseClearFence, store.task.Phase)
 	require.Equal(t, []string{"apply_meta:1", "apply_meta:4", "probe:4"}, runtime.ops)
+}
+
+func TestReplicaReplaceExecutorRetriesLaggingFinalTarget(t *testing.T) {
+	ctx := context.Background()
+	now := time.UnixMilli(1750000200000).UTC()
+	id := ch.ChannelID{ID: "executor-replica-lagging", Type: 1}
+	task := testReplicaReplaceExecutorTask(id)
+	task.Status = metadb.ChannelMigrationStatusRunning
+	task.Phase = metadb.ChannelMigrationPhaseFinalTargetCatchUp
+	task.OwnerNodeID = 2
+	task.OwnerLeaseUntilMS = now.Add(time.Minute).UnixMilli()
+	task.FenceToken = task.TaskID
+	task.FenceVersion = 4
+	task.CutoverLEO = 10
+	task.CutoverHW = 10
+	task.DrainedLeaderNode = 1
+	task.DrainedRuntimeGeneration = 30
+	task.DrainedChannelEpoch = 10
+	task.DrainedLeaderEpoch = 20
+	task.DrainedFenceVersion = 4
+	meta := testMigrationRuntimeMeta(id)
+	meta.Leader = 1
+	meta.LeaderEpoch = 20
+	meta.WriteFenceToken = task.TaskID
+	meta.WriteFenceVersion = 4
+	meta.WriteFenceReason = uint8(ch.WriteFenceReasonReplicaReplace)
+	meta.WriteFenceUntilMS = now.Add(time.Minute).UnixMilli()
+	store := newFakeMigrationExecutorStore(task, &meta, now)
+	runtime := &fakeMigrationExecutorRuntime{
+		probes: map[uint64][]ch.RuntimeProbeChannel{
+			4: {
+				{ChannelID: id, ChannelEpoch: 10, LeaderEpoch: 20, Role: ch.RoleFollower, Status: ch.StatusActive, HW: 9, LEO: 9, CheckpointHW: 9},
+				{ChannelID: id, ChannelEpoch: 10, LeaderEpoch: 20, Role: ch.RoleFollower, Status: ch.StatusActive, HW: 9, LEO: 10, CheckpointHW: 9},
+				{ChannelID: id, ChannelEpoch: 10, LeaderEpoch: 20, Role: ch.RoleFollower, Status: ch.StatusActive, HW: 10, LEO: 10, CheckpointHW: 10, WriteFence: ch.WriteFence{Token: task.TaskID, Version: 4}},
+			},
+		},
+	}
+	executor := NewMigrationExecutor(MigrationExecutorConfig{
+		LocalNode: 2,
+		Source:    fakeMigrationExecutorSource{store: store},
+		Store:     store,
+		Runtime:   runtime,
+		Meta:      fakeMigrationExecutorMetaReader{meta: &meta},
+		Clock:     func() time.Time { return now },
+	})
+
+	// Neither an incomplete log nor an uncommitted tail may promote the learner.
+	// Waiting must retain the proof and remain runnable without Slot writes.
+	for i := 0; i < 2; i++ {
+		require.NoError(t, executor.RunOnce(ctx))
+		require.Equal(t, task, store.task)
+		require.Empty(t, store.ops)
+	}
+	require.NoError(t, executor.RunOnce(ctx))
+	require.Equal(t, metadb.ChannelMigrationStatusRunning, store.task.Status)
+	require.Equal(t, metadb.ChannelMigrationPhasePromoteAndRemove, store.task.Phase)
+	require.Equal(t, taskCutoverProof(task), store.lastProof)
+	require.Equal(t, uint64(10), store.task.Progress.TargetLEO)
+	require.Equal(t, []string{"probe:4", "probe:4", "probe:4"}, runtime.ops)
 }
 
 func TestReplicaReplaceExecutorBlocksWhenSourceIsLeader(t *testing.T) {

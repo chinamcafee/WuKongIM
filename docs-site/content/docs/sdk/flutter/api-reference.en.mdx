@@ -1,0 +1,81 @@
+---
+title: Flutter API reference
+description: Find common wukongimfluttersdk entry points, listeners, models, and states by manager.
+---
+
+This page is a quick lookup. Return to each task page for complete usage and call order. The SDK singleton is `WKIM.shared`.
+
+## Initialization
+
+| API | Purpose |
+| --- | --- |
+| `setup(Options)` | Configure the current user and open that UID's local database |
+| `Options.newDefault(uid, token, {addr})` | Create the default options |
+| `Options.getAddr` | Supply a connection address dynamically |
+| `connectionManager` | Connection and state |
+| `messageManager` | Message sending, receiving, and queries |
+| `conversationManager` | Conversation list and unread counts |
+| `channelManager` | User and group metadata |
+
+## `WKConnectionManager`
+
+| API | Purpose |
+| --- | --- |
+| `connect()` | Start connecting |
+| `disconnect(false)` | Disconnect while retaining the current account |
+| `disconnect(true)` | Log out |
+| `addOnConnectionStatus(key, listener)` | Observe connection state |
+| `removeOnConnectionStatus(key)` | Remove the state listener |
+
+States: `fail`, `success`, `kicked`, `syncMsg`, `connecting`, `noNetwork`, and `syncCompleted`.
+
+## `WKMessageManager`
+
+| API | Purpose |
+| --- | --- |
+| `sendWithOption(content, channel, options)` | Send and await local processing |
+| `sendMessage(content, channel)` | Send with default options |
+| `addOnMsgInsertedListener` | Observe local insertion; one global callback |
+| `addOnRefreshMsgListener(key, listener)` | Observe message-object and send-state changes |
+| `addOnNewMsgListener(key, listener)` | Observe newly received messages |
+| `getOrSyncHistoryMessages` | Read local history and request remote history when needed |
+| `addOnSyncChannelMsgListener` | Connect a remote history API |
+| `addOnUploadAttachmentListener` | Connect media upload |
+| `registerMsgContent` | Register a custom payload |
+
+Use the same key with `removeOnRefreshMsgListener` and `removeNewMsgListener` when a screen is disposed.
+
+## `WKConversationManager`
+
+| API | Purpose |
+| --- | --- |
+| `getAll()` | Read all local conversations |
+| `getAllUnreadCount()` | Read the total unread count |
+| `getWithChannel(channelID, channelType)` | Read one channel's conversation |
+| `updateRedDot(channelID, channelType, count)` | Update its unread count |
+| `deleteMsg(channelID, channelType)` | Remove the conversation-list item |
+| `addOnRefreshMsgListListener(key, listener)` | Observe conversation batches |
+| `addOnSyncConversationListener` | Connect the multi-device conversation API |
+
+## `WKChannelManager`
+
+| API | Purpose |
+| --- | --- |
+| `getChannel(channelID, channelType)` | Read local channel metadata |
+| `fetchChannelInfo(channelID, channelType)` | Request a metadata refresh |
+| `addOnGetChannelListener` | Connect your user and group metadata API |
+| `addOrUpdateChannel` | Save metadata locally |
+| `addOnRefreshListener(key, listener)` | Observe metadata changes |
+
+## Common models
+
+| Type | Meaning |
+| --- | --- |
+| `WKChannel` | `channelID` and `channelType` together identify a chat target |
+| `WKMsg` | Message identity, payload, sequence, and send state |
+| `WKMessageContent` | Base class for message payloads |
+| `WKTextContent` / `WKImageContent` | Built-in text and image payloads |
+| `WKUIConversationMsg` | A conversation-list item and its unread count |
+| `WKSyncConversation` / `WKSyncChannelMsg` | Sync results returned from your API to the SDK |
+
+Common channel types are `WKChannelType.personal` and `WKChannelType.group`. Send states are `WKSendMsgResult.sendLoading`, `sendSuccess`, and `sendFail`.

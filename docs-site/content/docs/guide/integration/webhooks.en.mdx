@@ -1,18 +1,119 @@
 ---
 title: Webhooks
-description: Consume message and online-status events securely and idempotently.
+description: Choose a callback, connect your business service, and verify the result in three steps.
 ---
 
-Webhooks send committed messages, offline recipients, and online-status changes to one product HTTP endpoint. They are suitable for asynchronous business work, not client message synchronization.
+Goal: make a decision before sending, or receive business notifications after a message commits.
 
-## Enable webhooks
+## 1. Choose the callback
+
+| Callback | Purpose and result |
+| --- | --- |
+| Before-send<br/>`msg.before_send` | Allow, replace, or reject before submission; return an explicit JSON decision |
+| Async notification | Consume committed messages or status events; HTTP `200` acknowledges the callback request |
+
+For a default persistent message, the order is:
+
+<div className="tutorial-diagram">
+
+```mermaid
+flowchart TD
+  send["Send attempt"] --> before["Before-send (optional)<br/>allow / replace / reject"]
+  before -->|allow| commit["Durable message commit"]
+  commit --> notify["Async notify (optional)<br/>business handles event"]
+```
+
+</div>
+
+**Before-send allowance does not prove commit.** Explicit denial prevents submission; asynchronous failure does not undo a committed message.
+
+## 2. Connect your business service
+
+For synchronous decisions, start the [Go example](https://github.com/WuKongIM/WuKongIM/tree/main/docs-site/examples/go-webhook) from the repository root. It needs Go 1.22+ and no SDK or database:
+
+```bash
+cd docs-site/examples/go-webhook
+go run .
+```
+
+For asynchronous notifications, implement a receiver that validates the source, parses `event`, and durably deduplicates accepted events before returning HTTP `200`.
+
+**Callbacks have no built-in signature or shared-secret header.** Establish trust through HTTPS and a private network, service mesh, or protected proxy. Client Token authentication does not authenticate callback requests.
+
+The Go example listens only on same-host loopback. In another host or container, `127.0.0.1` refers to that environment; use a reachable trusted endpoint.
+
+<details>
+  <summary>Before-send configuration, payload, and failure policy</summary>
+
+`msg.before_send` runs synchronously after permission checks and Send plugins, before message submission. It defaults to disabled and is independent of asynchronous Webhook `http_addr`, `focus_events`, and plugin enablement. Configure every sending ingress node consistently; changes require a restart.
+
+```toml
+[webhook.before_send]
+enabled = true
+http_addr = "https://business.example.com/im/webhook"
+timeout = "500ms"
+on_timeout = "deny"
+on_error = "deny"
+max_in_flight = 256
+```
+
+Environment overrides are `WK_WEBHOOK_BEFORE_SEND_ENABLED`, `WK_WEBHOOK_BEFORE_SEND_HTTP_ADDR`, `WK_WEBHOOK_BEFORE_SEND_TIMEOUT`, `WK_WEBHOOK_BEFORE_SEND_ON_TIMEOUT`, `WK_WEBHOOK_BEFORE_SEND_ON_ERROR`, and `WK_WEBHOOK_BEFORE_SEND_MAX_IN_FLIGHT`. The URL must use HTTP(S), without userinfo or a fragment.
+
+```http
+POST /im/webhook?event=msg.before_send
+Content-Type: application/json
+```
+
+```json
+{
+  "from_uid": "u1",
+  "channel_id": "group1",
+  "channel_type": 2,
+  "client_msg_no": "business-message-001",
+  "payload": "aGVsbG8=",
+  "no_persist": false,
+  "sync_once": false
+}
+```
+
+`channel_id` identifies the canonical source channel: person channels use the server-normalized identity, SyncOnce uses the source rather than internal command channel, and request-scoped `subscribers` use the stable temporary source channel derived from that recipient snapshot. No committed `message_id` or `message_seq` exists yet. Payloads use Base64. Each group message invokes one callback per ingress send attempt, independent of member count; authority forwarding does not repeat it.
+
+Return HTTP 200 with one explicit JSON decision:
+
+| Outcome | Response |
+| --- | --- |
+| Allow unchanged | `{"allow":true}` |
+| Allow replacement | `{"allow":true,"payload":"bmV3"}` |
+| Standard rejection | `{"allow":false}` |
+| Business rejection code | `{"allow":false,"reason_code":200}` |
+
+`allow` is required. Only Payload can change; identity and routing fields remain immutable. Omit `payload` to preserve the input. A replacement must be valid Base64 decoding to 1–32767 bytes. The response is limited to 64 KiB and one JSON object; unknown or duplicate fields, missing decisions, trailing JSON, and invalid field types in allow responses are callback errors. Business codes 128–255 retain their values in SENDACK `reason_code` and WuKongIM HTTP API `reason`, independently of HTTP status. A decoded denial with an omitted or invalid rejection code returns standard NotAllowSend (11); an inapplicable Payload on a denial also remains a denial.
+
+| Condition | Behavior |
+| --- | --- |
+| Explicit business denial | Always reject, without message submission or delivery |
+| Callback timeout | `on_timeout`: `allow` keeps the pre-callback Payload; `deny` returns SystemError (15) |
+| Network failure, non-200 status, or no parseable decision | `on_error`: `allow` keeps the input; `deny` returns SystemError (15) |
+| `max_in_flight` reached | Immediately return SystemError (15), without another waiting queue |
+| Original send canceled or expired | Stop; failure-open policy cannot override it |
+
+Both failure policies default to `deny`. Calls are not automatically retried, redirects are not followed, and callbacks never enter the asynchronous notification queue. The callback is capped by the original send's remaining deadline; leave time for submission. Explicit denial takes precedence over callback failure-open, while parent cancellation always wins.
+
+Client retries may repeat callbacks. Deduplicate by sender, source channel, and `client_msg_no`; callers needing retry correlation must provide a stable nonempty `client_msg_no`. Business approval does not guarantee later message commit, so do not perform irreversible billing solely on this callback. NoPersist and SyncOnce also pass through it while retaining their existing delivery and storage semantics.
+
+Monitor `wukongim_webhook_before_send_total{result}` and `wukongim_webhook_before_send_duration_seconds{result}` for `allow`, `reject`, `timeout_allow`, `timeout_deny`, `error_allow`, `error_deny`, `overloaded`, `invalid_request`, and `canceled`. Labels contain no UID, channel, endpoint, or message content. The client sets only Content-Type, with no built-in signature or authentication header; establish callback trust through a controlled network or proxy.
+
+</details>
+
+<details>
+  <summary>Asynchronous notification configuration</summary>
 
 Configure `wukongim.toml`:
 
 ```toml
 [webhook]
 http_addr = "https://events.example.com/wukongim"
-focus_events = ["msg.notify", "msg.offline", "user.onlinestatus"]
+focus_events = ["msg.notify", "msg.offline.v2", "user.onlinestatus"]
 queue_size = 1024
 workers = 16
 request_timeout = "5s"
@@ -35,13 +136,76 @@ Content-Type: application/json
 
 Any HTTP 2xx is success. Critical message events retry durably with the same delivery identity; connection errors, timeouts, and non-2xx responses are persisted for a later attempt until they reach dead-letter.
 
-## Supported events
+</details>
+
+## 3. Verify the result
+
+Restart the single-node cluster or all ingress nodes after changing callback configuration; keep production settings consistent across nodes.
+
+Send these three texts through the Go before-send example:
+
+| Text | Expected result |
+| --- | --- |
+| `hello` | Allow unchanged; reception matches history |
+| `[replace] hello` | Receive `Reviewed: hello`; history stores the replacement |
+| `[reject] hello` | Send `reason=200`; no history row for the denied message |
+
+For async notifications, commit a test message and verify receipt plus HTTP `200`; confirm business processing separately. Consume duplicates idempotently and test bounded retries and event-loss behavior when the receiver fails.
+
+**Inspect the send result as well as reception and history.** The example's rejection code `200` is a send reason, not an HTTP status. Before-send timeout and error policies default to `deny`; retries may repeat callbacks, so retain the same sender/source/`client_msg_no` identity.
+
+<Callout type="warn" title="Webhook delivery is bounded and best effort">
+  Queue saturation, process exit, request cancellation, or retry exhaustion can lose an event. The current runtime has no disk-backed webhook outbox or crash replay. A webhook failure does not change an already-successful SENDACK or durable append.
+</Callout>
+
+<details>
+  <summary>Go example requests, replacement rules, and customization</summary>
+
+The default endpoint is `http://127.0.0.1:8090/webhook`. Change the port with `go run . -addr 127.0.0.1:8091`; stop with Ctrl+C. First try the callback from another terminal:
+
+```bash
+curl -fsS 'http://127.0.0.1:8090/webhook?event=msg.before_send' \
+  -H 'Content-Type: application/json' \
+  -d '{"from_uid":"alice","channel_id":"example-group","channel_type":2,"client_msg_no":"example-allow","payload":"aGVsbG8="}'
+```
+
+Expect `{"allow":true}`. Replace the Base64 `payload` to exercise each rule:
+
+| Text | Base64 Payload | Result |
+| --- | --- | --- |
+| `hello` | `aGVsbG8=` | Allow unchanged |
+| `[replace] hello` | `W3JlcGxhY2VdIGhlbGxv` | Rewrite to `Reviewed: hello` |
+| `[reject] hello` | `W3JlamVjdF0gaGVsbG8=` | HTTP 200 with `allow=false` and `reason_code=200` |
+
+Then configure the callback in your existing `wukongim.toml`:
+
+```toml
+[webhook.before_send]
+enabled = true
+http_addr = "http://127.0.0.1:8090/webhook"
+timeout = "500ms"
+on_timeout = "deny"
+on_error = "deny"
+max_in_flight = 64
+```
+
+Restart the single-node cluster or every ingress node on the same host, then send the table's text through your existing client. For SDK text Payloads such as `{"type":1,"content":"hello"}`, rules apply to `content` while preserving other JSON fields. Custom message types and binary Payloads pass through unchanged. The example README includes WuKongIM HTTP API group creation, send, and history commands. Successful sends return `reason=1`; this example's business denial returns 200. Received messages and history must contain the rewritten content, with no history row for a denied message.
+
+Customize `evaluate` in `main.go`. Its current rules have no side effects or cache: the same input and rules produce the same decision. Add durable idempotency if your business logic writes data, and do not treat callback allowance as proof of message commit. Logs contain only the decision type. The body is limited to 64 KiB, Payload to 32767 bytes, and each example process to 64 concurrent requests; excess requests receive HTTP 503. A rewrite exceeding the Payload limit explicitly rejects.
+
+The example accepts only loopback bind addresses for processes on the same host. `127.0.0.1` inside another host or container refers to that host or container; remote use needs a reachable trusted proxy and source authentication. Client Token authentication and business callback authentication are separate boundaries.
+
+</details>
+
+<details>
+  <summary>Event payloads and online-status parsing</summary>
 
 | Event | Request body | Typical use |
 | --- | --- | --- |
+| `msg.before_send` | One uncommitted message object | Synchronous allow, replace, or reject |
 | `msg.notify` | Array of committed messages | Audit, search indexing, asynchronous notification |
-| `msg.offline` | One message and a bounded batch of offline UIDs | Offline-push candidate calculation |
-| `user.onlinestatus` | Array of compatible online-status strings | Asynchronous product presence projection |
+| `msg.offline.v2` | One message and a bounded batch of offline device-targets | Offline-push candidate calculation |
+| `user.onlinestatus` | Array of compatibility status strings | UID-owner-local, best-effort session hint |
 
 Representative `msg.notify` request:
 
@@ -58,18 +222,18 @@ Representative `msg.notify` request:
     "from_uid": "system",
     "channel_id": "u1001",
     "channel_type": 1,
-    "timestamp": 1785398400,
+    "server_timestamp_ms": 1785398400,
     "payload": "eyJ2ZXJzaW9uIjoxLCJ0eXBlIjoib3JkZXJfdXBkYXRlIn0="
   }
 ]
 ```
 
-JSON encodes `payload` as Base64. For small recipient sets, `msg.offline` uses `to_uids`. At the compression threshold it may instead use `compress: "gzip"` with Base64-encoded `compress_to_uids`; receivers must support both forms.
+JSON encodes `payload` as Base64. For small recipient sets, `msg.offline.v2` uses `offline_targets`. At the compression threshold it may instead use `compress: "gzip"` with Base64-encoded `compress_offline_targets`; receivers must support both forms.
 
-## Reliability boundary
+Each `user.onlinestatus` item has this form:
 
 <Callout type="info" title="Critical message webhooks use a bounded durable Outbox">
-  `msg.notify` and `msg.offline` are sync-persisted in a node-local Pebble Outbox before dispatch, survive restart, and retain a stable `X-WK-Webhook-ID` across attempts. Capacity is bounded by record count and logical bytes; exhausted retries move to dead-letter for explicit bounded replay. `user.onlinestatus` remains a bounded best-effort memory queue. No webhook outcome changes an already-successful SENDACK or durable append.
+  `msg.notify` and `msg.offline.v2` are sync-persisted in a node-local Pebble Outbox before dispatch, survive restart, and retain a stable `X-WK-Webhook-ID` across attempts. Capacity is bounded by record count and logical bytes; exhausted retries move to dead-letter for explicit bounded replay. `user.onlinestatus` remains a bounded best-effort memory queue. No webhook outcome changes an already-successful SENDACK or durable append.
 </Callout>
 
 Recommended receiver flow:
@@ -79,15 +243,44 @@ Recommended receiver flow:
 3. Persist the raw event and `X-WK-Webhook-ID` to your own durable queue.
 4. Return HTTP 200 promptly after persistence.
 5. Run business logic asynchronously with a retryable state machine.
+```text
+{uid}-{device_flag}-{online:0|1}-{session_id}-{device_online_count}-{total_online_count}
+```
+
+The counts cover active sessions on the UID owner's current node only. They are not cluster-global presence and the event stream is neither complete nor ordered. A UID may contain `-`; parse the final five numeric fields from the right and treat the remaining prefix as the UID.
+
+</details>
+
+<details>
+  <summary>Receiver persistence and idempotency flow</summary>
+
+Recommended receiver flow:
+
+```mermaid
+flowchart TD
+  Receive["Receive webhook"] --> Verify{"Valid network origin and ingress identity?"}
+  Verify -->|no| Reject["Reject request"]
+  Verify -->|yes| Validate{"Body size and event allowlist valid?"}
+  Validate -->|no| Reject
+  Validate -->|yes| Persist["Persist raw event, idempotency key, and queue item in one transaction"]
+  Persist --> Response["Return HTTP 200 promptly"]
+  Persist --> Worker["Background worker runs product logic"]
+  Worker --> Result{"Succeeded?"}
+  Result -->|no, within budget| Worker
+  Result -->|yes| Done["Record terminal state"]
+```
 
 The server-provided stable ID is the primary idempotency key for critical
 events. If a compatibility receiver must derive one itself:
 
 - `msg.notify`: `event + message_id`;
-- `msg.offline`: `event + message_id + uid`, deduplicated per recipient;
-- `user.onlinestatus`: overwrite the latest state per user and device rather than requiring every transition.
+- `msg.offline.v2`: `event + message_id + uid`, deduplicated per recipient;
+- `user.onlinestatus`: deduplicate the complete string and treat it only as a local-session hint, never global online truth.
 
-## Security
+</details>
+
+<details>
+  <summary>Production source authentication</summary>
 
 The HTTP sender sets `Content-Type: application/json` and critical-delivery identity/attempt headers; it **does not add a signature or shared-secret header**. Build a trusted boundary around it in production:
 
@@ -98,13 +291,41 @@ The HTTP sender sets `Content-Type: application/json` and critical-delivery iden
 - never expose the callback as an anonymous public write endpoint;
 - avoid logging complete sensitive payloads.
 
-## Capacity and failure handling
+</details>
+
+<details>
+  <summary>Queue limits, metrics, and failure handling</summary>
 
 - `queue_size` is the bounded in-memory capacity for online-status events.
 - `workers` controls Outbox dispatch and online-status send concurrency.
 - `outbox_max_entries` and `outbox_max_bytes` bound critical persisted work.
 - `outbox_dispatch_batch_size` bounds each due-record claim.
-- `offline_uid_batch_size` controls offline UID chunking and compression.
+- `offline_uid_batch_size` controls offline device-target chunking and compression.
 - `retry_max_attempts` is the total number of durable attempts before dead-letter.
 
 If the receiver fails continuously, repair or isolate it instead of growing the Outbox without bound. Inspect backlog/dead-letter metrics and replay only an explicit bounded set after recovery.
+If the receiver fails continuously, repair or isolate it instead of growing WuKongIM's memory queues without bound. Critical product state must remain reconstructable from the product database or message history.
+
+</details>
+
+<details>
+  <summary>Optional source fault test</summary>
+
+Run from a source checkout containing this feature, with the Go toolchain required by `go.mod`. The test builds the current source and starts three real server processes plus a controllable callback on a loopback address. Docker, cloud servers, and an external Webhook URL are not required.
+
+```bash
+GOWORK=off go test -tags=e2e ./test/e2e/message/webhook \
+  -run '^TestBeforeSendWebhookAuthenticatedFaults$' -count=1 -timeout 2m -p=1 -v
+```
+
+This scenario enables client Token authentication and uses 256 hash slots, two Slot replicas, and two concurrent callbacks per node. The callback timeout is three seconds. Nodes intentionally use different failure policies to check denial, timeout-open, and error-open behavior separately; actual deployments must configure nodes consistently.
+
+The test checks authentication, allowance, Payload replacement, business denial, a 100 ms slow response, timeout, HTTP 503, malformed JSON, redirects, and connection failure. With both callback slots occupied on one node, 16 additional sends must reject without invoking the callback. Another node must remain available, and the saturated node must recover after release. Received content must match committed history, denied messages must be absent, and callback counts and public metric deltas must match the decisions.
+
+Verbose output records send latency, peak callback concurrency, and before/after heap and goroutine snapshots. If the platform lacks the process CPU metric, it reports `unavailable`. These observations describe a finite fault scenario, not throughput capacity, latency percentiles, or long-term memory stability. The test stops its processes and removes temporary data on completion.
+
+The callback uses test rules and does not validate your business logic or Webhook signature authentication. Repeat the allow, replace, reject, and failure-policy cases against your actual business service when it is available.
+
+</details>
+
+Next: [release checks](/en/guide/integration/acceptance). Look up [event payloads](/en/api/webhooks/payloads) and [reliability boundaries](/en/api/webhooks/reliability-and-security) when implementing your receiver.

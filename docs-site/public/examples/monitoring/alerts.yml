@@ -1,0 +1,34 @@
+# Starter thresholds: tune to the measured baseline for this cluster.
+groups:
+  - name: wukongim-starter
+    rules:
+      - alert: WuKongIMScrapeFailed
+        expr: up{job="wukongim"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "WuKongIM metrics collection failed"
+          description: "Check connectivity and /readyz for {{ $labels.instance }}."
+      - alert: WuKongIMSendFailures
+        expr: sum by (cluster, node_id, reason) (increase(wukongim_gateway_sendacks_total{job="wukongim",reason!="success"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "WuKongIM returned unsuccessful SENDACKs"
+          description: "Check reason {{ $labels.reason }} on node {{ $labels.node_id }}."
+      - alert: WuKongIMDeliveryQueueHigh
+        expr: |
+          (
+            wukongim_delivery_recipient_worker_queue_depth{job="wukongim"}
+            / clamp_min(wukongim_delivery_recipient_worker_queue_capacity{job="wukongim"}, 1)
+          ) > 0.8
+          and
+          wukongim_delivery_recipient_worker_queue_capacity{job="wukongim"} > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "WuKongIM delivery queue has remained above 80%"
+          description: "Check delivery workers and downstream nodes before increasing queue capacity."

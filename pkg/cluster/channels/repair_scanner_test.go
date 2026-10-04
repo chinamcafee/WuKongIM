@@ -208,15 +208,34 @@ func (s *fakeRepairScannerSource) ListRepairScannerRuntimeMetaPage(_ context.Con
 	}
 	s.pageLimits = append(s.pageLimits, limit)
 	pages := s.slotPages[slotID]
-	index := int(cursor.ChannelType)
-	if index >= len(pages) {
-		return nil, metadb.ChannelRuntimeMetaCursor{}, true, nil
+	index, offset := 0, 0
+	if cursor.ChannelID != "" {
+		found := false
+		for pi, page := range pages {
+			for ri, meta := range page {
+				if meta.ChannelID == cursor.ChannelID && meta.ChannelType == cursor.ChannelType {
+					index, offset, found = pi, ri+1, true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if found && offset >= len(pages[index]) {
+			index++
+			offset = 0
+		}
 	}
-	next := metadb.ChannelRuntimeMetaCursor{ChannelType: int64(index + 1)}
+	if index >= len(pages) {
+		return nil, cursor, true, nil
+	}
+	next := cursor
 	items := make([]RepairScannerRuntimeMeta, 0, len(pages[index]))
-	for _, meta := range pages[index] {
+	for _, meta := range pages[index][offset:] {
 		id := ch.ChannelID{ID: meta.ChannelID, Type: uint8(meta.ChannelType)}
 		items = append(items, RepairScannerRuntimeMeta{HashSlot: s.hashSlotByID[id], Meta: meta})
+		next = metadb.ChannelRuntimeMetaCursor{ChannelID: meta.ChannelID, ChannelType: meta.ChannelType}
 	}
 	return items, next, index == len(pages)-1, nil
 }
@@ -280,4 +299,82 @@ func (o *fakeRepairScannerObserver) FailoverResult(result string) {
 
 func (o *fakeRepairScannerObserver) ReplicaRepairResult(result string) {
 	o.replicaRepairResults = append(o.replicaRepairResults, result)
+}
+
+func TestRepairScannerContinuesAcrossSlotsAndPages(t *testing.T) {
+	source := newFakeRepairScannerSource()
+	source.localSlots = []uint32{1, 3}
+	source.slotPages[1] = [][]metadb.ChannelRuntimeMeta{{failoverPlannerMeta(ch.ChannelID{ID: "page-a", Type: 1})}, {failoverPlannerMeta(ch.ChannelID{ID: "page-b", Type: 1})}}
+	source.slotPages[3] = [][]metadb.ChannelRuntimeMeta{{failoverPlannerMeta(ch.ChannelID{ID: "later-slot", Type: 1})}}
+	store := &fakeRepairScannerStore{}
+	scanner := NewRepairScanner(RepairScannerConfig{Enabled: true, PageLimit: 1, MaxPagesPerTick: 1, MaxTasksPerTick: 1}, source, store)
+	for range 3 {
+		_, err := scanner.RunOnce(context.Background())
+		require.NoError(t, err)
+	}
+	got := []string{}
+	for _, call := range source.hashSlotActiveCalls {
+		got = append(got, call.ChannelID.ID)
+	}
+	require.Equal(t, []string{"page-a", "later-slot", "page-b"}, got)
+}
+
+func TestRepairScannerTaskBudgetPreservesUnreadPageRows(t *testing.T) {
+	a, b := ch.ChannelID{ID: "row-a", Type: 1}, ch.ChannelID{ID: "row-b", Type: 1}
+	source := newFakeRepairScannerSource(a, b)
+	source.slotPages[1] = [][]metadb.ChannelRuntimeMeta{{failoverPlannerMeta(a), failoverPlannerMeta(b)}}
+	store := &fakeRepairScannerStore{}
+	scanner := NewRepairScanner(RepairScannerConfig{Enabled: true, PageLimit: 10, MaxPagesPerTick: 1, MaxTasksPerTick: 1}, source, store)
+	for range 2 {
+		r, err := scanner.RunOnce(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, 1, r.TasksCreated)
+	}
+	require.Len(t, store.requests, 2)
+	require.Equal(t, a, store.requests[0].ChannelID)
+	require.Equal(t, b, store.requests[1].ChannelID)
+}
+
+func TestRepairScannerDropsCursorWhenSlotLeadershipIsLost(t *testing.T) {
+	source := newFakeRepairScannerSource()
+	source.slotPages[1] = [][]metadb.ChannelRuntimeMeta{{failoverPlannerMeta(ch.ChannelID{ID: "row-a", Type: 1})}, {failoverPlannerMeta(ch.ChannelID{ID: "row-b", Type: 1})}}
+	scanner := NewRepairScanner(RepairScannerConfig{Enabled: true, PageLimit: 1, MaxPagesPerTick: 1, MaxTasksPerTick: 1}, source, &fakeRepairScannerStore{})
+	_, err := scanner.RunOnce(context.Background())
+	require.NoError(t, err)
+	source.localSlots = nil
+	_, err = scanner.RunOnce(context.Background())
+	require.NoError(t, err)
+	source.localSlots = []uint32{1}
+	_, err = scanner.RunOnce(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, source.hashSlotActiveCalls[0].ChannelID, source.hashSlotActiveCalls[1].ChannelID)
+}
+
+func TestRepairScannerRevisitsPassedChannelsWhenLeaderHealthExpires(t *testing.T) {
+	a, b, c := ch.ChannelID{ID: "row-a", Type: 1}, ch.ChannelID{ID: "row-b", Type: 1}, ch.ChannelID{ID: "row-c", Type: 1}
+	source := newFakeRepairScannerSource(a, b, c)
+	source.nodes = failoverHealthyNodes(1, 2, 3)
+	source.slotPages[1] = [][]metadb.ChannelRuntimeMeta{{failoverPlannerMeta(a)}, {failoverPlannerMeta(b)}, {failoverPlannerMeta(c)}}
+	store := &fakeRepairScannerStore{}
+	scanner := NewRepairScanner(RepairScannerConfig{Enabled: true, PageLimit: 1, MaxPagesPerTick: 1, MaxTasksPerTick: 1}, source, store)
+	// The paused leader still has a fresh report when the early rows are scanned.
+	for range 2 {
+		r, err := scanner.RunOnce(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, 1, r.PagesScanned)
+		require.Zero(t, r.TasksCreated)
+	}
+	require.Equal(t, b.ID, scanner.cursors[1].ChannelID)
+	source.nodes[0].Health.Freshness = control.NodeHealthStale
+	r, err := scanner.RunOnce(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, r.PagesScanned)
+	require.Equal(t, 1, r.TasksCreated)
+	require.Equal(t, a, store.requests[0].ChannelID, "newly unavailable leadership must revisit already-passed channels")
+	// Unchanged unhealthy evidence does not reset the cursor on every tick.
+	r, err = scanner.RunOnce(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, r.PagesScanned)
+	require.Equal(t, 1, r.TasksCreated)
+	require.Equal(t, b, store.requests[1].ChannelID)
 }

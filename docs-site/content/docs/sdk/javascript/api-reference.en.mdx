@@ -1,0 +1,81 @@
+---
+title: JavaScript / Web API Reference
+description: Find common wukongimjssdk configuration, listeners, providers, and models by manager.
+---
+
+This is a lookup page for common entry points, not a replacement for the task guides. The root singleton is `WKSDK.shared()`.
+
+## `WKSDK` and configuration
+
+| API | Purpose |
+| --- | --- |
+| `WKSDK.shared()` | SDK singleton for the current page context |
+| `config.uid` / `config.token` | Current user identity |
+| `config.addr` | WebSocket endpoint |
+| `config.deviceFlag` | `0` App, `1` Web, `2` PC |
+| `config.provider` | Application data sources |
+| `connect()` / `disconnect()` | Connect and stop connecting |
+| `register(type, factory)` | Register custom message content |
+| `newChannel` / `newMessageText` | Convenience model constructors |
+
+## `ConnectManager`
+
+| API | Purpose |
+| --- | --- |
+| `addConnectStatusListener` | Observe connection state |
+| `removeConnectStatusListener` | Remove a state observer |
+| `addConnectDelayListener` | Observe heartbeat delay |
+| `removeConnectDelayListener` | Remove a delay observer |
+| `status` | Current `ConnectStatus` |
+
+States: `Disconnect`, `Connected`, `Connecting`, `ConnectFail`, and `ConnectKick`.
+
+## `ChatManager`
+
+| API | Purpose |
+| --- | --- |
+| `send(content, channel, setting?)` | Send and return a local `Message` |
+| `sendWithOptions(content, channel, options)` | Send with advanced options |
+| `addMessageListener` / `removeMessageListener` | Observe all incoming and outgoing messages |
+| `addMessageStatusListener` / `removeMessageStatusListener` | Observe server send results |
+| `syncMessages(channel, options)` | Synchronize through the provider |
+| `syncMessageExtras` | Synchronize message extra data |
+
+## `ConversationManager`
+
+| API | Purpose |
+| --- | --- |
+| `sync(filter?)` | Synchronize conversations from the application provider |
+| `conversations` | Current in-memory conversation list |
+| `findConversation(channel)` | Find one conversation |
+| `createEmptyConversation(channel)` | Create an empty conversation |
+| `removeConversation(channel)` | Remove an in-memory row |
+| `getAllUnreadCount()` | Total all unread counts |
+| `addConversationListener` / `removeConversationListener` | Observe list changes |
+
+## `ChannelManager`
+
+| API | Purpose |
+| --- | --- |
+| `fetchChannelInfo(channel)` | Fetch a profile through the provider |
+| `getChannelInfo(channel)` | Read a cached profile |
+| `addListener` / `removeListener` | Observe profile changes |
+| `syncSubscribes(channel)` | Synchronize group subscribers |
+| `getSubscribes(channel)` | Read cached subscribers |
+
+## Common providers
+
+| Configuration | Result |
+| --- | --- |
+| `connectAddrCallback` | Supplies a WebSocket endpoint through a callback |
+| `channelInfoCallback` | `Promise<ChannelInfo>` |
+| `syncSubscribersCallback` | `Promise<Subscriber[]>` |
+| `syncConversationsCallback` | `Promise<Conversation[]>` |
+| `syncMessagesCallback` | `Promise<Message[]>` |
+| `messageUploadTaskCallback` | `MessageTask` |
+
+## Common models
+
+`Channel`, `ChannelInfo`, `Subscriber`, `Message`, `MessageContent`, `MessageText`, `MessageImage`, `Conversation`, `SyncOptions`, and `SendOptions`.
+
+Common channel types: `ChannelTypePerson` and `ChannelTypeGroup`. Local message states: `MessageStatus.Wait`, `MessageStatus.Normal`, and `MessageStatus.Fail`.

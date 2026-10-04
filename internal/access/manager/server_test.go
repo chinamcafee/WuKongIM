@@ -136,6 +136,7 @@ func TestManagerNodesReturnsReadOnlyInventory(t *testing.T) {
 				ControllerLeaderID: 1,
 				Items: []managementusecase.Node{{
 					NodeID:          1,
+					Version:         "v3.0.0-beta.7",
 					Name:            "node-1",
 					Addr:            "127.0.0.1:7011",
 					Status:          "alive",
@@ -204,6 +205,7 @@ func TestManagerNodesReturnsReadOnlyInventory(t *testing.T) {
 		"total": 1,
 		"items": [{
 			"node_id": 1,
+			"version": "v3.0.0-beta.7",
 			"name": "node-1",
 			"addr": "127.0.0.1:7011",
 			"status": "alive",
@@ -277,6 +279,73 @@ func TestManagerNodesReturnsReadOnlyInventory(t *testing.T) {
 			}]
 	}`) {
 		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestManagerNodeReturnsExactInventoryItem(t *testing.T) {
+	generatedAt := time.Date(2026, 6, 16, 10, 0, 0, 0, time.UTC)
+	srv := New(Options{
+		Management: managerNodesStub{nodes: managementusecase.NodeList{
+			GeneratedAt: generatedAt,
+			Items: []managementusecase.Node{{
+				NodeID: 2,
+				Name:   "node-2",
+				Slots: managementusecase.NodeSlotSummary{
+					HostedIDs:     []uint32{1, 7},
+					LeaderIDs:     []uint32{7},
+					ReplicaCount:  2,
+					LeaderCount:   1,
+					FollowerCount: 1,
+				},
+			}},
+		}},
+	})
+
+	rec := httptest.NewRecorder()
+	srv.Engine().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/manager/nodes/2", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !jsonEqual(rec.Body.String(), `{
+		"node_id": 2,
+		"version": "",
+		"name": "node-2",
+		"addr": "",
+		"status": "",
+		"last_heartbeat_at": "0001-01-01T00:00:00Z",
+		"is_local": false,
+		"capacity_weight": 0,
+		"membership": {"role":"","join_state":"","schedulable":false},
+		"health": {"status":"","last_heartbeat_at":"0001-01-01T00:00:00Z","fresh":false,"freshness":"","runtime_ready":false,"report_age_ms":0,"report_ttl_ms":0,"observed_control_revision":0,"observed_slot_revision":0},
+		"controller": {"role":"","voter":false,"leader_id":0,"raft_health":"","first_index":0,"applied_index":0,"snapshot_index":0},
+		"slot_stats": {"count":2,"leader_count":1},
+		"slots": {"hosted_ids":[1,7],"leader_ids":[7],"replica_count":2,"leader_count":1,"follower_count":1,"quorum_lost_count":0,"unreported_count":0},
+		"channel_runtime": {"active_total":0,"active_leader":0,"active_follower":0,"unknown":false},
+		"runtime": {"node_id":0,"active_online":0,"closing_online":0,"total_online":0,"gateway_sessions":0,"pending_activations":0,"sessions_by_listener":{},"accepting_new_sessions":false,"draining":false,"unknown":false},
+		"actions": {"can_drain":false,"can_resume":false,"can_scale_in":false,"can_onboard":false,"can_move_slots_in":false,"can_move_slots_out":false,"can_promote_controller_voter":false}
+	}`) {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestManagerNodeRejectsInvalidOrMissingNode(t *testing.T) {
+	srv := New(Options{Management: managerNodesStub{nodes: managementusecase.NodeList{
+		Items: []managementusecase.Node{{NodeID: 2}},
+	}}})
+
+	for _, tc := range []struct {
+		path string
+		want int
+	}{
+		{path: "/manager/nodes/not-a-number", want: http.StatusBadRequest},
+		{path: "/manager/nodes/3", want: http.StatusNotFound},
+	} {
+		rec := httptest.NewRecorder()
+		srv.Engine().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+		if rec.Code != tc.want {
+			t.Fatalf("%s status = %d, want %d; body=%s", tc.path, rec.Code, tc.want, rec.Body.String())
+		}
 	}
 }
 
@@ -682,6 +751,7 @@ func TestManagerRealtimeMonitorReturnsUnifiedPayload(t *testing.T) {
 			Stats: []RealtimeMonitorStat{{
 				Key:   "avg",
 				Value: 12.5,
+				Unit:  "msg/s",
 			}},
 		}, {
 			Key:       "rpcSuccessRate",
@@ -732,7 +802,7 @@ func TestManagerRealtimeMonitorReturnsUnifiedPayload(t *testing.T) {
 		],
 		"snapshot":[],
 		"cards":[
-			{"key":"sendRate","category":"gateway","stage":"sendEntry","source":"prometheus","tone":"normal","unit":"msg/s","value":12.5,"series":[{"timestamp":1781767200000,"value":12.5}],"stats":[{"key":"avg","value":12.5}],"available":true,"error":""},
+			{"key":"sendRate","category":"gateway","stage":"sendEntry","source":"prometheus","tone":"normal","unit":"msg/s","value":12.5,"series":[{"timestamp":1781767200000,"value":12.5}],"stats":[{"key":"avg","value":12.5,"unit":"msg/s"}],"available":true,"error":""},
 			{"key":"rpcSuccessRate","category":"internal","stage":"internalNetwork","source":"prometheus","tone":"normal","unit":"%","value":99.96,"series":[{"timestamp":1781767200000,"value":99.96}],"stats":[],"available":true,"error":""}
 		]
 	}`) {
@@ -1217,6 +1287,34 @@ func TestManagerChannelRuntimeMetaReturnsClusterRuntimeList(t *testing.T) {
 	}
 }
 
+func TestManagerChannelRuntimeMetaExactUsesPointRead(t *testing.T) {
+	srv := New(Options{
+		Auth: testAuthConfig([]UserConfig{{
+			Username: "admin", Password: "secret",
+			Permissions: []PermissionConfig{{Resource: "cluster.channel", Actions: []string{"r"}}},
+		}}),
+		Management: managerNodesStub{channelRuntimeMetaPoint: managementusecase.ChannelRuntimeMeta{
+			ChannelID: "g1____cmd", ChannelType: 2, SlotID: 4, Leader: 3, Status: "active",
+		}},
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/manager/channel-runtime-meta?exact=1&channel_id=g1____cmd&channel_type=2", nil)
+	req.Header.Set("Authorization", "Bearer "+mustIssueTestToken(t, srv, "admin"))
+	srv.Engine().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var body ChannelRuntimeMetaListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if len(body.Items) != 1 || body.Items[0].ChannelID != "g1____cmd" || body.Items[0].Leader != 3 {
+		t.Fatalf("items = %#v, want exact command runtime row", body.Items)
+	}
+}
+
 func TestManagerBusinessChannelsRejectsInvalidNodeID(t *testing.T) {
 	srv := New(Options{Management: managerNodesStub{}})
 
@@ -1462,6 +1560,7 @@ type managerNodesStub struct {
 	nodeConfigSnapshot                 managementusecase.NodeConfigSnapshot
 	slots                              []managementusecase.Slot
 	channelRuntimeMeta                 managementusecase.ListChannelRuntimeMetaResponse
+	channelRuntimeMetaPoint            managementusecase.ChannelRuntimeMeta
 	channelMigrationSummary            managementusecase.ChannelMigrationSummary
 	channelMigrationList               managementusecase.ChannelMigrationListResponse
 	businessChannels                   managementusecase.ListBusinessChannelsResponse
@@ -1469,7 +1568,7 @@ type managerNodesStub struct {
 	businessChannelMutation            managementusecase.MutateBusinessChannelMembersResponse
 	recentConversations                managementusecase.RecentConversationsResponse
 	messagesPage                       managementusecase.ListMessagesResponse
-	connections                        []managementusecase.Connection
+	connectionsPage                    managementusecase.ListConnectionsResponse
 	connectionDetail                   managementusecase.ConnectionDetail
 	pluginList                         managementusecase.NodePluginList
 	pluginDetail                       managementusecase.Plugin
@@ -1736,6 +1835,18 @@ func (s managerNodesStub) ListChannelRuntimeMeta(_ context.Context, req manageme
 	return s.channelRuntimeMeta, s.channelRuntimeMetaErr
 }
 
+func (s managerNodesStub) GetChannelRuntimeMeta(_ context.Context, channelID string, channelType int64) (managementusecase.ChannelRuntimeMeta, error) {
+	if s.channelRuntimeMetaErr != nil {
+		return managementusecase.ChannelRuntimeMeta{}, s.channelRuntimeMetaErr
+	}
+	item := s.channelRuntimeMetaPoint
+	if item.ChannelID == "" {
+		item.ChannelID = channelID
+		item.ChannelType = channelType
+	}
+	return item, nil
+}
+
 func (s managerNodesStub) RequestChannelLeaderTransfer(_ context.Context, req managementusecase.LeaderTransferInput) (managementusecase.ChannelMigrationSummary, error) {
 	if s.lastChannelLeaderTransferRequest != nil {
 		*s.lastChannelLeaderTransferRequest = req
@@ -1979,18 +2090,27 @@ func (s managerNodesStub) ListBusinessChannels(_ context.Context, req management
 }
 
 func (s managerNodesStub) GetBusinessChannel(_ context.Context, channelID string, channelType int64) (managementusecase.BusinessChannelDetail, error) {
+	if s.businessChannelsErr != nil {
+		return managementusecase.BusinessChannelDetail{}, s.businessChannelsErr
+	}
 	return managementusecase.BusinessChannelDetail{
 		BusinessChannelListItem: managementusecase.BusinessChannelListItem{ChannelID: channelID, ChannelType: channelType},
 	}, nil
 }
 
 func (s managerNodesStub) CreateBusinessChannel(_ context.Context, req managementusecase.CreateBusinessChannelRequest) (managementusecase.BusinessChannelDetail, error) {
+	if s.businessChannelsErr != nil {
+		return managementusecase.BusinessChannelDetail{}, s.businessChannelsErr
+	}
 	return managementusecase.BusinessChannelDetail{
 		BusinessChannelListItem: managementusecase.BusinessChannelListItem{ChannelID: req.ChannelID, ChannelType: req.ChannelType, Ban: req.Ban, Disband: req.Disband, SendBan: req.SendBan},
 	}, nil
 }
 
 func (s managerNodesStub) UpdateBusinessChannel(_ context.Context, req managementusecase.UpdateBusinessChannelRequest) (managementusecase.BusinessChannelDetail, error) {
+	if s.businessChannelsErr != nil {
+		return managementusecase.BusinessChannelDetail{}, s.businessChannelsErr
+	}
 	return managementusecase.BusinessChannelDetail{
 		BusinessChannelListItem: managementusecase.BusinessChannelListItem{ChannelID: req.ChannelID, ChannelType: req.ChannelType, Ban: req.Ban, Disband: req.Disband, SendBan: req.SendBan},
 	}, nil
@@ -2000,7 +2120,7 @@ func (s managerNodesStub) ListBusinessChannelMembers(_ context.Context, req mana
 	if s.lastBusinessChannelMembersRequest != nil {
 		*s.lastBusinessChannelMembersRequest = req
 	}
-	return s.businessChannelMembers, nil
+	return s.businessChannelMembers, s.businessChannelsErr
 }
 
 func (s managerNodesStub) MutateBusinessChannelMembers(_ context.Context, req managementusecase.MutateBusinessChannelMembersRequest) (managementusecase.MutateBusinessChannelMembersResponse, error) {
@@ -2008,7 +2128,10 @@ func (s managerNodesStub) MutateBusinessChannelMembers(_ context.Context, req ma
 		*s.lastBusinessChannelMutationRequest = req
 	}
 	if s.businessChannelMutation.ChannelID != "" {
-		return s.businessChannelMutation, nil
+		return s.businessChannelMutation, s.businessChannelsErr
+	}
+	if s.businessChannelsErr != nil {
+		return managementusecase.MutateBusinessChannelMembersResponse{}, s.businessChannelsErr
 	}
 	return managementusecase.MutateBusinessChannelMembersResponse{
 		ChannelID: req.ChannelID, ChannelType: req.ChannelType, ListKind: req.ListKind,
@@ -2030,11 +2153,13 @@ func (s managerNodesStub) ListMessages(_ context.Context, req managementusecase.
 	return s.messagesPage, s.messagesErr
 }
 
-func (s managerNodesStub) ListConnections(_ context.Context, req managementusecase.ListConnectionsRequest) ([]managementusecase.Connection, error) {
+func (s managerNodesStub) ListConnections(_ context.Context, req managementusecase.ListConnectionsRequest) (managementusecase.ListConnectionsResponse, error) {
 	if s.connectionsReqSink != nil {
 		*s.connectionsReqSink = req
 	}
-	return append([]managementusecase.Connection(nil), s.connections...), s.connectionsErr
+	resp := s.connectionsPage
+	resp.Items = append([]managementusecase.Connection(nil), s.connectionsPage.Items...)
+	return resp, s.connectionsErr
 }
 
 func (s managerNodesStub) GetConnection(_ context.Context, req managementusecase.GetConnectionRequest) (managementusecase.ConnectionDetail, error) {

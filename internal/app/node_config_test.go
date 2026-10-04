@@ -75,3 +75,30 @@ func containsNodeConfigItem(snapshot managementusecase.NodeConfigSnapshot, key, 
 	}
 	return false
 }
+
+func TestNodeConfigDocumentOwnsMetadataAndRejectsOtherNodes(t *testing.T) {
+	source := managementusecase.NodeConfigDocument{
+		NodeID: 2, Source: managementusecase.NodeConfigSnapshotSourceEffectiveStartup,
+		TOML: "[node]\nid = 2\n", Sections: []managementusecase.NodeConfigDocumentSection{{Path: "node", Line: 1}},
+		Fields: []managementusecase.NodeConfigDocumentField{{Path: "node.id", Line: 2}},
+	}
+	instance := &App{cfg: Config{NodeID: 2, StartupConfigDocument: source}}
+	got, err := instance.NodeConfigDocument(context.Background(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Fields[0].Path = "changed"
+	got.Sections[0].Path = "changed"
+	again, err := instance.NodeConfigDocument(context.Background(), 2)
+	if err != nil || again.Fields[0].Path != "node.id" || again.Sections[0].Path != "node" {
+		t.Fatal("mutable snapshot escaped")
+	}
+	if _, err := instance.NodeConfigDocument(context.Background(), 1); !errors.Is(err, managementusecase.ErrNodeConfigUnavailable) {
+		t.Fatalf("wrong-node request: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := instance.NodeConfigDocument(ctx, 2); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled request: %v", err)
+	}
+}

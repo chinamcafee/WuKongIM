@@ -2,11 +2,13 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	channelruntime "github.com/WuKongIM/WuKongIM/pkg/channel"
+	channelreplication "github.com/WuKongIM/WuKongIM/pkg/channel/replication"
 	channelstore "github.com/WuKongIM/WuKongIM/pkg/channel/store"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/channels"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/control"
@@ -15,6 +17,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/observe"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/propose"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/routing"
+	"github.com/WuKongIM/WuKongIM/pkg/dataformat"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 	"github.com/WuKongIM/WuKongIM/pkg/raftlog"
 	"github.com/WuKongIM/WuKongIM/pkg/slot/multiraft"
@@ -88,8 +91,10 @@ type Node struct {
 	slotStatusCaller clusternet.Caller
 	// slotStatusRuntime proves current local Slot runtime availability and observed leadership for write readiness.
 	slotStatusRuntime slotStatusRuntime
-	slots             slotReconciler
-	tasks             taskExecutor
+	// writeProbe owns one in-flight noop batch and a short-lived authority-fenced write proof.
+	writeProbe writeProbeCache
+	slots      slotReconciler
+	tasks      taskExecutor
 	// preferredLeaderReconciler is an idle-only background seam and is never
 	// invoked synchronously by Start, applySnapshot, or the control watch loop.
 	preferredLeaderReconciler taskExecutor
@@ -109,6 +114,10 @@ type Node struct {
 	// channelRPCGateway is registered once per transport server and atomically
 	// follows Channel runtime rebuilds after a restore activation.
 	channelRPCGateway *channels.ServiceGateway
+	// channelQuorumGateway is registered once and follows node-owned quorum runtime rebuilds.
+	channelQuorumGateway *channels.QuorumExchangeGateway
+	// defaultChannelReplication owns local durability, peer batches, and recovery workers.
+	defaultChannelReplication *channelreplication.Runtime
 	// defaultChannelStore owns the Node-created message DB factory.
 	defaultChannelStore *channelstore.MessageDBFactory
 	// channelStoreFactory is the narrow acquisition surface used by local message read facades.
@@ -116,10 +125,16 @@ type Node struct {
 	channelStoreFactory channelstore.Factory
 	// defaultSlots reports whether Node constructed the local Slot runtime.
 	defaultSlots bool
+	// defaultProposer owns the service bound to the current Slot runtime and transport.
+	defaultProposer bool
+	// defaultTaskExecutor owns task handlers bound to the current Slot runtime and Controller.
+	defaultTaskExecutor bool
 	// defaultPreferredLeaderReconciler reports whether Node constructed the idle placement reconciler.
 	defaultPreferredLeaderReconciler bool
 	// defaultSlotRuntime owns the Node-created Slot Multi-Raft runtime.
 	defaultSlotRuntime *multiraft.Runtime
+	// slotRaftDiagnostics performs context-bounded, owner-loop fresh Slot status reads.
+	slotRaftDiagnostics slotRaftDiagnosticReader
 	// defaultSlotRaftDB owns the Node-created Slot Raft log store.
 	defaultSlotRaftDB *raftlog.DB
 	// defaultSlotMetaDB owns the Node-created Slot metadata store.
@@ -152,6 +167,8 @@ type Node struct {
 	mu              sync.RWMutex
 	snapshot        Snapshot
 	controlSnapshot control.Snapshot
+	// mqttStorageMemberIDs changes only with the durable storage roster.
+	mqttStorageMemberIDs []uint64
 	// controlApplyMu serializes control snapshot application from startup, watches, and probes.
 	controlApplyMu sync.Mutex
 	// routeAuthorityPublishMu serializes low-frequency Router mutations with
@@ -161,8 +178,11 @@ type Node struct {
 	taskReconcileMu         sync.Mutex
 	taskReconcileCancel     context.CancelFunc
 	taskReconcileWG         sync.WaitGroup
-	preferredLeaderCancel   context.CancelFunc
-	preferredLeaderWG       sync.WaitGroup
+	// taskReconcileWake coalesces notifications without retaining stale snapshots.
+	// Its channel identity is immutable after allocation under mu.
+	taskReconcileWake     chan struct{}
+	preferredLeaderCancel context.CancelFunc
+	preferredLeaderWG     sync.WaitGroup
 	// preferredLeaderInterval is a test override for the idle background interval.
 	preferredLeaderInterval time.Duration
 	// preferredLeaderIntentMu protects the currently published Controller-intent
@@ -182,6 +202,8 @@ type Node struct {
 	channelMigrationMu              sync.Mutex
 	channelMigrationCancel          context.CancelFunc
 	channelMigrationWG              sync.WaitGroup
+	// channelMigrationScan bounds and rotates active-task reads across owned hash slots.
+	channelMigrationScan migrationTaskScan
 	// healthReportCancel stops the low-frequency Controller health reporter.
 	healthReportCancel context.CancelFunc
 	// healthReporter sends low-frequency Controller node health reports.
@@ -213,10 +235,17 @@ type preferredLeaderIntentGeneration struct {
 	snapshot control.Snapshot
 }
 
-// New validates cfg and creates a cluster node.
+// New validates cfg, records format identity for a fresh directory, and creates a node.
+// Nonempty unregistered directories are rejected before writable runtimes open.
 func New(cfg Config, opts ...Option) (*Node, error) {
 	cfg = cfg.WithDefaults()
 	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	if err := validateOfflineImportConfig(cfg); err != nil {
+		return nil, err
+	}
+	if err := dataformat.EnsureFresh(cfg.DataDir, cfg.CreatedBy, cfg.Control.StateDir); err != nil {
 		return nil, err
 	}
 	node := &Node{cfg: cfg, router: routing.NewRouter(), discovery: clusternet.NewDiscovery(), snapshot: Snapshot{NodeID: cfg.NodeID}, channelDataPlaneLease: newChannelDataPlaneLeaseGuard(time.Now, cfg.HealthReport.TTL), messageEventStreamCache: newMessageEventStreamCache(0), messageEventFinishCoalescer: newMessageEventFinishCoalescer(defaultMessageEventFinishCoalesceWindow)}
@@ -858,6 +887,62 @@ func (n *Node) ReadChannelCommitted(ctx context.Context, id channelruntime.Chann
 	return store.ReadCommitted(ctx, req)
 }
 
+// ReadChannelCommittedBatch delegates aligned committed-message reads to the
+// Channel service, which groups remote calls by exact Channel Leader.
+func (n *Node) ReadChannelCommittedBatch(ctx context.Context, reads []channels.CommittedRead) ([]channels.CommittedReadResult, error) {
+	results, err := n.ReadChannelOriginalCommittedBatch(ctx, reads)
+	if err != nil {
+		return nil, err
+	}
+	if err := n.overlayMessageReads(ctx, reads, results); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+// ReadChannelOriginalCommittedBatch proves original publication content through
+// the current Channel Leader without applying later payload edits. It preserves
+// authority, HW and retention fences; it cannot bypass history retention.
+func (n *Node) ReadChannelOriginalCommittedBatch(ctx context.Context, reads []channels.CommittedRead) ([]channels.CommittedReadResult, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	if err := n.ensureForeground(); err != nil {
+		return nil, err
+	}
+	reader, ok := n.channels.(interface {
+		ReadCommittedBatch(context.Context, []channels.CommittedRead) ([]channels.CommittedReadResult, error)
+	})
+	if !ok {
+		return nil, ErrNotStarted
+	}
+	return reader.ReadCommittedBatch(ctx, reads)
+}
+
+// ReadChannelPersistedBatch routes conversation recents to current-Leader disk state.
+func (n *Node) ReadChannelPersistedBatch(ctx context.Context, reads []channels.CommittedRead) ([]channels.CommittedReadResult, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	if err := n.ensureForeground(); err != nil {
+		return nil, err
+	}
+	reader, ok := n.channels.(interface {
+		ReadPersistedBatch(context.Context, []channels.CommittedRead) ([]channels.CommittedReadResult, error)
+	})
+	if !ok {
+		return nil, ErrNotStarted
+	}
+	results, err := reader.ReadPersistedBatch(ctx, reads)
+	if err != nil {
+		return nil, err
+	}
+	if err := n.overlayMessageReads(ctx, reads, results); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
 // ReadLocalLatestMessages reads one newest-first page from this node's persisted message replicas.
 func (n *Node) ReadLocalLatestMessages(ctx context.Context, beforeMessageID uint64, limit int) ([]channelruntime.Message, bool, uint64, error) {
 	if err := ctxErr(ctx); err != nil {
@@ -872,7 +957,6 @@ func (n *Node) ReadLocalLatestMessages(ctx context.Context, beforeMessageID uint
 	}
 	latestStore, ok := storeFactory.(interface {
 		ListLatestMessages(context.Context, uint64, int) ([]channelruntime.Message, bool, uint64, error)
-		DeleteLatestMessageIndexes(context.Context, []uint64) error
 	})
 	if !ok {
 		return nil, false, 0, channelruntime.ErrInvalidConfig
@@ -903,12 +987,10 @@ func (n *Node) ReadLocalLatestMessages(ctx context.Context, beforeMessageID uint
 		if err := n.loadLocalLatestVisibility(ctx, storeFactory, items, visibility); err != nil {
 			return nil, false, 0, err
 		}
-		retainedMessageIDs := make([]uint64, 0)
 		pageFull := false
 		for _, item := range items {
 			state := visibility[localLatestChannelKey{id: item.ChannelID, typ: item.ChannelType}]
 			if item.MessageSeq <= state.retentionThrough {
-				retainedMessageIDs = append(retainedMessageIDs, item.MessageID)
 				continue
 			}
 			if item.MessageSeq > state.hw {
@@ -918,11 +1000,6 @@ func (n *Node) ReadLocalLatestMessages(ctx context.Context, beforeMessageID uint
 			if len(visible) == limit+1 {
 				pageFull = true
 				break
-			}
-		}
-		if len(retainedMessageIDs) > 0 {
-			if err := latestStore.DeleteLatestMessageIndexes(ctx, retainedMessageIDs); err != nil {
-				return nil, false, 0, err
 			}
 		}
 		if pageFull {
@@ -1007,6 +1084,19 @@ func localLeaderCommitsOwnLEO(meta metadb.ChannelRuntimeMeta, localNodeID uint64
 
 // LookupChannelIdempotency reads one local Channel idempotency index entry.
 func (n *Node) LookupChannelIdempotency(ctx context.Context, id channelruntime.ChannelID, fromUID string, clientMsgNo string) (channelstore.IdempotencyHit, bool, error) {
+	return n.lookupChannelIdempotency(ctx, id, fromUID, clientMsgNo, "")
+}
+
+// LookupChannelWillIdempotency reads one local server-domain candidate. The
+// caller must prove visibility through the current Leader's committed log.
+func (n *Node) LookupChannelWillIdempotency(ctx context.Context, id channelruntime.ChannelID, fromUID, serverKey string) (channelstore.IdempotencyHit, bool, error) {
+	if serverKey == "" {
+		return channelstore.IdempotencyHit{}, false, channelruntime.ErrInvalidConfig
+	}
+	return n.lookupChannelIdempotency(ctx, id, fromUID, "", serverKey)
+}
+
+func (n *Node) lookupChannelIdempotency(ctx context.Context, id channelruntime.ChannelID, fromUID, clientMsgNo, serverKey string) (channelstore.IdempotencyHit, bool, error) {
 	if err := ctxErr(ctx); err != nil {
 		return channelstore.IdempotencyHit{}, false, err
 	}
@@ -1022,6 +1112,13 @@ func (n *Node) LookupChannelIdempotency(ctx context.Context, id channelruntime.C
 		return channelstore.IdempotencyHit{}, false, err
 	}
 	defer func() { _ = store.Close() }()
+	if serverKey != "" {
+		lookup, ok := store.(channelstore.WillIdempotencyLookup)
+		if !ok {
+			return channelstore.IdempotencyHit{}, false, channelruntime.ErrInvalidConfig
+		}
+		return lookup.LookupWillIdempotency(ctx, fromUID, serverKey)
+	}
 	lookup, ok := store.(channelstore.IdempotencyLookup)
 	if !ok {
 		return channelstore.IdempotencyHit{}, false, channelruntime.ErrInvalidConfig
@@ -1051,6 +1148,196 @@ func (n *Node) ReadChannelLastVisible(ctx context.Context, id channelruntime.Cha
 		return channelruntime.Message{}, false, ErrNotStarted
 	}
 	return n.channels.ReadChannelLastVisible(ctx, id, visibleAfterSeq)
+}
+
+// ReadChannelConversationHead reads the exact conversation construction tuple
+// from the authoritative Channel leader.
+func (n *Node) ReadChannelConversationHead(ctx context.Context, id channelruntime.ChannelID, uid string) (channels.ConversationHead, error) {
+	if err := ctxErr(ctx); err != nil {
+		return channels.ConversationHead{}, err
+	}
+	if err := n.ensureForeground(); err != nil {
+		return channels.ConversationHead{}, err
+	}
+	metadata, metadataErr := n.GetChannelMetadata(ctx, id.ID, int64(id.Type))
+	if metadataErr == nil && metadata.Disband != 0 {
+		return channels.ConversationHead{}, channelruntime.ErrChannelNotFound
+	}
+	if metadataErr != nil && !errors.Is(metadataErr, metadb.ErrNotFound) {
+		return channels.ConversationHead{}, metadataErr
+	}
+	reader, ok := n.channels.(interface {
+		ReadConversationHead(context.Context, channelruntime.ChannelID, string) (channels.ConversationHead, error)
+	})
+	if !ok {
+		return channels.ConversationHead{}, ErrNotStarted
+	}
+	return reader.ReadConversationHead(ctx, id, uid)
+}
+
+// ReadChannelConversationHeads validates business channel lifecycle state and
+// delegates one aligned batch to the Channel service, which groups remote
+// reads by exact leader.
+func (n *Node) ReadChannelConversationHeads(ctx context.Context, ids []channelruntime.ChannelID, uid string, badges ...channels.ConversationBadgeQuery) ([]channels.ConversationHeadResult, error) {
+	return n.readChannelConversationHeads(ctx, ids, uid, false, badges...)
+}
+
+// ReadChannelPersistedConversationHeads reads current-Leader disk state for list previews only.
+func (n *Node) ReadChannelPersistedConversationHeads(ctx context.Context, ids []channelruntime.ChannelID, uid string, badges ...channels.ConversationBadgeQuery) ([]channels.ConversationHeadResult, error) {
+	if len(ids) > 200 {
+		return nil, channelruntime.ErrInvalidConfig
+	}
+	return n.readChannelConversationHeads(ctx, ids, uid, true, badges...)
+}
+
+func (n *Node) readChannelConversationHeads(ctx context.Context, ids []channelruntime.ChannelID, uid string, persisted bool, badges ...channels.ConversationBadgeQuery) ([]channels.ConversationHeadResult, error) {
+	if len(badges) != 0 && len(badges) != len(ids) {
+		return nil, channelruntime.ErrInvalidConfig
+	}
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	if err := n.ensureForeground(); err != nil {
+		return nil, err
+	}
+	reader, ok := n.channels.(interface {
+		ReadConversationHeads(context.Context, []channelruntime.ChannelID, string, ...channels.ConversationBadgeQuery) ([]channels.ConversationHeadResult, error)
+	})
+	if !ok {
+		return nil, ErrNotStarted
+	}
+	results := make([]channels.ConversationHeadResult, len(ids))
+	eligibleIDs := make([]channelruntime.ChannelID, 0, len(ids))
+	eligibleBadges := make([]channels.ConversationBadgeQuery, 0, len(ids))
+	eligibleIndexes := make([]int, 0, len(ids))
+	timer := n.conversationReadTimer(persisted)
+	metadataStart := timer.start()
+	metadataFailed := false
+	resolvedReader, hasResolvedReader := n.channels.(interface {
+		ReadPersistedConversationHeadsResolved(context.Context, []channelruntime.ChannelID, string, []channelruntime.Meta, ...channels.ConversationBadgeQuery) ([]channels.ConversationHeadResult, error)
+	})
+	// Injected services may resolve a different authoritative metadata source.
+	useResolved := persisted && n.defaultChannels && n.defaultSlotProxy != nil && hasResolvedReader
+	var eligibleMetas []channelruntime.Meta
+	headCtx := ctx
+	if useResolved {
+		eligibleMetas = make([]channelruntime.Meta, 0, len(ids))
+		var cancel context.CancelFunc
+		headCtx, cancel = context.WithTimeout(ctx, channels.PersistedConversationReadTimeout)
+		defer cancel()
+	}
+	metadataResults := n.readConversationChannelMetadataBatch(headCtx, ids, useResolved)
+	for index, id := range ids {
+		metadata := metadataResults[index].Channel
+		err := metadataResults[index].Err
+		metadataFailed = metadataFailed || err != nil
+		switch {
+		case err == nil && metadataResults[index].Found && metadata.Disband != 0:
+			results[index].Err = channelruntime.ErrChannelNotFound
+		case err == nil:
+			if useResolved {
+				raw := metadataResults[index].Runtime
+				if raw == nil {
+					results[index].Err = channelruntime.ErrChannelNotFound
+					metadataFailed = true
+					continue
+				}
+				if raw.ChannelID != id.ID || raw.ChannelType != int64(id.Type) ||
+					(metadataResults[index].Found && (metadata.ChannelID != id.ID || metadata.ChannelType != int64(id.Type))) {
+					results[index].Err = channelruntime.ErrStaleMeta
+					metadataFailed = true
+					continue
+				}
+				eligibleMetas = append(eligibleMetas, channels.ProjectRuntimeMeta(*raw))
+			}
+			eligibleIDs = append(eligibleIDs, id)
+			if len(badges) != 0 {
+				eligibleBadges = append(eligibleBadges, badges[index])
+			}
+			eligibleIndexes = append(eligibleIndexes, index)
+		default:
+			results[index].Err = err
+		}
+	}
+	timer.finish("metadata", metadataStart, metadataFailed)
+	if len(eligibleIDs) == 0 {
+		return results, nil
+	}
+	read := reader.ReadConversationHeads
+	if useResolved {
+		read = func(ctx context.Context, ids []channelruntime.ChannelID, uid string, badges ...channels.ConversationBadgeQuery) ([]channels.ConversationHeadResult, error) {
+			return resolvedReader.ReadPersistedConversationHeadsResolved(ctx, ids, uid, eligibleMetas, badges...)
+		}
+	} else if persisted {
+		persistedReader, ok := n.channels.(interface {
+			ReadPersistedConversationHeads(context.Context, []channelruntime.ChannelID, string, ...channels.ConversationBadgeQuery) ([]channels.ConversationHeadResult, error)
+		})
+		if !ok {
+			return nil, ErrNotStarted
+		}
+		read = persistedReader.ReadPersistedConversationHeads
+	}
+	headsStart := timer.start()
+	batch, err := read(headCtx, eligibleIDs, uid, eligibleBadges...)
+	headsFailed := err != nil || len(batch) != len(eligibleIDs)
+	if timer.observer != nil {
+		for i := range batch {
+			headsFailed = headsFailed || batch[i].Err != nil
+		}
+	}
+	timer.finish("heads", headsStart, headsFailed)
+	if err != nil {
+		return nil, err
+	}
+	if len(batch) != len(eligibleIDs) {
+		return nil, channelruntime.ErrInvalidConfig
+	}
+	targets := make([]*channelruntime.Message, 0, len(batch))
+	for i := range batch {
+		if batch[i].Err == nil && batch[i].Head.Found {
+			targets = append(targets, &batch[i].Head.Message)
+		}
+	}
+	overlayStart := timer.start()
+	err = n.overlayMessageContent(ctx, targets)
+	if len(targets) != 0 && n.defaultSlotProxy != nil {
+		timer.finish("edit_overlay", overlayStart, err != nil)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	for index, result := range batch {
+		results[eligibleIndexes[index]] = result
+	}
+	return results, nil
+}
+
+func (n *Node) readConversationChannelMetadataBatch(ctx context.Context, ids []channelruntime.ChannelID, includeRuntime bool) []slotproxy.PermissionMetadataReadResult {
+	results := make([]slotproxy.PermissionMetadataReadResult, len(ids))
+	if n != nil && n.defaultSlotProxy != nil {
+		reads := make([]slotproxy.PermissionMetadataRead, len(ids))
+		kind := slotproxy.PermissionMetadataReadChannel
+		if includeRuntime {
+			kind = slotproxy.PermissionMetadataReadConversation
+		}
+		for i, id := range ids {
+			reads[i] = slotproxy.PermissionMetadataRead{
+				Kind: kind, ChannelID: id.ID, ChannelType: int64(id.Type),
+			}
+		}
+		return n.defaultSlotProxy.ReadPermissionMetadataBatch(ctx, reads)
+	}
+	for i, id := range ids {
+		metadata, err := n.GetChannelMetadata(ctx, id.ID, int64(id.Type))
+		if errors.Is(err, metadb.ErrNotFound) {
+			continue
+		}
+		results[i].Channel = metadata
+		results[i].Found = err == nil
+		results[i].Err = err
+	}
+	return results
 }
 
 func minAvailableSeq(retentionThroughSeq uint64) uint64 {

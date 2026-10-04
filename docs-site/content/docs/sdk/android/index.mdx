@@ -1,0 +1,34 @@
+---
+title: Android
+description: 用 Java 接入 WuKongIMAndroidSDK，管理连接、消息、会话和频道资料。
+---
+
+`WuKongIMAndroidSDK` 是悟空 IM 的完整 Android SDK。它负责长连接、消息收发、本地消息库、会话列表和频道资料，适合需要自行构建聊天界面的应用。
+
+本文档对应 `WuKongIMAndroidSDK 1.5.5`，示例统一使用 Java。
+
+## 开始前
+
+你需要准备：
+
+- 一个可访问的 WuKongIM 服务；
+- 两个测试用户，例如 `alice` 和 `bob`；
+- 由业务服务端返回的 `uid`、`token`、连接 IP 或域名和端口；
+- 一个 Android 应用工程。
+
+<Callout type="info" title="Token 从哪里来？">
+  Token 应由你的业务服务端生成并返回给已登录用户。不要在 App 中保存悟空 IM 的管理密钥，也不要让 App 调用管理接口创建 Token。
+</Callout>
+
+## 推荐阅读顺序
+
+<Cards>
+  <Card title="快速开始" description="安装 SDK，连接用户并发送第一条在线文本消息。" href="/zh/sdk/android/quickstart" />
+  <Card title="连接管理" description="提供网关地址，监听连接状态并正确退出。" href="/zh/sdk/android/connection" />
+  <Card title="消息管理" description="发送、接收、重发和读取本地消息。" href="/zh/sdk/android/messages" />
+  <Card title="会话管理" description="展示聊天列表并维护未读数。" href="/zh/sdk/android/conversations" />
+  <Card title="频道管理" description="加载用户、群和群成员资料。" href="/zh/sdk/android/channels" />
+  <Card title="高级功能" description="接入自定义消息、媒体上传和历史消息。" href="/zh/sdk/android/advanced" />
+</Cards>
+
+不熟悉“频道”“会话”这些词时，先读[核心概念](/zh/sdk/wukongim/concepts)。只想查方法名时，打开 [API 参考](/zh/sdk/android/api-reference)。

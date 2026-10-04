@@ -1,0 +1,143 @@
+---
+title: Flutter Quickstart
+description: Install wukongimfluttersdk 1.7.9, connect a user, and exchange the first online text message.
+---
+
+This page has one goal: exchange a text message between two online Flutter clients.
+
+## Prerequisites
+
+- Your application server returns a `uid`, `token`, and `host:port` for both `alice` and `bob`.
+- You have two separate app processes or devices. `WKIM.shared` is a process singleton.
+- Your Flutter project runs on the target device.
+
+## 1. Install
+
+Pin the version in `pubspec.yaml`:
+
+```yaml
+dependencies:
+  wukongimfluttersdk: 1.7.9
+```
+
+Then run:
+
+```bash
+flutter pub get
+```
+
+## 2. Initialize
+
+```dart
+import 'package:flutter/widgets.dart';
+import 'package:wukongimfluttersdk/common/options.dart';
+import 'package:wukongimfluttersdk/entity/channel.dart';
+import 'package:wukongimfluttersdk/entity/conversation.dart';
+import 'package:wukongimfluttersdk/entity/msg.dart';
+import 'package:wukongimfluttersdk/model/wk_text_content.dart';
+import 'package:wukongimfluttersdk/type/const.dart';
+import 'package:wukongimfluttersdk/wkim.dart';
+
+WidgetsFlutterBinding.ensureInitialized();
+
+final im = WKIM.shared;
+final options = Options.newDefault(
+  bootstrap.uid,
+  bootstrap.token,
+  addr: bootstrap.address, // For example, im.example.com:5100
+)
+  ..debug = false
+  ..deviceFlag = 0;
+
+final initialized = await im.setup(options);
+if (!initialized) {
+  throw StateError('WuKongIM local database initialization failed');
+}
+```
+
+The address must not include `tcp://`, `http://`, or `https://`.
+
+## 3. Supply conversation sync and observe state
+
+After the connection protocol succeeds, the SDK synchronizes recent conversations. Even a new test account must finish this step:
+
+```dart
+im.conversationManager.addOnSyncConversationListener(
+  (lastMsgSeqs, msgCount, version, complete) async {
+    // A real app calls its server and returns a complete WKSyncConversation.
+    final empty = WKSyncConversation()
+      ..uid = bootstrap.uid
+      ..conversations = [];
+    complete(empty);
+  },
+);
+
+const listenerKey = 'chat-home';
+im.connectionManager.addOnConnectionStatus(
+  listenerKey,
+  (status, reasonCode, info) {
+    if (status == WKConnectStatus.syncCompleted) {
+      print('WuKongIM ready');
+    } else if (status == WKConnectStatus.fail && reasonCode != null) {
+      print('connect failed: $reasonCode');
+    } else if (status == WKConnectStatus.kicked) {
+      print('this account was signed in elsewhere');
+    }
+  },
+);
+```
+
+`WKConnectStatus.success` means the connection protocol succeeded. It is followed by `syncMsg` and `syncCompleted`; waiting for `syncCompleted` is the simplest send gate.
+
+## 4. Observe messages and connect
+
+```dart
+im.messageManager.addOnNewMsgListener(listenerKey, (messages) {
+  for (final message in messages) {
+    final content = message.messageContent;
+    if (content is WKTextContent) {
+      print('${message.fromUID}: ${content.content}');
+    }
+  }
+});
+
+im.messageManager.addOnRefreshMsgListener(listenerKey, (message) {
+  if (message.status == WKSendMsgResult.sendSuccess) {
+    print('message sent: ${message.clientMsgNO}');
+  } else if (message.status == WKSendMsgResult.sendFail) {
+    print('message failed: ${message.clientMsgNO}');
+  }
+});
+
+im.connectionManager.connect();
+```
+
+## 5. Send text
+
+After `syncCompleted`, send from Alice to Bob:
+
+```dart
+await im.messageManager.sendWithOption(
+  WKTextContent('Hello, Bob'),
+  WKChannel('bob', WKChannelType.personal),
+  WKSendOptions(),
+);
+```
+
+Awaiting `sendWithOption` ensures the local storage step is complete. The server result still comes through the message refresh listener.
+
+## Expected result
+
+1. Alice and Bob both reach `syncCompleted`.
+2. Alice's message becomes `sendSuccess`.
+3. Bob's new-message listener prints “Hello, Bob”.
+
+Clean up when the screen ends:
+
+```dart
+im.connectionManager.removeOnConnectionStatus(listenerKey);
+im.messageManager.removeNewMsgListener(listenerKey);
+im.messageManager.removeOnRefreshMsgListener(listenerKey);
+```
+
+Continue with [Connection](/en/sdk/flutter/connection) and [Messages](/en/sdk/flutter/messages).

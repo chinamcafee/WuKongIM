@@ -1,0 +1,29 @@
+mode: debug
+rootDir: /tmp/wukongim-migration-original-process-source
+dataDir: /tmp/wukongim-migration-original-process-source/data-standard
+addr: tcp://127.0.0.1:56186
+httpAddr: 127.0.0.1:56187
+wsAddr: ws://127.0.0.1:56188
+manager:
+  on: false
+demo:
+  on: false
+logger:
+  level: 1
+  dir: /tmp/wukongim-migration-original-process-source/logs
+auth:
+  kind: none
+cluster:
+  nodeId: 1
+  addr: tcp://127.0.0.1:56189
+  serverAddr: 127.0.0.1:56189
+  apiUrl: http://127.0.0.1:56187
+  slotCount: 64
+  slotReplicaCount: 1
+  channelReplicaCount: 1
+db:
+  shardNum: 2
+  slotShardNum: 2
+
+plugin:
+  socketPath: /tmp/wukongim-migration-original-process-source/plugin.sock

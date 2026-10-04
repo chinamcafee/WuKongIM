@@ -6,7 +6,9 @@ const (
 	// TableIDMessage is the channel message table ID.
 	TableIDMessage uint32 = 1
 
-	messageHeaderFamilyID  uint16 = 0
+	messageHeaderFamilyID uint16 = 0
+	// messagePayloadFamilyID is used only to bind the portable backup payload
+	// envelope to a distinct logical key. Live storage uses one complete row.
 	messagePayloadFamilyID uint16 = 1
 
 	messagePrimaryIndexID            uint16 = 1
@@ -14,35 +16,50 @@ const (
 	messageIndexIDClientMsgNo        uint16 = 3
 	messageIndexIDFromUIDClientMsgNo uint16 = 4
 	messageIndexIDGlobalMessageID    uint16 = 5
+	messageIndexIDFromUIDMessageSeq  uint16 = 6
+	messageIndexIDNonBusinessSeq     uint16 = 7
+	messageIndexIDServerWill         uint16 = 8
 
-	messageSystemIDCheckpoint          uint16 = 1
-	messageSystemIDHistory             uint16 = 2
-	messageSystemIDSnapshot            uint16 = 3
-	messageSystemIDRetention           uint16 = 4
-	messageSystemIDCursor              uint16 = 5
-	messageSystemIDLatestIndex         uint16 = 6
-	messageSystemIDLatestIndexProgress uint16 = 7
+	messageSystemIDCheckpoint             uint16 = 1
+	messageSystemIDHistory                uint16 = 2
+	messageSystemIDSnapshot               uint16 = 3
+	messageSystemIDRetention              uint16 = 4
+	messageSystemIDCursor                 uint16 = 5
+	messageSystemIDLatestIndex            uint16 = 6
+	messageSystemIDLatestIndexProgress    uint16 = 7
+	messageSystemIDProposalByLast         uint16 = 8
+	messageSystemIDProposalByCommand      uint16 = 9
+	messageSystemIDEntryIdentity          uint16 = 10
+	messageSystemIDNonBusinessIndex       uint16 = 11
+	messageSystemIDMQTTSource             uint16 = 12
+	messageSystemIDMQTTActivation         uint16 = 13
+	messageSystemIDMQTTReplayAnchor       uint16 = 14
+	messageSystemIDMQTTReplayRetirement   uint16 = 15
+	messageSystemIDWillReceipt            uint16 = 16
+	messageSystemIDMQTTStorage            uint16 = 17
+	messageSystemIDMQTTStoragePreparation uint16 = 18
 
-	messageColumnIDMessageSeq        uint16 = 1
-	messageColumnIDMessageID         uint16 = 2
-	messageColumnIDFramerFlags       uint16 = 3
-	messageColumnIDSetting           uint16 = 4
-	messageColumnIDStreamFlag        uint16 = 5
-	messageColumnIDMsgKey            uint16 = 6
-	messageColumnIDExpire            uint16 = 7
-	messageColumnIDClientSeq         uint16 = 8
-	messageColumnIDClientMsgNo       uint16 = 9
-	messageColumnIDStreamNo          uint16 = 10
-	messageColumnIDStreamID          uint16 = 11
-	messageColumnIDTimestamp         uint16 = 12
-	messageColumnIDChannelID         uint16 = 13
-	messageColumnIDChannelType       uint16 = 14
-	messageColumnIDTopic             uint16 = 15
-	messageColumnIDFromUID           uint16 = 16
-	messageColumnIDPayloadHash       uint16 = 17
-	messageColumnIDPayloadSize       uint16 = 18
-	messageColumnIDPayload           uint16 = 19
-	messageColumnIDServerTimestampMS uint16 = 20
+	messageColumnIDMessageSeq          uint16 = 1
+	messageColumnIDMessageID           uint16 = 2
+	messageColumnIDFramerFlags         uint16 = 3
+	messageColumnIDSetting             uint16 = 4
+	messageColumnIDStreamFlag          uint16 = 5
+	messageColumnIDMsgKey              uint16 = 6
+	messageColumnIDExpire              uint16 = 7
+	messageColumnIDClientSeq           uint16 = 8
+	messageColumnIDClientMsgNo         uint16 = 9
+	messageColumnIDStreamNo            uint16 = 10
+	messageColumnIDStreamID            uint16 = 11
+	messageColumnIDTimestamp           uint16 = 12
+	messageColumnIDChannelID           uint16 = 13
+	messageColumnIDChannelType         uint16 = 14
+	messageColumnIDTopic               uint16 = 15
+	messageColumnIDFromUID             uint16 = 16
+	messageColumnIDPayloadHash         uint16 = 17
+	messageColumnIDPayloadSize         uint16 = 18
+	messageColumnIDPayload             uint16 = 19
+	messageColumnIDServerTimestampMS   uint16 = 20
+	messageColumnIDPublicationMetadata uint16 = 21
 )
 
 // MessageTable describes the persisted channel message row schema.
@@ -70,11 +87,12 @@ var MessageTable = schema.Table{
 		{ID: messageColumnIDPayloadSize, Name: "payload_size", Type: schema.TypeUint64},
 		{ID: messageColumnIDPayload, Name: "payload", Type: schema.TypeBytes},
 		{ID: messageColumnIDServerTimestampMS, Name: "server_timestamp_ms", Type: schema.TypeInt64},
+		{ID: messageColumnIDPublicationMetadata, Name: "publication_metadata", Type: schema.TypeBytes},
 	},
 	Families: []schema.Family{
 		{
 			ID:   messageHeaderFamilyID,
-			Name: "header",
+			Name: "row",
 			Columns: []uint16{
 				messageColumnIDMessageID,
 				messageColumnIDFramerFlags,
@@ -93,13 +111,10 @@ var MessageTable = schema.Table{
 				messageColumnIDFromUID,
 				messageColumnIDPayloadHash,
 				messageColumnIDPayloadSize,
+				messageColumnIDPayload,
 				messageColumnIDServerTimestampMS,
+				messageColumnIDPublicationMetadata,
 			},
-		},
-		{
-			ID:      messagePayloadFamilyID,
-			Name:    "payload",
-			Columns: []uint16{messageColumnIDPayload},
 		},
 	},
 	Primary: schema.Index{
@@ -110,9 +125,12 @@ var MessageTable = schema.Table{
 		Columns: []uint16{messageColumnIDMessageSeq},
 	},
 	Indexes: []schema.Index{
-		{ID: messageIndexIDMessageID, Name: "uidx_message_id", Unique: true, Columns: []uint16{messageColumnIDMessageID}},
-		{ID: messageIndexIDClientMsgNo, Name: "idx_client_msg_no", Columns: []uint16{messageColumnIDClientMsgNo, messageColumnIDMessageSeq}},
-		{ID: messageIndexIDFromUIDClientMsgNo, Name: "uidx_from_uid_client_msg_no", Unique: true, Columns: []uint16{messageColumnIDFromUID, messageColumnIDClientMsgNo}},
+		// The server key is derived from publication metadata, not its full bytes.
+		{ID: messageIndexIDServerWill, Name: "uidx_server_will_from_uid", Unique: true, Columns: []uint16{messageColumnIDPublicationMetadata, messageColumnIDFromUID}},
+		{ID: messageIndexIDNonBusinessSeq, Name: "idx_non_business_seq", Columns: []uint16{messageColumnIDMessageSeq}},
+		{ID: messageIndexIDClientMsgNo, Name: "idx_senderless_client_msg_no", Columns: []uint16{messageColumnIDClientMsgNo, messageColumnIDMessageSeq}},
+		{ID: messageIndexIDFromUIDClientMsgNo, Name: "uidx_client_msg_no", Unique: true, Columns: []uint16{messageColumnIDClientMsgNo}},
 		{ID: messageIndexIDGlobalMessageID, Name: "uidx_global_message_id", Unique: true, Columns: []uint16{messageColumnIDMessageID}},
+		{ID: messageIndexIDFromUIDMessageSeq, Name: "idx_from_uid_message_seq", Columns: []uint16{messageColumnIDFromUID, messageColumnIDMessageSeq}},
 	},
 }

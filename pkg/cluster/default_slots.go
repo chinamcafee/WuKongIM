@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/channels"
 	clusternet "github.com/WuKongIM/WuKongIM/pkg/cluster/net"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/propose"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/slots"
@@ -22,10 +23,10 @@ import (
 )
 
 const (
-	defaultSlotTickInterval       = 10 * time.Millisecond
+	defaultSlotTickInterval       = 50 * time.Millisecond
 	defaultSlotLeaderPollInterval = 10 * time.Millisecond
-	defaultSlotElectionTick       = 50
-	defaultSlotHeartbeatTick      = 1
+	defaultSlotElectionTick       = 40
+	defaultSlotHeartbeatTick      = 2
 	defaultSlotRuntimeWorkerCount = 20
 	defaultSlotRaftDirName        = "slotraft"
 	defaultSlotMetaDirName        = "slotmeta"
@@ -39,6 +40,10 @@ func (n *Node) ensureDefaultSlots() error {
 	}
 	metaDB, err := metadb.OpenWithLogger(filepath.Join(n.cfg.DataDir, defaultSlotMetaDirName), namedLogger(n.cfg.Logger, "slot_meta_db"))
 	if err != nil {
+		return err
+	}
+	if err := metaDB.MetaDB().EnableRecoveryCheckpoints(); err != nil {
+		_ = metaDB.Close()
 		return err
 	}
 	raftDB, err := raftlog.Open(filepath.Join(n.cfg.DataDir, defaultSlotRaftDirName), raftlog.Options{Logger: namedLogger(n.cfg.Logger, "slot_raft_db")})
@@ -69,8 +74,12 @@ func (n *Node) ensureDefaultSlots() error {
 	}
 	adapter := slots.NewAdapter(runtime)
 	manager := slots.NewManager(slots.Config{
-		LocalNode: n.cfg.NodeID,
-		Runtime:   adapter,
+		ClusterID: n.cfg.Control.ClusterID,
+		// Only initial Node.Start owns the node-wide foreground admission fence.
+		// Later placement changes and maintenance reloads retain atomic restore.
+		StartupRecovery: func() bool { return !n.started.Load() },
+		LocalNode:       n.cfg.NodeID,
+		Runtime:         adapter,
 		Storage: func(slotID uint32) (multiraft.Storage, error) {
 			return raftDB.ForSlot(uint64(slotID)), nil
 		},
@@ -100,6 +109,7 @@ func (n *Node) ensureDefaultSlots() error {
 				Observer:   n.cfg.Slots.ReplicaMoveObserver,
 			}),
 		)
+		n.defaultTaskExecutor = true
 	}
 	if n.preferredLeaderReconciler == nil && n.control != nil {
 		n.preferredLeaderReconciler = tasks.NewPreferredLeaderReconciler(tasks.PreferredLeaderReconcilerConfig{
@@ -111,12 +121,27 @@ func (n *Node) ensureDefaultSlots() error {
 		n.defaultPreferredLeaderReconciler = true
 	}
 	n.defaultSlotRuntime = runtime
+	n.slotRaftDiagnostics = runtime
 	n.defaultSlotRaftDB = raftDB
 	n.defaultSlotMetaDB = metaDB
-	n.defaultSlotProposer = defaultSlotProposer{runtime: runtime, acquireAdmission: n.acquireWriteAdmission}
+	var metaCreateObserver channels.MetaCreateObserver
+	if n.cfg.Channel.Observer != nil {
+		metaCreateObserver, _ = n.cfg.Channel.Observer.(channels.MetaCreateObserver)
+	}
+	slotProposer := defaultSlotProposer{
+		runtime:            runtime,
+		acquireAdmission:   n.acquireWriteAdmission,
+		contentEpoch:       n.messageContentEpoch,
+		metaCreateObserver: metaCreateObserver,
+	}
+	n.defaultSlotProposer = slotProposer
 	n.slotStatusRuntime = runtime
-	n.defaultSlotProxy = slotproxy.NewChannelMetadataStore(n, metaDB)
-	n.registerDefaultSlotHandlers(runtime)
+	editObserver, _ := n.cfg.Channel.Observer.(slotproxy.MessageUpdateReadObserver)
+	n.defaultSlotProxy = slotproxy.NewChannelMetadataStore(n, metaDB, editObserver)
+	if observer, ok := n.cfg.Channel.Observer.(slotproxy.SendPermissionObserver); ok {
+		n.defaultSlotProxy.SetSendPermissionObserver(observer)
+	}
+	n.registerDefaultSlotHandlers(runtime, slotProposer)
 	n.defaultSlots = true
 	return nil
 }
@@ -128,12 +153,12 @@ func (n *Node) defaultSlotTransport() multiraft.Transport {
 	return networkSlotTransport{sender: n.transportClient}
 }
 
-func (n *Node) registerDefaultSlotHandlers(runtime *multiraft.Runtime) {
+func (n *Node) registerDefaultSlotHandlers(runtime *multiraft.Runtime, slotProposer defaultSlotProposer) {
 	if n == nil || n.transportServer == nil || runtime == nil {
 		return
 	}
 	n.transportServer.Register(clusternet.MsgSlotRaftBatch, slotRaftBatchHandler{runtime: runtime})
-	n.transportServer.Register(clusternet.RPCSlotForwardPropose, propose.NewForwardHandler(defaultSlotProposer{runtime: runtime, acquireAdmission: n.acquireWriteAdmission}))
+	n.transportServer.Register(clusternet.RPCSlotForwardPropose, propose.NewForwardHandler(slotProposer))
 	n.transportServer.Register(clusternet.RPCPluginBindingScan, pluginBindingScanHandler{node: n})
 	n.transportServer.Register(clusternet.RPCSlotStatus, slotStatusHandler{runtime: runtime})
 	n.transportServer.Register(clusternet.RPCChannelMigrationMeta, channelMigrationMetaHandler{node: n})

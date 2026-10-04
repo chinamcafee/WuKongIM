@@ -93,6 +93,9 @@ func TestSchedulerObservesQueueAdmissionAndWait(t *testing.T) {
 		queueEvent.Bytes != 3 || queueEvent.BytesCapacity != 10 {
 		t.Fatalf("scheduler_queue ok = %+v, want queue state populated", *queueEvent)
 	}
+	if queueEvent.Revision == 0 {
+		t.Fatal("scheduler_queue enqueue revision = 0, want physical state revision")
+	}
 	drainedQueueEvent := findLastEventByPriority(events, "scheduler_queue", "ok", core.PriorityRPC)
 	if drainedQueueEvent == nil {
 		t.Fatalf("missing drained scheduler_queue ok event: %#v", events)
@@ -101,6 +104,9 @@ func TestSchedulerObservesQueueAdmissionAndWait(t *testing.T) {
 		drainedQueueEvent.Capacity != 1 || drainedQueueEvent.Bytes != 0 ||
 		drainedQueueEvent.BytesCapacity != 10 {
 		t.Fatalf("drained scheduler_queue ok = %+v, want source-scoped drained queue", *drainedQueueEvent)
+	}
+	if drainedQueueEvent.Revision <= queueEvent.Revision {
+		t.Fatalf("drained scheduler_queue revision = %d, want greater than enqueue revision %d", drainedQueueEvent.Revision, queueEvent.Revision)
 	}
 
 	waitEvent := findEvent(events, "scheduler_wait", "ok")
@@ -830,5 +836,23 @@ func TestStopWakesWaitBatchAndReturnsQueuedItems(t *testing.T) {
 
 	if _, err := s.WaitBatch(); !errors.Is(err, core.ErrStopped) {
 		t.Fatalf("WaitBatch(after stop) error = %v, want ErrStopped", err)
+	}
+}
+
+func TestSchedulerChargesBackingBytesWithoutChangingWireBatchLimit(t *testing.T) {
+	s := New(Config{MaxItems: 4, MaxBytes: 16, MaxBatchFrames: 4, MaxBatchBytes: 8})
+	for i := 0; i < 2; i++ {
+		if err := s.Enqueue(context.Background(), Item{Priority: core.PriorityRPC, Bytes: 4, RetainedBytes: 8}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Enqueue(context.Background(), Item{Priority: core.PriorityRPC, Bytes: 1, RetainedBytes: 1}); !errors.Is(err, core.ErrQueueFull) {
+		t.Fatalf("admission=%v", err)
+	}
+	if batch := s.NextBatch(); len(batch) != 2 {
+		t.Fatalf("batch contains %d frames; retained capacity must not shrink wire batches", len(batch))
+	}
+	if snapshot := s.snapshotQueue(); snapshot.bytes != 0 {
+		t.Fatalf("remaining bytes=%d", snapshot.bytes)
 	}
 }

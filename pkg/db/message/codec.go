@@ -67,8 +67,16 @@ func encodeMessageHeader(key []byte, row messageRow) ([]byte, error) {
 	if err := w.Uint64(messageColumnIDPayloadSize, row.PayloadSize); err != nil {
 		return nil, err
 	}
+	if err := w.RawBytes(messageColumnIDPayload, row.Payload); err != nil {
+		return nil, err
+	}
 	if err := w.Int64(messageColumnIDServerTimestampMS, row.ServerTimestampMS); err != nil {
 		return nil, err
+	}
+	if len(row.PublicationMetadata) != 0 {
+		if err := w.RawBytes(messageColumnIDPublicationMetadata, row.PublicationMetadata); err != nil {
+			return nil, err
+		}
 	}
 	return rowcodec.Wrap(key, messageValueVersion, rowcodec.CodecColumns, rowcodec.FlagChecksum, w.Bytes()), nil
 }
@@ -94,7 +102,11 @@ func encodedMessageHeaderLen(row messageRow) int {
 	payloadLen += encodedStringColumnLen(&last, messageColumnIDFromUID, row.FromUID)
 	payloadLen += encodedUint64ColumnLen(&last, messageColumnIDPayloadHash, row.PayloadHash)
 	payloadLen += encodedUint64ColumnLen(&last, messageColumnIDPayloadSize, row.PayloadSize)
+	payloadLen += encodedBytesColumnLen(&last, messageColumnIDPayload, row.Payload)
 	payloadLen += encodedInt64ColumnLen(&last, messageColumnIDServerTimestampMS, row.ServerTimestampMS)
+	if len(row.PublicationMetadata) != 0 {
+		payloadLen += encodedBytesColumnLen(&last, messageColumnIDPublicationMetadata, row.PublicationMetadata)
+	}
 	return rowcodec.EnvelopeLen(payloadLen)
 }
 
@@ -126,7 +138,11 @@ func encodeMessageHeaderTo(dst []byte, key []byte, row messageRow) error {
 	pos = putStringColumn(payload, pos, &last, messageColumnIDFromUID, row.FromUID)
 	pos = putUint64Column(payload, pos, &last, messageColumnIDPayloadHash, row.PayloadHash)
 	pos = putUint64Column(payload, pos, &last, messageColumnIDPayloadSize, row.PayloadSize)
+	pos = putBytesColumn(payload, pos, &last, messageColumnIDPayload, row.Payload)
 	pos = putInt64Column(payload, pos, &last, messageColumnIDServerTimestampMS, row.ServerTimestampMS)
+	if len(row.PublicationMetadata) != 0 {
+		pos = putBytesColumn(payload, pos, &last, messageColumnIDPublicationMetadata, row.PublicationMetadata)
+	}
 	if pos != len(payload) {
 		return dberrors.ErrInvalidArgument
 	}
@@ -137,14 +153,14 @@ func decodeMessageHeader(key []byte, value []byte, row *messageRow) error {
 	if row == nil {
 		return dberrors.ErrInvalidArgument
 	}
-	env, err := rowcodec.Unwrap(key, value)
+	env, err := rowcodec.UnwrapBorrowed(key, value)
 	if err != nil {
 		return err
 	}
 	if env.Version != messageValueVersion || env.Codec != rowcodec.CodecColumns {
 		return fmt.Errorf("%w: invalid message header envelope", dberrors.ErrCorruptValue)
 	}
-	s := rowcodec.NewScanner(env.Payload)
+	s := rowcodec.NewBorrowedScanner(env.Payload)
 	for s.Next() {
 		if err := decodeMessageHeaderColumn(s, row); err != nil {
 			return err
@@ -153,8 +169,8 @@ func decodeMessageHeader(key []byte, value []byte, row *messageRow) error {
 	if err := s.Err(); err != nil {
 		return err
 	}
-	if row.MessageID == 0 {
-		return fmt.Errorf("%w: missing message_id", dberrors.ErrCorruptValue)
+	if err := row.validate(); err != nil {
+		return fmt.Errorf("%w: invalid message header", dberrors.ErrCorruptValue)
 	}
 	return nil
 }
@@ -229,6 +245,14 @@ func decodeMessageHeaderColumn(s *rowcodec.Scanner, row *messageRow) error {
 		value, err := s.Uint64()
 		row.PayloadSize = value
 		return err
+	case messageColumnIDPayload:
+		value, err := s.Bytes()
+		row.Payload = value
+		return err
+	case messageColumnIDPublicationMetadata:
+		value, err := s.Bytes()
+		row.PublicationMetadata = value
+		return err
 	case messageColumnIDServerTimestampMS:
 		value, err := s.Int64()
 		row.ServerTimestampMS = value
@@ -302,6 +326,10 @@ func encodedInt64ColumnLen(last *uint16, columnID uint16, value int64) int {
 	return encodedColumnBeginLen(last, columnID) + uvarintLen(encodeZigZagInt64(value))
 }
 
+func encodedBytesColumnLen(last *uint16, columnID uint16, value []byte) int {
+	return encodedColumnBeginLen(last, columnID) + uvarintLen(uint64(len(value))) + len(value)
+}
+
 func encodedUint8ColumnLen(last *uint16, columnID uint16, value uint8) int {
 	return encodedColumnBeginLen(last, columnID) + 1
 }
@@ -335,6 +363,13 @@ func putInt64Column(dst []byte, pos int, last *uint16, columnID uint16, value in
 	return pos + binary.PutUvarint(dst[pos:], encodeZigZagInt64(value))
 }
 
+func putBytesColumn(dst []byte, pos int, last *uint16, columnID uint16, value []byte) int {
+	pos = putColumnBegin(dst, pos, last, columnID, rowcodec.TypeBytes)
+	pos += binary.PutUvarint(dst[pos:], uint64(len(value)))
+	copy(dst[pos:], value)
+	return pos + len(value)
+}
+
 func putUint8Column(dst []byte, pos int, last *uint16, columnID uint16, value uint8) int {
 	pos = putColumnBegin(dst, pos, last, columnID, rowcodec.TypeUint8)
 	dst[pos] = value
@@ -349,14 +384,14 @@ func decodeMessagePayload(key []byte, value []byte, row *messageRow) error {
 	if row == nil {
 		return dberrors.ErrInvalidArgument
 	}
-	env, err := rowcodec.Unwrap(key, value)
+	env, err := rowcodec.UnwrapBorrowed(key, value)
 	if err != nil {
 		return err
 	}
 	if env.Version != messageValueVersion || env.Codec != rowcodec.CodecColumns {
 		return fmt.Errorf("%w: invalid message payload envelope", dberrors.ErrCorruptValue)
 	}
-	s := rowcodec.NewScanner(env.Payload)
+	s := rowcodec.NewBorrowedScanner(env.Payload)
 	for s.Next() {
 		if s.ColumnID() != messageColumnIDPayload {
 			continue

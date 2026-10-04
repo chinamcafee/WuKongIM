@@ -35,3 +35,25 @@ func (a *App) NodeConfigSnapshot(_ context.Context, requestedNodeID uint64) (man
 	snapshot.RequiresRestart = true
 	return snapshot, nil
 }
+
+// NodeConfigDocument returns an owned copy of this node's redacted startup document.
+func (a *App) NodeConfigDocument(ctx context.Context, requestedNodeID uint64) (managementusecase.NodeConfigDocument, error) {
+	if err := ctx.Err(); err != nil {
+		return managementusecase.NodeConfigDocument{}, err
+	}
+	if a == nil {
+		return managementusecase.NodeConfigDocument{}, managementusecase.ErrNodeConfigUnavailable
+	}
+	nodeID := a.cfg.Cluster.NodeID
+	if nodeID == 0 {
+		nodeID = a.cfg.NodeID
+	}
+	if nodeID != requestedNodeID {
+		return managementusecase.NodeConfigDocument{}, managementusecase.ErrNodeConfigUnavailable
+	}
+	document := a.cfg.StartupConfigDocument
+	if err := document.Validate(requestedNodeID); err != nil {
+		return managementusecase.NodeConfigDocument{}, err
+	}
+	return document.Clone(), nil
+}

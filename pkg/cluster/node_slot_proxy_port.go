@@ -6,6 +6,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/routing"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 	"github.com/WuKongIM/WuKongIM/pkg/slot/multiraft"
+	slotproxy "github.com/WuKongIM/WuKongIM/pkg/slot/proxy"
 )
 
 type slotProxyRPCHandlerFunc func(context.Context, []byte) ([]byte, error)
@@ -33,11 +34,14 @@ func (n *Node) SlotIDs() []multiraft.SlotID {
 
 // SlotForKey maps key to its current physical Slot.
 func (n *Node) SlotForKey(key string) multiraft.SlotID {
-	route, err := n.RouteKey(key)
+	if err := n.ensureForeground(); err != nil {
+		return 0
+	}
+	slotID, err := n.router.SlotForKey(key)
 	if err != nil {
 		return 0
 	}
-	return multiraft.SlotID(route.SlotID)
+	return multiraft.SlotID(slotID)
 }
 
 // HashSlotForKey maps key to a logical hash slot using the installed table size.
@@ -216,6 +220,19 @@ func (n *Node) HasChannelSubscribersAuthoritative(ctx context.Context, channelID
 		return false, ErrNotStarted
 	}
 	return n.defaultSlotProxy.HasChannelSubscribers(ctx, channelID, channelType)
+}
+
+// ReadPermissionMetadataBatchAuthoritative reads raw send-permission facts in
+// Slot-grouped authoritative batches while preserving request alignment.
+func (n *Node) ReadPermissionMetadataBatchAuthoritative(ctx context.Context, reads []slotproxy.PermissionMetadataRead) []slotproxy.PermissionMetadataReadResult {
+	if n == nil || n.defaultSlotProxy == nil {
+		results := make([]slotproxy.PermissionMetadataReadResult, len(reads))
+		for i := range results {
+			results[i].Err = ErrNotStarted
+		}
+		return results
+	}
+	return n.defaultSlotProxy.ReadPermissionMetadataBatch(ctx, reads)
 }
 
 // AddChannelSubscribersCounted applies a set add and returns its durable change count.

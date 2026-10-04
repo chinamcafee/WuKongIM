@@ -1,0 +1,36 @@
+---
+title: JavaScript / Web
+description: 用 TypeScript 接入 wukongimjssdk，管理 WebSocket、消息、会话和频道资料。
+---
+
+`wukongimjssdk` 是悟空 IM 的完整 JavaScript SDK。它管理 WebSocket、消息收发、内存中的会话列表和频道资料，适合浏览器、H5 以及经过单独适配验证的 JavaScript 运行时。
+
+本文档对应 `wukongimjssdk 1.3.5`，示例统一使用 TypeScript。
+
+## 开始前
+
+你需要准备：
+
+- 一个可从目标运行时访问的 WuKongIM WebSocket 地址；
+- 两个测试用户，例如 `alice` 和 `bob`；
+- 由业务服务端返回的 `uid`、`token` 和 `ws://` 或 `wss://` 地址；
+- 一个使用 npm、pnpm 或 Yarn 的前端项目。
+
+<Callout type="info" title="浏览器不能持有管理密钥">
+  浏览器只应从你的业务服务端获取当前用户的短期 Token 和连接地址。创建用户、签发 Token 与访问控制都留在服务端。
+</Callout>
+
+## 推荐阅读顺序
+
+<Cards>
+  <Card title="快速开始" description="安装 SDK，连接用户并发送第一条在线文本消息。" href="/zh/sdk/javascript/quickstart" />
+  <Card title="连接管理" description="处理地址、连接状态、自动重连和页面清理。" href="/zh/sdk/javascript/connection" />
+  <Card title="消息管理" description="发送、接收、同步和关联消息状态。" href="/zh/sdk/javascript/messages" />
+  <Card title="会话管理" description="维护内存聊天列表与未读数。" href="/zh/sdk/javascript/conversations" />
+  <Card title="频道管理" description="加载用户、群和订阅者资料。" href="/zh/sdk/javascript/channels" />
+  <Card title="高级功能" description="接入自定义消息、离线恢复与 UniApp 迁移。" href="/zh/sdk/javascript/advanced" />
+</Cards>
+
+仓库中的 `docs-site/examples/javascript-web-quickstart` 是可运行的双会话示例。先想理解 API 时直接读本页路径；需要联调真实服务时再运行示例。
+
+不熟悉“频道”“会话”这些词时，先读[核心概念](/zh/sdk/wukongim/concepts)。只想查方法名时，打开 [API 参考](/zh/sdk/javascript/api-reference)。

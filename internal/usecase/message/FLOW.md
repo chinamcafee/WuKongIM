@@ -1,154 +1,132 @@
-# internal/usecase/message Flow
+---
+scope: package
+summary: Owns entry-independent message permission policy, send orchestration, committed sync, and message-event projection contracts.
+---
+
+# Message Usecase Flow
 
 ## Responsibility
 
-`internal/usecase/message` owns the entry-agnostic message facade,
-legacy-compatible send permission checks, and compatible channel message sync.
-Allowed SEND work is delegated to a configured `channelappend.Submitter`; this
-package does not own channel authority routing, durable append, message ID
-allocation, or post-commit delivery effects. It knows about permission metadata
-ports, the channel message read port for sync, and the message event projection
-store port, but not gateway frames, wire protocols, HTTP JSON, or concrete
-cluster runtimes.
+`internal/usecase/message` evaluates legacy-compatible SEND permission policy,
+orchestrates pre-append hooks and person-directory establishment, delegates
+allowed work to `channelappend`, reads committed message pages, and validates
+message-event projection requests.
 
-## SendBatch Flow
+It exposes usecase DTOs and reasons shared by gateway and HTTP adapters without
+depending on their frames, JSON, or concrete cluster runtimes.
 
-```text
-SendBatch(items)
-  -> for each item:
-       normalize command-channel IDs to their source channel for permission checks
-       normalize person-channel IDs when requested by the entry adapter
-       if PermissionStore is nil, allow
-       if sender is a system UID, allow
-       check sender SendBan through the sender's person metadata row
-       if DeviceID matches SystemDeviceID, allow channel-specific checks
-       enforce group metadata, ban/disband, subscriber, denylist, and allowlist checks
-       reject expired group or canonical personal relationship channels with ReasonSendBan
-       enforce person receiver denylist and optional receiver allowlist/AllowStranger checks
-       enforce agent participant and visitors/customer-service membership checks
-       reject denied items with item-aligned Reason values
-       if SendHook is configured, run it before append admission
-       reject hook-denied items with item-aligned Reason values
-       when configured, check fresh personal sender/receiver account admission after hook mutation
-       reject unknown/denied account decisions before the cluster append router
-  -> if Submitter is nil, return ErrRouteNotReady for remaining allowed items
-  -> delegate allowed items to Submitter.SendBatch
-  -> copy delegated results back to original item indexes
-```
+## Boundaries
 
-`Send(ctx, cmd)` runs the same permission check and delegates allowed commands
-directly to `Submitter.Send`. When configured, `SendHook.BeforeSend` runs after
-permission success and before the submitter. It may mutate the command payload
-or reject with a usecase `Reason`; it does not run for permission-rejected
-items. Plugin-origin sends carry `Origin`/`HookDepth` recursion controls, and
-trusted internal paths may set `SkipPluginHooks`.
+- Channel authority routing, message-ID allocation, durable append,
+  idempotency, realtime `NoPersist`, and post-commit delivery belong to
+  `internal/runtime/channelappend`.
+- Permission stores return raw authoritative facts. This package owns policy
+  order and reason precedence.
+- Concrete Slot, Channel, cluster, gateway, and access types must not cross the
+  package boundary; the import-boundary test enforces this.
+- Message-event buffering and durable reduction are owned by the injected
+  store; this usecase validates and normalizes requests.
 
-The configured submitter is normally the app-level channel append router, which
-resolves channel append authority and admits work into the authority node's
-channel append reactor. Validation, request-scoped command-channel derivation,
-message ID allocation, append retries, committed cursors, subscriber scan,
-conversation projection, NoPersist realtime dispatch, PersistAfter hooks, and
-online delivery are all owned by `internal/runtime/channelappend`.
+## Main Flows
 
-Permission checks preserve legacy reason semantics while staying
-entry-agnostic: `internal/access/gateway` and `internal/access/api` map the
-usecase `Reason` values back to protocol reason codes at their boundaries.
-`PermissionCacheTTL` optionally wraps the permission metadata port with a
-bounded read-through cache for channel rows, subscriber point lookups,
-subscriber-set non-emptiness, and missing channel rows.
+`CheckPublishPermission` reuses person/group policy with uncached authority reads
+and a narrow UID/ordinary-target query. It fails without authority and performs no
+SEND hooks, directory writes or append; delayed publications must authorize again. PrepareWill runs payload-only hooks; SendPreparedWill rechecks fresh policy and delegates frozen output through ordinary directory/append without rerunning transformations. A trusted Will admission callback stays on the origin batch item, outside hooks and wire metadata, for the router to consume.
 
-## SyncChannelMessages Flow
+1. `SendBatchEach` uses an allocation-tight single-item path at cardinality one;
+   larger batches coalesce equivalent raw permission reads. Both evaluate the
+   same legacy policy, establish each accepted person directory once, run hooks
+   in original order, and copy aligned `channelappend` results to original
+   indexes. Each session submits its contiguous directory-ready prefix in input
+   order; a cold head fences later items. Independent Channel completions may
+   arrive out of order, while final publication follows the session chain.
+   Optional `SubmitBatchEach` joins the same preparation, then transfers append
+   completion to an injected bounded admission owner. Admission progress never
+   reads completion state; serialized publication and deadline cleanup join both
+   preparation and all results. Callers own cross-batch order and reservations.
+2. Single and batch sync validate membership and visibility, canonicalize
+   Channel IDs, and pass page intent plus an independent visibility floor to
+   `PageReader`. It owns latest-page selection, scan bounds, bounded lookahead,
+   filtering, bounded continuation, ascending order, and `HasMore` for sync and
+   plugin reads. Batch preparation reads exact UID memberships together, then batches terminal
+   channel state for valid memberships. Both ports are request-scoped and preserve
+   input alignment; point-only adapters retain at most eight concurrent reads.
+   All reads join and input-order failures resolve before any message batch starts.
+   The committed-record adapter executes routed scans and transfers owned records.
+   `PageReader` filters its first wave in place and clears discarded references;
+   sync transfers concrete PageReader pages directly and defensively copies custom
+   reader pages, including nested JSON event snapshots. Both paths optionally
+   enrich stream messages with bounded event metadata.
+3. Legacy event sync reads a bounded durable sequence page through Slot authority,
+   preserves original cursor/filter order, and does not invent event history.
+4. Exact message lookup reuses membership/visibility preparation and executes
+   bounded authority-routed index reads; limits or inconsistent evidence fail
+   without partial results, and overlapping selectors are deduplicated.
+5. Event append validates and canonicalizes its projection key, then delegates
+   cache or durable projection behavior to `MessageEventStore`.
 
-```text
-SyncChannelMessages(query)
-  -> validate login_uid, channel_id, and channel_type with legacy error strings
-  -> canonicalize person-channel IDs using login_uid
-  -> cap limit to the legacy maximum
-  -> call ChannelMessageReader.SyncMessages with a normalized ChannelID
-  -> treat missing channel runtime/storage as an empty page
-  -> clone payloads before returning SyncedMessage values to access adapters
-  -> when event_summary_mode is set, or include_event_meta asks for default
-     full metadata, batch-read MessageEventStore states for stream messages by
-     (channel_id, channel_type, client_msg_no) and attach compact event_meta
-```
+## Invariants and Failure Semantics
 
-The sync usecase returns `SyncedMessage` DTOs with the fields needed by legacy
-HTTP responses. Concrete storage adapters may return zero values for fields that
-the current Channel write path does not persist yet. Message event enrichment is
-page-batched for messages carrying the legacy stream setting bit and capped per
-message so a high-limit sync request does not issue event-state reads for
-ordinary messages or return unbounded lane state.
+- System UID, system device, disband, group membership, denylist, allowlist,
+  stranger, agent, and visitor rules retain their documented precedence.
+  Equivalent reads may be coalesced; commands and outcomes may not.
+- A missing submitter is route-not-ready. Permission, directory, or hook
+  failures remain item-local; batch order and cardinality are preserved.
+- Before-send validates publication provenance before callbacks. Empty MQTT input/replacement is valid; native bodies stay nonempty and nil replacement preserves input.
+- Permission and directory concurrency, batch sync size, page limits, event
+  enrichment, and observer data are bounded. No identity enters metric labels.
+  Submitter deadline errors preserve the original cause while attaching only
+  permission, pre-append, submitter, and pre-submit-budget timings for the
+  entry adapter's single existing diagnostic record.
+- Terminal source-Channel checks are authoritative and bypass stale permission
+  cache state.
+- Page preparation never rewrites a caller start sequence to enforce visibility;
+  `PageReader` interprets latest intent and the floor together. Command filtering
+  remains in the use case. Hidden raw records advance a monotonic scan cursor
+  until limit+1 visible records or the range end proves `HasMore`. Reads use
+  at most 64 aligned waves per Channel, each limited to the remaining visible
+  demand plus lookahead and at most 1,024 raw records, with a five-second
+  context; exhausted budgets or invalid progress fail instead of implying end
+  of history. Plugin reads retain separate authorization and response contracts.
+- History sync reads committed data only. The explicit persisted-batch method
+  reuses membership, page and event policy for conversation recents, without
+  falling back to the committed reader or treating missing storage as empty.
+  Persisted scans use at most 1 MiB per Channel wave and 8 MiB per batch across
+  waves; byte-limited short reads continue instead of falsely ending history.
+  Reads never mutate membership. A new person
+  conversation without membership returns an empty page without a Channel read;
+  missing group membership and tombstones still fail validation. Single and batch
+  reads map storage and routed Channel-not-found errors to empty pages after
+  membership validation; other read failures remain errors.
+- Stream-finish projection fails closed when authority movement loses required
+  cache-only lanes; callers must replay deltas or provide a complete snapshot.
 
-## AppendMessageEvent Flow
+- Legacy reads may expose `wk3-legacy-<message_id>` only for an empty stored client number. Exact lookup tries the real client-number index first, then at most one bounded Message-ID read for the alias, retaining visibility and original stored fields. It is not a SEND or event mutation key.
 
-```text
-AppendMessageEvent(event)
-  -> validate required channel_id, channel_type, client_msg_no, event_id, event_type
-  -> trim fields, lower-case event_type, default empty event_key to "main"
-  -> force stream.finish onto the reserved finish event key
-  -> canonicalize person-channel and agent-channel IDs using from_uid
-  -> stamp updated_at when absent
-  -> call MessageEventStore.AppendMessageEvent
-  -> return the projected lane status and the assigned msg_event_seq when durable
-```
+- Ordinary payload edits validate an existing committed message and submit a lifecycle-fenced Slot CAS with idempotency and the caller's expected restore epoch. CMD/SyncOnce, nonpersistent and stream messages are excluded. Single-channel edit cursors use a fixed-size canonical identity digest, bind user visibility, channel incarnation and restore epoch, and reset valid matching format-1 cursors to format 2; bootstrap captures a baseline before visible history reload. Latest-index pages revalidate originals and never create missing messages. Body-free notification progress reads pending identity/retention without payload hydration and uses a previous-cursor CAS, and retention cleanup rechecks the durable floor. Both committed and persisted page assembly enforce a total payload budget after replacement growth.
 
-`AppendMessageEvent` leaves stream buffering policy to the configured
-`MessageEventStore`. The cluster-backed store keeps `stream.open`,
-`stream.delta`, and `stream.snapshot` updates in a bounded Slot-leader cache and
-only proposes a durable projection when a terminal event
-(`stream.close`/`stream.error`/`stream.cancel`/`stream.finish`) arrives. Cache
-hits may return `msg_event_seq=0` because no Slot FSM cursor has advanced yet;
-terminal responses return the durable reducer-assigned message event sequence.
-When `stream.finish` completes a message-level stream, the cluster store flushes
-all still-open cached event lanes and the reserved finish marker in one Slot FSM
-batch proposal. If Slot leadership changes before finish and the new leader has
-no cached lanes, the cluster store fails the finish closed instead of writing a
-completed projection that silently drops cache-only deltas; callers must replay
-the stream deltas or provide a complete finish snapshot before retrying finish.
-Cache pressure is reported as typed backpressure rather than silently evicting
-active streams.
+- Successful edit CAS/idempotency responses optionally schedule their returned identity/version through a nonblocking post-commit callback. Notification failures never change the committed edit result; the worker uses the same authoritative dispatcher and durable progress checkpoints.
 
-This phase treats `(channel_id, channel_type, client_msg_no)` as the projection
-anchor and does not perform a routed base-message existence check before
-appending event state. A future anchor policy should use a cluster-routed
-message lookup rather than a node-local idempotency index so `/message/event`
-does not depend on which node accepted the request. Empty `from_uid` is also
-kept as an ordinary empty sender at this usecase boundary; any system-UID
-defaulting must be owned by the access/app configuration layer.
+- Public stream events validate the committed base identity, then dispatch through an optional narrow sender with four request-owned admission slots, 128-member authoritative pages and a five-second fanout budget. Post-acceptance delivery failures never undo storage; non-public events are not broadcast. Producers serialize events per message and clients deduplicate EVENT IDs; UTF-8 text offsets support snapshot recovery.
 
-## Message Event Projection Ports
+- UID SendBan and actual source-Channel SendBan/Disband precede all system
+  identity, system-device and plugin exemptions. Person policy applies to the
+  canonical pair in both directions; CMD inherits the source. Explicit-recipient
+  sends check only UID policy. One mixed-type plan deduplicates mandatory and
+  auxiliary facts; only membership/list facts may use TTL. Equal-budget requests
+  share sealed reads while retaining independent cancellation outcomes; hook
+  identity changes require fresh authorization and target directory admission.
 
-`MessageEventStore` is the usecase boundary for message-scoped event
-projections. It accepts one event update, may satisfy in-flight stream updates
-from cache, returns the assigned message-level `msg_event_seq` once durable, and
-reads compact event lane states in batch for `/channel/messagesync` enrichment.
-The usecase DTOs are independent from the concrete Slot/metadb storage types;
-cluster adapters perform mapping and payload cloning. Fine-grained
-`/message/eventsync` replay is intentionally not part of this port in this
-phase.
+## Read First
 
-## Import Boundary
+- [Permission policy](permission.go)
+- [Batch permission reads](permission_batch.go)
+- [Send orchestration](send.go)
+- [Committed sync](sync.go)
+- [Message-page policy and read seam](page_reader.go)
 
-The usecase package must remain independent from concrete entries and cluster
-adapters. The import-boundary test rejects imports of:
+## Update Triggers
 
-- `pkg/gateway`
-- `pkg/protocol/frame`
-- `pkg/cluster`
-- `pkg/channel`
-- `internal/access`
-- `internal/app`
-
-
-## Personal Account Admission
-
-An optional `PersonalSendAuthorizer` supplements metadata ACLs for ordinary
-personal sends after plugin mutation. It is separate from `SendHook` and cannot
-be skipped with `SkipPluginHooks`, `SystemDeviceID`, command-channel wrapping or
-request-scoped recipient lists. Single sends and batch sends share the same gate.
-Trusted system senders retain internal security/rights notification paths; normal
-senders to system receivers still require a valid sender account. Failed,
-malformed or missing admission decisions never reach the unchanged cluster
-append submitter. No positive decision cache is installed. A decision accepted
-before a concurrent account transition defines an already admitted send; this
-capability does not delete accepted or historical messages.
+Update this file when permission precedence, batching or caching, hook order,
+append delegation, sync visibility, event projection ownership, or the import
+boundary changes.

@@ -64,6 +64,71 @@ hash_slot_count = 256
 		t.Fatalf("omitted Channel workers = %d/%d/%d, want runtime-derived zero values",
 			cfg.Cluster.Channel.StoreAppendWorkers, cfg.Cluster.Channel.StoreApplyWorkers, cfg.Cluster.Channel.RPCWorkers)
 	}
+	if !cfg.Gateway.TokenAuthOn {
+		t.Fatal("Gateway.TokenAuthOn = false, want default true")
+	}
+}
+
+func TestLoadGatewayTokenAuthenticationFromTOMLAndEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wukongim.toml")
+	writeFile(t, path, `
+[node]
+id = 1
+data_dir = "`+dir+`/node1"
+
+[cluster]
+listen_addr = "127.0.0.1:7001"
+
+[gateway]
+token_auth_on = true
+`)
+
+	cfg, err := Load(Options{Args: []string{"-config", path}, Environ: []string{
+		"PATH=" + os.Getenv("PATH"),
+		"WK_GATEWAY_TOKEN_AUTH_ON=false",
+	}})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Gateway.TokenAuthOn {
+		t.Fatal("Gateway.TokenAuthOn = true, want environment override false")
+	}
+	item, ok := snapshotItem(cfg.StartupConfigSnapshot, "WK_GATEWAY_TOKEN_AUTH_ON")
+	if !ok || item.Value != "false" || item.Source != managementusecase.NodeConfigValueSourceEnvironment {
+		t.Fatalf("startup token auth snapshot = %#v, found=%t", item, ok)
+	}
+}
+
+func TestLoadMessageSystemUIDFromTOMLAndEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wukongim.toml")
+	writeFile(t, path, `
+[node]
+id = 1
+data_dir = "`+dir+`/node1"
+
+[cluster]
+listen_addr = "127.0.0.1:7001"
+
+[message]
+system_uid = "toml-system"
+`)
+
+	cfg, err := Load(Options{Args: []string{"-config", path}, Environ: []string{
+		"PATH=" + os.Getenv("PATH"),
+		"WK_MESSAGE_SYSTEM_UID=env-system",
+	}})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Message.SystemUID != "env-system" {
+		t.Fatalf("Message.SystemUID = %q, want environment override", cfg.Message.SystemUID)
+	}
+	item, ok := snapshotItem(cfg.StartupConfigSnapshot, "WK_MESSAGE_SYSTEM_UID")
+	if !ok || item.Value != "env-system" || item.Source != managementusecase.NodeConfigValueSourceEnvironment {
+		t.Fatalf("startup system UID snapshot = %#v, found=%t", item, ok)
+	}
 }
 
 func TestLoadRecordsMatchedDefaultConfigPath(t *testing.T) {
@@ -428,7 +493,6 @@ func TestLoadBuildsNormalizedEffectiveCriticalConfigSnapshot(t *testing.T) {
 		"WK_CLUSTER_CHANNEL_REACTOR_COUNT=0",
 		"WK_CLUSTER_CHANNEL_STORE_APPEND_WORKERS=0",
 		"WK_CLUSTER_CHANNEL_STORE_APPLY_WORKERS=0",
-		"WK_CLUSTER_CHANNEL_RPC_WORKERS=50",
 		"WK_GATEWAY_GNET_NUM_EVENT_LOOP=0",
 	}})
 	if err != nil {
@@ -443,16 +507,16 @@ func TestLoadBuildsNormalizedEffectiveCriticalConfigSnapshot(t *testing.T) {
 		"WK_CLUSTER_SLOT_REPLICA_N":                    {value: "3", source: managementusecase.NodeConfigValueSourceDerived},
 		"WK_CLUSTER_CHANNEL_REPLICA_N":                 {value: "3", source: managementusecase.NodeConfigValueSourceDerived},
 		"WK_CLUSTER_CHANNEL_REACTOR_COUNT":             {value: "4", source: managementusecase.NodeConfigValueSourceDerived},
-		"WK_CLUSTER_CHANNEL_STORE_APPEND_WORKERS":      {value: "8", source: managementusecase.NodeConfigValueSourceDerived},
+		"WK_CLUSTER_CHANNEL_STORE_APPEND_WORKERS":      {value: "128", source: managementusecase.NodeConfigValueSourceDerived},
 		"WK_CLUSTER_CHANNEL_STORE_APPLY_WORKERS":       {value: "8", source: managementusecase.NodeConfigValueSourceDerived},
-		"WK_CLUSTER_CHANNEL_RPC_WORKERS":               {value: "50", source: managementusecase.NodeConfigValueSourceEnvironment},
-		"WK_CLUSTER_CHANNEL_RPC_BATCH_MAX_ITEMS":       {value: "16", source: managementusecase.NodeConfigValueSourceDerived},
+		"WK_CLUSTER_CHANNEL_RPC_WORKERS":               {value: "96", source: managementusecase.NodeConfigValueSourceDerived},
+		"WK_CLUSTER_CHANNEL_RPC_BATCH_MAX_ITEMS":       {value: "8", source: managementusecase.NodeConfigValueSourceDerived},
 		"WK_GATEWAY_GNET_MULTICORE":                    {value: "true", source: managementusecase.NodeConfigValueSourceDerived},
-		"WK_GATEWAY_GNET_NUM_EVENT_LOOP":               {value: "2", source: managementusecase.NodeConfigValueSourceDerived},
-		"WK_GATEWAY_RUNTIME_ASYNC_SEND_WORKERS":        {value: "128", source: managementusecase.NodeConfigValueSourceDefault},
+		"WK_GATEWAY_TOKEN_AUTH_ON":                     {value: "true", source: managementusecase.NodeConfigValueSourceDefault},
+		"WK_GATEWAY_GNET_NUM_EVENT_LOOP":               {value: "4", source: managementusecase.NodeConfigValueSourceDerived},
+		"WK_GATEWAY_RUNTIME_ASYNC_SEND_WORKERS":        {value: "1000", source: managementusecase.NodeConfigValueSourceDefault},
 		"WK_GATEWAY_RUNTIME_ASYNC_SEND_QUEUE_CAPACITY": {value: "131072", source: managementusecase.NodeConfigValueSourceDefault},
-		"WK_DELIVERY_RECIPIENT_WORKER_CONCURRENCY":     {value: "100", source: managementusecase.NodeConfigValueSourceDefault},
-		"WK_CONVERSATION_AUTHORITY_CACHE_MAX_ROWS":     {value: "100000", source: managementusecase.NodeConfigValueSourceDefault},
+		"WK_DELIVERY_RECIPIENT_WORKER_CONCURRENCY":     {value: "320", source: managementusecase.NodeConfigValueSourceDefault},
 	}
 	for key, want := range wants {
 		item, ok := snapshotItem(cfg.StartupConfigSnapshot, key)

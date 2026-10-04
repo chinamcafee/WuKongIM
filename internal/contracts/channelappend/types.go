@@ -37,6 +37,8 @@ const (
 	ReasonDisband
 	// ReasonSendBan means the sender is send-banned.
 	ReasonSendBan
+	// ReasonSystemBusy means bounded admission is saturated and the send may be retried.
+	ReasonSystemBusy
 )
 
 // CommitMode controls when durable append completes.
@@ -81,6 +83,9 @@ type AuthorityTarget struct {
 	LeaderEpoch uint64
 	// RouteGeneration versions the complete authoritative channel routing record.
 	RouteGeneration uint64
+	// WriteFenced reports that the resolved authority currently blocks new appends.
+	// The local writer may still recover an already committed idempotent retry.
+	WriteFenced bool
 	// Large reports whether the channel should use paged subscriber fanout.
 	Large bool
 	// SubscriberMutationVersion identifies the subscriber-list version used for recipient cache invalidation.
@@ -119,11 +124,13 @@ type SendCommand struct {
 	Expire uint32
 	// Payload is the message body. Send-path implementations treat it as immutable.
 	Payload []byte
+	// PublicationMetadata is bounded immutable content and its original expiry basis.
+	PublicationMetadata []byte
 	// NoPersist requests transient delivery without writing the channel log.
 	NoPersist bool
 	// SyncOnce marks a one-shot sync command.
 	SyncOnce bool
-	// RedDot carries the client red-dot flag for future delivery side effects.
+	// RedDot carries the protocol unread-badge flag for persistence and delivery.
 	RedDot bool
 	// NormalizePersonChannel requests canonical person-channel ID normalization before append.
 	NormalizePersonChannel bool
@@ -146,6 +153,7 @@ type SendCommand struct {
 // Clone returns an independent copy of the send command.
 func (c SendCommand) Clone() SendCommand {
 	c.Payload = cloneBytes(c.Payload)
+	c.PublicationMetadata = cloneBytes(c.PublicationMetadata)
 	c.MessageScopedUIDs = append([]string(nil), c.MessageScopedUIDs...)
 	return c
 }
@@ -166,10 +174,16 @@ type SendResult struct {
 type SendBatchItem struct {
 	// Context is the per-send request context.
 	Context context.Context
-	// Deadline bounds durable append for this item without replacing Context.
+	// Deadline bounds the complete send pipeline. Entry adapters preserve
+	// Context; the message usecase derives a child context when this deadline
+	// is earlier so permission and pre-append work cannot consume append time.
 	Deadline time.Time
 	// Command is the SEND command.
 	Command SendCommand
+	// AppendAdmission is trusted origin-only permission, never wire metadata.
+	// Router invokes it before every local/remote submission, including retries,
+	// then strips it before handing off accepted work. Failure forbids submission.
+	AppendAdmission func(context.Context) error
 }
 
 // Clone returns an independent copy of the batch item.
@@ -224,6 +238,11 @@ type IdempotencyQuery struct {
 	SyncOnce bool
 	// RedDot is a durable framing flag compared on idempotency hits.
 	RedDot bool
+	// Payload is borrowed immutable content for exact publication retry comparison.
+	// Native callers retain the existing payload-hash-only contract.
+	Payload []byte
+	// PublicationMetadata is compared excluding only the ingress timestamp.
+	PublicationMetadata []byte
 }
 
 // Message is the durable append payload used by the channel appender port.
@@ -252,9 +271,11 @@ type Message struct {
 	ChannelKey string
 	// Payload is the durable message body.
 	Payload []byte
+	// PublicationMetadata is bounded immutable content and its original expiry basis.
+	PublicationMetadata []byte
 	// SyncOnce marks this durable message as a one-shot command-sync entry.
 	SyncOnce bool
-	// RedDot preserves the client red-dot framing flag.
+	// RedDot preserves the protocol unread-badge flag through storage and replication.
 	RedDot bool
 	// ServerTimestampMS is the server append timestamp in Unix milliseconds.
 	ServerTimestampMS int64
@@ -263,6 +284,7 @@ type Message struct {
 // Clone returns an independent copy of the durable append message.
 func (m Message) Clone() Message {
 	m.Payload = cloneBytes(m.Payload)
+	m.PublicationMetadata = cloneBytes(m.PublicationMetadata)
 	return m
 }
 
@@ -274,6 +296,9 @@ type AppendBatchRequest struct {
 	ExpectedEpoch uint64
 	// ExpectedLeaderEpoch fences append against stale authority leadership.
 	ExpectedLeaderEpoch uint64
+	// ExpectedRouteGeneration optionally binds preparation to exact durable authority.
+	// Nonzero requires both epochs and quorum commit; adapters must preserve it.
+	ExpectedRouteGeneration uint64
 	// Messages are the durable messages for the target channel.
 	Messages []Message
 	// TraceID is the first non-empty diagnostics trace identifier among request messages.
@@ -286,6 +311,9 @@ type AppendBatchRequest struct {
 	CommitMode CommitMode
 	// OmitResultPayload lets appenders skip payloads in successful item results when callers only need id and sequence.
 	OmitResultPayload bool
+	// ServerAllocatedMessageIDs proves every message ID in this request was issued by the node-scoped allocator.
+	// Storage may skip only its existing-message-ID lookup; idempotency-key validation remains strict.
+	ServerAllocatedMessageIDs bool
 }
 
 // Clone returns an independent copy of the append request.
@@ -355,9 +383,11 @@ type CommittedEnvelope struct {
 	ServerTimestampMS int64
 	// Payload is the writer-owned post-commit payload copy. Delivery paths treat it as immutable.
 	Payload []byte
+	// PublicationMetadata is bounded immutable content and its original expiry basis.
+	PublicationMetadata []byte
 	// RedDot carries the client red-dot flag for delivery side effects.
 	RedDot bool
-	// SyncOnce marks a one-shot sync command for post-commit conversation projection.
+	// SyncOnce marks a one-shot command that is persisted in the separate CMD Channel log.
 	SyncOnce bool
 	// MessageScopedUIDs are request-scoped one-shot delivery targets.
 	MessageScopedUIDs []string
@@ -366,6 +396,7 @@ type CommittedEnvelope struct {
 // Clone returns an independent copy of the committed envelope.
 func (e CommittedEnvelope) Clone() CommittedEnvelope {
 	e.Payload = cloneBytes(e.Payload)
+	e.PublicationMetadata = cloneBytes(e.PublicationMetadata)
 	e.MessageScopedUIDs = append([]string(nil), e.MessageScopedUIDs...)
 	return e
 }

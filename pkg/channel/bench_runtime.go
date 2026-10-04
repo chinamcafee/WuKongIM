@@ -98,8 +98,14 @@ type RuntimeProbeChannel struct {
 	LEO uint64
 	// HW is the local committed high watermark.
 	HW uint64
+	// RecoveryRequired means the current Leader has not completed quorum recovery.
+	// Its HW must not be treated as a recovered committed-read frontier.
+	RecoveryRequired bool
 	// CheckpointHW is the local durable checkpoint high watermark.
 	CheckpointHW uint64
+	// ReplayReadiness is attached only by an active, freshly fenced migration
+	// probe. Nil means unverified/unsupported; ordinary diagnostics leave it nil.
+	ReplayReadiness *MQTTReplayReadiness `json:"replay_readiness,omitempty"`
 	// WriteFence is the currently applied durable write fence.
 	WriteFence WriteFence
 	// InflightAppend reports whether a durable append batch is waiting on store completion.

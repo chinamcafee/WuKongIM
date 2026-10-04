@@ -10,6 +10,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/observability/diagnostics"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/control"
 	controller "github.com/WuKongIM/WuKongIM/pkg/controller"
+	runtimechannelid "github.com/WuKongIM/WuKongIM/pkg/protocol/channelid"
 )
 
 const controllerRaftHealthUnknown = "unknown"
@@ -119,6 +120,8 @@ type OpsMCPAuditReader interface {
 
 // Options configures the manager management usecase.
 type Options struct {
+	// CommandChannelSuffix identifies internal command channels excluded from business operations.
+	CommandChannelSuffix string
 	// Cluster reads cluster control state.
 	Cluster ControlSnapshotReader
 	// NodeConfig reads selected-node redacted effective startup configuration.
@@ -172,7 +175,7 @@ type Options struct {
 	// SystemUsers lists and mutates persisted system UID rows.
 	SystemUsers SystemUserOperator
 	// Conversations syncs UID-owned recent conversations for manager pages.
-	Conversations ConversationSyncer
+	Conversations ConversationLister
 	// Messages reads committed channel messages for manager pages.
 	Messages MessageReader
 	// LatestMessages reads cluster-wide newest messages for manager pages.
@@ -287,8 +290,8 @@ type userManagementDeps struct {
 
 // messageManagementDeps groups conversation, message, and retention ports.
 type messageManagementDeps struct {
-	// conversations reads recent conversation projections.
-	conversations ConversationSyncer
+	// conversations constructs recent conversation views from memberships.
+	conversations ConversationLister
 	// messages reads committed channel messages.
 	messages MessageReader
 	// latestMessages reads cluster-wide newest messages.
@@ -333,6 +336,8 @@ type operationsManagementDeps struct {
 
 // App serves manager management usecases through grouped domain capabilities.
 type App struct {
+	// commandChannels keeps internal command IDs consistent with this node configuration.
+	commandChannels runtimechannelid.CommandCodec
 	// nodeManagementDeps provides node lifecycle and diagnostic capabilities.
 	nodeManagementDeps
 	// channelManagementDeps provides channel inventory and migration capabilities.
@@ -356,6 +361,7 @@ func New(opts Options) *App {
 		now = time.Now
 	}
 	return &App{
+		commandChannels: runtimechannelid.CommandCodec{Suffix: opts.CommandChannelSuffix},
 		nodeManagementDeps: nodeManagementDeps{
 			cluster: opts.Cluster, nodeConfig: opts.NodeConfig, runtimeSummary: opts.RuntimeSummary,
 			gatewayDrain: opts.GatewayDrain, nodeLifecycle: opts.NodeLifecycle,
@@ -406,6 +412,8 @@ type NodeList struct {
 type Node struct {
 	// NodeID is the node identifier.
 	NodeID uint64
+	// Version is the program version reported by the node runtime.
+	Version string
 	// Name is the operator-facing node name.
 	Name string
 	// Addr is the cluster listen address of the node.
@@ -488,6 +496,10 @@ type NodeController struct {
 
 // NodeSlotSummary contains lightweight Slot placement counts for one node.
 type NodeSlotSummary struct {
+	// HostedIDs contains the ordered Slot IDs whose desired replica set includes the node.
+	HostedIDs []uint32
+	// LeaderIDs contains the ordered Slot IDs whose observed Raft leader is the node.
+	LeaderIDs []uint32
 	// ReplicaCount is the number of desired Slot replicas hosted by the node.
 	ReplicaCount int
 	// LeaderCount is the number of actual Slot Raft leaders hosted by the node.
@@ -516,6 +528,8 @@ type NodeChannelRuntimeSummary struct {
 type NodeRuntimeSummary struct {
 	// NodeID identifies the cluster node described by this summary.
 	NodeID uint64
+	// Version is the program version of the node process.
+	Version string
 	// ControlRevision is the local control snapshot revision observed by the node.
 	ControlRevision uint64
 	// ActiveOnline counts active authenticated online connections.
@@ -585,20 +599,39 @@ func (a *App) ListNodes(ctx context.Context) (NodeList, error) {
 }
 
 type slotSummary struct {
-	replicas map[uint64]int
-	leaders  map[uint64]int
+	replicas  map[uint64]int
+	leaders   map[uint64]int
+	hostedIDs map[uint64][]uint32
+	leaderIDs map[uint64][]uint32
 }
 
 func (a *App) summarizeSlots(ctx context.Context, assignments []control.SlotAssignment) slotSummary {
-	summary := slotSummary{replicas: map[uint64]int{}, leaders: map[uint64]int{}}
+	summary := slotSummary{
+		replicas:  map[uint64]int{},
+		leaders:   map[uint64]int{},
+		hostedIDs: map[uint64][]uint32{},
+		leaderIDs: map[uint64][]uint32{},
+	}
 	for _, assignment := range assignments {
 		for _, nodeID := range assignment.DesiredPeers {
 			summary.replicas[nodeID]++
+			summary.hostedIDs[nodeID] = append(summary.hostedIDs[nodeID], assignment.SlotID)
 		}
 		leaderID := a.actualSlotLeaderID(ctx, assignment)
 		if leaderID != 0 {
 			summary.leaders[leaderID]++
+			summary.leaderIDs[leaderID] = append(summary.leaderIDs[leaderID], assignment.SlotID)
 		}
+	}
+	for nodeID := range summary.hostedIDs {
+		sort.Slice(summary.hostedIDs[nodeID], func(i, j int) bool {
+			return summary.hostedIDs[nodeID][i] < summary.hostedIDs[nodeID][j]
+		})
+	}
+	for nodeID := range summary.leaderIDs {
+		sort.Slice(summary.leaderIDs[nodeID], func(i, j int) bool {
+			return summary.leaderIDs[nodeID][i] < summary.leaderIDs[nodeID][j]
+		})
 	}
 	return summary
 }
@@ -677,6 +710,7 @@ func buildNode(opts nodeBuildOptions) Node {
 	}
 	return Node{
 		NodeID:          opts.node.NodeID,
+		Version:         opts.runtime.Version,
 		Name:            fmt.Sprintf("node-%d", opts.node.NodeID),
 		Addr:            opts.node.Addr,
 		Status:          status,
@@ -707,6 +741,8 @@ func buildNode(opts nodeBuildOptions) Node {
 			RaftHealth: controllerRaftHealthUnknown,
 		},
 		Slots: NodeSlotSummary{
+			HostedIDs:     append([]uint32(nil), opts.slots.hostedIDs[opts.node.NodeID]...),
+			LeaderIDs:     append([]uint32(nil), opts.slots.leaderIDs[opts.node.NodeID]...),
 			ReplicaCount:  replicas,
 			LeaderCount:   leaders,
 			FollowerCount: followers,

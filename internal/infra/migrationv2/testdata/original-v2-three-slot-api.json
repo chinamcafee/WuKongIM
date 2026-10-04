@@ -1,0 +1,142 @@
+[
+  [
+    {
+      "replica_id": 1,
+      "leader_id": 2,
+      "running": 1,
+      "last_log_seq": 0,
+      "last_log_time": 0,
+      "term": 1,
+      "applied_index": 0,
+      "committed_index": 0,
+      "conf_version": 0
+    },
+    {
+      "replica_id": 2,
+      "leader_id": 2,
+      "running": 1,
+      "last_log_seq": 0,
+      "last_log_time": 0,
+      "term": 1,
+      "applied_index": 0,
+      "committed_index": 0,
+      "conf_version": 0
+    },
+    {
+      "replica_id": 3,
+      "leader_id": 2,
+      "running": 1,
+      "last_log_seq": 0,
+      "last_log_time": 0,
+      "term": 1,
+      "applied_index": 0,
+      "committed_index": 0,
+      "conf_version": 0
+    }
+  ],
+  [
+    {
+      "replica_id": 1,
+      "leader_id": 3,
+      "running": 1,
+      "last_log_seq": 3,
+      "last_log_time": 1788680077149661000,
+      "term": 1,
+      "applied_index": 3,
+      "committed_index": 3,
+      "conf_version": 0
+    },
+    {
+      "replica_id": 2,
+      "leader_id": 3,
+      "running": 1,
+      "last_log_seq": 3,
+      "last_log_time": 1788680077188157000,
+      "term": 1,
+      "applied_index": 3,
+      "committed_index": 3,
+      "conf_version": 0
+    },
+    {
+      "replica_id": 3,
+      "leader_id": 3,
+      "running": 1,
+      "last_log_seq": 3,
+      "last_log_time": 1788680077042832000,
+      "term": 1,
+      "applied_index": 3,
+      "committed_index": 3,
+      "conf_version": 0
+    }
+  ],
+  [
+    {
+      "replica_id": 1,
+      "leader_id": 3,
+      "running": 1,
+      "last_log_seq": 0,
+      "last_log_time": 0,
+      "term": 1,
+      "applied_index": 0,
+      "committed_index": 0,
+      "conf_version": 0
+    },
+    {
+      "replica_id": 2,
+      "leader_id": 3,
+      "running": 1,
+      "last_log_seq": 0,
+      "last_log_time": 0,
+      "term": 1,
+      "applied_index": 0,
+      "committed_index": 0,
+      "conf_version": 0
+    },
+    {
+      "replica_id": 3,
+      "leader_id": 3,
+      "running": 1,
+      "last_log_seq": 0,
+      "last_log_time": 0,
+      "term": 1,
+      "applied_index": 0,
+      "committed_index": 0,
+      "conf_version": 0
+    }
+  ],
+  [
+    {
+      "replica_id": 1,
+      "leader_id": 1,
+      "running": 1,
+      "last_log_seq": 6,
+      "last_log_time": 1788680077351132000,
+      "term": 1,
+      "applied_index": 6,
+      "committed_index": 6,
+      "conf_version": 0
+    },
+    {
+      "replica_id": 2,
+      "leader_id": 1,
+      "running": 1,
+      "last_log_seq": 6,
+      "last_log_time": 1788680077547821000,
+      "term": 1,
+      "applied_index": 6,
+      "committed_index": 6,
+      "conf_version": 0
+    },
+    {
+      "replica_id": 3,
+      "leader_id": 1,
+      "running": 1,
+      "last_log_seq": 6,
+      "last_log_time": 1788680077547833000,
+      "term": 1,
+      "applied_index": 6,
+      "committed_index": 6,
+      "conf_version": 0
+    }
+  ]
+]

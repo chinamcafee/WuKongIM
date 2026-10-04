@@ -36,8 +36,10 @@ type Config struct {
 type Item struct {
 	// Priority selects the weighted scheduler lane.
 	Priority core.Priority
-	// Bytes is the queue and batch byte size; negative values are treated as zero.
+	// Bytes is the logical batch byte size; negative values are treated as zero.
 	Bytes int
+	// RetainedBytes is the backing allocation cost; zero falls back to Bytes.
+	RetainedBytes int
 	// Value carries the caller-owned frame payload or metadata.
 	Value any
 	// enqueuedAt records when the item entered the queue for wait observations.
@@ -58,6 +60,8 @@ type lane struct {
 type Scheduler struct {
 	mu   sync.Mutex
 	cond *sync.Cond
+	// urgentReady interrupts optional coalescing when control or Raft work arrives.
+	urgentReady chan struct{}
 
 	maxItems       int
 	maxBytes       int64
@@ -66,15 +70,16 @@ type Scheduler struct {
 	observer       core.Observer
 	sourceID       uint64
 
-	lanes       []lane
-	nextLane    int
-	roundOpen   bool
-	roundSeen   int
-	roundOutput bool
-	queuedItems int
-	queuedBytes int64
-	stopped     bool
-	stopErr     error
+	lanes         []lane
+	nextLane      int
+	roundOpen     bool
+	roundSeen     int
+	roundOutput   bool
+	queuedItems   int
+	queuedBytes   int64
+	queueRevision uint64
+	stopped       bool
+	stopErr       error
 }
 
 // New creates a scheduler with configured queue limits and default batch limits.
@@ -89,6 +94,7 @@ func New(cfg Config) *Scheduler {
 	}
 
 	s := &Scheduler{
+		urgentReady:    make(chan struct{}, 1),
 		maxItems:       cfg.MaxItems,
 		maxBytes:       cfg.MaxBytes,
 		maxBatchFrames: maxBatchFrames,
@@ -145,7 +151,7 @@ func (s *Scheduler) Enqueue(ctx context.Context, item Item) error {
 		s.observeEnqueue("full", item, snapshot, laneSnapshot)
 		return core.ErrQueueFull
 	}
-	if s.maxBytes > 0 && s.queuedBytes+int64(item.Bytes) > s.maxBytes {
+	if s.maxBytes > 0 && s.queuedBytes+queueBytes(item) > s.maxBytes {
 		snapshot := s.snapshotQueueLocked()
 		laneSnapshot := s.snapshotLaneQueueLocked(item.Priority)
 		s.mu.Unlock()
@@ -161,10 +167,17 @@ func (s *Scheduler) Enqueue(ctx context.Context, item Item) error {
 			s.lanes[i].items++
 			s.lanes[i].bytes += queueBytes(item)
 			s.queuedItems++
-			s.queuedBytes += int64(item.Bytes)
+			s.queuedBytes += queueBytes(item)
+			s.queueRevision = core.NextStateRevision()
 			snapshot := s.snapshotQueueLocked()
 			laneSnapshot := s.snapshotLaneQueueLocked(item.Priority)
 			s.cond.Signal()
+			if item.Priority == core.PriorityControl || item.Priority == core.PriorityRaft {
+				select {
+				case s.urgentReady <- struct{}{}:
+				default:
+				}
+			}
 			s.mu.Unlock()
 			s.observeEnqueue("ok", item, snapshot, laneSnapshot)
 			return nil
@@ -176,6 +189,9 @@ func (s *Scheduler) Enqueue(ctx context.Context, item Item) error {
 	s.observeEnqueue("invalid", item, snapshot, laneSnapshot)
 	return core.ErrInvalidPriority
 }
+
+// UrgentReady wakes an optional writer delay; a stale signal may only shorten it.
+func (s *Scheduler) UrgentReady() <-chan struct{} { return s.urgentReady }
 
 // NextBatch returns the next weighted batch without blocking.
 func (s *Scheduler) NextBatch() []Item {
@@ -257,6 +273,7 @@ func (s *Scheduler) Stop(err error) []Item {
 	s.stopped = true
 	s.stopErr = err
 	drained := s.drainLocked()
+	s.queueRevision = core.NextStateRevision()
 	var events []core.Event
 	if s.observer != nil {
 		events = s.stoppedQueueEventsLocked()
@@ -297,7 +314,7 @@ func (s *Scheduler) nextBatchLocked(dst []Item, observe bool) ([]Item, batchObse
 			s.finishLaneLocked()
 			continue
 		}
-		if batchBytes+itemBytes > s.maxBatchBytes && len(batch) > 0 {
+		if batchBytes+int64(item.Bytes) > s.maxBatchBytes && len(batch) > 0 {
 			break
 		}
 
@@ -311,7 +328,7 @@ func (s *Scheduler) nextBatchLocked(dst []Item, observe bool) ([]Item, batchObse
 		if observe {
 			observation.touchedMask |= 1 << uint(laneIndex)
 		}
-		batchBytes += itemBytes
+		batchBytes += int64(item.Bytes)
 		s.roundOutput = true
 
 		if len(batch) >= s.maxBatchFrames || batchBytes >= s.maxBatchBytes {
@@ -320,6 +337,9 @@ func (s *Scheduler) nextBatchLocked(dst []Item, observe bool) ([]Item, batchObse
 		if l.items == 0 {
 			s.finishLaneLocked()
 		}
+	}
+	if len(batch) > 0 {
+		s.queueRevision = core.NextStateRevision()
 	}
 
 	if observe {
@@ -424,6 +444,9 @@ func (l *lane) compactQueueIfFull() {
 }
 
 func queueBytes(item Item) int64 {
+	if item.RetainedBytes > item.Bytes {
+		return int64(item.RetainedBytes)
+	}
 	if item.Bytes <= 0 {
 		return 0
 	}
@@ -442,6 +465,7 @@ type queueSnapshot struct {
 	capacity      int
 	bytes         int64
 	bytesCapacity int64
+	revision      uint64
 }
 
 // batchObservation preserves dequeue-time pressure state without allocating
@@ -472,6 +496,7 @@ func (s *Scheduler) snapshotQueueLocked() queueSnapshot {
 		capacity:      s.maxItems,
 		bytes:         s.queuedBytes,
 		bytesCapacity: s.maxBytes,
+		revision:      s.queueRevision,
 	}
 }
 
@@ -479,6 +504,7 @@ func (s *Scheduler) snapshotLaneQueueLocked(priority core.Priority) queueSnapsho
 	snapshot := queueSnapshot{
 		capacity:      s.maxItems,
 		bytesCapacity: s.maxBytes,
+		revision:      s.queueRevision,
 	}
 	for i := range s.lanes {
 		if s.lanes[i].priority != priority {
@@ -525,6 +551,7 @@ func (s *Scheduler) observeBatch(batch []Item, observation batchObservation) {
 			SourceID:      s.sourceID,
 			Priority:      s.lanes[i].priority,
 			Result:        "ok",
+			Revision:      snapshot.revision,
 			Items:         snapshot.items,
 			Capacity:      snapshot.capacity,
 			Bytes:         int(snapshot.bytes),
@@ -552,6 +579,7 @@ func (s *Scheduler) observeEnqueue(result string, item Item, snapshot queueSnaps
 		SourceID:      s.sourceID,
 		Priority:      item.Priority,
 		Result:        result,
+		Revision:      laneSnapshot.revision,
 		Items:         laneSnapshot.items,
 		Capacity:      laneSnapshot.capacity,
 		Bytes:         int(laneSnapshot.bytes),
@@ -567,6 +595,7 @@ func (s *Scheduler) stoppedQueueEventsLocked() []core.Event {
 			SourceID:      s.sourceID,
 			Priority:      lane.priority,
 			Result:        "stopped",
+			Revision:      s.queueRevision,
 			Capacity:      s.maxItems,
 			BytesCapacity: s.maxBytes,
 		})

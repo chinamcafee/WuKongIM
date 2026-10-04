@@ -1,6 +1,9 @@
 package api
 
 import (
+	"encoding/base64"
+	"encoding/binary"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -10,9 +13,10 @@ import (
 )
 
 type conversationListRequest struct {
-	UID    string                 `json:"uid"`
-	Cursor conversationListCursor `json:"cursor"`
-	Limit  int                    `json:"limit"`
+	UID               string `json:"uid"`
+	Cursor            string `json:"cursor"`
+	Limit             int    `json:"limit"`
+	CompletedCoverage int64  `json:"completed_coverage"`
 }
 
 type conversationListCursor struct {
@@ -22,9 +26,18 @@ type conversationListCursor struct {
 }
 
 type conversationListResponse struct {
-	Conversations []conversationListItem  `json:"conversations"`
-	NextCursor    *conversationListCursor `json:"next_cursor,omitempty"`
-	More          int                     `json:"more"`
+	Conversations           []conversationListItem `json:"conversations"`
+	Deletes                 []conversationListKey  `json:"deletes"`
+	NextCursor              string                 `json:"next_cursor,omitempty"`
+	Done                    bool                   `json:"done"`
+	Coverage                int64                  `json:"coverage"`
+	TombstonesRetainedSince int64                  `json:"tombstones_retained_since"`
+	ResetRequired           bool                   `json:"reset_required"`
+}
+
+type conversationListKey struct {
+	ChannelID   string `json:"channel_id"`
+	ChannelType int64  `json:"channel_type"`
 }
 
 type conversationListItem struct {
@@ -33,13 +46,13 @@ type conversationListItem struct {
 	ActiveAt     int64                    `json:"active_at"`
 	ReadSeq      uint64                   `json:"read_seq"`
 	DeletedToSeq uint64                   `json:"deleted_to_seq"`
-	SparseActive bool                     `json:"sparse_active"`
 	Unread       uint64                   `json:"unread"`
 	LastMessage  *conversationLastMessage `json:"last_message"`
 }
 
 type conversationLastMessage struct {
-	Header            legacyMessageHeader `json:"header"`
+	Version           uint64              `json:"version,string,omitempty"`
+	UpdatedAtMS       int64               `json:"updated_at_ms,omitempty"`
 	MessageID         uint64              `json:"message_id"`
 	MessageIDStr      string              `json:"message_idstr"`
 	MessageSeq        uint64              `json:"message_seq"`
@@ -47,6 +60,7 @@ type conversationLastMessage struct {
 	ClientMsgNo       string              `json:"client_msg_no"`
 	ServerTimestampMS int64               `json:"server_timestamp_ms"`
 	Payload           []byte              `json:"payload"`
+	Header            legacyMessageHeader `json:"header"`
 }
 
 func (s *Server) registerConversationRoutes() {
@@ -54,13 +68,18 @@ func (s *Server) registerConversationRoutes() {
 		return
 	}
 	s.engine.POST("/conversation/list", s.handleConversationList)
-	s.engine.POST("/conversation/sync", s.handleConversationSync)
+	s.engine.POST("/conversation/sync", s.handleConversationSyncLegacy)
 	s.engine.POST("/conversations/clearUnread", s.handleConversationClearUnread)
 	s.engine.POST("/conversations/setUnread", s.handleConversationSetUnread)
 	s.engine.POST("/conversations/delete", s.handleConversationDelete)
+	s.engine.POST("/conversations/activate", s.handleConversationActivate)
 }
 
 func (s *Server) handleConversationList(c *gin.Context) {
+	timer := s.conversationReadTimer("list")
+	handlerStart := timer.start()
+	succeeded := false
+	defer func() { timer.finish(c, "handler", handlerStart, succeeded) }()
 	start := time.Now()
 	var req conversationListRequest
 	if !bindJSON(c, &req) {
@@ -77,28 +96,41 @@ func (s *Server) handleConversationList(c *gin.Context) {
 		s.observeConversationList(ConversationListObservation{Result: "not_configured", Duration: time.Since(start)})
 		return
 	}
+	cursor, err := decodeConversationListCursor(req.Cursor)
+	if err != nil {
+		writeJSONError(c, "cursor格式错误！")
+		s.observeConversationList(ConversationListObservation{Result: "invalid_request", Duration: time.Since(start)})
+		return
+	}
 	result, err := s.conversations.List(c.Request.Context(), conversationusecase.ListRequest{
-		UID:    req.UID,
-		Cursor: req.Cursor.toUsecase(),
-		Limit:  req.Limit,
+		UID:               req.UID,
+		Cursor:            cursor.toUsecase(),
+		Limit:             req.Limit,
+		CompletedCoverage: req.CompletedCoverage,
 	})
 	if err != nil {
-		writeJSONError(c, err.Error())
+		status := http.StatusInternalServerError
+		if errors.Is(err, conversationusecase.ErrInvalidRequest) {
+			status = http.StatusBadRequest
+		}
+		if !writeReadUnavailable(c, err) {
+			c.JSON(status, gin.H{"msg": err.Error(), "status": status})
+		}
 		s.observeConversationList(ConversationListObservation{Result: "error", Duration: time.Since(start)})
 		return
 	}
 	s.observeConversationList(ConversationListObservation{
-		Result:           "ok",
-		Duration:         time.Since(start),
-		ReturnedItems:    len(result.Items),
-		SparseItems:      countConversationSparseItems(result.Items),
-		LastMessageLoads: len(result.Items),
-		// Stale active-index detection lives below the HTTP adapter and is not
-		// surfaced by the current usecase result yet.
-		ActiveIndexStaleSkips: 0,
-		More:                  result.HasMore,
+		Result:            "ok",
+		Duration:          time.Since(start),
+		ScannedCandidates: result.ScannedCandidates,
+		ReturnedItems:     len(result.Items),
+		Deletes:           len(result.Deletes),
+		Done:              result.Done,
 	})
+	responseStart := timer.start()
 	c.JSON(http.StatusOK, newConversationListResponse(req.UID, result))
+	succeeded = true
+	timer.finish(c, "response", responseStart, true)
 }
 
 func (s *Server) observeConversationList(event ConversationListObservation) {
@@ -121,21 +153,67 @@ func (c conversationListCursor) toUsecase() conversationusecase.Cursor {
 
 func newConversationListResponse(uid string, result conversationusecase.ListResult) conversationListResponse {
 	resp := conversationListResponse{
-		Conversations: make([]conversationListItem, 0, len(result.Items)),
-		More:          boolToInt(result.HasMore),
+		Conversations:           make([]conversationListItem, 0, len(result.Items)),
+		Deletes:                 make([]conversationListKey, 0, len(result.Deletes)),
+		Done:                    result.Done,
+		Coverage:                result.Coverage,
+		TombstonesRetainedSince: result.TombstonesRetainedSince,
+		ResetRequired:           result.ResetRequired,
 	}
 	for _, item := range result.Items {
 		resp.Conversations = append(resp.Conversations, newConversationListItem(uid, item))
 	}
-	if result.HasMore {
+	for _, key := range result.Deletes {
+		resp.Deletes = append(resp.Deletes, conversationListKey{
+			ChannelID: legacyMessageChannelID(uid, key.ChannelID, uint8(key.ChannelType)), ChannelType: key.ChannelType,
+		})
+	}
+	if !result.Done || result.NextCursor.ChannelID != "" {
 		cursor := conversationListCursor{
 			ActiveAt:    result.NextCursor.ActiveAt,
 			ChannelID:   result.NextCursor.ChannelID,
 			ChannelType: result.NextCursor.ChannelType,
 		}
-		resp.NextCursor = &cursor
+		resp.NextCursor = encodeConversationListCursor(cursor)
 	}
 	return resp
+}
+
+const conversationListCursorVersion = byte(1)
+
+var errInvalidConversationListCursor = errors.New("invalid conversation list cursor")
+
+func encodeConversationListCursor(cursor conversationListCursor) string {
+	if cursor.ChannelID == "" || len(cursor.ChannelID) > int(^uint16(0)) {
+		return ""
+	}
+	payload := make([]byte, 19+len(cursor.ChannelID))
+	payload[0] = conversationListCursorVersion
+	binary.BigEndian.PutUint64(payload[1:9], uint64(cursor.ActiveAt))
+	binary.BigEndian.PutUint64(payload[9:17], uint64(cursor.ChannelType))
+	binary.BigEndian.PutUint16(payload[17:19], uint16(len(cursor.ChannelID)))
+	copy(payload[19:], cursor.ChannelID)
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func decodeConversationListCursor(encoded string) (conversationListCursor, error) {
+	if encoded == "" {
+		return conversationListCursor{}, nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil || len(payload) < 19 || payload[0] != conversationListCursorVersion {
+		return conversationListCursor{}, errInvalidConversationListCursor
+	}
+	channelIDLen := int(binary.BigEndian.Uint16(payload[17:19]))
+	if channelIDLen == 0 || len(payload) != 19+channelIDLen {
+		return conversationListCursor{}, errInvalidConversationListCursor
+	}
+	activeAt := int64(binary.BigEndian.Uint64(payload[1:9]))
+	channelType := int64(binary.BigEndian.Uint64(payload[9:17]))
+	if activeAt < 0 || channelType <= 0 || channelType > 255 {
+		return conversationListCursor{}, errInvalidConversationListCursor
+	}
+	return conversationListCursor{ActiveAt: activeAt, ChannelID: string(payload[19:]), ChannelType: channelType}, nil
 }
 
 func newConversationListItem(uid string, item conversationusecase.Conversation) conversationListItem {
@@ -145,7 +223,6 @@ func newConversationListItem(uid string, item conversationusecase.Conversation) 
 		ActiveAt:     item.ActiveAt,
 		ReadSeq:      item.ReadSeq,
 		DeletedToSeq: item.DeletedToSeq,
-		SparseActive: item.SparseActive,
 		Unread:       item.Unread,
 	}
 	if item.LastMessage != nil {
@@ -155,24 +232,15 @@ func newConversationListItem(uid string, item conversationusecase.Conversation) 
 				RedDot:    boolToInt(item.LastMessage.RedDot),
 				SyncOnce:  boolToInt(item.LastMessage.SyncOnce),
 			},
+			Version: item.LastMessage.Version, UpdatedAtMS: item.LastMessage.UpdatedAtMS,
 			MessageID:         item.LastMessage.MessageID,
 			MessageIDStr:      strconv.FormatUint(item.LastMessage.MessageID, 10),
 			MessageSeq:        item.LastMessage.MessageSeq,
 			FromUID:           item.LastMessage.FromUID,
 			ClientMsgNo:       item.LastMessage.ClientMsgNo,
 			ServerTimestampMS: item.LastMessage.ServerTimestampMS,
-			Payload:           append([]byte(nil), item.LastMessage.Payload...),
+			Payload:           item.LastMessage.Payload,
 		}
 	}
 	return out
-}
-
-func countConversationSparseItems(items []conversationusecase.Conversation) int {
-	count := 0
-	for _, item := range items {
-		if item.SparseActive {
-			count++
-		}
-	}
-	return count
 }

@@ -13,14 +13,16 @@ import (
 	accessnode "github.com/WuKongIM/WuKongIM/internal/access/node"
 	accessops "github.com/WuKongIM/WuKongIM/internal/access/opsmcp"
 	opscontract "github.com/WuKongIM/WuKongIM/internal/contracts/opsmcp"
+	"github.com/WuKongIM/WuKongIM/internal/contracts/protocolmeta"
 	clusterinfra "github.com/WuKongIM/WuKongIM/internal/infra/cluster"
 	sendauthorization "github.com/WuKongIM/WuKongIM/internal/infra/sendauthorization"
 	applog "github.com/WuKongIM/WuKongIM/internal/log"
 	obsdiagnostics "github.com/WuKongIM/WuKongIM/internal/observability/diagnostics"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/channelappend"
-	"github.com/WuKongIM/WuKongIM/internal/runtime/conversationactive"
+	runtimedelivery "github.com/WuKongIM/WuKongIM/internal/runtime/delivery"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/online"
 	runtimeops "github.com/WuKongIM/WuKongIM/internal/runtime/opsmcp"
+	"github.com/WuKongIM/WuKongIM/internal/runtime/persondirectory"
 	authoritypresence "github.com/WuKongIM/WuKongIM/internal/runtime/presence"
 	channelusecase "github.com/WuKongIM/WuKongIM/internal/usecase/channel"
 	cmdsyncusecase "github.com/WuKongIM/WuKongIM/internal/usecase/cmdsync"
@@ -36,78 +38,96 @@ import (
 	obsmetrics "github.com/WuKongIM/WuKongIM/pkg/metrics"
 	"github.com/WuKongIM/WuKongIM/pkg/observability/sendtrace"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
+	mqttwire "github.com/WuKongIM/WuKongIM/pkg/protocol/mqtt"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
 func (a *App) applyConfigDefaults() error {
-	var err error
-	a.cfg.Manager = defaultManagerConfig(a.cfg.Manager)
-	if err := validateManagerConfig(a.cfg.Manager); err != nil {
-		return err
-	}
-	a.cfg.Message = defaultMessageConfig(a.cfg.Message)
-	if a.cfg.Message.PersonalSendAuthorizationURL != "" {
-		if _, err := sendauthorization.New(a.cfg.Message.PersonalSendAuthorizationURL, a.cfg.API.InternalCredentialHMACSecret,
-			a.cfg.Message.PersonalSendAuthorizationTimeout, a.cfg.Message.PersonalSendAuthorizationMaxConcurrent); err != nil {
-			return err
-		}
-	}
-
-	if err := validateMessageConfig(a.cfg.Message); err != nil {
-		return err
-	}
-	a.cfg.ChannelMessageRetention = defaultChannelMessageRetentionConfig(a.cfg.ChannelMessageRetention)
-	if err := validateChannelMessageRetentionConfig(a.cfg.ChannelMessageRetention); err != nil {
-		return err
-	}
-	a.cfg.Presence = defaultPresenceConfig(a.cfg.Presence)
-	if err := validatePresenceConfig(a.cfg.Presence); err != nil {
-		return err
-	}
-	a.cfg.Channel = defaultChannelConfig(a.cfg.Channel)
-	if err := validateChannelConfig(a.cfg.Channel); err != nil {
-		return err
-	}
-	a.cfg.ChannelAppend = defaultChannelAppendConfig(a.cfg.ChannelAppend)
-	if err := validateChannelAppendConfig(a.cfg.ChannelAppend); err != nil {
-		return err
-	}
-	a.cfg.Conversation = defaultConversationConfig(a.cfg.Conversation)
-	if err := validateConversationConfig(a.cfg.Conversation); err != nil {
-		return err
-	}
-	a.cfg.Delivery = defaultDeliveryConfig(a.cfg.Delivery)
-	if err := validateDeliveryConfig(a.cfg.Delivery); err != nil {
-		return err
-	}
-	{
-		webhook, err := NormalizeWebhookConfig(a.cfg.Webhook)
-		if err != nil {
-			return err
-		}
-		if webhook.Enabled && strings.TrimSpace(webhook.OutboxDir) == "" {
-			webhook.OutboxDir = filepath.Join(a.cfg.DataDir, "webhook-outbox")
-		}
-		a.cfg.Webhook = webhook
-	}
-	a.cfg.Plugin = defaultPluginConfig(a.cfg.DataDir, a.cfg.Plugin)
-	if err := validatePluginConfig(a.cfg.Plugin); err != nil {
-		return err
-	}
-	a.cfg.Observability = defaultObservabilityConfig(a.cfg.Observability)
-	a.cfg.Observability.Prometheus = defaultPrometheusConfigForApp(a.cfg)
-	if err := validateObservabilityConfig(a.cfg.Observability); err != nil {
-		return err
-	}
-	if err := validatePrometheusConfig(a.cfg); err != nil {
-		return err
-	}
-	a.cfg.Top, err = NormalizeTopConfig(a.cfg.Top)
+	normalized, err := NormalizeConfig(a.cfg)
 	if err != nil {
 		return err
 	}
-	a.cfg.Log = defaultLogConfig(a.cfg.Log)
+	a.cfg = normalized
+	if a.cfg.Message.PersonalSendAuthorizationURL != "" {
+		if _, err := sendauthorization.New(a.cfg.Message.PersonalSendAuthorizationURL, a.cfg.API.InternalCredentialHMACSecret, a.cfg.Message.PersonalSendAuthorizationTimeout, a.cfg.Message.PersonalSendAuthorizationMaxConcurrent); err != nil {
+			return err
+		}
+	}
+	if a.cfg.Webhook.Enabled && strings.TrimSpace(a.cfg.Webhook.OutboxDir) == "" {
+		a.cfg.Webhook.OutboxDir = filepath.Join(a.cfg.DataDir, "webhook-outbox")
+	}
 	return nil
+}
+
+// NormalizeConfig applies product defaults and validates the configuration
+// without constructing runtimes or touching the filesystem.
+func NormalizeConfig(cfg Config) (Config, error) {
+	var err error
+	cfg.MQTT, err = NormalizeMQTTConfig(cfg.MQTT)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Gateway = defaultGatewayConfig(cfg.Gateway)
+	cfg.Manager = defaultManagerConfig(cfg.Manager)
+	if err := validateManagerConfig(cfg.Manager); err != nil {
+		return Config{}, err
+	}
+	cfg.Message = defaultMessageConfig(cfg.Message)
+	if err := validateMessageConfig(cfg.Message); err != nil {
+		return Config{}, err
+	}
+	cfg.ChannelMessageRetention = defaultChannelMessageRetentionConfig(cfg.ChannelMessageRetention)
+	if err := validateChannelMessageRetentionConfig(cfg.ChannelMessageRetention); err != nil {
+		return Config{}, err
+	}
+	cfg.Presence = defaultPresenceConfig(cfg.Presence)
+	if err := validatePresenceConfig(cfg.Presence); err != nil {
+		return Config{}, err
+	}
+	cfg.Channel = defaultChannelConfig(cfg.Channel)
+	if err := validateChannelConfig(cfg.Channel); err != nil {
+		return Config{}, err
+	}
+	cfg.ChannelAppend = defaultChannelAppendConfig(cfg.ChannelAppend)
+	if err := validateChannelAppendConfig(cfg.ChannelAppend); err != nil {
+		return Config{}, err
+	}
+	cfg.Delivery = defaultDeliveryConfig(cfg.Delivery)
+	if err := validateDeliveryConfig(cfg.Delivery); err != nil {
+		return Config{}, err
+	}
+	{
+		webhook, err := NormalizeWebhookConfig(cfg.Webhook)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Webhook = webhook
+	}
+	cfg.Plugin = defaultPluginConfig(cfg.DataDir, cfg.Plugin)
+	if err := validatePluginConfig(cfg.Plugin); err != nil {
+		return Config{}, err
+	}
+	cfg.Observability = defaultObservabilityConfig(cfg.Observability)
+	cfg.Observability.Prometheus = defaultPrometheusConfigForApp(cfg)
+	if err := validateObservabilityConfig(cfg.Observability); err != nil {
+		return Config{}, err
+	}
+	if err := validatePrometheusConfig(cfg); err != nil {
+		return Config{}, err
+	}
+	cfg.Top, err = NormalizeTopConfig(cfg.Top)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Log = defaultLogConfig(cfg.Log)
+	return cfg, nil
+}
+
+func defaultGatewayConfig(cfg GatewayConfig) GatewayConfig {
+	if !cfg.tokenAuthOnSet {
+		cfg.TokenAuthOn = true
+	}
+	return cfg
 }
 
 func (a *App) applyOptions(opts []Option) {
@@ -163,7 +183,9 @@ func (a *App) configureObservability(clusterCfg *cluster.Config) {
 		top = a.ensureTopCollector(clusterCfg.NodeID, true)
 	}
 	if a.cfg.Observability.MetricsEnabled {
-		a.metrics = obsmetrics.New(clusterCfg.NodeID, fmt.Sprintf("node-%d", clusterCfg.NodeID))
+		a.metrics = obsmetrics.NewWithLogicalSlots(
+			clusterCfg.NodeID, fmt.Sprintf("node-%d", clusterCfg.NodeID), clusterCfg.Slots.InitialSlotCount,
+		)
 		if a.controllerTaskAudit != nil {
 			a.controllerTaskAudit.metrics = a.metrics
 		}
@@ -182,8 +204,10 @@ func (a *App) configureObservability(clusterCfg *cluster.Config) {
 			metrics: a.metrics,
 			workers: commitCoordinatorWorkerCount(clusterCfg.Storage.CommitShards),
 		})
+		clusterCfg.Storage.MQTTStorageObserver = combineMQTTStorageObservers(clusterCfg.Storage.MQTTStorageObserver, a.metrics.MQTT)
 		clusterCfg.Transport.Observer = combineTransportObservers(clusterCfg.Transport.Observer, &transportMetricsObserver{metrics: a.metrics})
 		clusterCfg.MessageEvent.Observer = combineMessageEventObservers(clusterCfg.MessageEvent.Observer, messageEventMetricsObserver{metrics: a.metrics})
+		clusterCfg.MembershipObserver = combineMembershipMutationObservers(clusterCfg.MembershipObserver, membershipMutationMetricsObserver{metrics: a.metrics})
 	}
 	if a.goroutines == nil {
 		a.goroutines = goruntimeregistry.Default()
@@ -284,22 +308,67 @@ func (a *App) wireDeliveryMetadata() {
 		}
 	}
 	if a.cfg.Delivery.Enabled && a.deliverySubscribers == nil {
-		a.deliverySubscribers = a.deliveryMeta
+		if node, ok := a.cluster.(recipientSubscriberNode); ok {
+			a.deliverySubscribers = channelAppendSubscriberSource{node: node}
+		}
 	}
+}
+
+func (a *App) wirePersonDirectoryProjector() error {
+	if a.personDirectoryProjector != nil {
+		return nil
+	}
+	source, sourceOK := a.cluster.(persondirectory.TaskSource)
+	memberships, membershipsOK := a.cluster.(clusterinfra.PersonDirectoryMembershipNode)
+	if !sourceOK && !membershipsOK {
+		return nil
+	}
+	if !sourceOK || !membershipsOK {
+		return fmt.Errorf("internal/app: incomplete person-directory cluster ports")
+	}
+	projector, err := persondirectory.New(persondirectory.Options{
+		Source:      source,
+		Memberships: clusterinfra.NewPersonDirectoryMembershipWriter(memberships),
+		Goroutines:  a.goroutines,
+		Observer:    personDirectoryPressureMetricsObserver{metrics: a.metrics},
+	})
+	if err != nil {
+		return fmt.Errorf("internal/app: wire person-directory projector: %w", err)
+	}
+	a.personDirectoryProjector = projector
+	return nil
+}
+
+type personDirectoryPressureMetricsObserver struct {
+	metrics *obsmetrics.Registry
+}
+
+func (o personDirectoryPressureMetricsObserver) ObservePersonDirectoryPressure(observation persondirectory.PressureObservation) {
+	if o.metrics == nil {
+		return
+	}
+	o.metrics.RuntimePressure.SetPoolWorkers("message", "person_directory", observation.Workers)
+	o.metrics.RuntimePressure.SetPoolInflight("message", "person_directory", observation.Inflight)
+	o.metrics.RuntimePressure.SetQueue("message", "person_directory", "task", "none", obsmetrics.RuntimePressureQueueObservation{
+		Depth: observation.Pending, Capacity: observation.Capacity,
+	})
 }
 
 func (a *App) wireChannels() {
 	if a.channels == nil {
 		if node, ok := a.cluster.(clusterinfra.ChannelMetadataNode); ok {
 			metadata := a.ensureChannelAppendMetadataCache()
-			store := clusterinfra.NewChannelMetadataStore(node, metadata)
+			store := clusterinfra.NewChannelMetadataStore(node, metadata, a.goroutines)
 			channelOptions := channelusecase.Options{
+				SendBanAudit:                  a.sendBanAuditObserver,
+				CommandChannelSuffix:          a.cfg.Message.CMDChannelSuffix,
 				Store:                         store,
 				LargeGroupSubscriberThreshold: a.cfg.Channel.LargeGroupSubscriberThreshold,
 				SubscriberMutationObserver:    channelAppendSubscriberMutationObserver{app: a},
 			}
 			if _, ok := node.(clusterinfra.ChannelMembershipNode); ok {
 				channelOptions.MembershipIndex = store
+				channelOptions.CommittedTail = store
 			}
 			a.channels = channelusecase.New(channelOptions)
 		}
@@ -308,85 +377,23 @@ func (a *App) wireChannels() {
 
 func (a *App) newConversationReadStore() *clusterinfra.ConversationStore {
 	if node, ok := a.cluster.(clusterinfra.ConversationNode); ok {
-		return clusterinfra.NewConversationStore(node, clusterinfra.ConversationStoreOptions{
-			MaxLastMessageConcurrency: a.cfg.Conversation.MaxLastMessageConcurrency,
-		})
+		return clusterinfra.NewConversationStore(node)
 	}
 	return nil
 }
 
-func (a *App) wireConversationAuthority() {
-	if a.conversationAuthorityClient == nil {
-		authorityNode, hasAuthorityNode := a.cluster.(clusterinfra.ConversationAuthorityNode)
-		authorityStore, hasAuthorityStore := a.cluster.(conversationAuthorityStore)
-		if hasAuthorityNode && hasAuthorityStore {
-			pressureSignals := make(chan conversationactive.PressureSignal, 1)
-			conversationObserver := a.conversationAuthorityObserver()
-			var activeObserver conversationactive.Observer
-			if observer, ok := conversationObserver.(conversationactive.Observer); ok {
-				activeObserver = observer
-			}
-			authority := newConversationAuthority(conversationAuthorityOptions{
-				LocalNodeID:          authorityNode.NodeID(),
-				Store:                authorityStore,
-				MaxRowsPerUID:        a.cfg.Conversation.AuthorityCacheMaxRowsPerUID,
-				MaxRows:              a.cfg.Conversation.AuthorityCacheMaxRows,
-				ListDBWindowMax:      a.cfg.Conversation.AuthorityListDBWindowMax,
-				AdmissionBatchRows:   a.cfg.Conversation.AuthorityAdmitBatchRows,
-				AdmissionConcurrency: a.cfg.Conversation.AuthorityAdmitConcurrency,
-				ActiveCooldown:       a.cfg.Conversation.AuthorityActiveCooldown,
-				FlushBatchRows:       a.cfg.Conversation.AuthorityFlushBatchRows,
-				PressureNotify:       pressureSignals,
-				CurrentRouteTarget:   a.currentConversationAuthorityRouteTarget,
-				Observer:             conversationObserver,
-			})
-			client := clusterinfra.NewConversationAuthorityClient(authorityNode, authority)
-			a.conversationAuthority = authority
-			a.conversationAuthorityClient = client
-			if a.conversationActiveWorker == nil {
-				a.conversationActiveWorker = newConversationActiveFlushWorker(conversationActiveFlushWorkerOptions{
-					Authority:       authority,
-					FlushInterval:   a.cfg.Conversation.AuthorityFlushInterval,
-					FlushTimeout:    a.cfg.Conversation.AuthorityFlushTimeout,
-					BatchRows:       a.cfg.Conversation.AuthorityFlushBatchRows,
-					PressureSignals: pressureSignals,
-					Observer:        activeObserver,
-					Logger:          a.logger.Named("conversation_active_flush"),
-				})
-			}
-			if a.conversationRouteLifecycle == nil {
-				routeLifecycle := newConversationAuthorityRouteLifecycle(conversationAuthorityRouteLifecycleOptions{
-					LocalAuthority: authority,
-					LocalNodeID:    authorityNode.NodeID(),
-					Initial:        a.currentPresenceAuthorities,
-					Watch:          authorityNode.WatchRouteAuthorities,
-					HandoffTimeout: a.cfg.Conversation.AuthorityHandoffTimeout,
-				})
-				routeLifecycle.applyRouteAuthorities(context.Background(), a.currentPresenceAuthorities())
-				a.conversationRouteLifecycle = routeLifecycle
-			}
-			adapter := accessnode.New(accessnode.Options{ConversationAuthority: authority, Logger: a.logger.Named("node")})
-			authorityNode.RegisterRPC(accessnode.ConversationAuthorityRPCServiceID, nodeRPCHandlerFunc(adapter.HandleConversationAuthorityRPC))
-		}
-	}
-}
-
 func (a *App) wireConversations(conversationReadStore *clusterinfra.ConversationStore) {
 	if a.conversations == nil {
-		if conversationReadStore != nil {
-			var store conversationusecase.Store = conversationReadStore
-			var deleteStore conversationusecase.DeleteStore = conversationReadStore
-			if a.conversationAuthorityClient != nil {
-				store = a.conversationAuthorityClient
-				deleteStore = a.conversationAuthorityClient
+		if conversationReadStore != nil && conversationReadStore.SupportsMembershipDirectory() {
+			options := conversationusecase.Options{
+				Directory:           conversationReadStore,
+				Hydrator:            conversationReadStore,
+				MembershipMutations: conversationReadStore,
 			}
-			a.conversations = conversationusecase.New(conversationusecase.Options{
-				Store:              store,
-				StateStore:         conversationReadStore,
-				StateMutationStore: conversationReadStore,
-				DeleteStore:        deleteStore,
-				Messages:           conversationReadStore,
-			})
+			if a.messages != nil {
+				options.LegacyMessages = conversationLegacyMessageReader{messages: a.messages}
+			}
+			a.conversations = conversationusecase.New(options)
 		}
 	}
 }
@@ -394,21 +401,28 @@ func (a *App) wireConversations(conversationReadStore *clusterinfra.Conversation
 func (a *App) wirePresence() {
 	if presenceNode, ok := a.cluster.(clusterinfra.PresenceNode); ok {
 		observer := presenceMetricsObserver{metrics: a.metrics}
-		directory := authoritypresence.NewDirectory(authoritypresence.DirectoryOptions{LocalNodeID: presenceNode.NodeID()})
+		recoveryNode, canRecover := a.cluster.(clusterinfra.PresenceRecoveryNode)
+		directory := authoritypresence.NewDirectory(authoritypresence.DirectoryOptions{LocalNodeID: presenceNode.NodeID(), RequireRecovery: canRecover})
 		a.presenceDirectory = directory
 		authority := clusterinfra.NewPresenceDirectoryAuthority(directory)
 		ownerActions := presenceOwnerActions{local: a.online}
+		ownerBootID := newOwnerBootID()
+		ownerReader := presence.NewOwnerRecovery(a.online, presenceNode.NodeID(), ownerBootID, func(target presence.RouteTarget) error {
+			return clusterinfra.ValidatePresenceTarget(presenceNode, target)
+		})
+		if canRecover {
+			authority.SetRecovery(presence.NewAuthorityRecovery(directory, clusterinfra.NewPresenceRecoveryOwners(recoveryNode, ownerReader)))
+		}
 		client := clusterinfra.NewPresenceAuthorityClient(presenceNode, authority)
 		client.SetLocalOwner(ownerActions)
 		if a.metrics != nil {
 			client.SetEndpointLookupObserver(observer)
 		}
 		a.presenceAuthorityClient = client
-		adapter := accessnode.New(accessnode.Options{Authority: authority, Owner: ownerActions, Logger: a.logger.Named("node")})
+		adapter := accessnode.New(accessnode.Options{Authority: authority, Owner: ownerActions, OwnerRoutes: ownerReader, Logger: a.logger.Named("node")})
 		presenceNode.RegisterRPC(accessnode.PresenceAuthorityRPCServiceID, nodeRPCHandlerFunc(adapter.HandlePresenceAuthorityRPC))
 		presenceNode.RegisterRPC(accessnode.PresenceOwnerRPCServiceID, nodeRPCHandlerFunc(adapter.HandlePresenceOwnerRPC))
 		if a.presence == nil {
-			ownerBootID := newOwnerBootID()
 			a.presence = presence.New(presence.Options{
 				Local:                a.online,
 				Authority:            client,
@@ -451,7 +465,8 @@ func (a *App) wireManagerConnectionRPC() {
 		return
 	}
 	readService := managementusecase.New(managementusecase.Options{
-		Cluster: clusterinfra.NewManagementSnapshotReader(node),
+		CommandChannelSuffix: a.cfg.Message.CMDChannelSuffix,
+		Cluster:              clusterinfra.NewManagementSnapshotReader(node),
 		RuntimeSummary: managementRuntimeSummaryReader{
 			app:         a,
 			localNodeID: node.NodeID(),
@@ -519,6 +534,7 @@ func (a *App) wireManagerNodeConfigRPC() {
 	}
 	adapter := accessnode.New(accessnode.Options{ManagerNodeConfig: a, Logger: a.logger.Named("node")})
 	registrar.RegisterRPC(accessnode.ManagerNodeConfigRPCServiceID, nodeRPCHandlerFunc(adapter.HandleManagerNodeConfigRPC))
+	registrar.RegisterRPC(accessnode.ManagerNodeConfigDocumentRPCServiceID, nodeRPCHandlerFunc(adapter.HandleManagerNodeConfigDocumentRPC))
 }
 
 func (a *App) wireManagerChannelRPC() {
@@ -529,6 +545,7 @@ func (a *App) wireManagerChannelRPC() {
 		return
 	}
 	service := managementusecase.New(managementusecase.Options{
+		CommandChannelSuffix:  a.cfg.Message.CMDChannelSuffix,
 		Cluster:               clusterinfra.NewManagementSnapshotReader(node),
 		ChannelBusinessReader: clusterinfra.NewChannelBusinessReader(channelNode),
 	})
@@ -543,7 +560,8 @@ func (a *App) wireManagerMessageRetentionRPC() {
 		return
 	}
 	service := managementusecase.New(managementusecase.Options{
-		MessageRetention: clusterinfra.NewLocalManagementMessageRetentionOperator(node),
+		CommandChannelSuffix: a.cfg.Message.CMDChannelSuffix,
+		MessageRetention:     clusterinfra.NewLocalManagementMessageRetentionOperator(node),
 	})
 	adapter := accessnode.New(accessnode.Options{ManagerMessageRetention: service, Logger: a.logger.Named("node")})
 	registrar.RegisterRPC(accessnode.ManagerMessageRetentionRPCServiceID, nodeRPCHandlerFunc(adapter.HandleManagerMessageRetentionRPC))
@@ -658,11 +676,13 @@ func (a *App) wireManagerPluginRPC() {
 	if !hasRegistrar || a.plugins == nil {
 		return
 	}
-	service := managementusecase.New(managementusecase.Options{Plugins: a.plugins})
+	service := managementusecase.New(managementusecase.Options{
+		CommandChannelSuffix: a.cfg.Message.CMDChannelSuffix, Plugins: a.plugins})
 	if node, ok := a.cluster.(clusterinfra.ManagementNode); ok {
 		service = managementusecase.New(managementusecase.Options{
-			Cluster: clusterinfra.NewManagementSnapshotReader(node),
-			Plugins: a.plugins,
+			CommandChannelSuffix: a.cfg.Message.CMDChannelSuffix,
+			Cluster:              clusterinfra.NewManagementSnapshotReader(node),
+			Plugins:              a.plugins,
 		})
 	}
 	adapter := accessnode.New(accessnode.Options{
@@ -683,24 +703,32 @@ func (a *App) wireUsers() {
 		if a.users == nil {
 			var systemUIDs userusecase.SystemUIDStore
 			if channelNode, ok := a.cluster.(clusterinfra.ChannelMetadataNode); ok {
-				systemUIDs = clusterinfra.NewChannelMetadataStore(channelNode, nil)
+				systemUIDs = clusterinfra.NewChannelMetadataStore(channelNode, nil, a.goroutines)
 			}
 			a.users = userusecase.New(userusecase.Options{
+				SendBanAudit:      a.sendBanAuditObserver,
 				Users:             userStore,
 				Devices:           userStore,
 				DeviceReader:      userStore,
-				DeviceCredentials: userStore,
-				CredentialFences:  a.presenceAuthorityClient,
 				Online:            a.online,
 				Presence:          a.presence,
 				SystemUIDs:        systemUIDs,
+				SystemUID:         a.cfg.Message.SystemUID,
 				Logger:            a.logger.Named("usecase.user"),
+				DeviceCredentials: userStore,
+				CredentialFences:  a.presenceAuthorityClient,
 			})
 		}
 	}
 }
 
 func (a *App) wireChannelAppend(nodeID uint64) error {
+	if a.mqttInboxWrites {
+		node, ok := a.cluster.(*cluster.Node)
+		if !ok || node == nil || a.personDirectoryProjector == nil || a.channelAppends != nil {
+			return fmt.Errorf("internal/app: inbox append requires real cluster, directory projector and owned appender")
+		}
+	}
 	if a.channelAppends == nil {
 		appendNode, hasAppendNode := a.cluster.(clusterinfra.ChannelAppendNode)
 		authorityNode, hasAuthorityNode := a.cluster.(clusterinfra.ChannelAppendAuthorityNode)
@@ -715,9 +743,18 @@ func (a *App) wireChannelAppend(nodeID uint64) error {
 				}
 				a.messageIDs = messageIDs
 			}
+			var durableAppender channelappend.Appender = clusterinfra.NewChannelAppender(appendNode, a.logger.Named("cluster.append"))
+			if a.mqttInboxWrites {
+				var err error
+				durableAppender, err = newMQTTInboxAppender(a.cluster.(*cluster.Node), messageIDs, durableAppender, a.personDirectoryProjector.Wake)
+				if err != nil {
+					return fmt.Errorf("internal/app: wire inbox append: %w", err)
+				}
+			}
 			opts := channelappend.Options{
+				CommandChannelSuffix:   a.cfg.Message.CMDChannelSuffix,
 				LocalNodeID:            nodeID,
-				Appender:               clusterinfra.NewChannelAppender(appendNode, a.logger.Named("cluster.append")),
+				Appender:               durableAppender,
 				MessageID:              messageIDs,
 				AuthorityShardCount:    a.cfg.ChannelAppend.AuthorityShardCount,
 				AdvancePoolSize:        a.cfg.ChannelAppend.AdvancePoolSize,
@@ -725,12 +762,14 @@ func (a *App) wireChannelAppend(nodeID uint64) error {
 				RecipientBatchSize:     a.cfg.Delivery.PushBatchSize,
 				SubscriberScanPageSize: a.cfg.Delivery.FanoutPageSize,
 			}
+			if commandNode, ok := a.cluster.(legacyCMDProjectionNode); ok {
+				opts.CMDActiveProjector = legacyCMDProjector{node: commandNode}
+			}
+
 			if idempotencyNode, ok := a.cluster.(clusterinfra.ChannelIdempotencyNode); ok {
 				opts.Idempotency = clusterinfra.NewChannelIdempotencyStore(idempotencyNode)
 			}
-			if a.deliveryMeta != nil {
-				opts.Subscribers = a.deliveryMeta
-			} else if a.deliverySubscribers != nil {
+			if a.deliverySubscribers != nil {
 				opts.Subscribers = a.deliverySubscribers
 			} else if subscriberNode, ok := a.cluster.(recipientSubscriberNode); ok {
 				opts.Subscribers = channelAppendSubscriberSource{node: subscriberNode}
@@ -742,10 +781,10 @@ func (a *App) wireChannelAppend(nodeID uint64) error {
 			if resolver := clusterinfra.NewRecipientAuthorityResolver(a.cluster, recipientObserver); resolver != nil {
 				opts.RecipientAuthorityResolver = resolver
 			}
-			if a.conversationAuthorityClient != nil {
-				opts.ConversationActiveAdmitter = a.conversationAuthorityClient
-			}
 			opts.PersistAfterEnqueuer = composePersistAfterEnqueuers(a.pluginPersistAfter, a.webhookNotify)
+			if a.cfg.MQTT.Enabled {
+				opts.PersistAfterEnqueuer = composePersistAfterEnqueuers(mqttPostCommitWake{notify: a.wakeMQTTSource}, opts.PersistAfterEnqueuer)
+			}
 			var observer deliveryMessageObserver
 			if _, topEnabled := a.topProvider.(*topCollector); a.cfg.Delivery.Enabled || a.metrics != nil || topEnabled {
 				observer = deliveryMessageObserver{app: a}
@@ -761,16 +800,23 @@ func (a *App) wireChannelAppend(nodeID uint64) error {
 			}
 			client := clusterinfra.NewChannelAppendClient(authorityNode, remote, metadata)
 			router := channelappend.NewRouter(channelappend.RouterOptions{
-				LocalNodeID:        nodeID,
-				Resolver:           client,
-				Local:              group,
-				Remote:             client,
-				MaxOutboundPerNode: a.cfg.Delivery.EventQueueSize,
-				MaxRouteAttempts:   defaultDeliveryRetryMaxAttempts,
-				Observer:           observer,
+				CommandChannelSuffix: a.cfg.Message.CMDChannelSuffix,
+				LocalNodeID:          nodeID,
+				Resolver:             client,
+				Local:                group,
+				Remote:               client,
+				MaxOutboundPerNode:   a.cfg.Delivery.EventQueueSize,
+				MaxRouteAttempts:     defaultDeliveryRetryMaxAttempts,
+				Observer:             observer,
+				PressureObserver:     observer,
 			})
 			a.channelAppends = group
 			a.channelAppendRouter = router
+			if a.messages == nil && a.gateway == nil && a.handler == nil && len(a.cfg.Gateway.Listeners) > 0 {
+				if err := a.wireChannelSubmissions(router); err != nil {
+					return err
+				}
+			}
 			if registrar, ok := a.cluster.(nodeRPCRegistrar); ok {
 				adapter := accessnode.NewChannelAppendAdapter(accessnode.ChannelAppendOptions{
 					ChannelAppend: channelAppendAuthorityLocal{group: group},
@@ -793,11 +839,15 @@ func (a *App) ensureChannelAppendMetadataCache() *clusterinfra.ChannelAppendMeta
 func (a *App) wireMessages() {
 	if a.messages == nil {
 		messageOpts := message.Options{
+			BeforeSendWebhook:      a.beforeSendWebhook,
+			CommandChannelSuffix:   a.cfg.Message.CMDChannelSuffix,
 			Submitter:              a.channelAppendRouter,
 			SystemUIDs:             a.users,
 			PersonWhitelistEnabled: a.cfg.Message.PersonWhitelistEnabled,
 			SystemDeviceID:         a.cfg.Message.SystemDeviceID,
 			PermissionCacheTTL:     a.cfg.Message.PermissionCacheTTL,
+			SendBatchObserver:      deliveryMessageObserver{app: a},
+			PermissionObserver:     deliveryMessageObserver{app: a},
 		}
 		if a.cfg.Message.PersonalSendAuthorizationURL != "" {
 			// applyConfigDefaults validated the fixed URL, signing key and resource bounds.
@@ -812,15 +862,44 @@ func (a *App) wireMessages() {
 			messageOpts.SendHook = a.plugins
 		}
 		if channelNode, ok := a.cluster.(clusterinfra.ChannelMetadataNode); ok {
-			messageOpts.PermissionStore = clusterinfra.NewChannelMetadataStore(channelNode, nil)
+			channelStore := clusterinfra.NewChannelMetadataStore(channelNode, a.ensureChannelAppendMetadataCache(), a.goroutines)
+			a.messageChannelStore = channelStore
+			messageOpts.PermissionStore = channelStore
+			if _, ok := channelNode.(clusterinfra.AuthoritativePermissionBatchNode); ok {
+				messageOpts.PermissionBatchStore = channelStore
+			}
+			messageOpts.ChannelState = channelStore
+			if _, ok := a.cluster.(clusterinfra.PersonDirectoryNode); ok && a.personDirectoryProjector != nil {
+				channelStore.SetPersonDirectoryWake(a.personDirectoryProjector.Wake)
+			}
 		}
 		if readNode, ok := a.cluster.(clusterinfra.ChannelMessageReadNode); ok {
-			messageOpts.Reader = clusterinfra.NewChannelMessageReader(readNode)
+			messageOpts.LookupReader = clusterinfra.NewCommittedMessageReader(readNode)
+			messageOpts.Reader = message.NewPageReader(messageOpts.LookupReader)
+		}
+		if readNode, ok := a.cluster.(clusterinfra.PersistedMessageReadNode); ok {
+			messageOpts.PersistedReader = message.NewPersistedPageReader(clusterinfra.NewPersistedMessageReader(readNode))
+		}
+		if membershipNode, ok := a.cluster.(clusterinfra.MessageMembershipNode); ok {
+			messageOpts.Memberships = clusterinfra.NewMessageMembershipStore(membershipNode)
 		}
 		if eventNode, ok := a.cluster.(clusterinfra.MessageEventNode); ok {
 			messageOpts.EventStore = clusterinfra.NewMessageEventStore(eventNode)
 		}
+		if node, ok := a.cluster.(clusterinfra.MessageUpdateNode); ok {
+			messageOpts.Updates = clusterinfra.NewMessageUpdateStore(node)
+			messageOpts.ContentEpoch = a.messageContentEpoch
+		}
+		a.wireMessageUpdateHints(&messageOpts)
+		a.wireMessageEvents(&messageOpts)
+		if a.channelSubmissions != nil {
+			messageOpts.BatchAdmission = a.channelSubmissions
+		}
 		a.messages = message.New(messageOpts)
+		if a.channelSubmissions != nil {
+			a.deferredGatewayMessages = a.messages
+		}
+		a.wireMessageUpdateWorker()
 	}
 }
 
@@ -828,11 +907,13 @@ func (a *App) wireCMDSync() {
 	if a.cmdSync == nil {
 		if node, ok := a.cluster.(clusterinfra.CMDSyncNode); ok {
 			store := clusterinfra.NewCMDSyncStore(node)
+			store.CommandChannelSuffix = a.cfg.Message.CMDChannelSuffix
 			a.cmdSync = cmdsyncusecase.New(cmdsyncusecase.Options{
-				States:       store,
-				DeviceStates: store,
-				Principals:   store,
-				Messages:     store,
+				CommandChannelSuffix: a.cfg.Message.CMDChannelSuffix,
+				States:               store,
+				Messages:             store,
+				DeviceStates:         store,
+				Principals:           store,
 			})
 		}
 	}
@@ -847,53 +928,79 @@ func (a *App) wireAPIMessageFacade() {
 func (a *App) wireGatewayHandler(ownerNodeID uint64) {
 	if a.handler == nil {
 		handlerMessages := accessgateway.MessageUsecase(a.messages)
+		// Disabled delivery leaves the optional feedback port absent.
+		var feedback runtimedelivery.FeedbackHandler
+		if a.onlineDelivery != nil {
+			feedback = a.onlineDelivery
+		}
+		var editCapabilities accessgateway.MessageUpdateCapabilities
+		if a.messageUpdateHintsReady {
+			editCapabilities = a.online
+		}
 		a.handler = accessgateway.New(accessgateway.Options{
-			Messages:        handlerMessages,
-			Presence:        a.gatewayPresenceUsecase(),
-			Delivery:        a.delivery,
-			OwnerNodeID:     ownerNodeID,
-			SendTimeout:     a.cfg.Gateway.SendTimeout,
-			SendackObserver: a.sendackObserver(),
-			Logger:          a.logger.Named("access.gateway"),
+			MessageUpdateCapabilities: editCapabilities,
+			Messages:                  handlerMessages,
+			Presence:                  a.gatewayPresenceUsecase(),
+			Delivery:                  feedback,
+			OwnerNodeID:               ownerNodeID,
+			SendTimeout:               a.cfg.Gateway.SendTimeout,
+			SendackObserver:           a.sendackObserver(),
+			Logger:                    a.logger.Named("access.gateway"),
 		})
 	}
 }
 
 func (a *App) wireAPI() {
 	if a.api == nil && strings.TrimSpace(a.cfg.API.ListenAddr) != "" {
+		var pluginRouter accessapi.PluginHTTPRouter
+		if a.plugins != nil {
+			pluginRouter = a.plugins
+		}
 		legacyRouteExternal, legacyRouteIntranet := legacyRouteAddresses(a.cfg.API, a.cfg.Gateway.Listeners)
 		legacyRouteNodes := legacyRouteNodeAddresses(a.cfg.NodeID, a.cfg.Cluster.Control.Voters, legacyRouteExternal, legacyRouteIntranet)
 		a.api = accessapi.New(accessapi.Options{
-			ListenAddr:                     a.cfg.API.ListenAddr,
-			Readyz:                         a.readyzReport,
-			Maintenance:                    a.restoreMaintenance.Load,
-			BenchEnabled:                   a.cfg.Bench.APIEnabled,
-			BenchToken:                     a.cfg.Bench.APIToken,
-			BenchMaxBatchSize:              a.cfg.Bench.APIMaxBatchSize,
-			BenchMaxPayloadBytes:           a.cfg.Bench.APIMaxPayloadBytes,
+			ContentEpoch:             a.messageContentEpoch,
+			ContentReadFence:         a.messageContentReadFence,
+			ListenAddr:               a.cfg.API.ListenAddr,
+			Readyz:                   a.readyzReport,
+			Maintenance:              a.restoreMaintenance.Load,
+			BenchEnabled:             a.cfg.Bench.APIEnabled,
+			BenchToken:               a.cfg.Bench.APIToken,
+			BenchMaxBatchSize:        a.cfg.Bench.APIMaxBatchSize,
+			BenchMaxPayloadBytes:     a.cfg.Bench.APIMaxPayloadBytes,
+			Gateway:                  apiGatewayAddresses(a.cfg.API, a.cfg.Gateway.Listeners),
+			BenchRuntime:             a.benchRuntimeController(),
+			BenchPresence:            a.benchPresenceController(),
+			BenchTerminalFence:       a.benchTerminalController(),
+			BenchData:                a.deliveryMeta,
+			Channels:                 a.channels,
+			Users:                    a.users,
+			Messages:                 a.apiMessages,
+			Plugins:                  pluginRouter,
+			PluginTimeout:            a.cfg.Plugin.Timeout,
+			SystemUID:                a.cfg.Message.SystemUID,
+			CMDSync:                  a.cmdSync,
+			Conversations:            a.conversations,
+			ConversationListObserver: a.conversationListObserver(),
+			LegacyRouteExternal:      legacyRouteExternal,
+			LegacyRouteHostFallback: accessapi.LegacyRouteHostFallback{
+				TCP: strings.TrimSpace(a.cfg.API.ExternalTCPAddr) == "",
+				WS:  strings.TrimSpace(a.cfg.API.ExternalWSAddr) == "",
+				WSS: strings.TrimSpace(a.cfg.API.ExternalWSSAddr) == "",
+			},
+			LegacyRouteIntranet: legacyRouteIntranet,
+			LegacyRouteNodes:    legacyRouteNodes,
+			MetricsHandler:      a.metricsHandler(),
+			DebugAPIEnabled:     a.cfg.Observability.DebugAPIEnabled,
+			DebugConfig:         a.debugConfigSnapshot,
+			DebugCluster: func(ctx context.Context) (any, error) {
+				return a.debugClusterSnapshot(ctx)
+			},
+			Diagnostics:                    a,
 			InternalCredentialHMACSecret:   a.cfg.API.InternalCredentialHMACSecret,
 			InternalCredentialReplayWindow: a.cfg.API.InternalCredentialReplayWindow,
 			InternalCredentialMaxBatchSize: a.cfg.API.InternalCredentialMaxBatchSize,
-			Gateway:                        apiGatewayAddresses(a.cfg.API, a.cfg.Gateway.Listeners),
-			BenchRuntime:                   a.benchRuntimeController(),
-			BenchPresence:                  a.benchPresenceController(),
-			BenchData:                      a.deliveryMeta,
-			Channels:                       a.channels,
-			Users:                          a.users,
 			DeviceCredentials:              a.users,
-			Messages:                       a.apiMessages,
-			CMDSync:                        a.cmdSync,
-			Conversations:                  a.conversations,
-			ConversationListObserver:       a.conversationListObserver(),
-			ConversationSyncObserver:       a.conversationSyncObserver(),
-			LegacyRouteExternal:            legacyRouteExternal,
-			LegacyRouteIntranet:            legacyRouteIntranet,
-			LegacyRouteNodes:               legacyRouteNodes,
-			MetricsHandler:                 a.metricsHandler(),
-			DebugAPIEnabled:                a.cfg.Observability.DebugAPIEnabled,
-			DebugConfig:                    a.debugConfigSnapshot,
-			DebugCluster:                   a.debugClusterSnapshot,
-			Diagnostics:                    a,
 			GoroutineSnapshot: func() any {
 				return a.goroutines.Snapshot()
 			},
@@ -1031,11 +1138,12 @@ func (a *App) newManagerMonitorProvider(control managerClusterControlReader) acc
 		nodeID = a.cfg.Cluster.NodeID
 	}
 	base := newManagerPrometheusMonitorProvider(managerPrometheusMonitorOptions{
-		Enabled:  a.cfg.Observability.MetricsEnabled && strings.TrimSpace(prometheusBaseURL) != "",
-		BaseURL:  prometheusBaseURL,
-		NodeID:   nodeID,
-		NodeName: fmt.Sprintf("node-%d", nodeID),
-		Control:  control,
+		Enabled:    a.cfg.Observability.MetricsEnabled && strings.TrimSpace(prometheusBaseURL) != "",
+		BaseURL:    prometheusBaseURL,
+		NodeID:     nodeID,
+		NodeName:   fmt.Sprintf("node-%d", nodeID),
+		Control:    control,
+		Goroutines: a.goroutines,
 	})
 	var remote managerGoroutineSnapshotReader
 	if node, ok := a.cluster.(accessnode.PresenceRPCNode); ok {
@@ -1068,6 +1176,7 @@ func managerPrometheusBaseURL(cfg PrometheusConfig) string {
 func (a *App) newManagerManagement() accessmanager.Management {
 	if node, ok := a.cluster.(clusterinfra.ManagementNode); ok {
 		opts := managementusecase.Options{
+			CommandChannelSuffix:    a.cfg.Message.CMDChannelSuffix,
 			Cluster:                 clusterinfra.NewManagementSnapshotReader(node),
 			Conversations:           a.conversations,
 			ChannelBusinessOperator: newManagerChannelBusinessOperator(a.channels),
@@ -1253,21 +1362,12 @@ func managerPermissionConfigs(permissions []ManagerPermissionConfig) []accessman
 
 func (a *App) wireGateway(nodeID uint64) error {
 	if a.gateway == nil && len(a.cfg.Gateway.Listeners) > 0 {
-		authOptions := gateway.WKProtoAuthOptions{
-			NodeID:                  nodeID,
-			RequiredProtocolVersion: frame.LatestVersion,
+		if a.cfg.Gateway.TokenAuthEnabled && a.gatewayTokenMetadata == nil {
+			return fmt.Errorf("%w: gateway credential metadata reader required", ErrInvalidConfig)
 		}
-		if a.cfg.Gateway.TokenAuthEnabled {
-			if a.gatewayTokenMetadata == nil {
-				return fmt.Errorf("%w: gateway token metadata reader required", ErrInvalidConfig)
-			}
-			authOptions.TokenAuthOn = true
-			authOptions.VerifyCredential = newGatewayCredentialVerifier(
-				a.gatewayTokenMetadata, a.cfg.Gateway.TokenAuthTimeout)
-		}
-		gw, err := gateway.New(gateway.Options{
-			Handler:        a.handler,
-			Authenticator:  gateway.NewWKProtoAuthenticator(authOptions),
+		options := gateway.Options{
+			Handler:        a.gatewayHandler(),
+			Authenticator:  a.newGatewayAuthenticator(nodeID),
 			Listeners:      a.cfg.Gateway.Listeners,
 			DefaultSession: a.cfg.Gateway.Session,
 			Runtime: func() gateway.RuntimeOptions {
@@ -1278,11 +1378,60 @@ func (a *App) wireGateway(nodeID uint64) error {
 			Transport: a.cfg.Gateway.Transport,
 			Observer:  a.gatewayObserver(),
 			Logger:    a.logger.Named("gateway"),
-		})
+		}
+		if a.mqtt != nil {
+			options.PacketHandler = a.mqtt
+			options.PacketProtocols = append(options.PacketProtocols, newMQTTProtocol(mqttwire.Limits{MaxPacketBytes: int(a.cfg.MQTT.MaxPacketBytes)}))
+		}
+		gw, err := gateway.New(options)
 		if err != nil {
 			return err
 		}
 		a.gateway = gw
 	}
 	return nil
+}
+
+func (a *App) newGatewayAuthenticator(nodeID uint64) gateway.Authenticator {
+	opts := gateway.WKProtoAuthOptions{
+		TokenAuthOn:             a.cfg.Gateway.TokenAuthOn,
+		RequiredProtocolVersion: frame.LatestVersion,
+		NodeID:                  nodeID,
+	}
+	if a.users != nil {
+		opts.VerifyToken = func(ctx context.Context, uid string, deviceFlag frame.DeviceFlag, token string) (frame.DeviceLevel, error) {
+			level, err := a.users.VerifyToken(ctx, uid, protocolmeta.DeviceFlag(deviceFlag), token)
+			return frame.DeviceLevel(level), err
+		}
+	}
+	if a.cfg.Gateway.TokenAuthEnabled && a.gatewayTokenMetadata != nil && (!a.cfg.Gateway.tokenAuthOnSet || a.cfg.Gateway.TokenAuthOn) {
+		opts.TokenAuthOn = true
+		opts.VerifyCredential = newGatewayCredentialVerifier(a.gatewayTokenMetadata, a.cfg.Gateway.TokenAuthTimeout)
+	}
+	return gateway.NewWKProtoAuthenticator(opts)
+}
+
+// mqttStorageObserver keeps product wiring independent of the storage adapter.
+type mqttStorageObserver interface {
+	ObserveMQTTStorage(used, granted, nodeLimit, clusterLimit uint64)
+	ObserveMQTTStorageEvent(string)
+}
+type combinedMQTTStorageObservers struct{ first, second mqttStorageObserver }
+
+func (o combinedMQTTStorageObservers) ObserveMQTTStorage(used, granted, nodeLimit, clusterLimit uint64) {
+	o.first.ObserveMQTTStorage(used, granted, nodeLimit, clusterLimit)
+	o.second.ObserveMQTTStorage(used, granted, nodeLimit, clusterLimit)
+}
+func (o combinedMQTTStorageObservers) ObserveMQTTStorageEvent(event string) {
+	o.first.ObserveMQTTStorageEvent(event)
+	o.second.ObserveMQTTStorageEvent(event)
+}
+func combineMQTTStorageObservers(first, second mqttStorageObserver) mqttStorageObserver {
+	if first == nil {
+		return second
+	}
+	if second == nil {
+		return first
+	}
+	return combinedMQTTStorageObservers{first, second}
 }

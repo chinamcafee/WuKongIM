@@ -15,6 +15,7 @@ import (
 
 // Compile-time interface assertion.
 var _ multiraft.BatchStateMachine = (*stateMachine)(nil)
+var _ multiraft.DurableAppliedStateMachine = (*stateMachine)(nil)
 
 type migrationRuntimePhase uint8
 
@@ -180,6 +181,7 @@ func (m *stateMachine) ApplyBatch(ctx context.Context, cmds []multiraft.Command)
 	appliedCommands := make([]command, len(cmds))
 	var pendingDeltaKeys []deltaReplayKey
 	var pendingForwardDeltas []pendingForwardDelta
+	var migrationMaintenance bool
 	pendingDeltaRecords := make(map[metadb.AppliedHashSlotDelta]struct{})
 	pendingMigrationStates := make(map[uint16]metadb.HashSlotMigrationState)
 commandLoop:
@@ -199,6 +201,7 @@ commandLoop:
 		if err != nil {
 			return nil, err
 		}
+		migrationMaintenance = migrationMaintenance || isMigrationMaintenanceCommand(decoded)
 		applyHashSlots := commandApplyHashSlots(decoded, hashSlot)
 		if _, ok := decoded.(scopedHashSlotCommand); ok {
 			if err := m.validateCommandHashSlots(applyHashSlots); err != nil {
@@ -263,8 +266,11 @@ commandLoop:
 		}
 		if err := decoded.apply(wb, hashSlot); err != nil {
 			if isStaleMetaResult(decoded, err) {
-				results[i] = []byte(ApplyResultStaleMeta)
-				continue
+				// Staging may still remember a task that an earlier command in
+				// this batch completes. Resolve against the committed prefix,
+				// discarding any operations the rejected command already staged.
+				_ = wb.Close()
+				return m.applySplitBatchAfterStaleResult(ctx, cmds)
 			}
 			return nil, fmt.Errorf("%w: apply command slot=%d hash_slot=%d command_type=%d", err, m.slot, hashSlot, commandTypeForDiagnostics(cmd.Data))
 		}
@@ -283,16 +289,30 @@ commandLoop:
 		appliedCommands[i] = decoded
 		results[i] = commandApplyResult(decoded)
 	}
+	if len(cmds) > 0 && cmds[len(cmds)-1].Index > 0 {
+		last := cmds[len(cmds)-1]
+		var err error
+		if migrationMaintenance {
+			// Legacy migration commands can address non-owned partitions.
+			// Keep global invalidation even if the final entry is ordinary.
+			err = wb.SetSlotAppliedIndex(m.slot, last.Index)
+		} else {
+			err = m.stageRecoveryCheckpoint(wb, last)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	started := time.Now()
 	err := wb.Commit()
 	multiraft.ObserveProposalStage(ctx, "meta_create_slot_fsm_commit", err, time.Since(started))
 	if err != nil {
 		if isStaleMetaCommitError(err) {
-			if len(cmds) == 1 {
-				return [][]byte{[]byte(ApplyResultStaleMeta)}, nil
-			}
-			return m.applyCommandsIndividuallyAfterStaleCommit(ctx, cmds)
+			// Logical rejection occurs before physical commit. Release its staged
+			// operations before rebuilding smaller, ordered batches.
+			_ = wb.Close()
+			return m.applySplitBatchAfterStaleResult(ctx, cmds)
 		}
 		return nil, err
 	}
@@ -300,10 +320,54 @@ commandLoop:
 	m.forwardCommittedDeltas(ctx, pendingForwardDeltas)
 	for i, decoded := range appliedCommands {
 		if decoded != nil {
+			// Conditional mutation outcomes are resolved while the batch commits.
 			results[i] = commandApplyResult(decoded)
+			// Observe a real durable resolution, including a definite conflict,
+			// separately from a caller that already abandoned its proposal future.
+			if will, ok := decoded.(*mqttWillCASCmd); ok && will.payload.Will.Stage == metadb.MQTTWillExecuting && will.payload.Will.DispatchStage == metadb.MQTTWillDispatchStarted && will.payload.Will.ExecutionGeneration == 1 {
+				// gofail: var wkMQTTWillStartedFSMComplete bool
+				// _ = wkMQTTWillStartedFSMComplete
+			}
+			// Count durable second-generation resolution, including conflict,
+			// without interpreting the abandoned caller as a dispatch grant.
+			if will, ok := decoded.(*mqttWillCASCmd); ok && will.payload.Will.Stage == metadb.MQTTWillExecuting && will.payload.Will.DispatchStage == metadb.MQTTWillDispatchStarted && will.payload.Will.ExecutionGeneration == 2 {
+				completeMatch := ""
+				// gofail: var wkMQTTWillSecondCompleteMatch string
+				// completeMatch = wkMQTTWillSecondCompleteMatch
+				if will.payload.Will.Key.ClientID == completeMatch {
+					// gofail: var wkMQTTWillSecondFSMComplete bool
+					// _ = wkMQTTWillSecondFSMComplete
+				}
+			}
 		}
 	}
 	return results, nil
+}
+
+// commitStaleAppliedIndex durably records a commit-time conditional no-op so
+// recovery does not replay an already-resolved Raft entry.
+func (m *stateMachine) commitStaleAppliedIndex(ctx context.Context, cmd multiraft.Command) error {
+	if cmd.Index == 0 {
+		return nil
+	}
+	wb := m.db.NewWriteBatch()
+	defer wb.Close()
+	if err := m.stageRecoveryCheckpoint(wb, cmd); err != nil {
+		return err
+	}
+	started := time.Now()
+	err := wb.Commit()
+	multiraft.ObserveProposalStage(ctx, "meta_create_slot_fsm_stale_watermark_commit", err, time.Since(started))
+	return err
+}
+
+// DurableAppliedIndex returns the last command index committed atomically with
+// Slot FSM state.
+func (m *stateMachine) DurableAppliedIndex(ctx context.Context) (uint64, error) {
+	if m == nil || m.db == nil {
+		return 0, metadb.ErrInvalidArgument
+	}
+	return m.db.SlotAppliedIndex(ctx, m.slot)
 }
 
 func commandApplyResult(decoded command) []byte {
@@ -337,20 +401,28 @@ func (m *stateMachine) validateCommandHashSlots(hashSlots []uint16) error {
 	return nil
 }
 
-func (m *stateMachine) applyCommandsIndividuallyAfterStaleCommit(ctx context.Context, cmds []multiraft.Command) ([][]byte, error) {
-	results := make([][]byte, len(cmds))
-	for i, cmd := range cmds {
-		result, err := m.ApplyBatch(ctx, []multiraft.Command{cmd})
-		if err != nil {
-			if isStaleMetaCommitError(err) {
-				results[i] = []byte(ApplyResultStaleMeta)
-				continue
-			}
+// applySplitBatchAfterStaleResult isolates conditional conflicts while keeping
+// healthy replay ranges batched. The left half must finish durably before the
+// right half observes its state; never parallelize these Raft-ordered writes.
+// Only logical rejections before physical commit enter this path. Single-entry
+// conflicts retain their durable no-op watermark after all staged writes close.
+func (m *stateMachine) applySplitBatchAfterStaleResult(ctx context.Context, cmds []multiraft.Command) ([][]byte, error) {
+	if len(cmds) == 1 {
+		if err := m.commitStaleAppliedIndex(ctx, cmds[0]); err != nil {
 			return nil, err
 		}
-		results[i] = result[0]
+		return [][]byte{[]byte(ApplyResultStaleMeta)}, nil
 	}
-	return results, nil
+	middle := len(cmds) / 2
+	left, err := m.ApplyBatch(ctx, cmds[:middle])
+	if err != nil {
+		return nil, err
+	}
+	right, err := m.ApplyBatch(ctx, cmds[middle:])
+	if err != nil {
+		return nil, err
+	}
+	return append(left, right...), nil
 }
 
 func isStaleMetaResult(cmd command, err error) bool {
@@ -696,14 +768,41 @@ func (m *stateMachine) forwardCommittedDeltas(ctx context.Context, pending []pen
 	}
 }
 
+// RestoreStartupSnapshot installs verified data before the Slot becomes
+// discoverable. Runtime snapshot replacement retains the atomic Restore path.
+func (m *stateMachine) RestoreStartupSnapshot(ctx context.Context, snap multiraft.Snapshot, reader io.ReadSeeker, size int64, report func(multiraft.RecoveryProgress)) error {
+	if !m.recoveryIsolated() {
+		return metadb.ErrInvalidArgument
+	}
+	m.ownershipMu.RLock()
+	hashSlots := m.runtimeSnapshotHashSlotsLocked()
+	m.ownershipMu.RUnlock()
+	return m.db.MetaDB().RestoreStartupSnapshot(ctx, m.slot, snap.Index, hashSlots, reader, size, func(p metadb.SnapshotRestoreProgress) {
+		if report != nil {
+			report(multiraft.RecoveryProgress{Stage: p.Stage, Bytes: p.Bytes, TotalBytes: p.TotalBytes, Entries: p.Entries, TotalEntries: p.TotalEntries})
+		}
+	})
+}
+
 func (m *stateMachine) Restore(ctx context.Context, snap multiraft.Snapshot) error {
 	m.ownershipMu.RLock()
 	hashSlots := m.runtimeSnapshotHashSlotsLocked()
 	m.ownershipMu.RUnlock()
-	return m.db.ImportHashSlotSnapshot(ctx, metadb.SlotSnapshot{
+	if err := m.db.ImportHashSlotSnapshot(ctx, metadb.SlotSnapshot{
 		HashSlots: hashSlots,
-		Data:      append([]byte(nil), snap.Data...),
-	})
+		Data:      snap.Data,
+	}); err != nil {
+		return err
+	}
+	if snap.Index == 0 {
+		return nil
+	}
+	wb := m.db.NewWriteBatch()
+	defer wb.Close()
+	if err := wb.SetSlotAppliedIndex(m.slot, snap.Index); err != nil {
+		return err
+	}
+	return wb.Commit()
 }
 
 func (m *stateMachine) Snapshot(ctx context.Context) (multiraft.Snapshot, error) {

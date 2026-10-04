@@ -1,0 +1,22 @@
+import base64,json,urllib.request,pathlib
+root=pathlib.Path('/tmp/wukongim-migration-original-process-source')
+trace=[]
+def call(path,data=None):
+    req=urllib.request.Request('http://127.0.0.1:56187'+path,data=None if data is None else json.dumps(data,ensure_ascii=False).encode(),headers={'Content-Type':'application/json'})
+    with urllib.request.urlopen(req,timeout=15) as r: result=json.load(r)
+    trace.append({'path':path,'request':data,'response':result})
+    (root/'api-baseline.json').write_text(json.dumps(trace,ensure_ascii=False,indent=2))
+    print(path,json.dumps(result,ensure_ascii=False))
+    return result
+for uid in ['migrationalice','migrationbob']:
+    call('/user/token',{'uid':uid,'token':'synthetic-'+uid,'device_flag':1,'device_level':1})
+call('/channel',{'channel_id':'migrationgroup','channel_type':2,'subscribers':['migrationalice','migrationbob']})
+call('/channel/blacklist_add',{'channel_id':'migrationgroup','channel_type':2,'uids':['migrationdenied']})
+call('/channel/whitelist_add',{'channel_id':'migrationgroup','channel_type':2,'uids':['migrationalice','migrationbob']})
+call('/user/systemuids_add',{'uids':['migrationrobot']})
+for seq in range(3):
+    call('/message/send',{'header':{'red_dot':1},'from_uid':'migrationalice','channel_id':'migrationgroup','channel_type':2,'client_msg_no':'original-v2-'+str(seq),'payload':base64.b64encode(('消息'+str(seq)).encode()).decode(),'expire':3600})
+call('/channel/messagesync',{'login_uid':'migrationbob','channel_id':'migrationgroup','channel_type':2,'start_message_seq':0,'end_message_seq':0,'limit':100,'pull_mode':0})
+call('/conversation/sync',{'uid':'migrationbob','msg_count':10})
+call('/channel/whitelist?channel_id=migrationgroup&channel_type=2')
+call('/user/systemuids')

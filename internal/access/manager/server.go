@@ -141,6 +141,8 @@ type Management interface {
 	MutateBusinessChannelMembers(ctx context.Context, req managementusecase.MutateBusinessChannelMembersRequest) (managementusecase.MutateBusinessChannelMembersResponse, error)
 	// ListChannelRuntimeMeta returns manager-facing channel runtime metadata rows.
 	ListChannelRuntimeMeta(ctx context.Context, req managementusecase.ListChannelRuntimeMetaRequest) (managementusecase.ListChannelRuntimeMetaResponse, error)
+	// GetChannelRuntimeMeta returns one exact authoritative runtime metadata row.
+	GetChannelRuntimeMeta(ctx context.Context, channelID string, channelType int64) (managementusecase.ChannelRuntimeMeta, error)
 	// RequestChannelLeaderTransfer submits a manual Channel leader transfer.
 	RequestChannelLeaderTransfer(ctx context.Context, req managementusecase.LeaderTransferInput) (managementusecase.ChannelMigrationSummary, error)
 	// RequestChannelReplicaReplace submits a manual Channel replica replacement.
@@ -160,7 +162,7 @@ type Management interface {
 	// AdvanceMessageRetention advances one channel's message retention boundary.
 	AdvanceMessageRetention(ctx context.Context, req managementusecase.AdvanceMessageRetentionRequest) (managementusecase.AdvanceMessageRetentionResponse, error)
 	// ListConnections returns manager-facing local connection DTOs.
-	ListConnections(ctx context.Context, req managementusecase.ListConnectionsRequest) ([]managementusecase.Connection, error)
+	ListConnections(ctx context.Context, req managementusecase.ListConnectionsRequest) (managementusecase.ListConnectionsResponse, error)
 	// GetConnection returns one manager-facing local connection detail DTO.
 	GetConnection(ctx context.Context, req managementusecase.GetConnectionRequest) (managementusecase.ConnectionDetail, error)
 	// ListNodePlugins returns one node's local plugin inventory.
@@ -427,6 +429,7 @@ func (s *Server) registerRoutes() {
 		s.engine.Any("/mcp", gin.WrapH(s.opsMCPHandler))
 	}
 	if s.auth.enabled() {
+		s.engine.GET("/manager/login", s.handleLoginInfo)
 		s.engine.POST("/manager/login", s.handleLogin)
 	}
 	permissions := s.engine.Group("/manager")
@@ -461,7 +464,9 @@ func (s *Server) registerRoutes() {
 		nodes.Use(s.requirePermission("cluster.node", "r"))
 	}
 	nodes.GET("/nodes", s.handleNodes)
+	nodes.GET("/nodes/:node_id", s.handleNode)
 	nodes.GET("/nodes/:node_id/config", s.handleNodeConfig)
+	nodes.GET("/nodes/:node_id/config/toml", s.handleNodeConfigDocument)
 	nodes.GET("/runtime/workqueues", s.handleRuntimeWorkqueues)
 	nodes.GET("/realtime-monitor", s.handleRealtimeMonitor)
 

@@ -1,0 +1,126 @@
+---
+title: Android Quickstart
+description: Install WuKongIMAndroidSDK 1.5.5, connect a user, and exchange the first online text message.
+---
+
+This page has one goal: exchange a text message between two online Android clients.
+
+## Prerequisites
+
+- Your application server returns a `uid`, `token`, gateway endpoint, and port for both `alice` and `bob`.
+- You have two separate app processes or devices.
+- Your Android project can access JitPack.
+
+## 1. Install
+
+Add JitPack to dependency repositories:
+
+```groovy
+maven { url 'https://jitpack.io' }
+```
+
+Pin the SDK in the app module:
+
+```groovy
+dependencies {
+    implementation 'com.github.WuKongIM:WuKongIMAndroidSDK:1.5.5'
+}
+```
+
+## 2. Initialize and supply an endpoint
+
+After application login, initialize with an Application Context:
+
+```java
+WKIM im = WKIM.getInstance();
+im.setDebug(false);
+im.init(getApplicationContext(), uid, token);
+
+im.getConnectionManager().addOnGetIpAndPortListener(callback ->
+    callback.onGetSocketIpAndPort("im.example.com", 5100)
+);
+```
+
+If an API assigns the gateway, request it asynchronously inside this listener and invoke `onGetSocketIpAndPort` on success.
+
+## 3. Observe connection and messages
+
+```java
+private static final String LISTENER_KEY = "chat-home";
+private boolean syncInProgress = false;
+
+im.getConnectionManager().addOnConnectionStatusListener(
+    LISTENER_KEY,
+    (status, reason) -> {
+        if (status == WKConnectStatus.syncMsg) {
+            syncInProgress = true;
+            Log.d("WKIM", "restoring messages");
+        } else if (status == WKConnectStatus.syncCompleted) {
+            Log.d("WKIM", "message restore complete");
+        } else if (status == WKConnectStatus.success && syncInProgress) {
+            syncInProgress = false;
+            Log.d("WKIM", "connected");
+        } else if (status == WKConnectStatus.kicked ||
+                   status == WKConnectStatus.noNetwork) {
+            syncInProgress = false;
+            Log.e("WKIM", "connection interrupted: " + reason);
+        } else if (status == WKConnectStatus.fail) {
+            syncInProgress = false;
+            Log.e("WKIM", "connect failed: " + reason);
+        }
+    }
+);
+
+im.getMsgManager().addOnNewMsgListener(LISTENER_KEY, messages -> {
+    for (WKMsg message : messages) {
+        if (message.baseContentMsgModel instanceof WKTextContent) {
+            WKTextContent text = (WKTextContent) message.baseContentMsgModel;
+            Log.d("WKIM", message.fromUID + ": " + text.content);
+        }
+    }
+});
+
+im.getMsgManager().addOnSendMsgAckListener(LISTENER_KEY, message -> {
+    if (message.status == WKSendMsgResult.send_success) {
+        Log.d("WKIM", "message sent: " + message.clientMsgNO);
+    } else {
+        Log.e("WKIM", "message failed: " + message.clientMsgNO);
+    }
+});
+```
+
+Give every observer a stable, unique key and remove it with the same key when its screen is destroyed.
+
+## 4. Connect and send
+
+```java
+im.getConnectionManager().connection();
+```
+
+Version `1.5.5` reports `success` once before synchronization starts and again
+after synchronization finishes. Send only after the `success` that follows
+`syncMsg` and `syncCompleted`:
+
+```java
+WKTextContent content = new WKTextContent("Hello, Bob");
+WKChannel channel = new WKChannel("bob", WKChannelType.PERSONAL);
+im.getMsgManager().send(content, channel);
+```
+
+## Expected result
+
+1. Alice and Bob both report the final successful connection after synchronization.
+2. Alice's send-state observer receives `send_success`.
+3. Bob's new-message observer prints “Hello, Bob”.
+
+If connection fails, verify the endpoint, client port, and that the token belongs to this UID. If sending produces no result, make sure it happens after connection and another screen has not replaced the same listener key.
+
+Clean up when the screen ends:
+
+```java
+im.getConnectionManager().removeOnConnectionStatusListener(LISTENER_KEY);
+im.getMsgManager().removeNewMsgListener(LISTENER_KEY);
+im.getMsgManager().removeSendMsgAckListener(LISTENER_KEY);
+```
+
+Continue with [Connection](/en/sdk/android/connection) and [Messages](/en/sdk/android/messages).

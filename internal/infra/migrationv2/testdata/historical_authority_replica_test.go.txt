@@ -1,0 +1,18 @@
+package replica
+import ("testing"; "github.com/stretchr/testify/require")
+func TestMigrationHistoricalSelfLeaderMarker(t *testing.T) {
+ for _, target := range []uint64{1001,1002} {
+  r:=New(1001,WithAutoRoleSwith(true))
+  r.appendLog(Log{Index:1,Term:1,Data:[]byte("historical")})
+  r.Ready()
+  require.NoError(t,r.Step(Message{MsgType:MsgInitResp,Config:Config{Role:RoleLeader,Term:1,Leader:1001,Replicas:[]uint64{1001,1002,1003},MigrateFrom:1001,MigrateTo:target,Version:1732364897806218890}}))
+  for _, n:=range []uint64{1002,1003} {require.NoError(t,r.Step(Message{MsgType:MsgSyncReq,Index:2,From:n}))}
+  rd:=r.Ready()
+  require.Equal(t,target==1002,hasMsg(rd.Messages,MsgFollowerToLeader))
+  require.False(t,hasMsg(rd.Messages,MsgLearnerToLeader))
+  require.False(t,hasMsg(rd.Messages,MsgLearnerToFollower))
+  require.Equal(t,uint64(1001),r.leader)
+  require.Equal(t,uint64(1732364897806218890),r.cfg.Version)
+  if target==1001 {require.False(t,r.stopPropose);require.NoError(t,r.Propose([]byte("still-writable")))}
+ }
+}

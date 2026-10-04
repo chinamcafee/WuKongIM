@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/dberrors"
+	"github.com/WuKongIM/WuKongIM/pkg/db/internal/engine"
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/schema"
 )
 
@@ -84,7 +85,12 @@ var DeviceTable = deviceTable.Schema()
 
 // UpsertDevice stores a device regardless of prior existence.
 func (s *Shard) UpsertDevice(ctx context.Context, device Device) error {
-	return deviceTable.Upsert(ctx, s, device)
+	b := s.db.NewBatch()
+	defer b.Close()
+	if err := b.UpsertDevice(s.hashSlot, device); err != nil {
+		return err
+	}
+	return b.Commit(ctx)
 }
 
 // GetDevice returns one device by UID and device flag.
@@ -95,7 +101,14 @@ func (s *Shard) GetDevice(ctx context.Context, uid string, deviceFlag int64) (De
 	return deviceTable.Get(ctx, s, KeyParts{String(uid), Int64Ordered(deviceFlag)})
 }
 
+// Historical rows may be imported, but never authorize Link-U credential authentication.
 func validateDevice(device Device) error {
+	if device.CredentialVersion == 0 && device.LoginSessionID == "" && device.OperationID == "" && device.OperationDigest == "" && device.CredentialStatus == "" && device.ExpiresAtUnixMS == 0 && device.UpdatedAtUnixMS == 0 && device.TerminationCause == "" {
+		return validateKeyString(device.UID)
+	}
+	return validateVersionedDevice(device)
+}
+func validateVersionedDevice(device Device) error {
 	if err := validateKeyString(device.UID); err != nil {
 		return err
 	}
@@ -120,6 +133,11 @@ func validateDevice(device Device) error {
 }
 
 func encodeDeviceValue(device Device) []byte {
+	if device.CredentialVersion == 0 {
+		// V2 imports keep the original token/level layout. Such rows never satisfy
+		// versioned gateway authentication or bypass the credential CAS fence.
+		return appendValueInt64(appendValueString(nil, device.Token), device.DeviceLevel)
+	}
 	value := appendValueString(nil, deviceValueCodecMarker)
 	value = appendValueString(value, device.Token)
 	value = appendValueInt64(value, device.DeviceLevel)
@@ -213,4 +231,38 @@ func sameDeviceCredentialMutation(left, right Device) bool {
 		left.OperationID == right.OperationID && left.OperationDigest == right.OperationDigest &&
 		left.CredentialStatus == right.CredentialStatus &&
 		left.LoginSessionID == right.LoginSessionID
+}
+
+// UpsertDevice stages an import/upsert without allowing a credential downgrade.
+func (b *Batch) UpsertDevice(hashSlot HashSlot, device Device) error {
+	if err := b.ensureOpen(); err != nil {
+		return err
+	}
+	if err := validateDevice(device); err != nil {
+		return err
+	}
+	pk := KeyParts{String(device.UID), Int64Ordered(device.DeviceFlag)}
+	key, err := deviceTable.primaryRowKey(hashSlot, pk)
+	if err != nil {
+		return err
+	}
+	value, err := deviceTable.encodeValue(key, device)
+	if err != nil {
+		return err
+	}
+	b.addOp(hashSlot, func(ctx context.Context, state *batchCommitState, batch *engine.Batch) error {
+		current, exists, err := deviceTable.loadBatchRow(state, hashSlot, pk, key)
+		if err != nil {
+			return err
+		}
+		if exists && current.CredentialVersion > device.CredentialVersion {
+			return dberrors.ErrInvalidArgument
+		}
+		if err := batch.Set(key, value); err != nil {
+			return err
+		}
+		state.tableRows[string(key)] = tableRowOverlay{value: append([]byte(nil), value...), exists: true}
+		return nil
+	})
+	return nil
 }

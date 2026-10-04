@@ -6,6 +6,7 @@ import (
 	"time"
 
 	ch "github.com/WuKongIM/WuKongIM/pkg/channel"
+	"github.com/WuKongIM/WuKongIM/pkg/channel/replication"
 	"github.com/WuKongIM/WuKongIM/pkg/channel/store"
 	"github.com/WuKongIM/WuKongIM/pkg/channel/transport"
 	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
@@ -33,6 +34,22 @@ const (
 	TaskColdMetaResolve
 	// TaskColdStoreLoad opens storage only after cold-channel authority is proven.
 	TaskColdStoreLoad
+	// TaskQuorumInstall recovers and installs one leader authority before admission opens.
+	TaskQuorumInstall
+	// TaskQuorumCommit executes one exact durable quorum proposal.
+	TaskQuorumCommit
+	// TaskStoreMQTTSource persists admitted HW and confirms source activation.
+	TaskStoreMQTTSource
+	// TaskStoreMQTTReplay prepares bounded shared content below captured HW.
+	TaskStoreMQTTReplay
+	// TaskQuorumMQTTAnchor admits one control through the durable sequencer.
+	TaskQuorumMQTTAnchor
+	// TaskStoreMQTTPlan checkpoints captured HW and reads one accepted-prefix view.
+	TaskStoreMQTTPlan
+	// TaskQuorumMQTTRetirement admits one whole-anchor retirement through quorum.
+	TaskQuorumMQTTRetirement
+	// TaskStoreWillReceipt checkpoints captured HW before a retained publication read.
+	TaskStoreWillReceipt
 )
 
 // Task describes blocking work submitted to a bounded pool.
@@ -49,7 +66,13 @@ type Task struct {
 	StoreLookupMessage *StoreLookupMessageTask
 	StoreApply         *StoreApplyTask
 	// StoreCheckpoint persists a checkpoint before runtime eviction.
-	StoreCheckpoint *StoreCheckpointTask
+	StoreCheckpoint      *StoreCheckpointTask
+	StoreMQTTSource      *StoreMQTTSourceTask
+	StoreMQTTReplay      *StoreMQTTReplayTask
+	QuorumMQTTAnchor     *QuorumMQTTAnchorTask
+	QuorumMQTTRetirement *QuorumMQTTRetirementTask
+	StoreMQTTPlan        *StoreMQTTPlanTask
+	StoreWillReceipt     *StoreWillReceiptTask
 	// StoreClose releases a store handle after the reactor has detached it.
 	StoreClose *StoreCloseTask
 	// StoreRetention adopts a logical retention boundary and optionally trims a safe prefix.
@@ -62,6 +85,10 @@ type Task struct {
 	RPCPullHint *RPCPullHintTask
 	// MetaResolve loads authoritative channel metadata without occupying store or RPC workers.
 	MetaResolve *MetaResolveTask
+	// QuorumInstall carries one authoritative leader generation into the durable log owner.
+	QuorumInstall *QuorumInstallTask
+	// QuorumCommit carries one immutable proposal into the durable log owner.
+	QuorumCommit *QuorumCommitTask
 
 	RunFunc func(context.Context) Result
 }
@@ -77,11 +104,21 @@ type MetaResolveTask struct {
 	ChannelID ch.ChannelID
 }
 
+// QuorumInstallTask asks the durable log to recover and install authority.
+type QuorumInstallTask struct {
+	Authority replication.Authority
+}
+
+// QuorumCommitTask asks the durable log to commit one immutable proposal.
+type QuorumCommitTask struct {
+	Proposal replication.Proposal
+}
+
 // StoreAppendTask asks a worker to durably append leader records.
 type StoreAppendTask struct {
-	ChannelID ch.ChannelID
-	Records   []ch.Record
-	Sync      bool
+	ChannelID                 ch.ChannelID
+	Records                   []ch.Record
+	ServerAllocatedMessageIDs bool
 }
 
 // StoreReadLogTask asks a worker to read raw records for replication.
@@ -205,6 +242,14 @@ func (t Task) Run(ctx context.Context, deps Deps) Result {
 		res = runStoreApply(ctx, deps, t)
 	case TaskStoreCheckpoint:
 		res = runStoreCheckpoint(ctx, deps, t)
+	case TaskStoreMQTTSource:
+		res = runStoreMQTTSource(ctx, deps, t)
+	case TaskStoreMQTTReplay:
+		res = runStoreMQTTReplay(ctx, deps, t)
+	case TaskStoreMQTTPlan:
+		res = runStoreMQTTPlan(ctx, deps, t)
+	case TaskStoreWillReceipt:
+		res = runStoreWillReceipt(ctx, deps, t)
 	case TaskStoreClose:
 		res = runStoreClose(ctx, deps, t)
 	case TaskStoreRetention:
@@ -219,10 +264,34 @@ func (t Task) Run(ctx context.Context, deps Deps) Result {
 		res = runRPCPullHint(ctx, deps, t)
 	case TaskMetaResolve, TaskColdMetaResolve:
 		res = runMetaResolve(ctx, deps, t)
+	case TaskQuorumInstall:
+		res = runQuorumInstall(ctx, deps, t)
+	case TaskQuorumCommit:
+		res = runQuorumCommit(ctx, deps, t)
+	case TaskQuorumMQTTAnchor:
+		res = runQuorumMQTTAnchor(ctx, deps, t)
+	case TaskQuorumMQTTRetirement:
+		res = runQuorumMQTTRetirement(ctx, deps, t)
 	default:
 		res = invalidResult(t)
 	}
 	return normalizeContextErr(ctx, res)
+}
+
+func runQuorumInstall(ctx context.Context, deps Deps, t Task) Result {
+	if t.QuorumInstall == nil || deps.QuorumLog == nil {
+		return invalidResult(t)
+	}
+	installed, err := deps.QuorumLog.Install(ctx, t.QuorumInstall.Authority)
+	return Result{Kind: t.Kind, Fence: t.Fence, Err: err, QuorumInstall: &QuorumInstallResult{Installed: installed}}
+}
+
+func runQuorumCommit(ctx context.Context, deps Deps, t Task) Result {
+	if t.QuorumCommit == nil || deps.QuorumLog == nil {
+		return invalidResult(t)
+	}
+	receipt, err := deps.QuorumLog.Commit(ctx, t.QuorumCommit.Proposal)
+	return Result{Kind: t.Kind, Fence: t.Fence, Err: err, QuorumCommit: &QuorumCommitResult{Receipt: receipt}}
 }
 
 func taskContext(parent context.Context, task context.Context) (context.Context, context.CancelFunc) {
@@ -345,7 +414,19 @@ func runStoreLoad(ctx context.Context, deps Deps, t Task) Result {
 			_ = cs.Close()
 		}
 	}()
-	initial, err := cs.Load(ctx)
+	var initial store.InitialState
+	if deps.QuorumLog != nil {
+		// Quorum writes can be durable before their cached LEO is published.
+		// Cold replicas must load one append/checkpoint-consistent frontier.
+		loader, ok := cs.(store.ExactStateLoader)
+		if !ok {
+			return invalidResult(t)
+		}
+		exact, loadErr := loader.LoadExactState(ctx)
+		initial, err = exact.InitialState, loadErr
+	} else {
+		initial, err = cs.Load(ctx)
+	}
 	if err != nil {
 		return Result{Kind: t.Kind, Fence: t.Fence, Err: err}
 	}
@@ -371,8 +452,22 @@ func runStoreAppend(ctx context.Context, deps Deps, t Task) Result {
 		return invalidResult(t)
 	}
 	defer func() { _ = cs.Close() }()
-	stored, err := cs.AppendLeader(ctx, store.AppendLeaderRequest{Records: payload.Records, Sync: payload.Sync})
-	return Result{Kind: t.Kind, Fence: t.Fence, Err: err, StoreAppend: &StoreAppendResult{BaseOffset: stored.BaseOffset, LastOffset: stored.LastOffset}}
+	stored, err := cs.AppendLeader(ctx, store.AppendLeaderRequest{Records: payload.Records, ServerAllocatedMessageIDs: payload.ServerAllocatedMessageIDs})
+	err = appendResultError(stored.Outcome, err)
+	return Result{Kind: t.Kind, Fence: t.Fence, Err: err, StoreAppend: &StoreAppendResult{BaseOffset: stored.BaseOffset, LastOffset: stored.LastOffset, Outcome: stored.Outcome}}
+}
+
+func appendResultError(outcome store.AppendOutcome, err error) error {
+	if !outcome.Valid() {
+		return ch.ErrInvalidConfig
+	}
+	if outcome.Durable() {
+		return nil
+	}
+	if err == nil {
+		return ch.ErrInvalidConfig
+	}
+	return err
 }
 
 func runStoreReadLog(ctx context.Context, deps Deps, t Task) Result {

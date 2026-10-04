@@ -14,10 +14,12 @@ type Registry struct {
 }
 
 type registryShard struct {
-	mu         sync.RWMutex
-	bySession  map[uint64]LocalSession
-	dirtyIDs   map[uint64]struct{}
-	dirtyOrder []uint64
+	mu        sync.RWMutex
+	bySession map[uint64]LocalSession
+	// activeByUID supports bounded reconstruction without scanning every session.
+	activeByUID map[string]map[uint64]struct{}
+	dirtyIDs    map[uint64]struct{}
+	dirtyOrder  []uint64
 }
 
 // NewRegistry creates an owner-local online registry.
@@ -31,6 +33,7 @@ func NewRegistry(opts RegistryOptions) *Registry {
 	}
 	for i := range reg.shards {
 		reg.shards[i].bySession = make(map[uint64]LocalSession)
+		reg.shards[i].activeByUID = make(map[string]map[uint64]struct{})
 		reg.shards[i].dirtyIDs = make(map[uint64]struct{})
 	}
 	return reg
@@ -52,6 +55,9 @@ func (r *Registry) RegisterPending(session LocalSession) error {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
+	if old, ok := shard.bySession[route.SessionID]; ok {
+		shard.removeActiveUID(old)
+	}
 	delete(shard.dirtyIDs, route.SessionID)
 	shard.bySession[route.SessionID] = session
 	return nil
@@ -71,6 +77,10 @@ func (r *Registry) MarkActive(sessionID uint64) error {
 		return nil
 	}
 	session.State = RouteStateActive
+	if shard.activeByUID[session.Route.UID] == nil {
+		shard.activeByUID[session.Route.UID] = make(map[uint64]struct{})
+	}
+	shard.activeByUID[session.Route.UID][sessionID] = struct{}{}
 	shard.bySession[sessionID] = session
 	return nil
 }
@@ -85,6 +95,7 @@ func (r *Registry) MarkClosingAndUnregister(sessionID uint64) (OwnerRoute, bool)
 	if !ok {
 		return OwnerRoute{}, false
 	}
+	shard.removeActiveUID(session)
 	delete(shard.bySession, sessionID)
 	delete(shard.dirtyIDs, sessionID)
 	session.State = RouteStateClosing
@@ -112,6 +123,31 @@ func (r *Registry) LocalSession(sessionID uint64) (LocalSession, bool) {
 
 	session, ok := shard.bySession[sessionID]
 	return session, ok
+}
+
+// RangeLocalSessions visits copies of owner-local session records without
+// allocating an inventory-sized slice. Returning false stops the traversal.
+// The visitor must not mutate this Registry because one shard read lock is held
+// while its records are visited.
+func (r *Registry) RangeLocalSessions(visit func(LocalSession) bool) {
+	if r == nil || visit == nil {
+		return
+	}
+	for i := range r.shards {
+		shard := &r.shards[i]
+		shard.mu.RLock()
+		keepGoing := true
+		for _, session := range shard.bySession {
+			if !visit(session) {
+				keepGoing = false
+				break
+			}
+		}
+		shard.mu.RUnlock()
+		if !keepGoing {
+			return
+		}
+	}
 }
 
 // LocalSessionsByUID returns copies of local sessions currently indexed for uid.
@@ -274,4 +310,22 @@ func sameRoute(a, b OwnerRoute) bool {
 		a.OwnerNodeID == b.OwnerNodeID &&
 		a.OwnerBootID == b.OwnerBootID &&
 		a.OwnerSeq == b.OwnerSeq
+}
+
+// EnableMessageUpdates records capability only for the authenticated active
+// session. It is removed automatically when the session unregisters.
+func (r *Registry) EnableMessageUpdates(uid string, sessionID uint64, enabled bool) error {
+	if r == nil {
+		return ErrConnectionNotFound
+	}
+	shard := r.sessionShard(sessionID)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	session, ok := shard.bySession[sessionID]
+	if !ok || session.Route.UID != uid || session.State != RouteStateActive {
+		return ErrConnectionNotFound
+	}
+	session.MessageUpdates = enabled
+	shard.bySession[sessionID] = session
+	return nil
 }

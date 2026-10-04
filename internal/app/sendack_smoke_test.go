@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	accessgateway "github.com/WuKongIM/WuKongIM/internal/access/gateway"
 	channelruntime "github.com/WuKongIM/WuKongIM/pkg/channel"
 	channelstore "github.com/WuKongIM/WuKongIM/pkg/channel/store"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster"
@@ -72,6 +73,9 @@ func seedGroupSendPermission(t *testing.T, node *cluster.Node, channelID channel
 
 func TestSingleNodeClusterAppConfigUsesStableLeaseAndExplicitlyDisablesPlugins(t *testing.T) {
 	cfg := singleNodeClusterAppConfig(t)
+	if cfg.Gateway.SendTimeout != accessgateway.DefaultSendTimeout {
+		t.Fatalf("send timeout = %v, want production default %v", cfg.Gateway.SendTimeout, accessgateway.DefaultSendTimeout)
+	}
 	if cfg.Log.Dir == "" {
 		t.Fatal("log directory is empty, want an isolated test directory")
 	}
@@ -122,7 +126,8 @@ func singleNodeClusterAppConfig(t *testing.T) Config {
 				TTL:      30 * time.Second,
 			},
 		},
-		Gateway: GatewayConfig{SendTimeout: time.Second},
+		// Smoke tests assert correctness, not a one-second cold-channel SLA.
+		Gateway: GatewayConfig{SendTimeout: accessgateway.DefaultSendTimeout},
 	}
 	return cfg
 }

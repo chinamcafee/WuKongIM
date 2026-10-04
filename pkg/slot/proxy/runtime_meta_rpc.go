@@ -7,17 +7,21 @@ import (
 	"fmt"
 	"strings"
 
+	clusternet "github.com/WuKongIM/WuKongIM/pkg/cluster/net"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
+	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 	"github.com/WuKongIM/WuKongIM/pkg/slot/multiraft"
 )
 
-const runtimeMetaRPCServiceID uint8 = 3
+const runtimeMetaRPCServiceID uint8 = clusternet.RPCSlotRuntimeMetadata
 
 const (
-	runtimeMetaRPCGet      = "get"
-	runtimeMetaRPCBatchGet = "batch_get"
-	runtimeMetaRPCList     = "list"
-	runtimeMetaRPCScanPage = "scan_page"
+	runtimeMetaRPCGet        = "get"
+	runtimeMetaRPCGetFresh   = "get_fresh"
+	runtimeMetaRPCBatchGet   = "batch_get"
+	runtimeMetaRPCList       = "list"
+	runtimeMetaRPCScanPage   = "scan_page"
+	runtimeMetaBatchMaxReads = 4096
 )
 
 type runtimeMetaRPCRequest struct {
@@ -25,7 +29,7 @@ type runtimeMetaRPCRequest struct {
 	SlotID      uint64                           `json:"slot_id"`
 	ChannelID   string                           `json:"channel_id,omitempty"`
 	ChannelType int64                            `json:"channel_type,omitempty"`
-	Keys        []metadb.ConversationKey         `json:"keys,omitempty"`
+	Keys        []metadb.ChannelKey              `json:"keys,omitempty"`
 	After       *metadb.ChannelRuntimeMetaCursor `json:"after,omitempty"`
 	Limit       int                              `json:"limit,omitempty"`
 	// CodecVersion tracks the binary request version so responses can match legacy callers.
@@ -39,6 +43,14 @@ type runtimeMetaRPCResponse struct {
 	Metas    []metadb.ChannelRuntimeMeta     `json:"metas,omitempty"`
 	Cursor   metadb.ChannelRuntimeMetaCursor `json:"cursor,omitempty"`
 	Done     bool                            `json:"done,omitempty"`
+}
+
+// ChannelRuntimeMetaReadResult is one item-scoped authoritative batch outcome.
+type ChannelRuntimeMetaReadResult struct {
+	// Meta contains the authoritative record on success.
+	Meta metadb.ChannelRuntimeMeta
+	// Err contains one item-scoped missing, routing, or Slot read failure.
+	Err error
 }
 
 func (r runtimeMetaRPCResponse) rpcStatus() string {
@@ -114,28 +126,88 @@ func (s *Store) scanChannelRuntimeMetaSlotPageAuthoritative(ctx context.Context,
 	return append([]metadb.ChannelRuntimeMeta(nil), resp.Metas...), resp.Cursor, resp.Done, nil
 }
 
-func (s *Store) BatchGetChannelRuntimeMetas(ctx context.Context, keys []metadb.ConversationKey) (map[metadb.ConversationKey]metadb.ChannelRuntimeMeta, error) {
-	if len(keys) == 0 {
-		return map[metadb.ConversationKey]metadb.ChannelRuntimeMeta{}, nil
+func (s *Store) BatchGetChannelRuntimeMetas(ctx context.Context, keys []metadb.ChannelKey) (map[metadb.ChannelKey]metadb.ChannelRuntimeMeta, error) {
+	results, err := s.ReadChannelRuntimeMetadataBatch(ctx, keys)
+	if err != nil {
+		return nil, err
 	}
-
-	grouped := make(map[multiraft.SlotID][]metadb.ConversationKey, len(keys))
-	for _, key := range keys {
-		slotID := s.cluster.SlotForKey(key.ChannelID)
-		grouped[slotID] = append(grouped[slotID], key)
-	}
-
-	out := make(map[metadb.ConversationKey]metadb.ChannelRuntimeMeta, len(keys))
-	for slotID, groupKeys := range grouped {
-		metasByKey, err := s.batchGetChannelRuntimeMetaAuthoritative(ctx, slotID, groupKeys)
-		if err != nil {
-			return nil, err
+	out := make(map[metadb.ChannelKey]metadb.ChannelRuntimeMeta, len(keys))
+	for i, result := range results {
+		if errors.Is(result.Err, metadb.ErrNotFound) {
+			continue
 		}
-		for key, meta := range metasByKey {
-			out[key] = meta
+		if result.Err != nil {
+			return nil, result.Err
 		}
+		out[keys[i]] = result.Meta
 	}
 	return out, nil
+}
+
+// ReadChannelRuntimeMetadataBatch groups arbitrary keys by physical Slot and
+// preserves item-scoped missing or Slot failures without discarding siblings.
+func (s *Store) ReadChannelRuntimeMetadataBatch(ctx context.Context, keys []metadb.ChannelKey) ([]ChannelRuntimeMetaReadResult, error) {
+	if len(keys) == 0 {
+		return []ChannelRuntimeMetaReadResult{}, nil
+	}
+	if len(keys) > runtimeMetaBatchMaxReads {
+		return nil, fmt.Errorf("%w: runtime metadata batch has %d reads, max %d", metadb.ErrInvalidArgument, len(keys), runtimeMetaBatchMaxReads)
+	}
+	results := make([]ChannelRuntimeMetaReadResult, len(keys))
+	if s == nil || s.cluster == nil || s.db == nil {
+		return nil, fmt.Errorf("metastore: runtime metadata batch store not ready")
+	}
+
+	type indexedKey struct {
+		index int
+		key   metadb.ChannelKey
+	}
+	grouped := make(map[multiraft.SlotID][]indexedKey, len(keys))
+	for i, key := range keys {
+		if key.ChannelID == "" {
+			results[i].Err = metadb.ErrInvalidArgument
+			continue
+		}
+		slotID := s.cluster.SlotForKey(key.ChannelID)
+		if slotID == 0 {
+			results[i].Err = errSlotNotFound
+			continue
+		}
+		grouped[slotID] = append(grouped[slotID], indexedKey{index: i, key: key})
+	}
+
+	type slotGroup struct {
+		slotID multiraft.SlotID
+		items  []indexedKey
+	}
+	groups := make([]slotGroup, 0, len(grouped))
+	for slotID, items := range grouped {
+		groups = append(groups, slotGroup{slotID: slotID, items: items})
+	}
+	runSlotMetadataBatchWorkers(goruntimeregistry.TaskSlotRuntimeMetaBatch, len(groups), func(groupIndex int) {
+		group := groups[groupIndex]
+		items := group.items
+		groupKeys := make([]metadb.ChannelKey, len(items))
+		for i, item := range items {
+			groupKeys[i] = item.key
+		}
+		metasByKey, err := s.batchGetChannelRuntimeMetaAuthoritative(ctx, group.slotID, groupKeys)
+		if err != nil {
+			for _, item := range items {
+				results[item.index].Err = err
+			}
+			return
+		}
+		for _, item := range items {
+			meta, ok := metasByKey[item.key]
+			if !ok {
+				results[item.index].Err = metadb.ErrNotFound
+				continue
+			}
+			results[item.index].Meta = meta
+		}
+	})
+	return results, nil
 }
 
 func (s *Store) callRuntimeMetaRPC(ctx context.Context, slotID multiraft.SlotID, req runtimeMetaRPCRequest) (runtimeMetaRPCResponse, error) {
@@ -176,6 +248,16 @@ func (s *Store) handleRuntimeMetaRPC(ctx context.Context, body []byte) ([]byte, 
 	req, err := decodeRuntimeMetaRPCRequest(body)
 	if err != nil {
 		return nil, err
+	}
+	if req.Op == runtimeMetaRPCGetFresh {
+		meta, err := s.readRuntimeMetaFreshLocal(ctx, req)
+		if errors.Is(err, metadb.ErrNotFound) {
+			return encodeRuntimeMetaRPCResponseForRequest(req, runtimeMetaRPCResponse{Status: rpcStatusNotFound})
+		}
+		if err != nil {
+			return nil, err
+		}
+		return encodeRuntimeMetaRPCResponseForRequest(req, runtimeMetaRPCResponse{Status: rpcStatusOK, Meta: &meta})
 	}
 
 	slotID := multiraft.SlotID(req.SlotID)
@@ -248,9 +330,9 @@ func (s *Store) handleRuntimeMetaRPC(ctx context.Context, body []byte) ([]byte, 
 	}
 }
 
-func (s *Store) batchGetChannelRuntimeMetaAuthoritative(ctx context.Context, slotID multiraft.SlotID, keys []metadb.ConversationKey) (map[metadb.ConversationKey]metadb.ChannelRuntimeMeta, error) {
+func (s *Store) batchGetChannelRuntimeMetaAuthoritative(ctx context.Context, slotID multiraft.SlotID, keys []metadb.ChannelKey) (map[metadb.ChannelKey]metadb.ChannelRuntimeMeta, error) {
 	if s.shouldServeSlotLocally(slotID) {
-		out := make(map[metadb.ConversationKey]metadb.ChannelRuntimeMeta, len(keys))
+		out := make(map[metadb.ChannelKey]metadb.ChannelRuntimeMeta, len(keys))
 		for _, key := range keys {
 			hashSlot := hashSlotForKey(s.cluster, key.ChannelID)
 			meta, err := s.db.ForHashSlot(hashSlot).GetChannelRuntimeMeta(ctx, key.ChannelID, key.ChannelType)
@@ -273,9 +355,9 @@ func (s *Store) batchGetChannelRuntimeMetaAuthoritative(ctx context.Context, slo
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[metadb.ConversationKey]metadb.ChannelRuntimeMeta, len(resp.Metas))
+	out := make(map[metadb.ChannelKey]metadb.ChannelRuntimeMeta, len(resp.Metas))
 	for _, meta := range resp.Metas {
-		out[metadb.ConversationKey{ChannelID: meta.ChannelID, ChannelType: meta.ChannelType}] = meta
+		out[metadb.ChannelKey{ChannelID: meta.ChannelID, ChannelType: meta.ChannelType}] = meta
 	}
 	return out, nil
 }

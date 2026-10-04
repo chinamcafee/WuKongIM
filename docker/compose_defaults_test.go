@@ -44,8 +44,8 @@ func TestComposeNodeConfigsUseHotPathTuning(t *testing.T) {
 			if cfg.Cluster.Storage.CommitShards != 1 {
 				t.Fatalf("%s CommitShards = %d, want 1", node, cfg.Cluster.Storage.CommitShards)
 			}
-			if cfg.Gateway.Runtime.AsyncSendWorkers != 128 {
-				t.Fatalf("%s AsyncSendWorkers = %d, want 128", node, cfg.Gateway.Runtime.AsyncSendWorkers)
+			if cfg.Gateway.Runtime.AsyncSendWorkers != 1000 {
+				t.Fatalf("%s AsyncSendWorkers = %d, want 1000", node, cfg.Gateway.Runtime.AsyncSendWorkers)
 			}
 			if cfg.Gateway.Transport.Gnet.NumEventLoop != 4 || !cfg.Gateway.Transport.Gnet.Multicore {
 				t.Fatalf("%s gnet = %#v, want multicore with 4 event loops", node, cfg.Gateway.Transport.Gnet)
@@ -112,6 +112,27 @@ func TestComposeNodeDataMountsCanTargetIndependentBackingStores(t *testing.T) {
 	}
 }
 
+func TestComposeDevelopmentBindMountsExplicitlyOverridePublishedImageUser(t *testing.T) {
+	composePath := filepath.Join(dockerRepoRoot(t), "docker-compose.yml")
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", composePath, err)
+	}
+	var compose struct {
+		Services map[string]struct {
+			User string `yaml:"user"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(data, &compose); err != nil {
+		t.Fatalf("decode %s: %v", composePath, err)
+	}
+	for _, service := range []string{"wk-node1", "wk-node2", "wk-node3", "wk-sim"} {
+		if got := compose.Services[service].User; got != "0:0" {
+			t.Fatalf("%s user = %q, want explicit development-only root override", service, got)
+		}
+	}
+}
+
 func TestComposeServesEmbeddedManagerWebWithoutStandaloneContainer(t *testing.T) {
 	composePath := filepath.Join(dockerRepoRoot(t), "docker-compose.yml")
 	data, err := os.ReadFile(composePath)
@@ -165,4 +186,25 @@ func dockerRepoRoot(t *testing.T) string {
 		t.Fatal("resolve test file path")
 	}
 	return filepath.Dir(filepath.Dir(filename))
+}
+
+func TestComposeSimulatorRoutesThroughUnifiedBenchmarkCLI(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join(dockerRepoRoot(t), "docker-compose.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var compose struct {
+		Services map[string]struct {
+			Entrypoint []string `yaml:"entrypoint"`
+			Command    []string `yaml:"command"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(body, &compose); err != nil {
+		t.Fatal(err)
+	}
+	sim := compose.Services["wk-sim"]
+	invocation := strings.Join(append(sim.Entrypoint, sim.Command...), " ")
+	if invocation != "/usr/local/bin/wkcli bench dev-sim --config /etc/wkbench/dev-sim.yaml" {
+		t.Fatalf("simulator invocation = %q", invocation)
+	}
 }

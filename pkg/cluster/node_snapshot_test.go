@@ -54,6 +54,9 @@ func TestSeedJoinJoiningMirrorDoesNotInstallPreferredSlotLeaders(t *testing.T) {
 	if err := node.applySnapshot(context.Background(), snapshot); err != nil {
 		t.Fatalf("applySnapshot() error = %v", err)
 	}
+	if node.installObservedRemoteSlotLeaders(context.Background(), snapshot) {
+		t.Fatal("joining mirror installed remote Slot leaders")
+	}
 	if _, err := node.RouteHashSlot(0); !errors.Is(err, ErrNoSlotLeader) {
 		t.Fatalf("RouteHashSlot() error = %v, want ErrNoSlotLeader while joining", err)
 	}
@@ -73,11 +76,41 @@ func TestSeedJoinActiveMirrorInstallsRemoteObservedSlotLeaders(t *testing.T) {
 	if err := node.applySnapshot(context.Background(), snapshot); err != nil {
 		t.Fatalf("applySnapshot() error = %v", err)
 	}
+	if !node.installObservedRemoteSlotLeaders(context.Background(), snapshot) {
+		t.Fatal("active mirror did not install remote observed Slot leaders")
+	}
 	route, err := node.RouteHashSlot(0)
 	if err != nil {
 		t.Fatalf("RouteHashSlot() error = %v", err)
 	}
 	if route.Leader != 2 || route.LeaderTerm != 9 || route.PreferredLeader != 1 || route.SlotID != 1 {
+		t.Fatalf("route = %#v, want remote observed leader 2 term 9 on slot 1", route)
+	}
+}
+
+func TestStaticNodeInstallsRemoteObservedSlotLeadersWhenItIsNotAReplica(t *testing.T) {
+	node := &Node{
+		cfg:                  Config{NodeID: 1},
+		router:               routing.NewRouter(),
+		slotStatusCaller:     &fakeSlotStatusCaller{statuses: []routing.SlotStatus{{SlotID: 1, Leader: 2, LeaderTerm: 9}}},
+		routeAuthorityEpochs: map[uint16]uint64{},
+	}
+	node.started.Store(true)
+	snapshot := nodeControlSnapshot()
+	snapshot.Slots[0].DesiredPeers = []uint64{2, 3}
+	snapshot.Slots[0].PreferredLeader = 2
+
+	if err := node.applySnapshot(context.Background(), snapshot); err != nil {
+		t.Fatalf("applySnapshot() error = %v", err)
+	}
+	if !node.installObservedRemoteSlotLeaders(context.Background(), snapshot) {
+		t.Fatal("static non-replica did not install remote observed Slot leaders")
+	}
+	route, err := node.RouteHashSlot(0)
+	if err != nil {
+		t.Fatalf("RouteHashSlot() error = %v", err)
+	}
+	if route.Leader != 2 || route.LeaderTerm != 9 || route.PreferredLeader != 2 || route.SlotID != 1 {
 		t.Fatalf("route = %#v, want remote observed leader 2 term 9 on slot 1", route)
 	}
 }
@@ -270,6 +303,25 @@ func TestNodeAppliesActiveDataNodesForChannelPlacement(t *testing.T) {
 		got = node.channelDataNodes.DataNodes()
 		return equalUint64s(got, []uint64{1, 2, 3, 4})
 	})
+	placementCtx, placementCancel := context.WithTimeout(context.Background(), time.Second)
+	placementNodes, err := node.channelDataNodes.PlacementDataNodes(placementCtx, next.Revision)
+	placementCancel()
+	if err != nil || !equalUint64s(placementNodes, []uint64{1, 2, 3, 4}) {
+		t.Fatalf("placement data-node snapshot nodes=%v error=%v, want revision=%d nodes=1,2,3,4", placementNodes, err, next.Revision)
+	}
+
+	revisionOnly := next.Clone()
+	revisionOnly.Revision = 3
+	if err := controller.Publish(revisionOnly); err != nil {
+		t.Fatalf("Publish(revision only) error = %v", err)
+	}
+	waitUntil(t, func() bool { return node.Snapshot().StateRevision == revisionOnly.Revision })
+	placementCtx, placementCancel = context.WithTimeout(context.Background(), time.Second)
+	placementNodes, err = node.channelDataNodes.PlacementDataNodes(placementCtx, revisionOnly.Revision)
+	placementCancel()
+	if err != nil || !equalUint64s(placementNodes, []uint64{1, 2, 3, 4}) {
+		t.Fatalf("revision-only placement data-node snapshot nodes=%v error=%v, want nodes=1,2,3,4", placementNodes, err)
+	}
 }
 
 func TestActiveDataNodeIDsExcludeLeavingAndRemovedNodes(t *testing.T) {

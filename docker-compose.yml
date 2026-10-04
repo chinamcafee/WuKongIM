@@ -5,6 +5,9 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    # Development-only bind mounts retain root compatibility. The published
+    # image defaults to UID/GID 10001; production examples must not copy this override.
+    user: "0:0"
     volumes:
       - ./docker/conf/node1.toml:/etc/wukongim/wukongim.toml:ro
       # Point WK_NODE{1,2,3}_DATA_MOUNT at independent disks when measuring durable QPS.
@@ -24,6 +27,7 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    user: "0:0"
     volumes:
       - ./docker/conf/node2.toml:/etc/wukongim/wukongim.toml:ro
       - ${WK_NODE2_DATA_MOUNT:-./docker/dev-cluster/node2}:/var/lib/wukongim
@@ -41,6 +45,7 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    user: "0:0"
     volumes:
       - ./docker/conf/node3.toml:/etc/wukongim/wukongim.toml:ro
       - ${WK_NODE3_DATA_MOUNT:-./docker/dev-cluster/node3}:/var/lib/wukongim
@@ -59,13 +64,15 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    user: "0:0"
     depends_on:
       - wk-node1
       - wk-node2
       - wk-node3
     entrypoint:
-      - /usr/local/bin/wkbench
+      - /usr/local/bin/wkcli
     command:
+      - bench
       - dev-sim
       - --config
       - /etc/wkbench/dev-sim.yaml
@@ -141,7 +148,7 @@ services:
       - --web.enable-lifecycle
     volumes:
       - ./docker/observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./docker/dev-observability/prometheus:/prometheus
+      - prometheus-data:/prometheus
     ports:
       - "9091:9090"
 
@@ -157,6 +164,10 @@ services:
     volumes:
       - ./docker/observability/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./docker/observability/grafana/dashboards:/etc/grafana/dashboards:ro
-      - ./docker/dev-observability/grafana:/var/lib/grafana
+      - grafana-data:/var/lib/grafana
     ports:
       - "3000:3000"
+
+volumes:
+  prometheus-data:
+  grafana-data:

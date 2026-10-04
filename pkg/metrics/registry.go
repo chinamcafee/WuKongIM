@@ -16,31 +16,37 @@ import (
 type Registry struct {
 	registry *prometheus.Registry
 
-	Gateway         *GatewayMetrics
-	Channel         *ChannelMetrics
-	ChannelAppend   *ChannelAppendMetrics
-	ChannelRuntime  *ChannelRuntimeMetrics
-	Slot            *SlotMetrics
-	Controller      *ControllerMetrics
-	Transport       *TransportMetrics
-	Storage         *StorageMetrics
-	Message         *MessageMetrics
-	Conversation    *ConversationMetrics
-	Delivery        *DeliveryMetrics
-	Presence        *PresenceMetrics
-	Plugin          *PluginMetrics
-	Webhook         *WebhookMetrics
-	Diagnostics     *DiagnosticsMetrics
-	RuntimePressure *RuntimePressureMetrics
-	AntsPool        *AntsPoolMetrics
-	NodeResource    *NodeResourceMetrics
-	NodeLifecycle   *NodeLifecycleMetrics
-	OpsMCP          *OpsMCPMetrics
+	Gateway           *GatewayMetrics
+	Channel           *ChannelMetrics
+	ChannelAppend     *ChannelAppendMetrics
+	ChannelRuntime    *ChannelRuntimeMetrics
+	Slot              *SlotMetrics
+	Controller        *ControllerMetrics
+	Transport         *TransportMetrics
+	Storage           *StorageMetrics
+	Message           *MessageMetrics
+	Conversation      *ConversationMetrics
+	Delivery          *DeliveryMetrics
+	Presence          *PresenceMetrics
+	Plugin            *PluginMetrics
+	BeforeSendWebhook *BeforeSendWebhookMetrics
+	Diagnostics       *DiagnosticsMetrics
+	RuntimePressure   *RuntimePressureMetrics
+	AntsPool          *AntsPoolMetrics
+	NodeResource      *NodeResourceMetrics
+	NodeLifecycle     *NodeLifecycleMetrics
+	OpsMCP            *OpsMCPMetrics
+	MQTT              *MQTTMetrics
+	Webhook           *WebhookMetrics
 }
 
 func New(nodeID uint64, nodeName string) *Registry {
 	registry := prometheus.NewRegistry()
-	registry.MustRegister(collectors.NewGoCollector())
+	// Scheduler runtime metrics add go_sched_latencies_seconds, which separates
+	// CPU starvation from storage queueing during soak diagnosis.
+	registry.MustRegister(collectors.NewGoCollector(
+		collectors.WithGoCollectorRuntimeMetrics(collectors.MetricsScheduler),
+	))
 	registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
 	labels := prometheus.Labels{
@@ -49,28 +55,39 @@ func New(nodeID uint64, nodeName string) *Registry {
 	}
 
 	return &Registry{
-		registry:        registry,
-		Gateway:         newGatewayMetrics(registry, labels),
-		Channel:         newChannelMetrics(registry, labels),
-		ChannelAppend:   newChannelAppendMetrics(registry, labels),
-		ChannelRuntime:  newChannelRuntimeMetrics(registry, labels),
-		Slot:            newSlotMetrics(registry, labels),
-		Controller:      newControllerMetrics(registry, labels),
-		Transport:       newTransportMetrics(registry, labels),
-		Storage:         newStorageMetrics(registry, labels),
-		Message:         newMessageMetrics(registry, labels),
-		Conversation:    newConversationMetrics(registry, labels),
-		Delivery:        newDeliveryMetrics(registry, labels),
-		Presence:        newPresenceMetrics(registry, labels),
-		Plugin:          newPluginMetrics(registry, labels),
-		Webhook:         newWebhookMetrics(registry, labels),
-		Diagnostics:     newDiagnosticsMetrics(registry, labels),
-		RuntimePressure: newRuntimePressureMetrics(registry, labels),
-		AntsPool:        newAntsPoolMetrics(registry, labels),
-		NodeResource:    newNodeResourceMetrics(registry, labels),
-		NodeLifecycle:   newNodeLifecycleMetrics(registry, labels),
-		OpsMCP:          newOpsMCPMetrics(registry, labels),
+		registry:          registry,
+		Gateway:           newGatewayMetrics(registry, labels),
+		Channel:           newChannelMetrics(registry, labels),
+		ChannelAppend:     newChannelAppendMetrics(registry, labels),
+		ChannelRuntime:    newChannelRuntimeMetrics(registry, labels),
+		Slot:              newSlotMetrics(registry, labels),
+		Controller:        newControllerMetrics(registry, labels),
+		Transport:         newTransportMetrics(registry, labels),
+		Storage:           newStorageMetrics(registry, labels),
+		Message:           newMessageMetrics(registry, labels),
+		Conversation:      newConversationMetrics(registry, labels),
+		Delivery:          newDeliveryMetrics(registry, labels),
+		Presence:          newPresenceMetrics(registry, labels),
+		Plugin:            newPluginMetrics(registry, labels),
+		BeforeSendWebhook: newBeforeSendWebhookMetrics(registry, labels),
+		Diagnostics:       newDiagnosticsMetrics(registry, labels),
+		RuntimePressure:   newRuntimePressureMetrics(registry, labels),
+		AntsPool:          newAntsPoolMetrics(registry, labels),
+		NodeResource:      newNodeResourceMetrics(registry, labels),
+		NodeLifecycle:     newNodeLifecycleMetrics(registry, labels),
+		OpsMCP:            newOpsMCPMetrics(registry, labels),
+		MQTT:              newMQTTMetrics(registry, labels),
+		Webhook:           newWebhookMetrics(registry, labels),
 	}
+}
+
+// NewWithLogicalSlots materializes metadata-create zero counters for every
+// configured logical Slot Raft Group. Callers must pass validated topology;
+// the 256-group bound matches the repository's physical hash-slot fence.
+func NewWithLogicalSlots(nodeID uint64, nodeName string, logicalSlotCount uint32) *Registry {
+	registry := New(nodeID, nodeName)
+	registry.ChannelRuntime.materializeMetaCreateSlots(logicalSlotCount)
+	return registry
 }
 
 func (r *Registry) Gather() ([]*dto.MetricFamily, error) {

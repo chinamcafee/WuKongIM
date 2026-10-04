@@ -1,7 +1,8 @@
-import { Pause, Play, RefreshCw, Search } from "lucide-react"
+import { Pause, Play, RefreshCw, Search, X } from "lucide-react"
 import { useIntl } from "react-intl"
 
 import { NodeFilter } from "@/components/manager/node-filter"
+import { StatusBadge } from "@/components/manager/status-badge"
 import { Button } from "@/components/ui/button"
 import type { ManagerApplicationLogSource, ManagerNodesResponse } from "@/lib/manager-api.types"
 import {
@@ -22,6 +23,9 @@ type AppLogsToolbarProps = {
   severity: AppLogSeverityFilter
   onSeverityChange: (severity: AppLogSeverityFilter) => void
   keyword: string
+  appliedKeyword: string
+  hasFilters: boolean
+  onClearFilters: () => void
   onKeywordChange: (keyword: string) => void
   followTail: boolean
   onFollowTailChange: (follow: boolean) => void
@@ -52,7 +56,7 @@ export function AppLogsToolbar(props: AppLogsToolbarProps) {
                 {intl.formatMessage({ id: "appLogs.nodeLocal" })}
               </span>
             ) : null}
-            {activeNode?.status ? <span className="text-xs text-muted-foreground">{activeNode.status}</span> : null}
+            {activeNode?.status ? <StatusBadge value={activeNode.status} /> : null}
           </div>
           <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
             <span>{activeNode?.addr ?? "-"}</span>
@@ -63,7 +67,7 @@ export function AppLogsToolbar(props: AppLogsToolbarProps) {
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button
-            disabled={!props.canLoad || props.refreshing}
+            disabled={!props.canLoad || props.loading || props.refreshing}
             onClick={props.onRefresh}
             size="sm"
             type="button"
@@ -75,19 +79,19 @@ export function AppLogsToolbar(props: AppLogsToolbarProps) {
           <Button
             aria-label={intl.formatMessage({ id: "appLogs.followTail" })}
             aria-pressed={props.followTail}
-            disabled={!props.canLoad}
+            disabled={!props.canLoad || props.loading || props.refreshing}
             onClick={() => props.onFollowTailChange(!props.followTail)}
             size="sm"
             type="button"
             variant={props.followTail ? "default" : "outline"}
           >
-            {props.followTail ? <Play /> : <Pause />}
-            {props.followTail ? intl.formatMessage({ id: "appLogs.status.following" }) : intl.formatMessage({ id: "appLogs.status.paused" })}
+            {props.followTail ? <Pause /> : <Play />}
+            {intl.formatMessage({ id: props.followTail ? "appLogs.pauseLive" : "appLogs.startLive" })}
           </Button>
         </div>
       </div>
 
-      <div className="grid gap-2 md:grid-cols-[minmax(12rem,1fr)_minmax(9rem,0.8fr)_minmax(9rem,0.8fr)_minmax(12rem,1fr)_auto] md:items-end">
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-[minmax(10rem,1fr)_minmax(8rem,0.8fr)_minmax(8rem,0.8fr)_minmax(12rem,1.4fr)_auto] xl:items-end">
         <NodeFilter nodes={props.nodes} selectedNodeId={props.selectedNodeId} onNodeChange={props.onNodeChange} />
         <label className="text-xs font-medium text-muted-foreground">
           {intl.formatMessage({ id: "appLogs.source" })}
@@ -127,7 +131,7 @@ export function AppLogsToolbar(props: AppLogsToolbarProps) {
             className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 text-sm text-foreground"
             onChange={(event) => props.onKeywordChange(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter") {
+              if (event.key === "Enter" && !event.nativeEvent.isComposing && props.canLoad && !props.loading && !props.refreshing) {
                 props.onSearch()
               }
             }}
@@ -135,14 +139,20 @@ export function AppLogsToolbar(props: AppLogsToolbarProps) {
             value={props.keyword}
           />
         </label>
-        <Button disabled={!props.canLoad || props.loading} onClick={props.onSearch} size="sm" type="button">
+        <Button disabled={!props.canLoad || props.loading || props.refreshing} onClick={props.onSearch} size="sm" type="button">
           <Search />
           {intl.formatMessage({ id: "common.search" })}
         </Button>
       </div>
 
-      <div className="text-xs text-muted-foreground" role="status">
-        {props.liveMessage || (props.followTail ? intl.formatMessage({ id: "appLogs.status.following" }) : intl.formatMessage({ id: "appLogs.status.paused" }))}
+      <div className="flex min-h-7 flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+        <span role="status">{props.liveMessage || intl.formatMessage({ id: props.followTail ? "appLogs.status.following" : "appLogs.status.paused" })}</span>
+        <div className="flex items-center gap-2">
+          {props.keyword.trim() !== props.appliedKeyword ? <span>{intl.formatMessage({ id: "appLogs.pendingKeyword" })}</span> : null}
+          {props.hasFilters ? (
+            <Button onClick={props.onClearFilters} size="sm" type="button" variant="ghost"><X />{intl.formatMessage({ id: "appLogs.clearFilters" })}</Button>
+          ) : null}
+        </div>
       </div>
     </section>
   )

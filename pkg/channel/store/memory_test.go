@@ -20,7 +20,6 @@ func TestMemoryStoreRetentionAdoptAndTrim(t *testing.T) {
 			{ID: 32, Payload: []byte("two"), SizeBytes: len("two")},
 			{ID: 33, Payload: []byte("three"), SizeBytes: len("three")},
 		},
-		Sync: true,
 	})
 	require.NoError(t, err)
 
@@ -56,7 +55,6 @@ func TestMemoryStoreRetentionLEOAfterTrim(t *testing.T) {
 			{ID: 41, Payload: []byte("one"), SizeBytes: len("one")},
 			{ID: 42, Payload: []byte("two"), SizeBytes: len("two")},
 		},
-		Sync: true,
 	})
 	require.NoError(t, err)
 
@@ -71,7 +69,30 @@ func TestMemoryStoreRetentionLEOAfterTrim(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), loaded.LEO)
 
-	appendResult, err := cs.AppendLeader(ctx, AppendLeaderRequest{Records: []ch.Record{{ID: 43, Payload: []byte("three"), SizeBytes: len("three")}}, Sync: true})
+	appendResult, err := cs.AppendLeader(ctx, AppendLeaderRequest{Records: []ch.Record{{ID: 43, Payload: []byte("three"), SizeBytes: len("three")}}})
 	require.NoError(t, err)
-	require.Equal(t, AppendLeaderResult{BaseOffset: 3, LastOffset: 3}, appendResult)
+	require.Equal(t, AppendLeaderResult{BaseOffset: 3, LastOffset: 3, Outcome: AppendOutcomeDurable}, appendResult)
+}
+
+func TestMemoryStoreLastSenderSequenceHonorsCommittedBoundary(t *testing.T) {
+	ctx := context.Background()
+	cs, err := NewMemoryFactory().ChannelStore("sender:1", ch.ChannelID{ID: "sender", Type: 1})
+	require.NoError(t, err)
+	_, err = cs.AppendLeader(ctx, AppendLeaderRequest{Records: []ch.Record{
+		{ID: 1, FromUID: "u1"},
+		{ID: 2, FromUID: "u2"},
+		{ID: 3, FromUID: "u1", SyncOnce: true},
+	}})
+	require.NoError(t, err)
+
+	lookup, ok := cs.(SenderSequenceLookup)
+	require.True(t, ok)
+	seq, found, err := lookup.GetLastSenderMessageSeq(ctx, "u1", 2)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, uint64(1), seq)
+	seq, found, err = lookup.GetLastSenderMessageSeq(ctx, "u1", 3)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, uint64(1), seq)
 }

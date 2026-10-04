@@ -13,6 +13,7 @@ import (
 	messageusecase "github.com/WuKongIM/WuKongIM/internal/usecase/message"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 type sendMessageRequest struct {
@@ -41,29 +42,38 @@ const (
 )
 
 type sendMessageHeaderRequest struct {
+	// RedDot preserves the protocol unread-badge flag when non-zero.
+	RedDot int `json:"red_dot"`
 	// NoPersist marks the send as non-durable when non-zero.
 	NoPersist int `json:"no_persist"`
 	// SyncOnce marks the send as a one-shot command-channel message when non-zero.
 	SyncOnce int `json:"sync_once"`
-	// RedDot preserves the durable notification framing flag when non-zero.
-	RedDot int `json:"red_dot"`
 }
 
 type sendMessageResponse struct {
-	MessageID  int64  `json:"message_id"`
-	MessageSeq uint64 `json:"message_seq"`
-	Reason     uint8  `json:"reason"`
+	// ClientMsgNo is the caller-provided or generated identifier stored with the message.
+	ClientMsgNo string `json:"client_msg_no"`
+	MessageID   int64  `json:"message_id"`
+	MessageSeq  uint64 `json:"message_seq"`
+	Reason      uint8  `json:"reason"`
 }
 
 func (s *Server) registerMessageRoutes() {
 	if s == nil || s.engine == nil {
 		return
 	}
+	s.engine.POST("/messages", s.handleMessageLookup)
 	s.engine.POST("/message/send", s.handleSendMessage)
+	s.engine.POST("/message/update", s.handleMessageUpdate)
+	s.engine.POST("/channel/messageupdates", s.handleChannelMessageUpdates)
 	s.engine.POST("/message/event", s.handleMessageEventAppend)
 	s.engine.POST("/v3/message/commands/sync", s.requireCommandHMAC(), s.handleV3CommandSync)
 	s.engine.POST("/v3/message/commands/ack", s.requireCommandHMAC(), s.handleV3CommandAck)
+	s.engine.POST("/message/eventsync", s.handleMessageEventSync)
+	s.engine.POST("/message/cmd/bind", s.handleMessageCMDBind)
+	s.engine.POST("/message/cmd/unbind", s.handleMessageCMDUnbind)
 	s.engine.POST("/channel/messagesync", s.handleChannelMessageSync)
+	s.engine.POST("/channel/messagesyncbatch", s.handleChannelMessageSyncBatch)
 }
 
 func (s *Server) handleSendMessage(c *gin.Context) {
@@ -72,11 +82,16 @@ func (s *Server) handleSendMessage(c *gin.Context) {
 		writeSendJSONError(c, http.StatusBadRequest, "invalid request")
 		return
 	}
+	hasExplicitSender := strings.TrimSpace(req.FromUID) != "" || strings.TrimSpace(req.LegacyFromUID) != ""
 	if req.FromUID == "" {
 		req.FromUID = req.LegacyFromUID
 	}
+	if req.FromUID == "" {
+		// Preserve the legacy HTTP contract: an omitted sender is a system send.
+		req.FromUID = s.systemUID
+	}
 	requestScoped := len(req.Subscribers) > 0
-	if req.FromUID == "" || req.Payload == "" {
+	if req.Payload == "" {
 		writeSendJSONError(c, http.StatusBadRequest, "invalid request")
 		return
 	}
@@ -90,7 +105,7 @@ func (s *Server) handleSendMessage(c *gin.Context) {
 		return
 	}
 	noPersist := req.Header.NoPersist != 0 || req.NoPersist != 0
-	if !noPersist && strings.TrimSpace(req.ClientMsgNo) == "" {
+	if !noPersist && hasExplicitSender && strings.TrimSpace(req.ClientMsgNo) == "" {
 		writePersistError(c, http.StatusBadRequest, "client_msg_no_required", "持久消息的client_msg_no不能为空", false)
 		return
 	}
@@ -126,6 +141,16 @@ func (s *Server) handleSendMessage(c *gin.Context) {
 		return
 	}
 
+	if strings.TrimSpace(req.ClientMsgNo) == "" {
+		// Legacy HTTP sends supply a unique client key even for system messages.
+		id, err := uuid.NewRandom()
+		if err != nil {
+			writeSendJSONError(c, http.StatusInternalServerError, "message identity unavailable")
+			return
+		}
+		req.ClientMsgNo = strings.ReplaceAll(id.String(), "-", "") + "0"
+	}
+
 	reqCtx := c.Request.Context()
 	if traceID, ok := tracectx.ValidateHeaderTraceID(c.GetHeader("X-WK-Trace-ID")); ok {
 		reqCtx = tracectx.WithContext(reqCtx, tracectx.Context{TraceID: traceID, Sampled: true})
@@ -144,8 +169,8 @@ func (s *Server) handleSendMessage(c *gin.Context) {
 		Expire:                 req.Expire,
 		Payload:                payload,
 		NoPersist:              noPersist,
-		SyncOnce:               syncOnce,
 		RedDot:                 req.Header.RedDot != 0,
+		SyncOnce:               syncOnce,
 		NormalizePersonChannel: req.ChannelType == frame.ChannelTypePerson,
 		ProtocolVersion:        frame.LatestVersion,
 	}
@@ -201,9 +226,10 @@ func (s *Server) handleSendMessage(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, sendMessageResponse{
-		MessageID:  int64(result.MessageID),
-		MessageSeq: result.MessageSeq,
-		Reason:     uint8(mapMessageReason(result.Reason)),
+		ClientMsgNo: req.ClientMsgNo,
+		MessageID:   int64(result.MessageID),
+		MessageSeq:  result.MessageSeq,
+		Reason:      uint8(mapMessageReason(result.Reason)),
 	})
 }
 

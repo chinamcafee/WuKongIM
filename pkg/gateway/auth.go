@@ -15,6 +15,8 @@ type AuthResult = gatewaytypes.AuthResult
 type CredentialAuthResult = gatewaytypes.CredentialAuthResult
 
 const (
+	// SessionValuePeerAddr identifies the physical TCP peer retained for diagnostics.
+	SessionValuePeerAddr            = gatewaytypes.SessionValuePeerAddr
 	SessionValueUID                 = gatewaytypes.SessionValueUID
 	SessionValueDeviceID            = gatewaytypes.SessionValueDeviceID
 	SessionValueDeviceFlag          = gatewaytypes.SessionValueDeviceFlag
@@ -64,7 +66,8 @@ func NewWKProtoAuthenticator(opts WKProtoAuthOptions) Authenticator {
 				Connack: &frame.ConnackPacket{ReasonCode: frame.ReasonAuthFail},
 			}, nil
 		}
-		if opts.RequiredProtocolVersion != 0 && connect.Version != opts.RequiredProtocolVersion {
+		isJSONRPC := authContext != nil && authContext.Protocol == "jsonrpc"
+		if !isJSONRPC && opts.RequiredProtocolVersion != 0 && connect.Version != opts.RequiredProtocolVersion {
 			return &AuthResult{
 				Connack: connackForConnect(connect, opts.RequiredProtocolVersion, frame.ReasonProtocolUpgradeRequired),
 			}, nil
@@ -116,10 +119,19 @@ func NewWKProtoAuthenticator(opts WKProtoAuthOptions) Authenticator {
 			}
 		}
 
+		serverVersion := connect.Version
+		if serverVersion == 0 || serverVersion > frame.LatestVersion {
+			serverVersion = frame.LatestVersion
+		}
+
+		timeDiff := nowFn().UnixMilli() - connect.ClientTimestamp
+		if isJSONRPC && connect.ClientTimestamp == 0 {
+			timeDiff = 0
+		}
 		connack := connackForConnect(connect, opts.RequiredProtocolVersion, frame.ReasonSuccess)
-		connack.TimeDiff = nowFn().UnixMilli() - connect.ClientTimestamp
+		connack.TimeDiff = timeDiff
 		connack.NodeId = opts.NodeID
-		serverVersion := connack.ServerVersion
+		serverVersion = connack.ServerVersion
 
 		sessionValues := map[string]any{
 			SessionValueUID:             connect.UID,
@@ -133,7 +145,7 @@ func NewWKProtoAuthenticator(opts WKProtoAuthOptions) Authenticator {
 			sessionValues[SessionValueLoginSessionID] = loginSessionID
 			sessionValues[SessionValueCredentialExpiresAt] = credentialExpiresAt
 		}
-		if encryptionEnabled {
+		if encryptionEnabled && !isJSONRPC {
 			if connect.ClientKey == "" {
 				return &AuthResult{
 					Connack: connackForConnect(connect, opts.RequiredProtocolVersion, frame.ReasonClientKeyIsEmpty),

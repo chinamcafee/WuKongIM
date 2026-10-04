@@ -56,6 +56,20 @@ func emptyControlSnapshot(snapshot control.Snapshot) bool {
 func (n *Node) applySnapshot(ctx context.Context, snapshot control.Snapshot) error {
 	n.controlApplyMu.Lock()
 	defer n.controlApplyMu.Unlock()
+	n.mu.RLock()
+	previous := n.controlSnapshot.Clone()
+	// A failed initial task may leave its committed publication visible while
+	// Start rolls back runtimes. A new startup must reconcile recreated Slots
+	// and retry synchronous setup even when the Controller revision is unchanged.
+	firstSnapshot := !n.started.Load() || emptyControlSnapshot(previous)
+	n.mu.RUnlock()
+	// Watches and readiness probes may capture snapshots before waiting for
+	// this lock. Never replay an older generation after a newer one has been
+	// fully applied, including its maintenance fence and task progress.
+	// Equal revisions still refresh Controller leadership and node health.
+	if snapshot.Revision < previous.Revision {
+		return nil
+	}
 	// Publish restore maintenance before slower placement reconciliation so no
 	// business write races an archive installation.
 	n.setMaintenance(snapshot.Maintenance)
@@ -64,10 +78,6 @@ func (n *Node) applySnapshot(ctx context.Context, snapshot control.Snapshot) err
 	// as their nonblocking fence against an apply-in-progress stale intent.
 	n.beginPreferredLeaderIntentApply()
 
-	n.mu.RLock()
-	previous := n.controlSnapshot.Clone()
-	firstSnapshot := emptyControlSnapshot(previous)
-	n.mu.RUnlock()
 	changes := snapshotChanges(previous, snapshot)
 	if n.router != nil && (firstSnapshot || changes.slots || changes.hashSlots) {
 		if err := n.updateRouteAuthorityTable(func() error {
@@ -84,17 +94,10 @@ func (n *Node) applySnapshot(ctx context.Context, snapshot control.Snapshot) err
 			return err
 		}
 	}
-	if n.router != nil && (firstSnapshot || changes.nodes || changes.slots || changes.hashSlots) {
-		n.installSeedJoinActiveRemoteSlotLeaders(ctx, snapshot)
-	}
-	if n.tasks != nil && (firstSnapshot || changes.tasks || changes.slots) {
-		if err := n.reconcileTasks(ctx, snapshot); err != nil {
-			return err
-		}
-	}
-	if firstSnapshot || changes.nodes {
-		n.channelDataNodes.Update(activeDataNodeIDs(snapshot.Nodes))
-	}
+	// Placement candidates carry the accepted control revision even when the
+	// node set is unchanged, because foreground routes advance on every applied
+	// snapshot and must never be combined with an older candidate generation.
+	n.channelDataNodes.UpdateAtRevision(snapshot.Revision, activeDataNodeIDs(snapshot.Nodes))
 	if n.router != nil {
 		_ = n.updateRouteAuthorityTable(func() error {
 			n.router.AdvanceRevision(snapshot.Revision)
@@ -108,12 +111,52 @@ func (n *Node) applySnapshot(ctx context.Context, snapshot control.Snapshot) err
 		slotsReady = localAssignedSlotsReady(localAssignedSlotIDs, statuses)
 	}
 	n.mu.Lock()
+	ready := !n.stopping.Load()
 	n.controlSnapshot = snapshot.Clone()
-	n.snapshot = Snapshot{NodeID: n.cfg.NodeID, ControllerLead: snapshot.ControllerID, StateRevision: snapshot.Revision, RoutesReady: n.router != nil && n.router.Table() != nil, SlotsReady: slotsReady, ChannelsReady: n.channels != nil, SlotCount: uint32(len(snapshot.Slots)), HashSlotCount: snapshot.HashSlots.Count}
+	if firstSnapshot || changes.nodes {
+		members := make([]uint64, 0, len(snapshot.Nodes))
+		for _, node := range snapshot.Nodes {
+			if controlNodeJoinState(node.JoinState) == control.NodeJoinStateRemoved {
+				continue
+			}
+			for _, role := range node.Roles {
+				if role == control.RoleData {
+					members = append(members, node.NodeID)
+					break
+				}
+			}
+		}
+		sort.Slice(members, func(i, j int) bool { return members[i] < members[j] })
+		n.mqttStorageMemberIDs = members
+	}
+	n.snapshot = Snapshot{
+		NodeID:         n.cfg.NodeID,
+		ControllerLead: snapshot.ControllerID,
+		StateRevision:  snapshot.Revision,
+		RoutesReady:    ready && n.router != nil && n.router.Table() != nil,
+		SlotsReady:     ready && slotsReady,
+		ChannelsReady:  ready && n.channels != nil,
+		SlotCount:      uint32(len(snapshot.Slots)),
+		HashSlotCount:  snapshot.HashSlots.Count,
+	}
 	n.mu.Unlock()
 	n.publishPreferredLeaderIntent(snapshot)
 	if observer := n.cfg.Control.SnapshotObserver; observer != nil {
 		observer.ObserveControlSnapshot(snapshot.Clone())
+	}
+	// Task progress writes can wait on Controller Raft or another reconciliation.
+	// Publish reconciled routes, Slot readiness and committed health first so
+	// those side effects cannot hide current placement eligibility from readers.
+	if n.tasks != nil && (firstSnapshot || changes.tasks || changes.slots) {
+		if n.started.Load() {
+			n.requestTaskReconcile()
+		} else {
+			// Initial startup still verifies synchronous task setup before the
+			// background owner and foreground admission exist.
+			if err := n.reconcileTasks(ctx, snapshot); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -354,6 +397,7 @@ func (n *Node) setMaintenance(enabled bool) {
 	}
 	n.maintenanceAdmissionMu.Lock()
 	n.maintenance.Store(enabled)
+	n.invalidateWriteProbeProof()
 	n.channelDataPlaneLease.setMaintenance(enabled)
 	n.maintenanceAdmissionMu.Unlock()
 	if !enabled && n.cfg.MaintenanceObserver != nil {

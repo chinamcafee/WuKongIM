@@ -53,11 +53,11 @@ func TestReadJSONLRejectsMissingRequiredField(t *testing.T) {
 	}
 }
 
-func TestReadJSONLRejectsUnknownConversationKind(t *testing.T) {
-	input := strings.NewReader("{\"hash_slot\":1,\"uid\":\"u1\",\"kind\":\"other\",\"channel_id\":\"g1\",\"channel_type\":2}\n")
-	err := readJSONL(context.Background(), input, FileKindMetaConversations, func(any) error { return nil })
-	if err == nil || !strings.Contains(err.Error(), "kind") {
-		t.Fatalf("readJSONL() error = %v, want kind error", err)
+func TestReadJSONLRejectsMissingCommandChannelID(t *testing.T) {
+	input := strings.NewReader("{\"hash_slot\":1,\"uid\":\"u1\",\"channel_type\":2}\n")
+	err := readJSONL(context.Background(), input, FileKindMetaUserCMDChannelMemberships, func(any) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "command_channel_id") {
+		t.Fatalf("readJSONL() error = %v, want command_channel_id error", err)
 	}
 }
 
@@ -123,5 +123,20 @@ func assertInt64Field(t *testing.T, name string, got any, want int64) {
 	}
 	if value != want {
 		t.Fatalf("%s = %d, want %d", name, value, want)
+	}
+}
+
+func TestSendBanImportRejectsInvalidFlags(t *testing.T) {
+	for _, tc := range []struct {
+		kind FileKind
+		row  string
+	}{
+		{FileKindMetaUsers, `{"hash_slot":1,"uid":"u","send_ban":2}`},
+		{FileKindMetaChannels, `{"hash_slot":1,"channel_id":"g","channel_type":2,"send_ban":-1}`},
+	} {
+		err := readJSONL(context.Background(), strings.NewReader(tc.row), tc.kind, func(any) error { t.Fatal("invalid flag reached importer"); return nil })
+		if err == nil {
+			t.Fatal("invalid send ban accepted")
+		}
 	}
 }

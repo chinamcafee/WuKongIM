@@ -1,0 +1,84 @@
+---
+title: Android API Reference
+description: Find common WuKongIMAndroidSDK entry points, listeners, models, and states by manager.
+---
+
+This is a lookup page for common entry points, not a replacement for the task guides. The root singleton is `WKIM.getInstance()`.
+
+## Initialization
+
+| API | Purpose |
+| --- | --- |
+| `init(Context, uid, token)` | Initialize a user and open that UID's local database |
+| `setDebug(boolean)` | Control debug logging |
+| `setFileCacheDir(String)` | Set the file-cache directory |
+| `getMsgManager()` | Message manager |
+| `getConnectionManager()` | Connection manager |
+| `getConversationManager()` | Conversation manager |
+| `getChannelManager()` | Channel-profile manager |
+| `getChannelMembersManager()` | Group-member manager |
+
+## `ConnectionManager`
+
+| API | Purpose |
+| --- | --- |
+| `addOnGetIpAndPortListener` | Supply a connection IP or hostname and port |
+| `connection()` | Start a connection attempt |
+| `disconnect(false)` | Stop connecting while retaining identity |
+| `disconnect(true)` | Sign out and clear the token |
+| `addOnConnectionStatusListener(key, listener)` | Observe connection state |
+| `removeOnConnectionStatusListener(key)` | Remove a state observer |
+
+States: `fail`, `success`, `kicked`, `syncMsg`, `connecting`, `noNetwork`, and `syncCompleted`.
+
+## `MsgManager`
+
+| API | Purpose |
+| --- | --- |
+| `send(content, channel)` | Send content to a channel |
+| `sendWithOptions(content, channel, options)` | Send with advanced settings |
+| `sendMessage(WKMsg)` | Send or retry an existing message |
+| `addOnSendMsgCallback` | Observe local message insertion |
+| `addOnSendMsgAckListener` | Observe the server send result |
+| `addOnNewMsgListener` | Observe new messages |
+| `addOnRefreshMsgListener` | Observe message-object changes |
+| `getOrSyncHistoryMessages` | Read local and, when needed, remote history |
+| `addOnSyncChannelMsgListener` | Connect remote channel history |
+| `addOnUploadAttachListener` | Connect media upload |
+| `registerContentMsg` | Register custom content |
+
+Use the same key in the matching removal method, such as `removeNewMsgListener`, `removeSendMsgAckListener`, or `removeRefreshMsgListener`.
+
+## `ConversationManager`
+
+| API | Purpose |
+| --- | --- |
+| `getAll(callback)` | Read the conversation list asynchronously |
+| `getWithChannel` | Read the conversation for one channel |
+| `updateRedDot` | Set a channel's unread count |
+| `deleteWitchChannel` | Delete a conversation row |
+| `addOnRefreshMsgListListener` | Observe batches of conversation changes |
+| `addOnSyncConversationListener` | Connect multi-device conversation sync |
+
+## `ChannelManager`
+
+| API | Purpose |
+| --- | --- |
+| `getChannel` | Read a local channel profile |
+| `fetchChannelInfo` | Request a profile refresh |
+| `addOnGetChannelInfoListener` | Connect user and group profile APIs |
+| `saveOrUpdateChannel` | Store a profile locally |
+| `addOnRefreshChannelInfo` | Observe profile changes |
+
+## Common models
+
+| Type | Meaning |
+| --- | --- |
+| `WKChannel` | `channelID`, `channelType`, name, avatar, and settings |
+| `WKMsg` | Message identity, content, sequence, and send state |
+| `WKMessageContent` | Base class for message content |
+| `WKTextContent` / `WKImageContent` | Built-in text and image content |
+| `WKUIConversationMsg` | Chat-list row and unread count |
+| `WKChannelMember` | Group-member profile |
+
+Common channel types: `WKChannelType.PERSONAL` and `WKChannelType.GROUP`. Send states: `WKSendMsgResult.send_loading`, `send_success`, and `send_fail`.

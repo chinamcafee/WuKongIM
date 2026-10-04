@@ -1,17 +1,31 @@
 package workload
 
-import "github.com/WuKongIM/WuKongIM/internal/bench/metrics"
+import (
+	"time"
+
+	"github.com/WuKongIM/WuKongIM/internal/bench/metrics"
+)
 
 const (
 	schedulerDropPendingWindowExpired   = "pending_window_expired"
 	schedulerDropUnstartedWindowExpired = "unstarted_window_expired"
 )
 
+// recordSchedulerPlan publishes the immutable admission denominator before
+// the first SEND can block. Lifecycle observers therefore see the configured
+// measured plan while the window is still active rather than only after the
+// scheduler returns and cooldown has started.
+func recordSchedulerPlan(registry *metrics.Registry, labels metrics.Labels, planned uint64) {
+	if registry == nil || planned == 0 {
+		return
+	}
+	registry.AddCounter("workload_scheduler_planned_total", labels, planned)
+}
+
 func recordSchedulerStats(registry *metrics.Registry, labels metrics.Labels, stats *scheduledMessageStats) {
 	if registry == nil || stats == nil {
 		return
 	}
-	registry.AddCounter("workload_scheduler_planned_total", labels, stats.Planned)
 	registry.AddCounter("workload_scheduler_enqueued_total", labels, stats.Enqueued)
 	registry.AddCounter("workload_scheduler_dispatched_total", labels, stats.Dispatched)
 	registry.AddCounter("workload_scheduler_busy_key_stall_total", labels, stats.BusyKeyStalls)
@@ -33,4 +47,14 @@ func schedulerDropLabels(labels metrics.Labels, reason string) metrics.Labels {
 	}
 	out["reason"] = reason
 	return out
+}
+
+func newScheduledMessageStats(registry *metrics.Registry, labels metrics.Labels) *scheduledMessageStats {
+	return &scheduledMessageStats{dispatchLag: func(d time.Duration) { registry.ObserveLatency("workload_dispatch_lag_seconds", labels, d) }}
+}
+
+func (s *scheduledMessageStats) observeDispatchLag(d time.Duration) {
+	if s != nil && s.dispatchLag != nil {
+		s.dispatchLag(max(0, d))
+	}
 }

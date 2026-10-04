@@ -1,93 +1,13 @@
-import { Conversation, MessageContentType, Setting } from "wukongimjssdk";
-import { WKSDK, Message, Channel, ChannelTypePerson, ChannelTypeGroup, MessageStatus, SyncOptions, MessageExtra, MessageContent } from "wukongimjssdk";
+import { Conversation, messageFromHTTP, WKSDK, Message, Channel, MessageExtra } from "wukongimjssdk";
 import BigNumber from "bignumber.js";
 import { Buffer } from 'buffer';
 export class Convert {
     static toMessage(msgMap: any): Message {
-        const message = new Message();
-        if (msgMap['message_idstr']) {
-            message.messageID = msgMap['message_idstr'];
-        } else {
-            message.messageID = new BigNumber(msgMap['message_id']).toString();
-        }
-        if (msgMap["header"]) {
-            message.header.reddot = msgMap["header"]["red_dot"] === 1 ? true : false
-        }
-        if (msgMap["setting"]) {
-            message.setting = Setting.fromUint8(msgMap["setting"])
-        }
-        if (msgMap["revoke"]) {
-            message.remoteExtra.revoke = msgMap["revoke"] === 1 ? true : false
-        }
-        if(msgMap["message_extra"]) {
-            const messageExtra = msgMap["message_extra"]
-           message.remoteExtra = this.toMessageExtra(messageExtra)
-        }
-        
-        message.clientSeq = msgMap["client_seq"]
-        message.channel = new Channel(msgMap['channel_id'], msgMap['channel_type']);
-        message.messageSeq = msgMap["message_seq"]
-        message.clientMsgNo = msgMap["client_msg_no"]
-        message.fromUID = msgMap["from_uid"]
-        message.timestamp = msgMap["timestamp"]
-        message.status = MessageStatus.Normal
-
-        // 解析 event_meta（新协议）
-        const eventMeta = msgMap["event_meta"]
-        if (eventMeta) {
-            (message as any).eventMeta = eventMeta
-            if (eventMeta.completed) {
-                (message as any).completed = true
-            }
-        }
-
-        // 从 event_meta snapshot 或 legacy stream_data 中提取流文本
-        let streamTextResolved = false
-        if (eventMeta && eventMeta.events && eventMeta.events.length > 0) {
-            for (const ek of eventMeta.events) {
-                if (ek.event_key === "main" || eventMeta.events.length === 1) {
-                    const snapshot = ek.snapshot
-                    if (snapshot && snapshot.kind === "text" && snapshot.text) {
-                        message.streamText = snapshot.text
-                        streamTextResolved = true
-                        break
-                    }
-                }
-            }
-        }
-        if (!streamTextResolved) {
-            const streamBase64Data = msgMap["stream_data"]
-            if (streamBase64Data) {
-                const streamText = Buffer.from(streamBase64Data, 'base64')
-                message.streamText = streamText.toString('utf8')
-            }
-        }
-       
-        let contentType = 0
-        try {
-            let contentObj = null
-            const payload = msgMap["payload"]
-            if(payload && payload!=="") {
-                const decodedBuffer = Buffer.from(payload, 'base64')
-                 contentObj = JSON.parse(decodedBuffer.toString('utf8'))
-                if (contentObj) {
-                    contentType = contentObj.type
-                }
-            }
-           
-            const messageContent = WKSDK.shared().getMessageContent(contentType)
-            if (contentObj) {
-                messageContent.decode(this.stringToUint8Array(JSON.stringify(contentObj)))
-            }
-            message.content = messageContent
-        }catch(e) {
-            console.log(e)
-            // 如果报错，直接设置为unknown  
-            const messageContent = WKSDK.shared().getMessageContent(MessageContentType.unknown)
-            message.content = messageContent
-        }
-       
-       
+        // Keep SDK identity/version validation and the Demo's extra fields together.
+        const message = messageFromHTTP(msgMap);
+        message.clientSeq = msgMap.client_seq;
+        if (msgMap.revoke) message.remoteExtra.revoke = msgMap.revoke === 1;
+        if (msgMap.message_extra) message.remoteExtra = this.toMessageExtra(msgMap.message_extra);
 
         message.isDeleted = msgMap["is_deleted"] === 1
 
@@ -98,11 +18,19 @@ export class Convert {
         const conversation = new Conversation()
         conversation.channel = new Channel(conversationMap['channel_id'], conversationMap['channel_type'])
         conversation.unread = conversationMap['unread'] || 0;
-        conversation.timestamp = conversationMap['timestamp'] || 0;
-        let recents = conversationMap["recents"];
-        if (recents && recents.length > 0) {
-            const messageModel = this.toMessage(recents[0]);
+        const lastMessage = conversationMap["last_message"];
+        if (lastMessage) {
+            const timestamp = Math.floor((lastMessage["server_timestamp_ms"] || 0) / 1000)
+            const messageModel = this.toMessage({
+                ...lastMessage,
+                channel_id: conversationMap['channel_id'],
+                channel_type: conversationMap['channel_type'],
+                timestamp,
+            });
             conversation.lastMessage = messageModel
+            conversation.timestamp = timestamp
+        } else {
+            conversation.timestamp = Math.floor((conversationMap['active_at'] || 0) / 1_000_000_000)
         }
         conversation.extra = {}
 

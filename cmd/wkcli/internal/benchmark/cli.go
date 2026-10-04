@@ -1,0 +1,112 @@
+package benchmark
+
+import (
+	"errors"
+	"fmt"
+	"io"
+
+	"github.com/spf13/cobra"
+)
+
+type commandExit struct {
+	code    int
+	message string
+}
+
+// ExitCode preserves the benchmark command family process status.
+func (e commandExit) ExitCode() int { return e.code }
+
+func (e commandExit) Error() string {
+	return e.message
+}
+
+// NewCommand exposes the full benchmark tree beneath wkcli.
+func NewCommand(stderr io.Writer) *cobra.Command { return newRootCommand(stderr) }
+
+func newRootCommand(stderr io.Writer) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:           "bench",
+		Short:         "Black-box benchmark driver for WuKongIM clusters",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := cmd.Help(); err != nil {
+				return commandExit{code: exitInternal, message: err.Error()}
+			}
+			return commandExit{code: exitConfig}
+		},
+	}
+	cmd.SetOut(stderr)
+	cmd.SetErr(stderr)
+	cmd.AddCommand(
+		newRunCommand(stderr),
+		newSoakCommand(stderr),
+		newWorkerCommand(stderr),
+		newHostMetricsCommand(stderr),
+		newValidateCommand(stderr),
+		newDoctorCommand(stderr),
+		newDevSimCommand(stderr),
+		newCapacityCommand(stderr),
+		newFormalChainCommand(stderr),
+		newMetricsCommand(stderr),
+		newReportCommand(),
+	)
+	return cmd
+}
+
+func executeRoot(args []string, stderr io.Writer) int {
+	cmd := newRootCommand(stderr)
+	cmd.SetArgs(args)
+	if err := cmd.Execute(); err != nil {
+		var exit commandExit
+		if errors.As(err, &exit) {
+			if exit.message != "" {
+				fmt.Fprintln(stderr, exit.message)
+			}
+			return exit.code
+		}
+		fmt.Fprintln(stderr, err)
+		return exitConfig
+	}
+	return 0
+}
+
+func exitCodeError(code int) error {
+	if code == 0 {
+		return nil
+	}
+	return commandExit{code: code}
+}
+
+func exitConfigError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return commandExit{code: exitConfig, message: err.Error()}
+}
+
+func newReportCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "report",
+		Short: "Render standalone benchmark reports",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := cmd.Help(); err != nil {
+				return commandExit{code: exitInternal, message: err.Error()}
+			}
+			return commandExit{code: exitConfig}
+		},
+	}
+	cmd.AddCommand(
+		newLocalChatLifecycleStepReportCommand(),
+		newLocalSingleNodeStepReportCommand(),
+		newLocalSingleNodeStepClosureCommand(),
+		newLocalSingleNodeBaselineReportCommand(),
+		newLocalSingleNodeProfileThresholdCommand(),
+		newLocalTerminalQueueConvergenceCommand(),
+		newLocalSingleNodePublishCommand(),
+		newLocalSingleNodeCompletionCommand(),
+		newLocalChatLifecycleTimelineReportCommand(),
+		newLocalChatLifecycleCutQueryCommand(),
+	)
+	return cmd
+}

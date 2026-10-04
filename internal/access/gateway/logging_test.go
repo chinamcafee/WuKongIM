@@ -3,6 +3,8 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
+	"github.com/WuKongIM/WuKongIM/pkg/gateway/transport"
 	"testing"
 	"time"
 
@@ -137,6 +139,95 @@ func TestOnSendBatchLogsResultCountMismatch(t *testing.T) {
 	requireLogEntry(t, logger, "ERROR", "internal.access.gateway.frame", "internal.access.gateway.send_batch_result_count_mismatch")
 }
 
+func TestOnSendBatchTimeoutLogCarriesConsumedStageBudget(t *testing.T) {
+	logger := newRecordingLogger("internal.access.gateway")
+	var written []frame.Frame
+	sess := newTestSession(t, &written)
+	sess.SetValue(coregateway.SessionValueUID, "u1")
+	handler := New(Options{
+		Logger: logger, SendTimeout: 100 * time.Millisecond,
+		Messages: message.New(message.Options{
+			PersonDirectory: gatewayDelayedPersonDirectory{delay: 20 * time.Millisecond},
+			Submitter:       gatewayDeadlineSubmitter{},
+		}),
+	})
+
+	err := handler.OnSendBatch([]coregateway.SendBatchItem{{
+		Context: coregateway.Context{Session: sess, RequestContext: context.Background()},
+		Frame: &frame.SendPacket{
+			ClientSeq: 1, ClientMsgNo: "timeout", ChannelID: "u2", ChannelType: 1, Payload: []byte("one"),
+		},
+	}})
+	if err != nil {
+		t.Fatalf("OnSendBatch() error = %v", err)
+	}
+	entry := requireLogEntry(t, logger, "WARN", "internal.access.gateway.frame", "internal.access.gateway.send_failed")
+	if stage := requireFieldValue[string](t, entry, "failedStage"); stage != "submitter" {
+		t.Fatalf("failed stage = %q, want submitter", stage)
+	}
+	if duration := requireFieldValue[time.Duration](t, entry, "preAppendDuration"); duration < 15*time.Millisecond {
+		t.Fatalf("pre-append duration = %v, want delayed directory cost", duration)
+	}
+	if budget := requireFieldValue[time.Duration](t, entry, "deadlineBudgetBeforeSubmit"); budget <= 0 || budget >= 95*time.Millisecond {
+		t.Fatalf("deadline budget before submit = %v, want consumed positive budget", budget)
+	}
+}
+
+func TestHandlerWarnsForCanceledWorkBeforePlannedShutdown(t *testing.T) {
+	logger := newRecordingLogger("internal.access.gateway")
+	handler := New(Options{Logger: logger})
+
+	handler.logSendFailure(message.SendCommand{
+		FromUID: "u1", ChannelID: "u2", ChannelType: 1, ClientMsgNo: "runtime-cancel",
+	}, sendackSourceBatchResultError, sendackErrorClassCanceled, context.Canceled)
+
+	entry := requireLogEntry(t, logger, "WARN", "internal.access.gateway.frame", "internal.access.gateway.send_failed")
+	if class := requireFieldValue[string](t, entry, "errorClass"); class != sendackErrorClassCanceled {
+		t.Fatalf("canceled send error class = %q, want %q", class, sendackErrorClassCanceled)
+	}
+}
+
+func TestHandlerSuppressesCanceledWorkAfterPlannedShutdownFence(t *testing.T) {
+	logger := newRecordingLogger("internal.access.gateway")
+	handler := New(Options{Logger: logger})
+	handler.BeginPlannedShutdown()
+
+	handler.logSendFailure(message.SendCommand{
+		FromUID: "u1", ChannelID: "u2", ChannelType: 1, ClientMsgNo: "planned-stop",
+	}, sendackSourceBatchResultError, sendackErrorClassCanceled, context.Canceled)
+
+	if entries := logger.entries(); len(entries) != 0 {
+		t.Fatalf("planned canceled send log entries = %#v, want none", entries)
+	}
+}
+
+type gatewayDelayedPersonDirectory struct{ delay time.Duration }
+
+func (d gatewayDelayedPersonDirectory) AdmitPersonChannelDirectory(ctx context.Context, _ string, _ int64) error {
+	timer := time.NewTimer(d.delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+type gatewayDeadlineSubmitter struct{}
+
+func (gatewayDeadlineSubmitter) Send(context.Context, message.SendCommand) (message.SendResult, error) {
+	return message.SendResult{}, context.DeadlineExceeded
+}
+
+func (gatewayDeadlineSubmitter) SendBatch(items []message.SendBatchItem) []message.SendBatchItemResult {
+	results := make([]message.SendBatchItemResult, len(items))
+	for index := range results {
+		results[index].Err = context.DeadlineExceeded
+	}
+	return results
+}
+
 func requireLogEntry(t *testing.T, logger *recordingLogger, level, module, event string) recordedLogEntry {
 	t.Helper()
 	for _, entry := range logger.entries() {
@@ -168,4 +259,34 @@ func requireFieldValue[T any](t *testing.T, entry recordedLogEntry, key string) 
 	var zero T
 	t.Fatalf("missing field %q in %#v", key, entry.fields)
 	return zero
+}
+
+func TestHandlerSamplesHandshakeRejectionsWithoutSuppressingListenerFaults(t *testing.T) {
+	logger := newRecordingLogger("internal.access.gateway")
+	h := New(Options{Logger: logger})
+	rejected := &transport.HandshakeRejectionError{StatusCode: 404, Err: errors.New("path mismatch")}
+	h.OnListenerError("ws", fmt.Errorf("wrapped: %w", rejected))
+	// Use a fixed timestamp inside the already opened window, without sleeps.
+	now := h.rejectionNext.Add(-time.Second)
+	for i := 0; i < 1000; i++ {
+		h.logHandshakeRejection("ws", rejected, 404, now)
+	}
+	h.OnListenerError("tcp", errors.New("accept failed"))
+	h.OnListenerError("ws", nil)
+	if got := len(logger.entries()); got != 2 {
+		t.Fatalf("log count = %d, want one sample and one fault", got)
+	}
+	entry := requireLogEntry(t, logger, "INFO", "internal.access.gateway.conn", "internal.access.gateway.handshake_rejected")
+	if got := requireFieldValue[uint64](t, entry, "rejected_total"); got != 1 {
+		t.Fatalf("total = %d", got)
+	}
+	requireLogEntry(t, logger, "ERROR", "internal.access.gateway.conn", "internal.access.gateway.listener_error")
+	h.logHandshakeRejection("ws", rejected, 404, now.Add(time.Second))
+	entries := logger.entries()
+	if len(entries) != 3 {
+		t.Fatalf("next window did not log: %d", len(entries))
+	}
+	if got := requireFieldValue[uint64](t, entries[2], "rejected_total"); got != 1002 {
+		t.Fatalf("total = %d, want 1002", got)
+	}
 }

@@ -7,12 +7,11 @@ import (
 	"strings"
 
 	"github.com/WuKongIM/WuKongIM/internal/contracts/onlinedelivery"
-	"github.com/WuKongIM/WuKongIM/internal/runtime/conversationactive"
-	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 	runtimechannelid "github.com/WuKongIM/WuKongIM/pkg/protocol/channelid"
 )
 
-const subscriberSnapshotLoadLimit = 1 << 30
+// Bound each snapshot read before the Slot store allocates its row page.
+const subscriberSnapshotLoadLimit = 1024
 
 const (
 	inlineRecipientAuthorityUIDLimit = 512
@@ -48,14 +47,9 @@ func (t *inlineRecipientAuthorityUIDTable) lookupOrInsert(uid string, authorityU
 type recipientDispatchResult struct {
 	// subscriberCache carries a successfully loaded non-large recipient snapshot.
 	subscriberCache subscriberCache
-	// activeErr reports an independent conversation projection failure without failing delivery.
-	activeErr error
 }
 
-type recipientSetDispatchResult struct {
-	// activeErr reports the best-effort conversation projection outcome for this recipient set.
-	activeErr error
-}
+type recipientSetDispatchResult struct{}
 
 type normalizedRecipientAuthoritySet struct {
 	// recipients preserves the normalized delivery input order, including duplicate UIDs.
@@ -66,10 +60,24 @@ type normalizedRecipientAuthoritySet struct {
 	authorityRecipient []bool
 	// recipientAuthorityIndexes maps each recipient back to its authorityUIDs entry.
 	recipientAuthorityIndexes []int
-	// senderAuthorityIndex is the sender entry in authorityUIDs, or -1 when omitted.
-	senderAuthorityIndex int
 	// uniqueRecipientCount counts distinct normalized recipient UIDs.
 	uniqueRecipientCount int
+}
+
+// recipientDispatchScratch owns page-local indexes that can be reused after
+// each delivery plan has taken ownership of its grouped recipient storage.
+type recipientDispatchScratch struct {
+	inlineUIDs                inlineRecipientAuthorityUIDTable
+	seen                      map[string]int
+	authorityUIDs             []string
+	authorityRecipient        []bool
+	recipientAuthorityIndexes []int
+	normalizedRecipients      []Recipient
+	groups                    []recipientAuthorityGroup
+	deliveryOrder             []int
+	authorityGroupIndexes     []int
+	recipientGroupIndexes     []int
+	firstGroupByHashSlot      [256]uint32
 }
 
 type recipientAuthorityGroup struct {
@@ -79,16 +87,8 @@ type recipientAuthorityGroup struct {
 	recipientCount int
 	// recipients preserves delivery order for UIDs owned by target.
 	recipients []Recipient
-	// activeCount sizes the conversation-active slice before the fill pass.
-	activeCount int
-	// activeRecipients contains recipient projections owned by target.
-	activeRecipients []conversationactive.ActiveEntry
-	// senderUID is populated only for the sender authority group.
-	senderUID string
 	// deliverySeen reports whether target has at least one delivery recipient.
 	deliverySeen bool
-	// activeSeen reports whether target participates in conversation projection.
-	activeSeen bool
 }
 
 type recipientAuthorityGrouping struct {
@@ -96,10 +96,6 @@ type recipientAuthorityGrouping struct {
 	groups []recipientAuthorityGroup
 	// deliveryOrder preserves first-seen target order for delivery dispatch.
 	deliveryOrder []int
-	// activeOrder preserves first-seen target order for conversation projection.
-	activeOrder []int
-	// activeReady reports whether every sender and recipient active route is usable.
-	activeReady bool
 }
 
 func dispatchCommittedRecipients(ctx context.Context, event CommittedEnvelope, ports commitPorts) error {
@@ -117,33 +113,31 @@ func dispatchCommittedRecipientsForTarget(ctx context.Context, target AuthorityT
 
 func dispatchRecipientsForTarget(ctx context.Context, mode onlinedelivery.Mode, target AuthorityTarget, event CommittedEnvelope, cache subscriberCache, ports commitPorts) (recipientDispatchResult, error) {
 	enqueuer := ports.deliveryEnqueuer
-	if ports.activeAdmitter == nil && enqueuer == nil {
+	if enqueuer == nil && (ports.cmdActiveProjector == nil || mode != onlinedelivery.ModeDurable || !event.SyncOnce) {
 		return recipientDispatchResult{}, nil
 	}
 	if err := contextErr(ctx); err != nil {
 		return recipientDispatchResult{}, withPostCommitFailureDetail(err, PostCommitFailureDetail{Phase: "context"})
 	}
 	if len(event.MessageScopedUIDs) > 0 {
-		result, err := dispatchRecipientSetResultForMode(ctx, mode, event, recipientsFromUIDs(event.MessageScopedUIDs), ports)
-		return recipientDispatchResult{activeErr: result.activeErr}, err
+		_, err := dispatchRecipientSetResultForMode(ctx, mode, event, recipientsFromUIDs(event.MessageScopedUIDs), ports)
+		return recipientDispatchResult{}, err
 	}
-	sourceChannelID, commandChannel := runtimechannelid.FromCommandChannel(event.ChannelID)
 	if event.ChannelType == channelTypePerson {
-		left, right, err := runtimechannelid.DecodePersonChannel(sourceChannelID)
+		// Resolve participants from the source ID, retaining the command ID on the event.
+		sourceID, _ := ports.commandChannels.FromCommandChannel(event.ChannelID)
+		left, right, err := runtimechannelid.DecodePersonChannel(sourceID)
 		if err != nil {
 			return recipientDispatchResult{}, withPostCommitFailureDetail(err, PostCommitFailureDetail{Phase: "person_channel_decode"})
 		}
-		result, dispatchErr := dispatchRecipientSetResultForMode(ctx, mode, event, []Recipient{{UID: left}, {UID: right}}, ports)
-		return recipientDispatchResult{activeErr: result.activeErr}, dispatchErr
+		_, dispatchErr := dispatchRecipientSetResultForMode(ctx, mode, event, []Recipient{{UID: left}, {UID: right}}, ports)
+		return recipientDispatchResult{}, dispatchErr
 	}
-	// A command channel is an internal delivery/storage view of its source channel.
-	// Subscriber membership remains authoritative on the source channel and its
-	// mutation version is not reflected by the derived command-channel target.
-	// Always page the current source membership instead of using a stale cache.
-	if commandChannel {
-		return dispatchSubscriberPages(ctx, mode, event, ports)
-	}
-	if target.Large {
+	// Command runtime metadata has no version fence for the source group's
+	// membership. Read bounded source pages on each send instead of reusing a
+	// snapshot fenced by the command Channel's unrelated mutation version.
+	_, command := ports.commandChannels.FromCommandChannel(event.ChannelID)
+	if target.Large || command {
 		return dispatchSubscriberPages(ctx, mode, event, ports)
 	}
 	return dispatchSubscriberSnapshot(ctx, mode, target, event, cache, ports)
@@ -153,16 +147,18 @@ func dispatchSubscriberPages(ctx context.Context, mode onlinedelivery.Mode, even
 	if ports.subscribers == nil {
 		return recipientDispatchResult{}, nil
 	}
+	sourceID, _ := ports.commandChannels.FromCommandChannel(event.ChannelID)
 	pageSize := boundedPositive(ports.subscriberPageSize, defaultSubscriberScanPageSize)
 	cursor := ""
 	var result recipientDispatchResult
+	var scratch recipientDispatchScratch
 	for {
 		previousCursor := cursor
 		if err := contextErr(ctx); err != nil {
 			return result, withPostCommitFailureDetail(err, PostCommitFailureDetail{Phase: "context"})
 		}
 		page, err := ports.subscribers.NextSubscriberPage(ctx, SubscriberPageRequest{
-			ChannelID: subscriberSourceChannel(event),
+			ChannelID: ChannelID{ID: sourceID, Type: event.ChannelType},
 			Cursor:    cursor,
 			Limit:     pageSize,
 		})
@@ -175,10 +171,7 @@ func dispatchSubscriberPages(ctx context.Context, mode onlinedelivery.Mode, even
 				RecipientCount: len(page.Recipients),
 			})
 		}
-		pageResult, dispatchErr := dispatchRecipientSetResultForMode(ctx, mode, event, page.Recipients, ports)
-		if result.activeErr == nil {
-			result.activeErr = pageResult.activeErr
-		}
+		_, dispatchErr := dispatchRecipientSetResultForModeWithScratch(ctx, mode, event, page.Recipients, ports, &scratch)
 		if dispatchErr != nil {
 			return result, dispatchErr
 		}
@@ -194,35 +187,47 @@ func dispatchSubscriberSnapshot(ctx context.Context, mode onlinedelivery.Mode, t
 		return recipientDispatchResult{}, nil
 	}
 	if cache.matches(target) {
-		result, err := dispatchRecipientSetResultForMode(ctx, mode, event, cache.recipients, ports)
-		return recipientDispatchResult{subscriberCache: cache, activeErr: result.activeErr}, err
+		_, err := dispatchRecipientSetResultForMode(ctx, mode, event, cache.recipients, ports)
+		return recipientDispatchResult{subscriberCache: cache}, err
 	}
 	if err := contextErr(ctx); err != nil {
 		return recipientDispatchResult{}, withPostCommitFailureDetail(err, PostCommitFailureDetail{Phase: "context"})
 	}
-	page, err := ports.subscribers.NextSubscriberPage(ctx, SubscriberPageRequest{
-		ChannelID: subscriberSourceChannel(event),
-		Limit:     subscriberSnapshotLoadLimit,
-	})
-	if err != nil {
-		return recipientDispatchResult{}, withPostCommitFailureDetail(err, PostCommitFailureDetail{Phase: "subscriber_snapshot"})
-	}
-	if !page.Done {
-		return recipientDispatchResult{}, withPostCommitFailureDetail(ErrInvalidSubscriberCursor, PostCommitFailureDetail{
-			Phase:          "subscriber_snapshot",
-			RecipientCount: len(page.Recipients),
+	var recipients []Recipient
+	cursor := ""
+	for {
+		if err := contextErr(ctx); err != nil {
+			return recipientDispatchResult{}, withPostCommitFailureDetail(err, PostCommitFailureDetail{Phase: "context"})
+		}
+		page, err := ports.subscribers.NextSubscriberPage(ctx, SubscriberPageRequest{
+			ChannelID: ChannelID{ID: event.ChannelID, Type: event.ChannelType},
+			Cursor:    cursor,
+			Limit:     subscriberSnapshotLoadLimit,
 		})
+		if err != nil {
+			return recipientDispatchResult{}, withPostCommitFailureDetail(err, PostCommitFailureDetail{Phase: "subscriber_snapshot"})
+		}
+		if !page.Done && (page.Cursor == "" || page.Cursor == cursor) {
+			return recipientDispatchResult{}, withPostCommitFailureDetail(ErrInvalidSubscriberCursor, PostCommitFailureDetail{
+				Phase: "subscriber_cursor", RecipientCount: len(page.Recipients),
+			})
+		}
+		recipients = append(recipients, page.Recipients...)
+		if page.Done {
+			break
+		}
+		cursor = page.Cursor
 	}
 	nextCache := subscriberCache{
 		ready:           true,
 		mutationVersion: target.SubscriberMutationVersion,
-		recipients:      append([]Recipient(nil), page.Recipients...),
+		recipients:      recipients,
 	}
-	dispatch, err := dispatchRecipientSetResultForMode(ctx, mode, event, page.Recipients, ports)
+	_, err := dispatchRecipientSetResultForMode(ctx, mode, event, recipients, ports)
 	if err != nil {
-		return recipientDispatchResult{activeErr: dispatch.activeErr}, err
+		return recipientDispatchResult{}, err
 	}
-	return recipientDispatchResult{subscriberCache: nextCache, activeErr: dispatch.activeErr}, nil
+	return recipientDispatchResult{subscriberCache: nextCache}, nil
 }
 
 func subscriberSourceChannel(event CommittedEnvelope) ChannelID {
@@ -240,13 +245,26 @@ func dispatchRecipientSetResult(ctx context.Context, event CommittedEnvelope, re
 }
 
 func dispatchRecipientSetResultForMode(ctx context.Context, mode onlinedelivery.Mode, event CommittedEnvelope, recipients []Recipient, ports commitPorts) (recipientSetDispatchResult, error) {
+	var scratch recipientDispatchScratch
+	return dispatchRecipientSetResultForModeWithScratch(ctx, mode, event, recipients, ports, &scratch)
+}
+
+func dispatchRecipientSetResultForModeWithScratch(ctx context.Context, mode onlinedelivery.Mode, event CommittedEnvelope, recipients []Recipient, ports commitPorts, scratch *recipientDispatchScratch) (recipientSetDispatchResult, error) {
 	enqueuer := ports.deliveryEnqueuer
-	if len(recipients) == 0 || (ports.activeAdmitter == nil && enqueuer == nil) {
+	if len(recipients) == 0 || (enqueuer == nil && (ports.cmdActiveProjector == nil || mode != onlinedelivery.ModeDurable || !event.SyncOnce)) {
 		return recipientSetDispatchResult{}, nil
 	}
-	routedActive, hasRoutedActive := ports.activeAdmitter.(RoutedConversationActiveAdmitter)
-	normalized := normalizeRecipientsForAuthorityResolution(event.FromUID, recipients, hasRoutedActive)
+	normalized := normalizeRecipientsForAuthorityResolutionWithScratch(recipients, scratch)
 	if len(normalized.recipients) == 0 {
+		return recipientSetDispatchResult{}, nil
+	}
+
+	if mode == onlinedelivery.ModeDurable && event.SyncOnce && ports.cmdActiveProjector != nil {
+		if err := ports.cmdActiveProjector.ProjectCMDRecipients(ctx, event, normalized.recipients); err != nil {
+			return recipientSetDispatchResult{}, withPostCommitFailureDetail(err, PostCommitFailureDetail{Phase: "cmd_directory"})
+		}
+	}
+	if enqueuer == nil {
 		return recipientSetDispatchResult{}, nil
 	}
 
@@ -256,10 +274,10 @@ func dispatchRecipientSetResultForMode(ctx context.Context, mode onlinedelivery.
 		grouping   recipientAuthorityGrouping
 		groupErr   error
 	)
-	if ports.recipientAuthorityResolver != nil && (enqueuer != nil || hasRoutedActive) {
+	if ports.recipientAuthorityResolver != nil {
 		results, resolveErr = resolveRecipientAuthorityTargets(ctx, ports.recipientAuthorityResolver, normalized.authorityUIDs)
 		if resolveErr == nil {
-			grouping, groupErr = groupRecipientAuthorities(normalized, results, event.FromUID)
+			grouping, groupErr = groupRecipientAuthoritiesWithScratch(normalized, results, scratch)
 		}
 	}
 
@@ -277,13 +295,7 @@ func dispatchRecipientSetResultForMode(ctx context.Context, mode onlinedelivery.
 		}
 	}
 
-	var activeErr error
-	if hasRoutedActive && resolveErr == nil && groupErr == nil && grouping.activeReady {
-		activeErr = admitRoutedConversationActiveBatches(ctx, event, normalized, grouping, routedActive)
-	} else {
-		activeErr = admitConversationActiveBatch(ctx, event, normalized.recipients, normalized.uniqueRecipientCount, ports.activeAdmitter)
-	}
-	return recipientSetDispatchResult{activeErr: activeErr}, deliveryErr
+	return recipientSetDispatchResult{}, deliveryErr
 }
 
 func dispatchRecipientDelivery(ctx context.Context, mode onlinedelivery.Mode, event CommittedEnvelope, grouping recipientAuthorityGrouping, ports commitPorts, enqueuer OnlineDeliveryEnqueuer) error {
@@ -304,7 +316,7 @@ func dispatchRecipientPlans(
 	enqueuer OnlineDeliveryEnqueuer,
 ) error {
 	planTargetCapacity := min(batchSize, len(order))
-	plan := onlinedelivery.RecipientDeliveryPlan{Mode: mode, Event: event, Targets: make([]onlinedelivery.RecipientTargetBatch, 0, planTargetCapacity)}
+	plan := onlinedelivery.RecipientDeliveryPlan{Mode: mode, Event: event}
 	flush := func() error {
 		if plan.RecipientCount() == 0 {
 			return nil
@@ -319,7 +331,7 @@ func dispatchRecipientPlans(
 			detail.DispatchBatchSize = plan.RecipientCount()
 			return withPostCommitFailureDetail(err, detail)
 		}
-		plan = onlinedelivery.RecipientDeliveryPlan{Mode: mode, Event: event, Targets: make([]onlinedelivery.RecipientTargetBatch, 0, planTargetCapacity)}
+		plan.Targets = nil
 		return nil
 	}
 
@@ -339,6 +351,9 @@ func dispatchRecipientPlans(
 			if n > len(recipients) {
 				n = len(recipients)
 			}
+			if plan.Targets == nil {
+				plan.Targets = make([]onlinedelivery.RecipientTargetBatch, 0, planTargetCapacity)
+			}
 			plan.Targets = append(plan.Targets, onlinedelivery.RecipientTargetBatch{
 				Target: target,
 				// Grouping already owns this normalized recipient storage. A
@@ -353,82 +368,60 @@ func dispatchRecipientPlans(
 	return flush()
 }
 
-func admitConversationActiveBatch(ctx context.Context, event CommittedEnvelope, recipients []Recipient, uniqueRecipientCount int, admitter ConversationActiveAdmitter) error {
-	if admitter == nil {
-		return nil
+func normalizeRecipientsForAuthorityResolutionWithScratch(recipients []Recipient, scratch *recipientDispatchScratch) normalizedRecipientAuthoritySet {
+	if scratch == nil {
+		scratch = &recipientDispatchScratch{}
 	}
-	entries := make([]conversationactive.ActiveEntry, 0, len(recipients))
-	for _, recipient := range recipients {
-		if recipient.UID == "" {
-			continue
-		}
-		entries = append(entries, conversationactive.ActiveEntry{UID: recipient.UID})
+	clear(scratch.authorityUIDs)
+	clear(scratch.normalizedRecipients)
+	scratch.authorityUIDs = scratch.authorityUIDs[:0]
+	scratch.authorityRecipient = scratch.authorityRecipient[:0]
+	scratch.recipientAuthorityIndexes = scratch.recipientAuthorityIndexes[:0]
+	scratch.normalizedRecipients = scratch.normalizedRecipients[:0]
+	if cap(scratch.authorityUIDs) < len(recipients) {
+		scratch.authorityUIDs = make([]string, 0, len(recipients))
 	}
-	if len(entries) == 0 && event.FromUID == "" {
-		return nil
+	if cap(scratch.authorityRecipient) < len(recipients) {
+		scratch.authorityRecipient = make([]bool, 0, len(recipients))
 	}
-	batch := conversationactive.ActiveBatch{
-		Kind:        conversationKindForCommittedEnvelope(event),
-		SenderUID:   event.FromUID,
-		ChannelID:   event.ChannelID,
-		ChannelType: event.ChannelType,
-		MessageSeq:  event.MessageSeq,
-		ActiveAtMS:  event.ServerTimestampMS,
-		Recipients:  entries,
+	if cap(scratch.recipientAuthorityIndexes) < len(recipients) {
+		scratch.recipientAuthorityIndexes = make([]int, 0, len(recipients))
 	}
-	if err := admitter.AdmitActiveBatch(ctx, batch); err != nil {
-		return withPostCommitFailureDetail(err, PostCommitFailureDetail{
-			Phase:          "conversation_active",
-			UID:            firstRecipientUID(recipients),
-			UIDCount:       uniqueRecipientCount,
-			RecipientCount: len(recipients),
-		})
-	}
-	return nil
-}
-
-func conversationKindForCommittedEnvelope(event CommittedEnvelope) metadb.ConversationKind {
-	if event.SyncOnce || runtimechannelid.IsCommandChannel(event.ChannelID) {
-		return metadb.ConversationKindCMD
-	}
-	return metadb.ConversationKindNormal
-}
-
-func normalizeRecipientsForAuthorityResolution(senderUID string, recipients []Recipient, includeSender bool) normalizedRecipientAuthoritySet {
 	set := normalizedRecipientAuthoritySet{
-		authorityUIDs:             make([]string, 0, len(recipients)+1),
-		authorityRecipient:        make([]bool, 0, len(recipients)+1),
-		recipientAuthorityIndexes: make([]int, 0, len(recipients)),
-		senderAuthorityIndex:      -1,
+		authorityUIDs:             scratch.authorityUIDs,
+		authorityRecipient:        scratch.authorityRecipient,
+		recipientAuthorityIndexes: scratch.recipientAuthorityIndexes,
 	}
 	copyRecipients := false
-	var inlineUIDs inlineRecipientAuthorityUIDTable
 	var seen map[string]int
 	if len(recipients) > inlineRecipientAuthorityUIDLimit {
-		seen = make(map[string]int, len(recipients)+1)
-	}
-	if includeSender && senderUID != "" {
-		set.senderAuthorityIndex = 0
-		set.authorityUIDs = append(set.authorityUIDs, senderUID)
-		set.authorityRecipient = append(set.authorityRecipient, false)
-		if seen != nil {
-			seen[senderUID] = 0
+		if scratch.seen == nil {
+			scratch.seen = make(map[string]int, len(recipients))
 		} else {
-			inlineUIDs.lookupOrInsert(senderUID, set.authorityUIDs, 0)
+			clear(scratch.seen)
 		}
+		seen = scratch.seen
+	} else {
+		clear(scratch.inlineUIDs.positions[:])
 	}
 	for recipientIndex, recipient := range recipients {
 		uid := strings.TrimSpace(recipient.UID)
 		if uid == "" {
 			if !copyRecipients {
-				set.recipients = make([]Recipient, 0, len(recipients))
+				if cap(scratch.normalizedRecipients) < len(recipients) {
+					scratch.normalizedRecipients = make([]Recipient, 0, len(recipients))
+				}
+				set.recipients = scratch.normalizedRecipients
 				set.recipients = append(set.recipients, recipients[:recipientIndex]...)
 				copyRecipients = true
 			}
 			continue
 		}
 		if uid != recipient.UID && !copyRecipients {
-			set.recipients = make([]Recipient, 0, len(recipients))
+			if cap(scratch.normalizedRecipients) < len(recipients) {
+				scratch.normalizedRecipients = make([]Recipient, 0, len(recipients))
+			}
+			set.recipients = scratch.normalizedRecipients
 			set.recipients = append(set.recipients, recipients[:recipientIndex]...)
 			copyRecipients = true
 		}
@@ -443,7 +436,7 @@ func normalizeRecipientsForAuthorityResolution(senderUID string, recipients []Re
 		if seen != nil {
 			authorityIndex, ok = seen[uid]
 		} else {
-			authorityIndex, ok = inlineUIDs.lookupOrInsert(uid, set.authorityUIDs, len(set.authorityUIDs))
+			authorityIndex, ok = scratch.inlineUIDs.lookupOrInsert(uid, set.authorityUIDs, len(set.authorityUIDs))
 		}
 		if !ok {
 			authorityIndex = len(set.authorityUIDs)
@@ -462,7 +455,12 @@ func normalizeRecipientsForAuthorityResolution(senderUID string, recipients []Re
 	if !copyRecipients {
 		// The caller retains ownership; downstream grouping only reads this normalized view.
 		set.recipients = recipients
+	} else {
+		scratch.normalizedRecipients = set.recipients
 	}
+	scratch.authorityUIDs = set.authorityUIDs
+	scratch.authorityRecipient = set.authorityRecipient
+	scratch.recipientAuthorityIndexes = set.recipientAuthorityIndexes
 	return set
 }
 
@@ -489,13 +487,23 @@ func resolveRecipientAuthorityTargets(ctx context.Context, resolver RecipientAut
 	return results, nil
 }
 
-func groupRecipientAuthorities(set normalizedRecipientAuthoritySet, results []RecipientAuthorityResult, senderUID string) (recipientAuthorityGrouping, error) {
+func groupRecipientAuthoritiesWithScratch(set normalizedRecipientAuthoritySet, results []RecipientAuthorityResult, scratch *recipientDispatchScratch) (recipientAuthorityGrouping, error) {
+	if scratch == nil {
+		scratch = &recipientDispatchScratch{}
+	}
 	groupCapacity := recipientAuthorityGroupCapacity(results)
+	clear(scratch.groups)
+	scratch.groups = scratch.groups[:0]
+	scratch.deliveryOrder = scratch.deliveryOrder[:0]
+	if cap(scratch.groups) < groupCapacity {
+		scratch.groups = make([]recipientAuthorityGroup, 0, groupCapacity)
+	}
+	if cap(scratch.deliveryOrder) < groupCapacity {
+		scratch.deliveryOrder = make([]int, 0, groupCapacity)
+	}
 	grouping := recipientAuthorityGrouping{
-		groups:        make([]recipientAuthorityGroup, 0, groupCapacity),
-		deliveryOrder: make([]int, 0, groupCapacity),
-		activeOrder:   make([]int, 0, groupCapacity),
-		activeReady:   len(results) == len(set.authorityUIDs),
+		groups:        scratch.groups,
+		deliveryOrder: scratch.deliveryOrder,
 	}
 	if len(results) != len(set.authorityUIDs) {
 		return grouping, fmt.Errorf("channelappend: aligned recipient authority result count %d does not match UID count %d: %w", len(results), len(set.authorityUIDs), ErrRouteNotReady)
@@ -503,8 +511,14 @@ func groupRecipientAuthorities(set normalizedRecipientAuthoritySet, results []Re
 	// The default physical hash-slot table is 256 entries. The fixed first-group
 	// index removes a target-keyed map from the hot path while the exact-target
 	// scan preserves semantics for custom slot counts and transition collisions.
-	var firstGroupByHashSlot [256]uint32
-	authorityGroupIndexes := make([]int, len(results))
+	clear(scratch.firstGroupByHashSlot[:])
+	firstGroupByHashSlot := &scratch.firstGroupByHashSlot
+	if cap(scratch.authorityGroupIndexes) < len(results) {
+		scratch.authorityGroupIndexes = make([]int, len(results))
+	} else {
+		scratch.authorityGroupIndexes = scratch.authorityGroupIndexes[:len(results)]
+	}
+	authorityGroupIndexes := scratch.authorityGroupIndexes
 	for index := range authorityGroupIndexes {
 		authorityGroupIndexes[index] = -1
 	}
@@ -538,34 +552,25 @@ func groupRecipientAuthorities(set normalizedRecipientAuthoritySet, results []Re
 	}
 	for index, result := range results {
 		if result.Err != nil || result.Target.Validate() != nil {
-			grouping.activeReady = false
 			continue
 		}
 		indexForGroup := ensureGroup(result.Target)
 		authorityGroupIndexes[index] = indexForGroup
-		group := &grouping.groups[indexForGroup]
-		if !group.activeSeen {
-			group.activeSeen = true
-			grouping.activeOrder = append(grouping.activeOrder, indexForGroup)
-		}
-		if index == set.senderAuthorityIndex {
-			group.senderUID = senderUID
-		}
-		if set.authorityRecipient[index] {
-			group.activeCount++
-		}
 	}
 
-	recipientGroupIndexes := make([]int, len(set.recipients))
+	if cap(scratch.recipientGroupIndexes) < len(set.recipients) {
+		scratch.recipientGroupIndexes = make([]int, len(set.recipients))
+	} else {
+		scratch.recipientGroupIndexes = scratch.recipientGroupIndexes[:len(set.recipients)]
+	}
+	recipientGroupIndexes := scratch.recipientGroupIndexes
 	for index, recipient := range set.recipients {
 		authorityIndex := set.recipientAuthorityIndexes[index]
 		result := results[authorityIndex]
 		if result.Err != nil {
-			grouping.activeReady = false
 			return grouping, withRecipientRouteResolveDetail(result.Err, set)
 		}
 		if err := result.Target.Validate(); err != nil {
-			grouping.activeReady = false
 			detail := postCommitTargetDetail(result.Target)
 			detail.Phase = "recipient_target_validate"
 			detail.UID = recipient.UID
@@ -599,28 +604,9 @@ func groupRecipientAuthorities(set normalizedRecipientAuthoritySet, results []Re
 		groupIndex := recipientGroupIndexes[index]
 		grouping.groups[groupIndex].recipients = append(grouping.groups[groupIndex].recipients, recipient)
 	}
+	scratch.groups = grouping.groups
+	scratch.deliveryOrder = grouping.deliveryOrder
 
-	if grouping.activeReady {
-		activeStorage := make([]conversationactive.ActiveEntry, set.uniqueRecipientCount)
-		activeOffset := 0
-		for index := range grouping.groups {
-			count := grouping.groups[index].activeCount
-			if count == 0 {
-				continue
-			}
-			end := activeOffset + count
-			// Keep active groups disjoint while sharing one allocation.
-			grouping.groups[index].activeRecipients = activeStorage[activeOffset:activeOffset:end]
-			activeOffset = end
-		}
-		for authorityIndex, recipient := range set.authorityRecipient {
-			if !recipient {
-				continue
-			}
-			groupIndex := authorityGroupIndexes[authorityIndex]
-			grouping.groups[groupIndex].activeRecipients = append(grouping.groups[groupIndex].activeRecipients, conversationactive.ActiveEntry{UID: set.authorityUIDs[authorityIndex]})
-		}
-	}
 	return grouping, nil
 }
 
@@ -654,37 +640,6 @@ func withRecipientRouteResolveDetail(err error, set normalizedRecipientAuthority
 		UIDCount:       set.uniqueRecipientCount,
 		RecipientCount: len(set.recipients),
 	})
-}
-
-func admitRoutedConversationActiveBatches(ctx context.Context, event CommittedEnvelope, set normalizedRecipientAuthoritySet, grouping recipientAuthorityGrouping, admitter RoutedConversationActiveAdmitter) error {
-	groups := make([]ConversationActiveTargetBatch, 0, len(grouping.activeOrder))
-	for _, groupIndex := range grouping.activeOrder {
-		group := grouping.groups[groupIndex]
-		groups = append(groups, ConversationActiveTargetBatch{
-			Target: group.target,
-			Batch: conversationactive.ActiveBatch{
-				Kind:        conversationKindForCommittedEnvelope(event),
-				SenderUID:   group.senderUID,
-				ChannelID:   event.ChannelID,
-				ChannelType: event.ChannelType,
-				MessageSeq:  event.MessageSeq,
-				ActiveAtMS:  event.ServerTimestampMS,
-				Recipients:  group.activeRecipients,
-			},
-		})
-	}
-	if len(groups) == 0 {
-		return nil
-	}
-	if err := admitter.AdmitRoutedActiveBatches(ctx, groups); err != nil {
-		return withPostCommitFailureDetail(err, PostCommitFailureDetail{
-			Phase:          "conversation_active",
-			UID:            firstRecipientUID(set.recipients),
-			UIDCount:       set.uniqueRecipientCount,
-			RecipientCount: len(set.recipients),
-		})
-	}
-	return nil
 }
 
 func firstString(values []string) string {

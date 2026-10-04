@@ -1,19 +1,28 @@
 ---
 title: API & Protocols
-description: Reference HTTP APIs, webhooks, and client protocols.
+description: Reference WuKongIM HTTP API, operations HTTP, webhooks, WKProto, and internal-interface boundaries.
 ---
 
-This area plans the WuKongIM v3 product API, operations API, webhooks, client protocols, and shared dictionaries.
+This section classifies every current source interface by audience and protocol. Public contracts are downloadable; private, conditional, and experimental entries are documented as boundaries, not compatibility promises.
 
-<Callout type="warn" title="OpenAPI status">
-  The existing OpenAPI file still contains v2 material. Phase one does not publish it as the v3 reference; specification rendering starts after alignment.
-</Callout>
-
-## Reference entry points
+## Quick links
 
 <Cards>
-  <Card title="Conventions" description="Base URLs, formats, pagination, idempotency, and response envelopes." href="/en/api/conventions" />
-  <Card title="Product HTTP API" description="Users, channels, messages, conversations, and route discovery." href="/en/api/product-http" />
-  <Card title="Client protocols" description="TCP binary protocol and WebSocket JSON-RPC." href="/en/api/client-protocols" />
-  <Card title="Specifications" description="OpenAPI, JSON-RPC schema, and protocol changelog." href="/en/api/specifications" />
+  <Card title="Conventions" description="Base URL, JSON, identifiers, cursors, and retry rules." href="/en/api/conventions" />
+  <Card title="Authentication & Security" description="Trust boundaries for WuKongIM HTTP API and Gateway." href="/en/api/authentication" />
+  <Card title="WuKongIM HTTP API" description="All 44 business HTTP operations registered by the current source." href="/en/api/product-http" />
+  <Card title="Operations HTTP API" description="Health, readiness, metrics, Top, Debug, and Bench boundaries." href="/en/api/operations-http" />
+  <Card title="Webhooks" description="Three outbound events, payloads, and reliability semantics." href="/en/api/webhooks" />
+  <Card title="Client Protocols" description="WKProto frames, lifecycle, encryption, and the EasySDK JSON-RPC core path." href="/en/api/client-protocols" />
+  <Card title="Shared Dictionaries" description="Channel, device, message-flag, and Reason Code values." href="/en/api/dictionaries" />
+  <Card title="Interface Inventory" description="Manager, node transport, MCP, plugin, and agent-private contracts." href="/en/api/interface-inventory" />
+  <Card title="Specifications" description="OpenAPI 3.1 and the experimental JSON-RPC Schema." href="/en/api/specifications" />
 </Cards>
+
+## Usage boundaries
+
+- WuKongIM HTTP API is for trusted backends only; do not expose it directly to browsers or mobile clients.
+- Operations HTTP and Manager belong on an isolated operator network; they are separate contracts.
+- JSON-RPC supports CONNECT, ping, online SEND/SENDACK, RECV/RECVACK, and server-to-client public stream.* EVENT for EasySDK; batches, subscriptions, offline sync, and general-purpose RPC are outside that contract.
+- HTTP status, endpoint responses, and CONNACK/SENDACK Reason Codes belong to separate layers and must be handled separately.
+- See [API Compatibility](/en/api/compatibility) for version coverage and [Error Responses](/en/api/product-http/errors) for failure handling.

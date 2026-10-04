@@ -20,6 +20,8 @@ var errOnlineDeliveryMessageIDOverflow = errors.New("internal/infra/delivery: de
 
 // LocalSessionWriterOptions configures the narrow owner-local session adapter.
 type LocalSessionWriterOptions struct {
+	// CommandChannelSuffix selects the reserved suffix removed from client-facing channel IDs.
+	CommandChannelSuffix string
 	// Online resolves exact active owner-local sessions.
 	Online *online.Registry
 	// Now supplies packet timestamps.
@@ -31,6 +33,8 @@ type LocalSessionWriterOptions struct {
 // LocalSessionWriter validates, builds, and writes one exact local route.
 // Pending-ACK state belongs to runtime/delivery and is deliberately absent.
 type LocalSessionWriter struct {
+	// commandChannels applies the deployment suffix without process-global state.
+	commandChannels runtimechannelid.CommandCodec
 	// online is the owner-local exact-session registry.
 	online *online.Registry
 	// now supplies protocol packet timestamps.
@@ -43,7 +47,7 @@ var _ runtimedelivery.LocalSessionWriter = (*LocalSessionWriter)(nil)
 
 // NewLocalSessionWriter creates the owner-local physical write adapter.
 func NewLocalSessionWriter(opts LocalSessionWriterOptions) *LocalSessionWriter {
-	return &LocalSessionWriter{online: opts.Online, now: opts.Now, logger: opts.Logger}
+	return &LocalSessionWriter{commandChannels: runtimechannelid.CommandCodec{Suffix: opts.CommandChannelSuffix}, online: opts.Online, now: opts.Now, logger: opts.Logger}
 }
 
 // WriteSession performs final exact-session validation and one physical write.
@@ -63,7 +67,7 @@ func (w *LocalSessionWriter) WriteSession(ctx context.Context, write runtimedeli
 	if !ok {
 		return runtimedelivery.SessionWriteResult{Disposition: runtimedelivery.SessionWriteDropped}
 	}
-	packet, err := buildOnlineDeliveryRecvPacket(write.Event, write.Route.UID, int32(w.nowTime().Unix()))
+	packet, err := w.buildOnlineDeliveryRecvPacket(write.Event, write.Route.UID, int32(w.nowTime().Unix()))
 	if err != nil {
 		w.loggerOrNop().Warn("delivery recv packet build failed",
 			wklog.Event("internal.infra.delivery.recv_packet_build_failed"),
@@ -119,23 +123,21 @@ func terminalOnlineDeliveryWriteError(err error) bool {
 		errors.Is(err, gatewaytransport.ErrOutboundBytesExceeded)
 }
 
-func buildOnlineDeliveryRecvPacket(event channelappendcontract.CommittedEnvelope, uid string, timestamp int32) (*frame.RecvPacket, error) {
+func (w *LocalSessionWriter) buildOnlineDeliveryRecvPacket(event channelappendcontract.CommittedEnvelope, uid string, timestamp int32) (*frame.RecvPacket, error) {
 	if event.MessageID > uint64(1<<63-1) {
 		return nil, errOnlineDeliveryMessageIDOverflow
 	}
-	sourceChannelID, commandChannel := runtimechannelid.FromCommandChannel(event.ChannelID)
-	channelID := sourceChannelID
+	channelID, commandChannel := w.commandChannels.FromCommandChannel(event.ChannelID)
 	if event.ChannelType == frame.ChannelTypePerson {
-		sourceEvent := event
-		sourceEvent.ChannelID = sourceChannelID
-		channelID = onlineDeliveryPersonChannelView(sourceEvent, uid)
+		source := event
+		source.ChannelID = channelID
+		channelID = onlineDeliveryPersonChannelView(source, uid)
 	}
 	return &frame.RecvPacket{
-		Framer: frame.Framer{
-			NoPersist: event.MessageSeq == 0,
-			RedDot:    event.RedDot,
-			SyncOnce:  commandChannel,
-		},
+		Framer:      frame.Framer{NoPersist: event.MessageSeq == 0, RedDot: event.RedDot, SyncOnce: event.SyncOnce || commandChannel},
+		Setting:     frame.Setting(event.Setting),
+		Topic:       event.Topic,
+		Expire:      event.Expire,
 		MessageID:   int64(event.MessageID),
 		MessageSeq:  event.MessageSeq,
 		ClientMsgNo: event.ClientMsgNo,

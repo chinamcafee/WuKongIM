@@ -11,6 +11,12 @@ import (
 var (
 	// ErrUIDRequired reports a missing user id in CMD sync commands.
 	ErrUIDRequired = errors.New("internal/usecase/cmdsync: uid required")
+	// ErrChannelRequired reports a missing source channel id in CMD binding commands.
+	ErrChannelRequired = errors.New("internal/usecase/cmdsync: channel id required")
+	// ErrChannelTypeRequired reports a missing source channel type in CMD binding commands.
+	ErrChannelTypeRequired = errors.New("internal/usecase/cmdsync: channel type required")
+	// ErrSequenceExhausted reports a command channel whose tail cannot produce a new start sequence.
+	ErrSequenceExhausted = errors.New("internal/usecase/cmdsync: command channel sequence exhausted")
 	// ErrStateStoreRequired reports a missing durable CMD state dependency.
 	ErrStateStoreRequired = errors.New("internal/usecase/cmdsync: state store required")
 	// ErrMessageStoreRequired reports a missing command-channel message dependency.
@@ -29,6 +35,11 @@ var (
 	ErrBatchIDMismatch = errors.New("internal/usecase/cmdsync: batch id mismatch")
 	// ErrAckCursorInvalid reports an invalid or duplicate v3 command ACK cursor.
 	ErrAckCursorInvalid = errors.New("internal/usecase/cmdsync: invalid ack cursor")
+	// ErrChannelDisbanded rejects CMD pulls from a terminal source channel.
+	ErrChannelDisbanded = errors.New("internal/usecase/cmdsync: channel disbanded")
+	// ErrStateCursorDidNotAdvance prevents an infinite scan when a state store
+	// reports another page without advancing its stable cursor.
+	ErrStateCursorDidNotAdvance = errors.New("internal/usecase/cmdsync: state cursor did not advance")
 )
 
 // SyncQuery is the /message/sync request after access-layer validation.
@@ -89,6 +100,28 @@ type BatchAckCommand struct {
 	AckCursors []AckCursor
 }
 
+// BindCommand creates or restores durable CMD discovery for a bounded recipient set and source channel.
+type BindCommand struct {
+	// UIDs binds a bounded recipient batch to one explicit source Channel.
+	UIDs []string
+	// Subscribers binds the exact normalized request-scoped recipient set.
+	// It cannot be combined with UID, UIDs, ChannelID, or ChannelType.
+	Subscribers []string
+	UID         string
+	ChannelID   string
+	ChannelType uint8
+}
+
+// UnbindCommand tombstones durable CMD discovery for a bounded recipient set and source channel.
+type UnbindCommand struct {
+	// UIDs and Subscribers use the same mutually exclusive forms as BindCommand.
+	UIDs        []string
+	Subscribers []string
+	UID         string
+	ChannelID   string
+	ChannelType uint8
+}
+
 // SyncedMessage is a command-channel message returned by CMD sync.
 type SyncedMessage struct {
 	// RedDot reports whether this command should affect its business badge domain.
@@ -139,10 +172,38 @@ type CommandChannelKey struct {
 	ChannelType uint8
 }
 
-// StateStore supplies CMD-kind conversation state from the unified projection.
+// StateStore supplies the UID-owned CMD directory and persists acknowledgements.
 type StateStore interface {
-	ListConversationActiveView(ctx context.Context, uid string, limit int) ([]metadb.ConversationState, error)
-	UpsertConversationStates(ctx context.Context, states []metadb.ConversationState) error
+	ListUserCMDChannelMembershipPage(ctx context.Context, uid string, after metadb.UserCMDChannelMembershipCursor, limit int) ([]metadb.UserCMDChannelMembership, metadb.UserCMDChannelMembershipCursor, bool, error)
+	UpsertUserCMDChannelMemberships(ctx context.Context, memberships []metadb.UserCMDChannelMembership) error
+	AdvanceUserCMDChannelMembershipAcks(ctx context.Context, memberships []metadb.UserCMDChannelMembership) error
+	TombstoneUserCMDChannelMemberships(ctx context.Context, memberships []metadb.UserCMDChannelMembership) error
+}
+
+// MaxCommandReadBatch bounds one aligned multi-channel CMD read.
+const MaxCommandReadBatch = 32
+
+// CommandMessageRead carries one channel's durable recovery boundary.
+type CommandMessageRead struct {
+	Key     CommandChannelKey
+	FromSeq uint64
+	Limit   int
+}
+
+// CommandMessageReadResult preserves one source's result within an aligned batch.
+type CommandMessageReadResult struct {
+	// Messages contains this source's committed commands when Err is nil.
+	Messages []SyncedMessage
+	// Err identifies a terminal source or a read failure; global sync skips only
+	// ErrChannelDisbanded and must fail for every unavailable or unknown result.
+	Err error
+}
+
+// MessageBatchStore coalesces authoritative reads without changing ordering or
+// acknowledgement semantics. Results align exactly with at most
+// MaxCommandReadBatch inputs; an outer error invalidates the complete batch.
+type MessageBatchStore interface {
+	LoadCommandMessagesBatch(context.Context, []CommandMessageRead) ([]CommandMessageReadResult, error)
 }
 
 // DeviceStateStore supplies independent v3 command cursors by device class.
@@ -158,12 +219,15 @@ type PrincipalStore interface {
 
 // MessageStore loads authoritative messages from command-channel logs.
 type MessageStore interface {
+	CommandChannelTail(ctx context.Context, key CommandChannelKey) (uint64, error)
 	LoadCommandMessages(ctx context.Context, key CommandChannelKey, fromSeq uint64, limit int) ([]SyncedMessage, error)
 }
 
 // Options configures the CMD sync usecase.
 type Options struct {
-	// States supplies CMD-kind unified conversation rows and persists read progress.
+	// CommandChannelSuffix selects command IDs; empty retains the legacy default.
+	CommandChannelSuffix string
+	// States supplies CMD directory rows and persists acknowledgement progress.
 	States StateStore
 	// DeviceStates supplies v3 device-scoped command cursors.
 	DeviceStates DeviceStateStore
@@ -177,6 +241,8 @@ type Options struct {
 	Now func() time.Time
 	// ActiveScanLimit is the production store's active-index page size. The
 	// cluster adapter continues paging until the full CMD view is exhausted.
+	// ActiveScanLimit bounds each CMD membership page; Sync continues until the
+	// stable UID directory is exhausted while retaining only the result limit.
 	ActiveScanLimit int
 	// DefaultLimit is used when SyncQuery.Limit is not positive.
 	DefaultLimit int

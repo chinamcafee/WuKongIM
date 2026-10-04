@@ -72,7 +72,7 @@ type RuntimeOptions struct {
 	OfflineNotificationDeviceFlags []uint8
 	// QueueSize bounds accepted Recipient Delivery Plans.
 	QueueSize int
-	// Workers bounds concurrent plan processing.
+	// Workers bounds concurrent plans across independently ordered Channels.
 	Workers int
 	// PlanTimeout bounds one accepted plan's total processing time.
 	PlanTimeout time.Duration
@@ -116,9 +116,9 @@ type Runtime struct {
 	offlineRecipientsObserver OfflineRecipientsObserver
 	// offlineNotificationDeviceFlags is the validated immutable observed shape list.
 	offlineNotificationDeviceFlags []uint8
-	// queue is the fixed-capacity ownership-transfer boundary for plans.
-	queue chan onlinedelivery.RecipientDeliveryPlan
-	// workers is the fixed plan-processing concurrency.
+	// queue is the globally bounded, per-Channel ordered ownership-transfer module.
+	queue *orderedPlanQueue
+	// workers bounds simultaneous plans across distinct Channels.
 	workers int
 	// planTimeout bounds the complete processing lifetime of one accepted plan.
 	planTimeout time.Duration
@@ -159,6 +159,15 @@ type Runtime struct {
 	runCancel context.CancelFunc
 	// done closes after every current-generation plan worker exits.
 	done chan struct{}
+	// quiescing keeps the generation's ACK tracker intact until every accepted
+	// RECVACK clears. It distinguishes terminal evidence drain from ordinary
+	// Stop, which finalizes and resets transient state.
+	quiescing bool
+	// quiesceDone closes only after accepted plans, owner pushes, and pending
+	// owner-local RECVACK identities have all reached their terminal cut.
+	quiesceDone chan struct{}
+	// quiesceOnce starts the detached terminal drain once for this generation.
+	quiesceOnce sync.Once
 	// admissionSenders accounts calls that passed the lifecycle admission gate.
 	admissionSenders sync.WaitGroup
 	// ownerPushes accounts synchronous RPC owner pushes during shutdown.
@@ -204,8 +213,7 @@ func NewRuntime(opts RuntimeOptions) *Runtime {
 		remoteOwnerPusher:              opts.RemoteOwnerPusher,
 		sessionWriter:                  opts.SessionWriter,
 		offlineRecipientsObserver:      opts.OfflineRecipientsObserver,
-		offlineNotificationDeviceFlags: offlineFlags,
-		queue:                          make(chan onlinedelivery.RecipientDeliveryPlan, queueSize),
+		queue:                          newOrderedPlanQueue(queueSize),
 		workers:                        workers,
 		planTimeout:                    planTimeout,
 		maxPlanRecipients:              maxPlanRecipients,
@@ -221,10 +229,11 @@ func NewRuntime(opts RuntimeOptions) *Runtime {
 		observer:                       opts.Observer,
 		goroutines:                     opts.Goroutines,
 		state:                          runtimeClosed,
+		offlineNotificationDeviceFlags: offlineFlags,
 	}
 }
 
-// WorkerCapacity returns the configured plan worker count.
+// WorkerCapacity returns the maximum number of concurrently executing plans.
 func (r *Runtime) WorkerCapacity() int {
 	if r == nil {
 		return 0
@@ -244,6 +253,10 @@ func (r *Runtime) Start(context.Context) error {
 		r.mu.Unlock()
 		return nil
 	case runtimeClosing:
+		if r.quiescing {
+			r.mu.Unlock()
+			return ErrRuntimeClosed
+		}
 		closed, removed := r.finishClosedIfDoneLocked()
 		if !closed {
 			r.mu.Unlock()
@@ -296,7 +309,12 @@ func (r *Runtime) Stop(ctx context.Context) error {
 		return nil
 	case runtimeClosing:
 		done := r.done
+		quiescing := r.quiescing
+		quiesceDone := r.quiesceDone
 		r.mu.Unlock()
+		if quiescing {
+			return r.waitQuiescedThenStop(ctx, quiesceDone, done)
+		}
 		return r.waitClosed(ctx, done)
 	}
 	acceptDone := r.acceptDone
@@ -320,6 +338,73 @@ func (r *Runtime) Stop(ctx context.Context) error {
 	return err
 }
 
+// Quiesce closes Recipient Delivery Plan admission and waits for every
+// accepted plan, owner push, and pending owner-local RECVACK to finish. It
+// never resets the ACK tracker. Caller cancellation only stops waiting; the
+// same generation keeps draining and a later Quiesce call joins it.
+func (r *Runtime) Quiesce(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	r.mu.Lock()
+	switch r.state {
+	case runtimeClosed:
+		r.mu.Unlock()
+		return ErrRuntimeClosed
+	case runtimeClosing:
+		if !r.quiescing {
+			r.mu.Unlock()
+			return ErrRuntimeClosed
+		}
+		done := r.quiesceDone
+		r.mu.Unlock()
+		return waitRuntimeDone(ctx, done)
+	}
+	acceptDone := r.acceptDone
+	stopReady := r.stopReady
+	done := r.done
+	r.state = runtimeClosing
+	r.quiescing = true
+	r.quiesceDone = make(chan struct{})
+	quiesceDone := r.quiesceDone
+	close(acceptDone)
+	r.mu.Unlock()
+	r.quiesceOnce.Do(func() {
+		goruntimeregistry.SafeGo(r.goroutines, goruntimeregistry.TaskOnlineDeliveryLifecycle, func() {
+			r.admissionSenders.Wait()
+			r.ownerPushes.Wait()
+			close(stopReady)
+			<-done
+			r.waitPendingAcks()
+			close(quiesceDone)
+		})
+	})
+	return waitRuntimeDone(ctx, quiesceDone)
+}
+
+// waitPendingAcks keeps the terminal drain independent from any caller's
+// deadline. RECVACK continues to mutate the tracker while plan admission is
+// closed, so this wait must happen before ordinary Stop resets the tracker.
+func (r *Runtime) waitPendingAcks() {
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for r.PendingAckCount() > 0 {
+		<-ticker.C
+	}
+}
+
+func waitRuntimeDone(ctx context.Context, done <-chan struct{}) error {
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // EnqueueRecipientDeliveryPlan transfers ownership of one valid bounded plan.
 func (r *Runtime) EnqueueRecipientDeliveryPlan(ctx context.Context, plan onlinedelivery.RecipientDeliveryPlan) error {
 	started := time.Now()
@@ -327,7 +412,7 @@ func (r *Runtime) EnqueueRecipientDeliveryPlan(ctx context.Context, plan onlined
 	defer func() {
 		if r != nil {
 			r.observePlanAdmission(PlanAdmissionEvent{
-				Result: result, QueueDepth: len(r.queue), QueueCapacity: cap(r.queue), Duration: positiveRuntimeDuration(time.Since(started)),
+				Result: result, QueueDepth: r.queue.Depth(), QueueCapacity: r.queue.Capacity(), Duration: positiveRuntimeDuration(time.Since(started)),
 			})
 		}
 	}()
@@ -352,23 +437,21 @@ func (r *Runtime) EnqueueRecipientDeliveryPlan(ctx context.Context, plan onlined
 		result = ObservationResultClosed
 		return ErrRuntimeClosed
 	}
-	queue := r.queue
 	acceptDone := r.acceptDone
 	r.admissionSenders.Add(1)
 	r.mu.Unlock()
 	defer r.admissionSenders.Done()
 
-	select {
-	case queue <- plan:
+	err := r.queue.enqueue(ctx, acceptDone, plan)
+	if err == nil {
 		r.observePressure()
 		return nil
-	case <-acceptDone:
+	} else if errors.Is(err, ErrRuntimeClosed) {
 		result = ObservationResultClosed
-		return ErrRuntimeClosed
-	case <-ctx.Done():
-		result = runtimeResultForContext(ctx.Err())
-		return ctx.Err()
+	} else {
+		result = runtimeResultForContext(err)
 	}
+	return err
 }
 
 func (r *Runtime) validatePlan(plan onlinedelivery.RecipientDeliveryPlan) error {
@@ -396,19 +479,12 @@ func (r *Runtime) validatePlan(plan onlinedelivery.RecipientDeliveryPlan) error 
 // expires, so a successful Stop never discards accepted delivery work.
 func (r *Runtime) runWorker(runCtx context.Context, stopReady <-chan struct{}) {
 	for {
-		select {
-		case plan := <-r.queue:
-			r.runPlan(runCtx, plan)
-		case <-stopReady:
-			for {
-				select {
-				case plan := <-r.queue:
-					r.runPlan(runCtx, plan)
-				default:
-					return
-				}
-			}
+		plan, ok := r.queue.dequeue(stopReady)
+		if !ok {
+			return
 		}
+		r.runPlan(runCtx, plan)
+		r.queue.complete(plan)
 	}
 }
 
@@ -1157,7 +1233,7 @@ func (r *Runtime) observePressure() {
 		_ = recover()
 	}()
 	r.observer.SetRuntimePressure(RuntimePressureEvent{
-		QueueDepth: len(r.queue), QueueCapacity: cap(r.queue),
+		QueueDepth: r.queue.Depth(), QueueCapacity: r.queue.Capacity(),
 		Inflight: int(r.inflight.Load()), Workers: r.workers,
 	})
 }
@@ -1203,6 +1279,14 @@ func (r *Runtime) waitClosed(ctx context.Context, done <-chan struct{}) error {
 	}
 }
 
+func (r *Runtime) waitQuiescedThenStop(ctx context.Context, quiesceDone <-chan struct{}, done <-chan struct{}) error {
+	if err := waitRuntimeDone(ctx, quiesceDone); err != nil {
+		return err
+	}
+	r.finishClosedForDone(done)
+	return nil
+}
+
 // finishClosedForDone finalizes only the generation owning done, preventing a
 // late lifecycle goroutine from resetting a subsequently restarted runtime.
 func (r *Runtime) finishClosedForDone(done <-chan struct{}) {
@@ -1243,6 +1327,9 @@ func (r *Runtime) finishClosedLocked() int {
 		r.runCancel = nil
 	}
 	r.done = nil
+	r.quiescing = false
+	r.quiesceDone = nil
+	r.quiesceOnce = sync.Once{}
 	r.pendingAckExpiryNext.Store(0)
 	r.ackMu.Lock()
 	removed := r.acks.PendingCount()

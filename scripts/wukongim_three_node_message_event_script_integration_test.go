@@ -16,7 +16,7 @@ func TestWukongIMThreeNodeMessageEventScriptDryRunBuildsCommandAndEvidence(t *te
 	binDir := t.TempDir()
 	callsDir := t.TempDir()
 	outDir := t.TempDir()
-	writeFakeMessageEventWkbench(t, filepath.Join(binDir, "wkbench"), callsDir)
+	writeFakeMessageEventWkbench(t, filepath.Join(binDir, "wkcli"), callsDir)
 	writeFakeActivateCurl(t, filepath.Join(binDir, "curl"), callsDir)
 	writeFakeActivatePgrep(t, filepath.Join(binDir, "pgrep"), callsDir)
 	writeFakeActivatePS(t, filepath.Join(binDir, "ps"), callsDir)
@@ -24,7 +24,7 @@ func TestWukongIMThreeNodeMessageEventScriptDryRunBuildsCommandAndEvidence(t *te
 	cmd := exec.Command("bash", "scripts/bench-wukongim-three-nodes-message-event.sh",
 		"--no-start",
 		"--out-dir", outDir,
-		"--wkbench-bin", filepath.Join(binDir, "wkbench"),
+		"--wkcli-bin", filepath.Join(binDir, "wkcli"),
 		"--run-id", "message-event-test",
 		"--channels", "4",
 		"--streams-per-channel", "3",
@@ -91,7 +91,7 @@ func TestWukongIMThreeNodeMessageEventScriptStartsWithCurrentClusterSlotDefaults
 	callsDir := t.TempDir()
 	outDir := t.TempDir()
 	startScript := filepath.Join(binDir, "start-three.sh")
-	writeFakeMessageEventWkbench(t, filepath.Join(binDir, "wkbench"), callsDir)
+	writeFakeMessageEventWkbench(t, filepath.Join(binDir, "wkcli"), callsDir)
 	writeFakeMessageEventStartScript(t, startScript, callsDir)
 	writeFakeActivateCurl(t, filepath.Join(binDir, "curl"), callsDir)
 	writeFakeActivatePgrep(t, filepath.Join(binDir, "pgrep"), callsDir)
@@ -100,7 +100,7 @@ func TestWukongIMThreeNodeMessageEventScriptStartsWithCurrentClusterSlotDefaults
 	cmd := exec.Command("bash", "scripts/bench-wukongim-three-nodes-message-event.sh",
 		"--start-script", startScript,
 		"--out-dir", outDir,
-		"--wkbench-bin", filepath.Join(binDir, "wkbench"),
+		"--wkcli-bin", filepath.Join(binDir, "wkcli"),
 		"--run-id", "message-event-start-defaults",
 		"--ready-timeout", "2",
 		"--channels", "1",
@@ -148,7 +148,7 @@ func TestWukongIMThreeNodeMessageEventScriptAppliesProfileWarmupAndEvidenceGates
 	binDir := t.TempDir()
 	callsDir := t.TempDir()
 	outDir := t.TempDir()
-	writeFakeMessageEventWkbench(t, filepath.Join(binDir, "wkbench"), callsDir)
+	writeFakeMessageEventWkbench(t, filepath.Join(binDir, "wkcli"), callsDir)
 	writeFakeActivateCurl(t, filepath.Join(binDir, "curl"), callsDir)
 	writeFakeActivatePgrep(t, filepath.Join(binDir, "pgrep"), callsDir)
 	writeFakeActivatePS(t, filepath.Join(binDir, "ps"), callsDir)
@@ -156,7 +156,7 @@ func TestWukongIMThreeNodeMessageEventScriptAppliesProfileWarmupAndEvidenceGates
 	cmd := exec.Command("bash", "scripts/bench-wukongim-three-nodes-message-event.sh",
 		"--no-start",
 		"--out-dir", outDir,
-		"--wkbench-bin", filepath.Join(binDir, "wkbench"),
+		"--wkcli-bin", filepath.Join(binDir, "wkcli"),
 		"--run-id", "message-event-medium",
 		"--profile", "medium",
 		"--warm-channels",
@@ -213,6 +213,8 @@ func writeFakeMessageEventWkbench(t *testing.T, path string, callsDir string) {
 	t.Helper()
 	script := `#!/usr/bin/env bash
 set -euo pipefail
+[[ "${1:-}" == bench ]] || { echo "expected wkcli bench" >&2; exit 2; }
+shift
 mkdir -p "` + callsDir + `"
 printf '%s\n' "$*" >> "` + callsDir + `/wkbench.calls"
 if [[ "${1:-}" == "metrics" && "${2:-}" == "classify" ]]; then

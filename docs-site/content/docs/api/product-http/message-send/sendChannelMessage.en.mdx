@@ -1,0 +1,194 @@
+---
+title: Submit a message
+full: true
+_openapi:
+  preload:
+    - wukongim-product-http-complete-beta-en
+  method: POST
+  webhook: false
+  toc:
+    - depth: 2
+      title: Header Parameters
+      url: '#parameters-header'
+    - depth: 2
+      title: Request Body
+      url: '#request-body'
+    - depth: 2
+      title: Response Body
+      url: '#response-body'
+  structuredData:
+    headings:
+      - content: Submit a message
+        id: submit-a-message
+    contents:
+      - content: Accepts the complete compatibility parser, including legacy aliases,
+          transient flags, and request-scoped subscribers; inspect reason on
+          HTTP 200.
+        heading: submit-a-message
+      - content: >-
+          POST /message/send
+
+          sendChannelMessage
+
+          Submit a message
+
+          Accepts the complete compatibility parser, including legacy aliases,
+          transient flags, and request-scoped subscribers; inspect reason on
+          HTTP 200.
+
+          X-WK-Trace-ID header optional `string` pattern: `^[0-9a-fA-F]{32}$`
+          Optional 32-character hexadecimal trace ID; an invalid value is
+          ignored and replaced with a generated ID.
+
+          SendMessageRequest
+
+          Complete compatibility message-send parameters.
+
+          additionalProperties true
+
+          from_uid `string` — Message sender UID; when empty, sender_uid is
+          consulted, and when both are empty the system account configured by
+          message.system_uid is used.
+
+          sender_uid `string` — Deprecated sender-UID alias used only when
+          from_uid is empty; when both are empty, the configured system account
+          is used.
+
+          device_id `string` — Caller-supplied sending-device identifier; it may
+          be empty.
+
+          channel_id `string` — Target Channel ID; required for an ordinary send
+          and required to be empty for a request-scoped subscribers send.
+
+          channel_type `integer:uint8` 0–255 Target Channel type; it must be
+          greater than 0 for an ordinary send and is 0 for a request-scoped
+          subscribers send.
+
+          client_msg_no `string` — Optional client idempotency key; omitted or
+          blank values generate a unique number returned in the response. Reuse
+          an explicit key when retrying the same message.
+
+          setting `integer:uint8` 0–255 WKProto Setting bitset; combine SDK
+          constants instead of writing unknown bits by hand.
+
+          topic `string` — Optional Topic; it has protocol meaning only when the
+          matching Setting bit and client capability are present.
+
+          expire `integer:uint32` 0–∞ Caller-supplied message expiration in
+          seconds; 0 means no expiration is set.
+
+          payload `string` minLength: 1; encoding: base64 Base64-encoded message
+          payload; decoding failure returns 400.
+
+          subscribers `array | null` — Request-scoped delivery UIDs; when
+          non-empty, channel_id must be empty and sync_once must be enabled; the
+          field may be omitted, empty, or null.
+
+          header `SendMessageHeaderRequest` | `null` — Optional compatibility
+          header flags; it may be an object, null, or omitted.
+
+          no_persist `integer` default: `0` Top-level compatibility flag;
+          non-zero means non-durable and is ORed with header.no_persist.
+
+          sync_once `integer` default: `0` Top-level compatibility flag;
+          non-zero means a one-shot command message and is ORed with
+          header.sync_once.
+
+          wait_for_persist `integer` enum: `0`, `1`; default: `0` 1 waits for a
+          durable receipt; incompatible with no_persist.
+
+          persist_timeout_ms `integer` 0–10000; default: `0` Only with
+          wait_for_persist=1: 0 selects 3000ms; otherwise 100 to 10000ms.
+
+          SendMessageHeaderRequest
+
+          Compatibility flags for the message fixed header; same-named top-level
+          no_persist and sync_once fields are ORed with the header values.
+
+          red_dot `integer` default: `0` Non-zero preserves the message red-dot
+          flag; omitted means 0. There is no top-level red_dot alias.
+
+          no_persist `integer` default: `0` A non-zero value makes the message
+          non-durable.
+
+          sync_once `integer` default: `0` A non-zero value treats the message
+          as a one-shot command message.
+
+          200 Transport completed; inspect reason
+
+          SendMessageResponse
+
+          Completed message-send transport response; reason still requires
+          inspection.
+
+          additionalProperties false
+
+          message_id `integer:int64` — Server message ID; JavaScript must parse
+          it without losing int64 precision.
+
+          message_seq `integer:uint64` 0–∞ Sequence of this message within the
+          target Channel; JavaScript must parse it without losing uint64
+          precision.
+
+          reason `integer:uint8` enum: `1`, `2`, `3`, `4`, `5`, `9`, `11`, `13`,
+          `15`, `18`, `19`, `24`, `25` WKProto Reason Code; HTTP 200 does not
+          replace this success check.
+
+          client_msg_no `string` — Client message number submitted with this
+          send; generated by the server when omitted.
+
+          400 Invalid request or payload
+
+          SendError
+
+          HTTP error body for message sending.
+
+          error `string` — Human-readable diagnostic text; do not match the full
+          text.
+
+          404 Channel not found
+
+          408 Request cancelled or timed out
+
+          500 Unmapped send failure
+
+          503 Retry-required routing failure or restore maintenance
+
+          RetryRequiredError
+
+          Send error requiring re-routing before retry.
+
+          error `string` const: `"retry required"` Fixed at retry required.
+
+          MaintenanceError
+
+          503 error body returned while cluster restore maintenance is active.
+
+          error `string` const: `"maintenance"` Stable maintenance error
+          category.
+
+          message `string` const: `"restore maintenance is active"` Current
+          restore-maintenance message.
+---
+
+<Callout type="warn" title="Operation boundary">
+
+- **Caller**: Trusted backend only
+- **Scope**: Messages are submitted by a trusted backend; optional X-WK-Trace-ID must be 32 hexadecimal characters or the server ignores it and generates a new value.
+- **Success**: Even with HTTP 200, inspect reason; only a success Reason Code means the message was accepted.
+
+</Callout>
+
+{/* This file was generated by Fumadocs. Do not edit this file directly. Any changes should be made by running the generation command again. */}
+
+export default function Layout(props) {
+  const { APIPage, OpenAPIPage } = props.components ?? {};
+  // "APIPage" is the old name from v10, this allows both for backward compatibility
+  const Comp = OpenAPIPage ?? APIPage;
+  return (
+    <>
+      {props.children}
+      <Comp document="wukongim-product-http-complete-beta-en" operations={[{"path":"/message/send","method":"post"}]} showDescription />
+    </>
+  );
+}

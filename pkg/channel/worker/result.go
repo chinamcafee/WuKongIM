@@ -4,6 +4,7 @@ import (
 	"time"
 
 	ch "github.com/WuKongIM/WuKongIM/pkg/channel"
+	"github.com/WuKongIM/WuKongIM/pkg/channel/replication"
 	"github.com/WuKongIM/WuKongIM/pkg/channel/store"
 	"github.com/WuKongIM/WuKongIM/pkg/channel/transport"
 )
@@ -16,20 +17,28 @@ type Result struct {
 	// Duration is the worker execution time measured by the owning pool.
 	Duration time.Duration
 
-	StoreAppend        *StoreAppendResult
-	StoreLoad          *StoreLoadResult
-	StoreReadLog       *StoreReadLogResult
-	StoreLookupMessage *StoreLookupMessageResult
-	StoreApply         *StoreApplyResult
-	StoreCheckpoint    *StoreCheckpointResult
-	StoreClose         *StoreCloseResult
-	StoreRetention     *StoreRetentionResult
-	RPCPull            *RPCPullResult
-	RPCAck             *RPCAckResult
-	RPCNotify          *RPCNotifyResult
-	RPCPullHint        *RPCPullHintResult
-	MetaResolve        *MetaResolveResult
-	Value              any
+	StoreAppend          *StoreAppendResult
+	StoreLoad            *StoreLoadResult
+	StoreReadLog         *StoreReadLogResult
+	StoreLookupMessage   *StoreLookupMessageResult
+	StoreApply           *StoreApplyResult
+	StoreCheckpoint      *StoreCheckpointResult
+	StoreMQTTSource      *StoreMQTTSourceResult
+	StoreMQTTReplay      *StoreMQTTReplayResult
+	StoreMQTTPlan        *StoreMQTTPlanResult
+	StoreWillReceipt     *StoreWillReceiptResult
+	StoreClose           *StoreCloseResult
+	StoreRetention       *StoreRetentionResult
+	RPCPull              *RPCPullResult
+	RPCAck               *RPCAckResult
+	RPCNotify            *RPCNotifyResult
+	RPCPullHint          *RPCPullHintResult
+	MetaResolve          *MetaResolveResult
+	QuorumInstall        *QuorumInstallResult
+	QuorumCommit         *QuorumCommitResult
+	QuorumMQTTAnchor     *QuorumMQTTAnchorResult
+	QuorumMQTTRetirement *QuorumMQTTRetirementResult
+	Value                any
 }
 
 // StoreLoadResult returns an opened channel store and its durable initial state.
@@ -48,6 +57,8 @@ type StoreAppendResult struct {
 	BaseOffset uint64
 	// LastOffset is the last offset assigned to the appended records.
 	LastOffset uint64
+	// Outcome is the storage proof for this append attempt.
+	Outcome store.AppendOutcome
 }
 
 // StoreReadLogResult contains raw log records read for replication.
@@ -124,6 +135,16 @@ type RPCPullHintResult struct{}
 type MetaResolveResult struct {
 	// Meta is the authoritative metadata resolved for the requested channel identity.
 	Meta ch.Meta
+}
+
+// QuorumInstallResult contains the recovered ready frontier for an authority.
+type QuorumInstallResult struct {
+	Installed replication.Installed
+}
+
+// QuorumCommitResult contains the exact quorum-durable proposal receipt.
+type QuorumCommitResult struct {
+	Receipt replication.Receipt
 }
 
 // CompletionSink receives worker completions for routing back to reactors.

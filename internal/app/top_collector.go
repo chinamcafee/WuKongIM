@@ -511,7 +511,16 @@ func (c *topCollector) recordSampleAt(at time.Time) {
 	if c.count < len(c.ring) {
 		c.count++
 	}
-	c.updateAlertsLocked(at.UTC(), c.alertSignalsLocked())
+	alertWindow := c.windowRefsLocked(topAlertSignalWindow)
+	c.mu.Unlock()
+
+	// Samples retained in the ring are immutable. Keep percentile sorting and
+	// pressure evaluation outside the ingestion mutex so one periodic snapshot
+	// cannot convoy synchronous SEND, channel, storage, and transport observers.
+	alertSignals := topAlertSignals(alertWindow)
+
+	c.mu.Lock()
+	c.updateAlertsLocked(at.UTC(), alertSignals)
 	c.pruneAlertsLocked(at.UTC())
 	c.mu.Unlock()
 }
@@ -607,21 +616,45 @@ func (c *topCollector) observeStorageMetrics() {
 	snapshot := snapshotFn()
 	for _, store := range snapshot.Stores {
 		metrics.SetPebbleMetrics(store.Store, obsmetrics.StoragePebbleObservation{
-			DiskSpaceUsageBytes:          store.Engine.DiskSpaceUsageBytes,
-			ReadAmplification:            store.Engine.ReadAmplification,
-			MemTableSizeBytes:            store.Engine.MemTableSizeBytes,
-			MemTableCount:                store.Engine.MemTableCount,
-			WALFiles:                     store.Engine.WALFiles,
-			WALSizeBytes:                 store.Engine.WALSizeBytes,
-			WALPhysicalSizeBytes:         store.Engine.WALPhysicalSizeBytes,
-			WALBytesIn:                   store.Engine.WALBytesIn,
-			WALBytesWritten:              store.Engine.WALBytesWritten,
-			FlushCount:                   store.Engine.FlushCount,
-			FlushesInProgress:            store.Engine.FlushesInProgress,
-			CompactionCount:              store.Engine.CompactionCount,
-			CompactionEstimatedDebtBytes: store.Engine.CompactionEstimatedDebtBytes,
-			CompactionInProgressBytes:    store.Engine.CompactionInProgressBytes,
-			CompactionsInProgress:        store.Engine.CompactionsInProgress,
+			SequencedExactFreshAppends:     store.Engine.SequencedExactFreshAppends,
+			DurablePredecessorCacheHits:    store.Engine.DurablePredecessorCacheHits,
+			DurablePredecessorValidations:  store.Engine.DurablePredecessorValidations,
+			IdempotencyNegativeFilterSkips: store.Engine.IdempotencyNegativeFilterSkips,
+			IdempotencyPointReads:          store.Engine.IdempotencyPointReads,
+			DiskSpaceUsageBytes:            store.Engine.DiskSpaceUsageBytes,
+			ReadAmplification:              store.Engine.ReadAmplification,
+			MemTableSizeBytes:              store.Engine.MemTableSizeBytes,
+			MemTableCount:                  store.Engine.MemTableCount,
+			WALFiles:                       store.Engine.WALFiles,
+			WALSizeBytes:                   store.Engine.WALSizeBytes,
+			WALPhysicalSizeBytes:           store.Engine.WALPhysicalSizeBytes,
+			WALBytesIn:                     store.Engine.WALBytesIn,
+			WALBytesWritten:                store.Engine.WALBytesWritten,
+			SSTableSizeBytes:               store.Engine.SSTableSizeBytes,
+			FlushBytesWritten:              store.Engine.FlushBytesWritten,
+			CompactionBytesRead:            store.Engine.CompactionBytesRead,
+			CompactionBytesWritten:         store.Engine.CompactionBytesWritten,
+			FlushCount:                     store.Engine.FlushCount,
+			FlushesInProgress:              store.Engine.FlushesInProgress,
+			CompactionCount:                store.Engine.CompactionCount,
+			CompactionEstimatedDebtBytes:   store.Engine.CompactionEstimatedDebtBytes,
+			CompactionInProgressBytes:      store.Engine.CompactionInProgressBytes,
+			CompactionsInProgress:          store.Engine.CompactionsInProgress,
+			WriteStallMemTableCount:        store.Engine.WriteStallMemTableCount,
+			WriteStallL0Count:              store.Engine.WriteStallL0Count,
+			WriteStallOtherCount:           store.Engine.WriteStallOtherCount,
+			WriteStallTotalNanos:           store.Engine.WriteStallTotalNanos,
+			WriteStallMaxNanos:             store.Engine.WriteStallMaxNanos,
+			WriteStallActive:               store.Engine.WriteStallActive,
+			WALFsyncCount:                  store.Engine.WALFsyncCount,
+			WALFsyncSumNanos:               store.Engine.WALFsyncSumNanos,
+			WALFsyncOver100ms:              store.Engine.WALFsyncOver100ms,
+			WALFsyncOver1s:                 store.Engine.WALFsyncOver1s,
+			WALFsyncOver5s:                 store.Engine.WALFsyncOver5s,
+			DiskSlowWALEvents:              store.Engine.DiskSlowWALEvents,
+			DiskSlowWALMaxNanos:            store.Engine.DiskSlowWALMaxNanos,
+			DiskSlowOtherEvents:            store.Engine.DiskSlowOtherEvents,
+			DiskSlowOtherMaxNanos:          store.Engine.DiskSlowOtherMaxNanos,
 		})
 		if store.Store == "channel_log" {
 			metrics.SetChannelEntryMetrics(obsmetrics.StorageChannelEntryObservation{
@@ -653,7 +686,7 @@ func (c *topCollector) SnapshotTop(_ context.Context, query accessapi.TopSnapsho
 	traffic := buildTraffic(window, seconds)
 	clients := buildClients(window, seconds)
 	resources := buildResources(window)
-	pressure := c.buildPressureLocked(window, query.Limit)
+	pressure := buildTopPressure(window, query.Limit)
 	verdict := buildTopVerdict(last.cluster, traffic, pressure)
 	alerts := c.snapshotAlertsLocked(query.Limit)
 
@@ -748,6 +781,30 @@ func (c *topCollector) windowLocked(window time.Duration) []topSample {
 		sample := c.ring[(oldest+i)%len(c.ring)]
 		if !sample.at.Before(cutoff) && !sample.at.After(last) {
 			out = append(out, cloneTopSample(sample))
+		}
+	}
+	return out
+}
+
+// windowRefsLocked returns immutable ring samples without cloning their maps.
+// The collector's single sampler owner consumes this view before another ring
+// write; caller-facing snapshots continue to use windowLocked's deep copies.
+func (c *topCollector) windowRefsLocked(window time.Duration) []topSample {
+	if c.count == 0 || len(c.ring) == 0 {
+		return nil
+	}
+	if window <= 0 {
+		window = 10 * time.Second
+	}
+	lastIndex := (c.head - 1 + len(c.ring)) % len(c.ring)
+	last := c.ring[lastIndex].at
+	cutoff := last.Add(-window)
+	out := make([]topSample, 0, c.count)
+	oldest := (c.head - c.count + len(c.ring)) % len(c.ring)
+	for i := 0; i < c.count; i++ {
+		sample := c.ring[(oldest+i)%len(c.ring)]
+		if !sample.at.Before(cutoff) && !sample.at.After(last) {
+			out = append(out, sample)
 		}
 	}
 	return out
@@ -1079,7 +1136,7 @@ func (c *topCollector) topNodeSnapshot(snapshot cluster.Snapshot) accessapi.TopN
 	}
 }
 
-func (c *topCollector) buildPressureLocked(window []topSample, limit int) *accessapi.TopPressure {
+func buildTopPressure(window []topSample, limit int) *accessapi.TopPressure {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -1307,15 +1364,13 @@ func readinessReasons(snapshot cluster.Snapshot) []string {
 	return reasons
 }
 
-func (c *topCollector) alertSignalsLocked() []topAlertSignal {
-	if c.count == 0 || len(c.ring) == 0 {
+func topAlertSignals(window []topSample) []topAlertSignal {
+	if len(window) == 0 {
 		return nil
 	}
-	lastIndex := (c.head - 1 + len(c.ring)) % len(c.ring)
-	last := c.ring[lastIndex]
+	last := window[len(window)-1]
 	signals := readinessAlertSignals(last.cluster)
 
-	window := c.windowLocked(topAlertSignalWindow)
 	if len(window) >= 2 {
 		first := window[0]
 		seconds := sampleWindowSeconds(window)
@@ -1340,7 +1395,7 @@ func (c *topCollector) alertSignalsLocked() []topAlertSignal {
 		}
 	}
 
-	pressure := c.buildPressureLocked(window, topMaxRetainedAlerts)
+	pressure := buildTopPressure(window, topMaxRetainedAlerts)
 	if pressure != nil {
 		for _, item := range pressure.Top {
 			if item.Level == "ok" {

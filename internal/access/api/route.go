@@ -1,8 +1,11 @@
 package api
 
 import (
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -80,7 +83,68 @@ func (s *Server) legacyRouteAddresses(c *gin.Context) (LegacyRouteAddresses, boo
 	if legacyRouteUseIntranet(c) {
 		return s.legacyRouteIntranet, true
 	}
-	return s.legacyRouteExternal, true
+	addrs := s.legacyRouteExternal
+	host := legacyRouteRequestHostname(c.Request.Host)
+	if host != "" {
+		if s.legacyRouteFallback.TCP {
+			addrs.TCPAddr = legacyRouteTCPRequestHost(addrs.TCPAddr, host)
+		}
+		if s.legacyRouteFallback.WS {
+			addrs.WSAddr = legacyRouteWebSocketRequestHost(addrs.WSAddr, host)
+		}
+		if s.legacyRouteFallback.WSS {
+			addrs.WSSAddr = legacyRouteWebSocketRequestHost(addrs.WSSAddr, host)
+		}
+	}
+	if addrs != s.legacyRouteExternal {
+		// The completed addresses belong to this request, never to a shared route cache.
+		c.Header("Cache-Control", "no-store")
+	}
+	return addrs, true
+}
+
+// legacyRouteRequestHostname uses the requested authority, never the client's IP
+// or untrusted proxy headers. An unusable authority leaves configured routes intact.
+func legacyRouteRequestHostname(authority string) string {
+	parsed, err := url.Parse("//" + authority)
+	if err != nil || parsed.Host != authority || parsed.User != nil || parsed.Hostname() == "" {
+		return ""
+	}
+	host := parsed.Hostname()
+	if legacyRouteWildcardHost(host) || (strings.Contains(host, ":") && net.ParseIP(host) == nil) {
+		return ""
+	}
+	return host
+}
+
+func legacyRouteWildcardHost(host string) bool {
+	return host == "" || net.ParseIP(host).IsUnspecified()
+}
+
+func legacyRouteTCPRequestHost(addr, host string) string {
+	listenerHost, port, err := net.SplitHostPort(addr)
+	if err != nil || !legacyRouteWildcardHost(listenerHost) {
+		return addr
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// legacyRouteWebSocketRequestHost preserves the listener's scheme, port, path and
+// query. HTTP TLS and API ports cannot reveal a separate Gateway's public ingress.
+func legacyRouteWebSocketRequestHost(addr, host string) string {
+	parsed, err := url.Parse(addr)
+	if err != nil || (parsed.Scheme != "ws" && parsed.Scheme != "wss") || parsed.Host == "" ||
+		parsed.User != nil || !legacyRouteWildcardHost(parsed.Hostname()) {
+		return addr
+	}
+	if port := parsed.Port(); port != "" {
+		parsed.Host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		parsed.Host = "[" + host + "]"
+	} else {
+		parsed.Host = host
+	}
+	return parsed.String()
 }
 
 func legacyRouteUseIntranet(c *gin.Context) bool {

@@ -10,7 +10,7 @@ BASE_SCRIPT="${WK_BENCH_SINGLE_REAL_QPS_BASE_SCRIPT:-$ROOT_DIR/scripts/bench-wuk
 MIN_ACTUAL_RATIO="${WK_BENCH_MIN_ACTUAL_RATIO:-0.95}"
 SENDER_PICK="${WK_BENCH_SENDER_PICK:-round_robin}"
 
-WK_BENCH_BIN="${WK_BENCH_BIN:-$ROOT_DIR/data/wkbench-test}"
+WK_CLI_BIN="${WK_CLI_BIN:-$ROOT_DIR/data/wkcli-test}"
 START_SCRIPT="${WK_BENCH_SINGLE_NODE_START_SCRIPT:-$ROOT_DIR/scripts/start-wukongim-single-node.sh}"
 READY_TIMEOUT="${WK_BENCH_SINGLE_NODE_READY_TIMEOUT:-90}"
 
@@ -62,7 +62,7 @@ Options:
   --recv-ack BOOL            Whether group recv frames are acknowledged. Default: true.
   --heartbeat BOOL           Whether benchmark clients send heartbeat pings. Default: true.
   --profile-seconds N        Capture final CPU pprof for each node when N > 0. Default: 0.
-  --wkbench-bin PATH         wkbench binary path. Default: data/wkbench-test.
+  --wkcli-bin PATH         wkcli binary path. Default: data/wkcli-test.
   --start-script PATH        Single-node startup script. Default: scripts/start-wukongim-single-node.sh.
   --ready-timeout SECS       Cluster ready wait timeout. Default: 90.
   --api LIST                 Comma-separated API base URLs. Default: node 5001.
@@ -249,9 +249,9 @@ while [[ $# -gt 0 ]]; do
       PROFILE_SECONDS="$2"
       shift 2
       ;;
-    --wkbench-bin)
-      [[ $# -ge 2 ]] || die '--wkbench-bin requires a value'
-      WK_BENCH_BIN="$2"
+    --wkcli-bin)
+      [[ $# -ge 2 ]] || die '--wkcli-bin requires a value'
+      WK_CLI_BIN="$2"
       shift 2
       ;;
     --start-script)
@@ -369,7 +369,7 @@ GATEWAY_SEND_TIMEOUT=${WK_GATEWAY_SEND_TIMEOUT:-14s}
 API_ADDRS=$API_ADDRS
 GATEWAY_ADDRS=$GATEWAY_ADDRS
 METRICS_ADDRS=$METRICS_ADDRS
-WK_BENCH_BIN=$WK_BENCH_BIN
+WK_CLI_BIN=$WK_CLI_BIN
 BASE_SCRIPT=$BASE_SCRIPT
 START_SCRIPT=$START_SCRIPT
 READY_TIMEOUT=$READY_TIMEOUT
@@ -1063,7 +1063,7 @@ run_attempt() {
     "$BASE_SCRIPT" \
       --qps "$qps" \
       --out-dir "$attempt_dir" \
-      --wkbench-bin "$WK_BENCH_BIN" \
+      --wkcli-bin "$WK_CLI_BIN" \
       --start-script "$START_SCRIPT" \
       --ready-timeout "$READY_TIMEOUT" \
       --channels "$CHANNELS" \

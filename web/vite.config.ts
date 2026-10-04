@@ -26,6 +26,52 @@ export function createViteConfig(
     build: {
       outDir: path.resolve(__dirname, "../internal/access/manager/webui/dist"),
       emptyOutDir: true,
+      modulePreload: {
+        // Normalize JS discovery order while preserving stylesheet cascade order.
+        resolveDependencies: (_filename, dependencies) => {
+          const scripts = dependencies.filter((dependency) => dependency.endsWith(".js")).sort()
+          let index = 0
+          return dependencies.map((dependency) => dependency.endsWith(".js") ? scripts[index++] : dependency)
+        },
+      },
+      rolldownOptions: {
+        output: {
+          codeSplitting: {
+            groups: [
+              {
+                name: "react-core",
+                test: /node_modules[\\/](?:react|react-dom|scheduler)[\\/]/,
+                tags: ["$initial"],
+              },
+              {
+                name: "router",
+                test: /node_modules[\\/]react-router(?:-dom)?[\\/]/,
+                tags: ["$initial"],
+              },
+              {
+                name: "internationalization",
+                test: /node_modules[\\/](?:(?:react-intl|intl-messageformat)[\\/]|@formatjs[\\/])/,
+                tags: ["$initial"],
+              },
+              {
+                name: "ui-primitives",
+                test: /node_modules[\\/](?:radix-ui[\\/]|@radix-ui[\\/])/,
+                tags: ["$initial"],
+              },
+              {
+                name: "icons",
+                test: /node_modules[\\/]lucide-react[\\/]/,
+                tags: ["$initial"],
+              },
+              {
+                name: "utilities",
+                test: /node_modules[\\/](?:class-variance-authority|clsx|tailwind-merge|zustand)[\\/]/,
+                tags: ["$initial"],
+              },
+            ],
+          },
+        },
+      },
     },
     server: {
       proxy: {

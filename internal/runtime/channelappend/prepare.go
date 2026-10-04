@@ -3,7 +3,6 @@ package channelappend
 import (
 	"context"
 	"errors"
-	"strings"
 	"time"
 
 	runtimechannelid "github.com/WuKongIM/WuKongIM/pkg/protocol/channelid"
@@ -28,19 +27,19 @@ type preparedSend struct {
 	Command SendCommand
 	// ServerTimestampMS is the server timestamp assigned exactly once during prepare.
 	ServerTimestampMS int64
-	future            *Future
-	// postCommitReserved reports that this item owns one global handoff slot.
-	// It is transferred to committed state on append success and released on
-	// append failure or terminal post-commit completion.
-	postCommitReserved bool
+	// serverAllocatedMessageID proves Command.MessageID came from ports.messageID during this preparation.
+	serverAllocatedMessageID bool
+	future                   *Future
 }
 
 type preparePorts struct {
-	messageID   MessageIDAllocator
-	authorizer  Authorizer
-	idempotency IdempotencyStore
-	senderFence SenderFenceValidator
-	clock       Clock
+	// commandChannels applies the deployment suffix without process-global state.
+	commandChannels runtimechannelid.CommandCodec
+	messageID       MessageIDAllocator
+	authorizer      Authorizer
+	idempotency     IdempotencyStore
+	senderFence     SenderFenceValidator
+	clock           Clock
 }
 
 type prepareOutcome struct {
@@ -56,7 +55,7 @@ func (allowAllAuthorizer) AuthorizeSend(context.Context, SendCommand) (Decision,
 	return Decision{Allowed: true, Reason: ReasonSuccess}, nil
 }
 
-func prepareBatch(runtimeCtx context.Context, items []SendBatchItem, ports preparePorts) prepareOutcome {
+func prepareBatch(runtimeCtx context.Context, items []SendBatchItem, ports preparePorts, lookupIdempotency bool) prepareOutcome {
 	results := make([]SendBatchItemResult, len(items))
 	prepared := make([]preparedSend, 0, len(items))
 	var realtime []preparedSend
@@ -68,7 +67,7 @@ func prepareBatch(runtimeCtx context.Context, items []SendBatchItem, ports prepa
 			ctx = context.Background()
 		}
 		effectCtx, cancelEffectCtx := prepareItemContext(runtimeCtx, ctx)
-		next, done := prepareSend(effectCtx, item.Command, ports)
+		next, done := prepareSend(effectCtx, item.Command, ports, lookupIdempotency)
 		cancelEffectCtx()
 		next.setItemMetadata(i, ctx, item.Deadline)
 		if done {
@@ -137,33 +136,35 @@ func (r *prepareSendResult) setItemMetadata(index int, ctx context.Context, dead
 	r.item.Deadline = deadline
 }
 
-func prepareSend(ctx context.Context, cmd SendCommand, ports preparePorts) (prepareSendResult, bool) {
+func prepareSend(ctx context.Context, cmd SendCommand, ports preparePorts, lookupIdempotency bool) (prepareSendResult, bool) {
 	if cmd.FromUID == "" {
 		return prepareSendResult{result: SendResult{Reason: ReasonAuthFail}}, true
 	}
-	if cmd.RequestScoped || (len(cmd.MessageScopedUIDs) > 0 && cmd.ChannelID == "") {
-		return prepareRequestScopedSend(ctx, cmd, ports)
+	// MQTT content may be empty; native sends still require a body. Validate the
+	// complete provenance before any scoped/transient branch can allocate an ID.
+	if !validSendPublication(cmd.PublicationMetadata) || (len(cmd.Payload) == 0 && len(cmd.PublicationMetadata) == 0) {
+		return prepareSendResult{result: SendResult{Reason: ReasonInvalidRequest}}, true
 	}
-	if cmd.ChannelID == "" || cmd.ChannelType == 0 || len(cmd.Payload) == 0 {
+	if cmd.RequestScoped || (len(cmd.MessageScopedUIDs) > 0 && cmd.ChannelID == "") {
+		return prepareRequestScopedSend(ctx, cmd, ports, lookupIdempotency)
+	}
+	if cmd.ChannelID == "" || cmd.ChannelType == 0 {
 		return prepareSendResult{result: SendResult{Reason: ReasonInvalidRequest}}, true
 	}
 	if cmd.NoPersist {
 		return prepareNoPersistSend(ctx, cmd, ports, true)
 	}
-	return prepareCanonicalSend(ctx, cmd, ports, true)
+	return prepareCanonicalSend(ctx, cmd, ports, true, lookupIdempotency)
 }
 
-func prepareRequestScopedSend(ctx context.Context, cmd SendCommand, ports preparePorts) (prepareSendResult, bool) {
-	if len(cmd.Payload) == 0 {
-		return prepareSendResult{result: SendResult{Reason: ReasonInvalidRequest}}, true
-	}
+func prepareRequestScopedSend(ctx context.Context, cmd SendCommand, ports preparePorts, lookupIdempotency bool) (prepareSendResult, bool) {
 	if !cmd.SyncOnce {
 		return prepareSendResult{err: ErrRequestSubscribersRequireSyncOnce}, true
 	}
 	if cmd.ChannelID != "" {
 		return prepareSendResult{err: ErrRequestSubscribersConflictChannel}, true
 	}
-	scoped, err := runtimechannelid.RequestSubscriberChannelFor(cmd.MessageScopedUIDs)
+	scoped, err := ports.commandChannels.RequestSubscriberChannelFor(cmd.MessageScopedUIDs)
 	if err != nil {
 		if errors.Is(err, runtimechannelid.ErrRequestSubscribersRequired) {
 			return prepareSendResult{err: ErrRequestSubscribersRequired}, true
@@ -177,37 +178,35 @@ func prepareRequestScopedSend(ctx context.Context, cmd SendCommand, ports prepar
 	if cmd.NoPersist {
 		return prepareNoPersistRealtimeSend(ctx, cmd, ports, false)
 	}
-	return prepareCanonicalSend(ctx, cmd, ports, false)
+	return prepareCanonicalSend(ctx, cmd, ports, false, lookupIdempotency)
 }
 
-func prepareCanonicalSend(ctx context.Context, cmd SendCommand, ports preparePorts, normalizePerson bool) (prepareSendResult, bool) {
-	if strings.TrimSpace(cmd.ClientMsgNo) == "" {
-		return prepareSendResult{result: SendResult{Reason: ReasonInvalidRequest}}, true
-	}
+func prepareCanonicalSend(ctx context.Context, cmd SendCommand, ports preparePorts, normalizePerson bool, lookupIdempotency bool) (prepareSendResult, bool) {
 	nextCmd, result, done := prepareValidatedCommand(ctx, cmd, ports, normalizePerson)
 	if done {
 		return result, true
 	}
 	cmd = nextCmd
-	if existing, ok, err := lookupIdempotentSend(ctx, cmd, ports); err != nil {
-		return prepareSendResult{err: err}, true
-	} else if ok {
-		return prepareSendResult{result: existing, command: cmd, canonicalResult: true}, true
+	if cmd.SyncOnce {
+		cmd.ChannelID = ports.commandChannels.ToCommandChannel(cmd.ChannelID)
+	}
+	if lookupIdempotency {
+		if existing, ok, err := lookupIdempotentSend(ctx, cmd, ports); err != nil {
+			return prepareSendResult{err: err}, true
+		} else if ok {
+			return prepareSendResult{result: existing, command: cmd, canonicalResult: true}, true
+		}
 	}
 	return prepareAllocatedSend(cmd, ports, false)
 }
 
 func prepareNoPersistSend(ctx context.Context, cmd SendCommand, ports preparePorts, normalizePerson bool) (prepareSendResult, bool) {
-	sourceChannelID, alreadyCommandChannel := runtimechannelid.FromCommandChannel(cmd.ChannelID)
+	sourceChannelID, alreadyCommandChannel := ports.commandChannels.FromCommandChannel(cmd.ChannelID)
 	cmd.ChannelID = sourceChannelID
-	if !cmd.SyncOnce && !alreadyCommandChannel {
-		nextCmd, result, done := prepareValidatedCommand(ctx, cmd, ports, normalizePerson)
-		if done {
-			return result, true
-		}
-		return prepareSendResult{result: SendResult{Reason: ReasonSuccess}, command: nextCmd, canonicalResult: true}, true
+	// Ordinary transient sends retain their source Channel authority and recipients.
+	if cmd.SyncOnce || alreadyCommandChannel {
+		cmd.ChannelID = ports.commandChannels.ToCommandChannel(cmd.ChannelID)
 	}
-	cmd.ChannelID = runtimechannelid.ToCommandChannel(cmd.ChannelID)
 	return prepareNoPersistRealtimeSend(ctx, cmd, ports, normalizePerson)
 }
 
@@ -217,9 +216,6 @@ func prepareNoPersistRealtimeSend(ctx context.Context, cmd SendCommand, ports pr
 		return result, true
 	}
 	cmd = nextCmd
-	if !runtimechannelid.IsCommandChannel(cmd.ChannelID) {
-		cmd.ChannelID = runtimechannelid.ToCommandChannel(cmd.ChannelID)
-	}
 	return prepareAllocatedSend(cmd, ports, true)
 }
 
@@ -246,9 +242,14 @@ func prepareValidatedCommand(ctx context.Context, cmd SendCommand, ports prepare
 		}
 	}
 	if normalizePerson && cmd.NormalizePersonChannel && cmd.ChannelType == channelTypePerson {
-		channelID, err := runtimechannelid.NormalizePersonChannel(cmd.FromUID, cmd.ChannelID)
+		// A command suffix belongs to the channel, never to either participant UID.
+		sourceID, isCommand := ports.commandChannels.FromCommandChannel(cmd.ChannelID)
+		channelID, err := runtimechannelid.NormalizePersonChannel(cmd.FromUID, sourceID)
 		if err != nil {
 			return cmd, prepareSendResult{err: err}, true
+		}
+		if isCommand {
+			channelID = ports.commandChannels.ToCommandChannel(channelID)
 		}
 		cmd.ChannelID = channelID
 	}
@@ -256,6 +257,7 @@ func prepareValidatedCommand(ctx context.Context, cmd SendCommand, ports prepare
 }
 
 func prepareAllocatedSend(cmd SendCommand, ports preparePorts, realtime bool) (prepareSendResult, bool) {
+	serverAllocatedMessageID := cmd.MessageID == 0
 	if cmd.MessageID == 0 {
 		if ports.messageID == nil {
 			return prepareSendResult{err: ErrMessageIDAllocatorRequired}, true
@@ -268,8 +270,9 @@ func prepareAllocatedSend(cmd SendCommand, ports preparePorts, realtime bool) (p
 	}
 	return prepareSendResult{
 		item: preparedSend{
-			Command:           cmd,
-			ServerTimestampMS: clock.Now().UnixMilli(),
+			Command:                  cmd,
+			ServerTimestampMS:        clock.Now().UnixMilli(),
+			serverAllocatedMessageID: serverAllocatedMessageID,
 		},
 		realtime: realtime,
 	}, false
@@ -279,17 +282,19 @@ func lookupIdempotentSend(ctx context.Context, cmd SendCommand, ports preparePor
 	if ports.idempotency == nil || cmd.ClientMsgNo == "" {
 		return SendResult{}, false, nil
 	}
+	var payload []byte
+	if len(cmd.PublicationMetadata) != 0 {
+		payload = cmd.Payload
+	}
 	result, ok, err := ports.idempotency.LookupSend(ctx, IdempotencyQuery{
 		FromUID:     cmd.FromUID,
 		ClientMsgNo: cmd.ClientMsgNo,
 		ChannelID:   cmd.ChannelID,
 		ChannelType: cmd.ChannelType,
 		PayloadHash: idempotencyPayloadHash(cmd.Payload),
-		Setting:     cmd.Setting,
-		Topic:       cmd.Topic,
-		Expire:      cmd.Expire,
-		SyncOnce:    cmd.SyncOnce,
-		RedDot:      cmd.RedDot,
+		Setting:     cmd.Setting, Topic: cmd.Topic, Expire: cmd.Expire, RedDot: cmd.RedDot, SyncOnce: cmd.SyncOnce,
+		Payload:             payload,
+		PublicationMetadata: cmd.PublicationMetadata,
 	})
 	if ok && err == nil {
 		result.Deduplicated = true

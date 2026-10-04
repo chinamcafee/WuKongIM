@@ -46,10 +46,8 @@ func (e realtimeEffect) runItem(runtimeCtx context.Context, item preparedSend, p
 	}
 	ctx, cancel := prepareItemContext(runtimeCtx, item.Context)
 	defer cancel()
-	realtimePorts := ports
-	realtimePorts.activeAdmitter = nil
 	event := committedEnvelopeForRealtime(item)
-	if _, err := dispatchRecipientsForTarget(ctx, onlinedelivery.ModeTransient, e.target, event, subscriberCache{}, realtimePorts); err != nil {
+	if _, err := dispatchRecipientsForTarget(ctx, onlinedelivery.ModeTransient, e.target, event, subscriberCache{}, ports); err != nil {
 		return realtimeItemCompletion{item: item, result: SendBatchItemResult{Err: err}}
 	}
 	return realtimeItemCompletion{item: item, result: SendBatchItemResult{Result: SendResult{
@@ -62,18 +60,22 @@ func (e realtimeEffect) runItem(runtimeCtx context.Context, item preparedSend, p
 func committedEnvelopeForRealtime(item preparedSend) CommittedEnvelope {
 	cmd := item.Command
 	return CommittedEnvelope{
-		MessageID:         cmd.MessageID,
-		MessageSeq:        0,
-		ChannelID:         cmd.ChannelID,
-		ChannelType:       cmd.ChannelType,
-		FromUID:           cmd.FromUID,
-		SenderNodeID:      cmd.SenderNodeID,
-		SenderSessionID:   cmd.SenderSessionID,
-		ClientMsgNo:       cmd.ClientMsgNo,
-		ServerTimestampMS: item.ServerTimestampMS,
-		Payload:           cloneBytes(cmd.Payload),
-		RedDot:            cmd.RedDot,
-		SyncOnce:          cmd.SyncOnce,
-		MessageScopedUIDs: append([]string(nil), cmd.MessageScopedUIDs...),
+		MessageID:           cmd.MessageID,
+		MessageSeq:          0,
+		ChannelID:           cmd.ChannelID,
+		ChannelType:         cmd.ChannelType,
+		FromUID:             cmd.FromUID,
+		SenderNodeID:        cmd.SenderNodeID,
+		SenderSessionID:     cmd.SenderSessionID,
+		Setting:             cmd.Setting,
+		Topic:               cmd.Topic,
+		Expire:              cmd.Expire,
+		ClientMsgNo:         cmd.ClientMsgNo,
+		ServerTimestampMS:   item.ServerTimestampMS,
+		Payload:             cloneBytes(cmd.Payload),
+		PublicationMetadata: cloneBytes(cmd.PublicationMetadata),
+		RedDot:              cmd.RedDot,
+		SyncOnce:            cmd.SyncOnce,
+		MessageScopedUIDs:   append([]string(nil), cmd.MessageScopedUIDs...),
 	}
 }

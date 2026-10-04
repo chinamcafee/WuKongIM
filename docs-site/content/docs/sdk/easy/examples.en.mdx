@@ -1,0 +1,188 @@
+---
+title: Run official examples
+description: Prepare a server and two accounts, run the eight platform examples, and check online bidirectional messaging.
+---
+
+Exchange messages between Alice and Bob before integrating the tutorial code into your application. Choose one platform below; the two clients may also use different platforms.
+
+## 1. Prepare a development single-node cluster
+
+Follow [Docker deployment](/en/server/deployment/docker) to start a development single-node cluster. Make WebSocket port `5200` and WuKongIM HTTP API port `5001` reachable. The default uses 256 hash slots. Keep the server running and check from a trusted development terminal:
+
+```bash
+curl -fsS http://127.0.0.1:5001/readyz
+```
+
+The readiness request should succeed. The default development URL is `ws://127.0.0.1:5200`; append `/ws` only when configured on the listener or proxy. Use WSS for production clients and keep management APIs within your trusted backend.
+
+## 2. Prepare Alice and Bob
+
+**Choose the device category first.** The requests below use mobile category `0`. Use `1` for Web and `2` for Rust/C#/C++/Python. Set each account’s value separately when platforms differ. `alice-token` and `bob-token` are local demonstration values only.
+
+A trusted product backend should prepare each user's `uid`, `token`, and WebSocket URL. Only for a loopback development environment, a trusted terminal can call [`POST /user/token`](/en/api/product-http/users/setQuickstartUserToken) to create test identities. The commands below assume two native clients; change a user's `device_flag` to `1` when that user signs in through the Web example:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:5001/user/token \
+  -H 'Content-Type: application/json' \
+  -d '{"uid":"alice","token":"alice-token","device_flag":0,"device_level":1}'
+
+curl -fsS -X POST http://127.0.0.1:5001/user/token \
+  -H 'Content-Type: application/json' \
+  -d '{"uid":"bob","token":"bob-token","device_flag":0,"device_level":1}'
+```
+
+Native mobile clients use APP `0`, Web uses WEB `1`, and desktop uses PC `2`. The default product composition exactly validates the stored token for the same UID and device category. A production deployment must still protect this route, implement expiry and rotation policy, and separately prove rejection of invalid, revoked, and product-expired tokens.
+
+Choose the WebSocket URL from where the client runs:
+
+| Client | Local development URL |
+| --- | --- |
+| Browser, Node.js, macOS app, iOS Simulator | `ws://127.0.0.1:5200` |
+| Android Emulator | `ws://10.0.2.2:5200` |
+| Physical phone | `ws://<development-host LAN IP>:5200`, with firewall and routing verified |
+
+## 3. Choose and run an example
+
+Prepare the development tools for your platform. Source examples below use pinned versions. To integrate a distributed package into your application, use the install command in its quickstart.
+
+### iOS [#ios]
+
+```bash
+git clone https://github.com/WuKongIM/WuKongEasySDK-iOS.git
+cd WuKongEasySDK-iOS
+git checkout WK_EASYSDK_IOS_SOURCE_REF
+swift build -c release
+cd Examples/WuKongIMExample-Unified
+./build.sh macos
+./build.sh ios
+```
+
+Boot an iOS Simulator, then run:
+
+```bash
+./build.sh ios --run
+```
+
+You can instead start the macOS variant with `./build.sh macos --run`. The iOS ATS cleartext exception in the example exists only for local `ws://` development; do not copy it into a production app.
+
+[iOS quickstart](/en/sdk/easy/ios/getting-started)
+
+### Android [#android]
+
+```bash
+git clone https://github.com/WuKongIM/WuKongEasySDK-Android.git
+cd WuKongEasySDK-Android
+git checkout WK_EASYSDK_ANDROID_SOURCE_REF
+./gradlew :example:assembleDebug
+./gradlew :example:installDebug
+```
+
+Launch the `example` on an API 21+ device or emulator. An Android Emulator reaches the host at `ws://10.0.2.2:5200`, not `localhost`. Use two devices or emulators for two native identities, or use the browser example as the peer.
+
+[Android quickstart](/en/sdk/easy/android/getting-started)
+
+### Flutter [#flutter]
+
+```bash
+git clone https://github.com/WuKongIM/WuKongEasySDK-Flutter.git
+cd WuKongEasySDK-Flutter
+git checkout WK_EASYSDK_FLUTTER_SOURCE_REF
+flutter pub get
+cd example
+flutter pub get
+flutter devices
+flutter run -d <device-id>
+```
+
+Run every target you intend to ship. An iOS Simulator result cannot stand in for Android, Web, or desktop acceptance.
+
+[Flutter quickstart](/en/sdk/easy/flutter/getting-started)
+
+### Web [#javascript]
+
+```bash
+git clone https://github.com/WuKongIM/WuKongEasySDK-JS.git
+cd WuKongEasySDK-JS
+git checkout WK_EASYSDK_JAVASCRIPT_SOURCE_REF
+npm ci
+npm run build
+python3 -m http.server 8080
+```
+
+Open `http://127.0.0.1:8080/example/`. Use two isolated browser contexts for Alice and Bob. Do not print tokens or complete payloads to the Console.
+
+[Web quickstart](/en/sdk/easy/javascript/getting-started)
+
+### Rust [#rust]
+
+Requires Rust 1.86+. Check out source matching crates.io WK_EASYSDK_RUST_VERSION:
+
+```bash
+git clone --branch WK_EASYSDK_RUST_TAG --depth 1 https://github.com/WuKongIM/WuKongEasySDK-Rust.git
+cd WuKongEasySDK-Rust
+cargo build --locked --example chat
+```
+
+In two terminals set `WK_WS_URL`, `WK_UID`, `WK_TOKEN`, and `WK_PEER_UID`, then run `cargo run --locked --example chat`. Once both connect, type text and observe received events. Enter `/quit` to exit.
+
+[Rust quickstart](/en/sdk/easy/rust/getting-started)
+
+### C# [#csharp]
+
+Create `MyChat` with the complete `Program.cs` in the [C# quickstart](/en/sdk/easy/csharp/getting-started) and install public NuGet WK_EASYSDK_CSHARP_VERSION. Set `WUKONGIM_WS_URL`, `WUKONGIM_UID`, and `WUKONGIM_TOKEN` in each terminal:
+
+```bash
+# Alice
+dotnet run --project MyChat -- bob
+# Bob
+dotnet run --project MyChat -- alice
+```
+
+After both print `Connected.`, press Enter to send and observe `Message received.` at the peer. Press Enter again after checking both directions to exit.
+
+[C# quickstart](/en/sdk/easy/csharp/getting-started)
+
+### C++ [#cpp]
+
+Use the [C++ quickstart](/en/sdk/easy/cpp/getting-started) to build `my_app` with vcpkg, or use `wukong_chat` from a prebuilt archive. For `my_app`, set `WKIM_URL`, `WKIM_UID`, and `WKIM_TOKEN`, then run `./build/my_app bob` (Bob uses `alice`). For the archive client, set `WKIM_TOKEN` and run `./build/wukong_chat ws://127.0.0.1:5200 alice bob`.
+
+With `my_app`, wait for both clients to connect, press Enter to send, then Enter again to exit. With `wukong_chat`, type messages interactively and `/quit` to exit. Windows executables are under `build/Release/` with an `.exe` suffix.
+
+[C++ quickstart](/en/sdk/easy/cpp/getting-started)
+
+### Python [#python]
+
+Run in a Python 3.11+ virtual environment:
+
+```bash
+python -m pip install --index-url https://pypi.org/simple "wukong-easy-sdk==WK_EASYSDK_PYTHON_VERSION"
+git clone --branch WK_EASYSDK_PYTHON_TAG --depth 1 https://github.com/WuKongIM/WuKongEasySDK-Python.git
+python WuKongEasySDK-Python/examples/chat.py
+```
+
+First set each terminal’s `WKIM_URL`, `WKIM_UID`, `WKIM_TOKEN`, and `WKIM_PEER`. Type text after both show `Connected`; enter `/quit` to exit.
+
+[Python quickstart](/en/sdk/easy/python/getting-started)
+
+## 4. Check results and exit
+
+1. Both clients show a successful connection.
+2. Alice receives a server send result, and Bob observes Alice’s message event.
+3. Bob replies and Alice receives it.
+4. Exit using the platform instructions or close the page. Reopening should not leave duplicate events or an old connection.
+
+Example interfaces may display test content; production logs must not record Tokens or full messages.
+
+## Troubleshooting
+
+**Cannot connect:** check `/readyz`, the reachable address, and ports. Android Emulator uses `10.0.2.2`; physical devices use the development machine’s LAN address.
+
+**Authentication fails:** check UID, Token, and `device_flag`. Use different UIDs for the two clients.
+
+**Send succeeds but nothing arrives:** ensure the peer is online, the destination is its UID, and the message listener is registered. SENDACK does not prove recipient delivery.
+
+**Messages are missing after being offline:** EasySDK does not fetch history. Recover through your backend or choose the full SDK.
+
+## Next
+
+[Choose a platform and integrate your application](/en/sdk/easy). Historical versions and independent source/package results are in [engineering validation records](https://github.com/WuKongIM/WuKongIM/blob/main/docs/superpowers/reports/2026-09-08-easysdk-validation-history.md). Continue testing WSS, Token rotation, and recovery in your deployment.

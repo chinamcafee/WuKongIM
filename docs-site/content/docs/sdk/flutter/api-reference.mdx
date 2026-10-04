@@ -1,0 +1,81 @@
+---
+title: Flutter API 参考
+description: 按管理器快速查找 wukongimfluttersdk 常用入口、监听器、模型和状态。
+---
+
+本页是常用入口速查。完整用法和调用顺序请回到对应任务页面。SDK 单例是 `WKIM.shared`。
+
+## 初始化
+
+| API | 用途 |
+| --- | --- |
+| `setup(Options)` | 配置当前用户并打开该 UID 的本地数据库 |
+| `Options.newDefault(uid, token, {addr})` | 创建默认配置 |
+| `Options.getAddr` | 动态提供长连接地址 |
+| `connectionManager` | 连接与状态 |
+| `messageManager` | 消息收发与查询 |
+| `conversationManager` | 会话列表与未读数 |
+| `channelManager` | 用户和群资料 |
+
+## `WKConnectionManager`
+
+| API | 用途 |
+| --- | --- |
+| `connect()` | 发起连接 |
+| `disconnect(false)` | 断开但保留当前账号 |
+| `disconnect(true)` | 退出账号 |
+| `addOnConnectionStatus(key, listener)` | 监听连接状态 |
+| `removeOnConnectionStatus(key)` | 移除状态监听 |
+
+状态：`fail`、`success`、`kicked`、`syncMsg`、`connecting`、`noNetwork`、`syncCompleted`。
+
+## `WKMessageManager`
+
+| API | 用途 |
+| --- | --- |
+| `sendWithOption(content, channel, options)` | 发送并等待本地处理完成 |
+| `sendMessage(content, channel)` | 使用默认选项发送 |
+| `addOnMsgInsertedListener` | 监听本地消息插入；单一全局回调 |
+| `addOnRefreshMsgListener(key, listener)` | 监听消息对象和发送状态变化 |
+| `addOnNewMsgListener(key, listener)` | 监听收到的新消息 |
+| `getOrSyncHistoryMessages` | 读取本地并按需请求远端历史 |
+| `addOnSyncChannelMsgListener` | 接入远端历史 API |
+| `addOnUploadAttachmentListener` | 接入媒体上传 |
+| `registerMsgContent` | 注册自定义正文 |
+
+使用同一个 key 调用 `removeOnRefreshMsgListener` 和 `removeNewMsgListener` 移除页面监听。
+
+## `WKConversationManager`
+
+| API | 用途 |
+| --- | --- |
+| `getAll()` | 读取全部本地会话 |
+| `getAllUnreadCount()` | 读取总未读数 |
+| `getWithChannel(channelID, channelType)` | 读取一个频道的会话 |
+| `updateRedDot(channelID, channelType, count)` | 更新未读数 |
+| `deleteMsg(channelID, channelType)` | 删除会话列表项 |
+| `addOnRefreshMsgListListener(key, listener)` | 监听会话批量变化 |
+| `addOnSyncConversationListener` | 接入多设备会话同步 API |
+
+## `WKChannelManager`
+
+| API | 用途 |
+| --- | --- |
+| `getChannel(channelID, channelType)` | 读取本地频道资料 |
+| `fetchChannelInfo(channelID, channelType)` | 请求刷新资料 |
+| `addOnGetChannelListener` | 接入用户和群资料 API |
+| `addOrUpdateChannel` | 保存资料到本地 |
+| `addOnRefreshListener(key, listener)` | 监听资料变化 |
+
+## 常用模型
+
+| 类型 | 说明 |
+| --- | --- |
+| `WKChannel` | `channelID` 和 `channelType` 共同确定聊天目标 |
+| `WKMsg` | 消息身份、正文、序号和发送状态 |
+| `WKMessageContent` | 消息正文基类 |
+| `WKTextContent` / `WKImageContent` | 内置文本和图片正文 |
+| `WKUIConversationMsg` | 会话列表项和未读数 |
+| `WKSyncConversation` / `WKSyncChannelMsg` | 业务 API 返回给 SDK 的同步结果 |
+
+常用频道类型：`WKChannelType.personal`、`WKChannelType.group`。发送状态：`WKSendMsgResult.sendLoading`、`sendSuccess`、`sendFail`。

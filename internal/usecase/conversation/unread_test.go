@@ -2,6 +2,7 @@ package conversation
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -12,171 +13,187 @@ import (
 func TestClearUnreadAdvancesReadSeqToLatestMessage(t *testing.T) {
 	now := time.Unix(0, 123)
 	store := newConversationMutationStore()
-	store.latest[metadb.ConversationKey{ChannelID: "g1", ChannelType: 2}] = LastMessage{MessageSeq: 12}
-	app := New(Options{Store: store, Messages: store, Now: func() time.Time { return now }})
+	store.head.ReadThroughSeq = 12
+	app := New(Options{Hydrator: store, MembershipMutations: store, Now: func() time.Time { return now }})
 
 	if err := app.ClearUnread(context.Background(), ClearUnreadCommand{UID: "u1", ChannelID: "g1", ChannelType: 2}); err != nil {
 		t.Fatalf("ClearUnread() error = %v", err)
 	}
 
-	want := []metadb.ConversationState{{
-		UID:         "u1",
-		Kind:        metadb.ConversationKindNormal,
-		ChannelID:   "g1",
-		ChannelType: 2,
-		ReadSeq:     12,
-		UpdatedAt:   now.UnixNano(),
-	}}
-	if !reflect.DeepEqual(store.upserts, want) {
-		t.Fatalf("upserts = %#v, want %#v", store.upserts, want)
-	}
-}
-
-func TestClearUnreadWithExplicitSequenceDoesNotClearNewerConcurrentMessage(t *testing.T) {
-	now := time.Unix(0, 234)
-	store := newConversationMutationStore()
-	store.latest[metadb.ConversationKey{ChannelID: "g1", ChannelType: 2}] = LastMessage{MessageSeq: 14}
-	app := New(Options{Store: store, Messages: store, Now: func() time.Time { return now }})
-
-	if err := app.ClearUnread(context.Background(), ClearUnreadCommand{
-		UID: "u1", ChannelID: "g1", ChannelType: 2, MessageSeq: 12,
-	}); err != nil {
-		t.Fatalf("ClearUnread() error = %v", err)
-	}
-
-	if len(store.upserts) != 1 || store.upserts[0].ReadSeq != 12 {
-		t.Fatalf("upserts = %#v, want explicit read seq 12", store.upserts)
-	}
-}
-
-func TestClearUnreadClampsExplicitSequenceToLatestVisibleMessage(t *testing.T) {
-	store := newConversationMutationStore()
-	store.latest[metadb.ConversationKey{ChannelID: "g1", ChannelType: 2}] = LastMessage{MessageSeq: 14}
-	app := New(Options{Store: store, Messages: store})
-
-	if err := app.ClearUnread(context.Background(), ClearUnreadCommand{
-		UID: "u1", ChannelID: "g1", ChannelType: 2, MessageSeq: 99,
-	}); err != nil {
-		t.Fatalf("ClearUnread() error = %v", err)
-	}
-
-	if len(store.upserts) != 1 || store.upserts[0].ReadSeq != 14 {
-		t.Fatalf("upserts = %#v, want clamped read seq 14", store.upserts)
-	}
-}
-
-func TestClearUnreadNeverRegressesExistingReadSequence(t *testing.T) {
-	store := newConversationMutationStore()
-	key := ConversationKey{ChannelID: "g1", ChannelType: 2}
-	store.states[key] = metadb.ConversationState{Kind: metadb.ConversationKindNormal, ReadSeq: 13}
-	store.latest[metadb.ConversationKey{ChannelID: "g1", ChannelType: 2}] = LastMessage{MessageSeq: 14}
-	app := New(Options{Store: store, Messages: store})
-
-	if err := app.ClearUnread(context.Background(), ClearUnreadCommand{
-		UID: "u1", ChannelID: "g1", ChannelType: 2, MessageSeq: 12,
-	}); err != nil {
-		t.Fatalf("ClearUnread() error = %v", err)
-	}
-
-	if len(store.upserts) != 0 {
-		t.Fatalf("upserts = %#v, want no regression write", store.upserts)
+	want := []membershipReadMutation{{uid: "u1", channelID: "g1", channelType: 2, readSeq: 12, updatedAt: now.UnixNano()}}
+	if !reflect.DeepEqual(store.readMutations, want) {
+		t.Fatalf("read mutations = %#v, want %#v", store.readMutations, want)
 	}
 }
 
 func TestSetUnreadAdvancesReadSeqToKeepRequestedUnreadTail(t *testing.T) {
 	now := time.Unix(0, 456)
 	store := newConversationMutationStore()
-	store.latest[metadb.ConversationKey{ChannelID: "g1", ChannelType: 2}] = LastMessage{MessageSeq: 12}
-	app := New(Options{Store: store, Messages: store, Now: func() time.Time { return now }})
+	store.head.ReadThroughSeq = 12
+	app := New(Options{Hydrator: store, MembershipMutations: store, Now: func() time.Time { return now }})
 
 	if err := app.SetUnread(context.Background(), SetUnreadCommand{UID: "u1", ChannelID: "g1", ChannelType: 2, Unread: 3}); err != nil {
 		t.Fatalf("SetUnread() error = %v", err)
 	}
 
-	if len(store.upserts) != 1 || store.upserts[0].ReadSeq != 9 || store.upserts[0].UpdatedAt != now.UnixNano() {
-		t.Fatalf("upserts = %#v, want read seq 9 with fixed updated time", store.upserts)
+	if len(store.readMutations) != 1 || store.readMutations[0].readSeq != 9 || store.readMutations[0].updatedAt != now.UnixNano() {
+		t.Fatalf("read mutations = %#v, want read seq 9 with fixed updated time", store.readMutations)
 	}
 }
 
 func TestDeleteConversationHidesThroughLatestMessage(t *testing.T) {
 	now := time.Unix(0, 789)
 	store := newConversationMutationStore()
-	store.latest[metadb.ConversationKey{ChannelID: "g1", ChannelType: 2}] = LastMessage{MessageSeq: 12}
-	app := New(Options{Store: store, Messages: store, Now: func() time.Time { return now }})
+	store.head.ReadThroughSeq = 12
+	app := New(Options{Hydrator: store, MembershipMutations: store, Now: func() time.Time { return now }})
 
 	if err := app.DeleteConversation(context.Background(), DeleteConversationCommand{UID: "u1", ChannelID: "g1", ChannelType: 2}); err != nil {
 		t.Fatalf("DeleteConversation() error = %v", err)
 	}
 
-	want := []metadb.ConversationDelete{{
-		UID:          "u1",
-		Kind:         metadb.ConversationKindNormal,
-		ChannelID:    "g1",
-		ChannelType:  2,
-		DeletedToSeq: 12,
-		UpdatedAt:    now.UnixNano(),
-	}}
-	if !reflect.DeepEqual(store.deletes, want) {
-		t.Fatalf("deletes = %#v, want %#v", store.deletes, want)
+	want := []membershipHideMutation{{uid: "u1", channelID: "g1", channelType: 2, deletedToSeq: 12, updatedAt: now.UnixNano()}}
+	if !reflect.DeepEqual(store.hideMutations, want) {
+		t.Fatalf("hide mutations = %#v, want %#v", store.hideMutations, want)
 	}
 }
 
+func TestActivateConversationOnlyRaisesMembershipPriorityOnExplicitCommand(t *testing.T) {
+	now := time.Unix(0, 999)
+	store := newConversationMutationStore()
+	app := New(Options{MembershipMutations: store, Now: func() time.Time { return now }})
+	if err := app.ActivateConversation(context.Background(), ActivateConversationCommand{UID: "u1", ChannelID: "g1", ChannelType: 2}); err != nil {
+		t.Fatalf("ActivateConversation() error = %v", err)
+	}
+	if len(store.activationMutations) != 1 || store.activationMutations[0].activatedAt != now.UnixNano() {
+		t.Fatalf("activation mutations = %#v", store.activationMutations)
+	}
+}
+
+type membershipReadMutation struct {
+	uid, channelID string
+	channelType    int64
+	readSeq        uint64
+	updatedAt      int64
+}
+
+type membershipHideMutation struct {
+	uid, channelID string
+	channelType    int64
+	deletedToSeq   uint64
+	updatedAt      int64
+}
+
+type membershipActivationMutation struct {
+	uid, channelID string
+	channelType    int64
+	activatedAt    int64
+	updatedAt      int64
+}
+
 type conversationMutationStore struct {
-	states  map[ConversationKey]metadb.ConversationState
-	latest  map[metadb.ConversationKey]LastMessage
-	upserts []metadb.ConversationState
-	deletes []metadb.ConversationDelete
+	membership          metadb.UserChannelMembership
+	missing             bool
+	membershipErr       error
+	hydrationErr        error
+	hydrationCalls      int
+	head                HydrationResult
+	readMutations       []membershipReadMutation
+	hideMutations       []membershipHideMutation
+	activationMutations []membershipActivationMutation
 }
 
 func newConversationMutationStore() *conversationMutationStore {
 	return &conversationMutationStore{
-		states: make(map[ConversationKey]metadb.ConversationState),
-		latest: make(map[metadb.ConversationKey]LastMessage),
+		membership: metadb.UserChannelMembership{UID: "u1", ChannelID: "g1", ChannelType: 2, JoinSeq: 1},
+		head:       HydrationResult{Key: ConversationKey{ChannelID: "g1", ChannelType: 2}, Outcome: HydrationNoVisibleMessage},
 	}
 }
 
-func (s *conversationMutationStore) ListConversationActiveView(context.Context, metadb.ConversationKind, string, metadb.ConversationActiveCursor, int) (ActiveViewPage, error) {
-	return ActiveViewPage{Done: true}, nil
+func (s *conversationMutationStore) GetUserChannelMembership(_ context.Context, _, _ string, _ int64) (metadb.UserChannelMembership, bool, error) {
+	return s.membership, !s.missing, s.membershipErr
 }
 
-func (s *conversationMutationStore) GetConversationState(_ context.Context, kind metadb.ConversationKind, uid, channelID string, channelType int64) (metadb.ConversationState, bool, error) {
-	state, ok := s.states[ConversationKey{ChannelID: channelID, ChannelType: channelType}]
-	if ok && state.Kind != kind {
-		return metadb.ConversationState{}, false, nil
-	}
-	if ok {
-		state.UID = uid
-		state.Kind = kind
-	}
-	return state, ok, nil
+func (s *conversationMutationStore) HydrateConversationHeads(_ context.Context, _ string, _ []metadb.UserChannelMembership, keepUnread ...uint64) ([]HydrationResult, error) {
+	s.hydrationCalls++
+	return []HydrationResult{s.head}, s.hydrationErr
 }
 
-func (s *conversationMutationStore) GetLastVisibleMessages(_ context.Context, requests []LastVisibleMessageRequest) (map[metadb.ConversationKey]LastMessage, error) {
-	out := make(map[metadb.ConversationKey]LastMessage, len(requests))
-	for _, req := range requests {
-		key := metadb.ConversationKey{ChannelID: req.ChannelID, ChannelType: req.ChannelType}
-		msg, ok := s.latest[key]
-		if ok && msg.MessageSeq > req.VisibleAfterSeq {
-			out[key] = msg
-		}
-	}
-	return out, nil
-}
-
-func (s *conversationMutationStore) CountUnreadMessages(_ context.Context, _ string, requests []UnreadCountRequest) (map[metadb.ConversationKey]uint64, error) {
-	out := make(map[metadb.ConversationKey]uint64, len(requests))
-	for _, req := range requests {
-		out[metadb.ConversationKey{ChannelID: req.ChannelID, ChannelType: req.ChannelType}] = req.ThroughSeq - req.AfterSeq
-	}
-	return out, nil
-}
-
-func (s *conversationMutationStore) UpsertConversationStates(_ context.Context, states []metadb.ConversationState) error {
-	s.upserts = append(s.upserts, states...)
+func (s *conversationMutationStore) AdvanceUserChannelMembershipReadSeq(_ context.Context, uid, channelID string, channelType int64, readSeq uint64, updatedAt int64) error {
+	s.readMutations = append(s.readMutations, membershipReadMutation{uid: uid, channelID: channelID, channelType: channelType, readSeq: readSeq, updatedAt: updatedAt})
 	return nil
 }
 
-func (s *conversationMutationStore) HideConversations(_ context.Context, reqs []metadb.ConversationDelete) error {
-	s.deletes = append(s.deletes, reqs...)
+func (s *conversationMutationStore) HideUserChannelMembership(_ context.Context, uid, channelID string, channelType int64, deletedToSeq uint64, updatedAt int64) error {
+	s.hideMutations = append(s.hideMutations, membershipHideMutation{uid: uid, channelID: channelID, channelType: channelType, deletedToSeq: deletedToSeq, updatedAt: updatedAt})
 	return nil
+}
+
+func (s *conversationMutationStore) ActivateUserChannelMembership(_ context.Context, uid, channelID string, channelType int64, activatedAt, updatedAt int64) error {
+	s.activationMutations = append(s.activationMutations, membershipActivationMutation{uid: uid, channelID: channelID, channelType: channelType, activatedAt: activatedAt, updatedAt: updatedAt})
+	return nil
+}
+
+func TestUnreadEmptyConversationIsIdempotent(t *testing.T) {
+	for _, state := range []string{"missing", "tombstone", "missing channel", "empty channel"} {
+		t.Run(state, func(t *testing.T) {
+			store := newConversationMutationStore()
+			switch state {
+			case "missing":
+				store.missing = true
+			case "tombstone":
+				store.membership.Tombstone = true
+			case "missing channel":
+				store.head.Outcome = HydrationDelete
+			}
+			app := New(Options{Hydrator: store, MembershipMutations: store})
+			for attempt := 0; attempt < 2; attempt++ {
+				if err := app.ClearUnread(context.Background(), ClearUnreadCommand{UID: "u1", ChannelID: "g1", ChannelType: 2}); err != nil {
+					t.Fatal(err)
+				}
+				for _, unread := range []int{0, 3} {
+					if err := app.SetUnread(context.Background(), SetUnreadCommand{UID: "u1", ChannelID: "g1", ChannelType: 2, Unread: unread}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if len(store.readMutations)+len(store.hideMutations)+len(store.activationMutations) != 0 {
+				t.Fatal("empty conversation mutated membership")
+			}
+			if (state == "missing" || state == "tombstone") && store.hydrationCalls != 0 {
+				t.Fatal("absent membership triggered a channel read")
+			}
+		})
+	}
+}
+
+func TestUnreadEmptyConversationDoesNotHideFailures(t *testing.T) {
+	for _, stage := range []string{"membership", "hydration", "route"} {
+		t.Run(stage, func(t *testing.T) {
+			store := newConversationMutationStore()
+			want := metadb.ErrNotFound
+			switch stage {
+			case "membership":
+				store.membershipErr = want
+			case "hydration":
+				store.hydrationErr = want
+			case "route":
+				store.head.Outcome = HydrationRetryable
+				want = ErrRouteNotReady
+			}
+			app := New(Options{Hydrator: store, MembershipMutations: store})
+			if err := app.ClearUnread(context.Background(), ClearUnreadCommand{UID: "u1", ChannelID: "g1", ChannelType: 2}); !errors.Is(err, want) {
+				t.Fatalf("clear error = %v, want %v", err, want)
+			}
+			if err := app.SetUnread(context.Background(), SetUnreadCommand{UID: "u1", ChannelID: "g1", ChannelType: 2}); !errors.Is(err, want) {
+				t.Fatalf("set error = %v, want %v", err, want)
+			}
+			if len(store.readMutations) != 0 {
+				t.Fatal("failed read caused mutation")
+			}
+		})
+	}
+}
+
+func (h *conversationMutationStore) HydratePersistedConversationHeads(ctx context.Context, uid string, rows []metadb.UserChannelMembership) ([]HydrationResult, error) {
+	return h.HydrateConversationHeads(ctx, uid, rows)
 }

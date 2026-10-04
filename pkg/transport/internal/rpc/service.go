@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,13 +20,23 @@ const (
 
 // Request is one service invocation owned by the service after a successful Enqueue.
 type Request struct {
+	// Context carries the connection lifetime and negotiated caller budget. Nil
+	// uses the service lifetime. Running cancellation is opt-in per service.
+	Context context.Context
+	// Finish removes connection request tracking after an admitted request ends.
+	Finish func()
+	// entry owns removable queue state and its admission timestamp.
+	entry *requestEntry
+	// retainedBytes is captured at admission and survives payload release.
+	retainedBytes int64
 	// Payload carries the request bytes and must be released by the service owner.
 	Payload core.OwnedBuffer
 	// Reply optionally receives a copied response payload and terminal handler error.
 	Reply chan Response
-	// Respond, when non-nil, is invoked exactly once with the terminal response in
-	// place of Reply. It runs on the executor worker goroutine; it must not block.
-	Respond func(Response)
+	// RespondBorrowed receives a response whose payload is valid only during the callback.
+	// It takes precedence over Reply and must copy or encode bytes before returning.
+	// It runs synchronously on the terminal owner goroutine and must not block.
+	RespondBorrowed func(Response)
 }
 
 // Service owns a bounded queue and executor-backed pump for a registered transport service.
@@ -57,10 +68,24 @@ type Service struct {
 	queuedItems int
 	// queuedBytes is the byte cost currently waiting in queue.
 	queuedBytes int64
-	// queue stores requests waiting for a worker.
-	queue chan Request
+	// retainedBytes and retainedItems include queued and executing request owners.
+	retainedBytes int64
+	retainedItems int
+	// queueRevision orders absolute queue snapshots captured under mu.
+	queueRevision uint64
+	// head and tail form an intrusive FIFO; expired entries can be removed in O(1).
+	head, tail *requestEntry
+	// queueTimer is reused for the earliest FIFO queue deadline. Service.mu
+	// protects rearming; callbacks recheck the current head before expiring it.
+	queueTimer *time.Timer
+	// queueReady wakes the pump after admission without spawning per-request workers.
+	queueReady chan struct{}
+	// requestWG joins admitted owners, including concurrent queue expiry callbacks.
+	requestWG sync.WaitGroup
 	// inflight is the current number of handlers running for this service.
 	inflight atomic.Int32
+	// inflightStateMu orders physical inflight mutations and their revisions.
+	inflightStateMu sync.Mutex
 	// tokens bounds this service's handler concurrency on the shared executor.
 	tokens chan struct{}
 
@@ -99,6 +124,12 @@ func normalizeServiceOptions(opts core.ServiceOptions) core.ServiceOptions {
 	if opts.MaxQueueBytes <= 0 {
 		opts.MaxQueueBytes = 1
 	}
+	if opts.MaxRetainedBytes == 0 {
+		opts.MaxRetainedBytes = opts.MaxQueueBytes
+		if opts.MaxQueueBytes <= math.MaxInt64/2 {
+			opts.MaxRetainedBytes *= 2
+		}
+	}
 	return opts
 }
 
@@ -114,7 +145,7 @@ func newService(id uint16, handler core.Handler, opts core.ServiceOptions, obser
 		ownExecutor: ownExecutor,
 		ctx:         ctx,
 		cancel:      cancel,
-		queue:       make(chan Request, opts.QueueSize),
+		queueReady:  make(chan struct{}, 1),
 		tokens:      make(chan struct{}, opts.Concurrency),
 		done:        make(chan struct{}),
 	}
@@ -123,85 +154,92 @@ func newService(id uint16, handler core.Handler, opts core.ServiceOptions, obser
 	goruntimeregistry.SafeGo(nil, goruntimeregistry.TaskTransportRPCService, func() {
 		s.pumpWG.Wait()
 		s.taskWG.Wait()
+		s.requestWG.Wait()
 		close(s.done)
 	})
 	return s
 }
 
-// Enqueue transfers payload ownership to the service when it succeeds.
+// Enqueue transfers payload ownership on success. Failed admission releases the
+// payload but leaves error response and Finish responsibility with the caller.
 func (s *Service) Enqueue(req Request) error {
 	payloadLen := req.Payload.Len()
+	req.retainedBytes = int64(req.Payload.RetainedBytes())
 	if s.opts.MaxPayload > 0 && payloadLen > s.opts.MaxPayload {
-		snapshot := s.queueSnapshot()
 		req.Payload.Release()
-		s.observeAdmissionAndQueue("too_large", payloadLen, snapshot)
+		s.observeAdmissionAndQueue("too_large", payloadLen, s.queueSnapshot())
 		return core.ErrMsgTooLarge
 	}
-
+	if req.Context == nil {
+		req.Context = s.ctx
+	}
 	s.mu.Lock()
-
-	if s.stopped {
+	var err error
+	result := "ok"
+	switch {
+	case s.stopped:
+		err = core.ErrStopped
+		result = "stopped"
+	case req.Context.Err() != nil:
+		err = requestError(req.Context.Err())
+		result = "canceled"
+	case s.queuedItems >= s.opts.QueueSize || req.retainedBytes > s.opts.MaxQueueBytes-s.queuedBytes || req.retainedBytes > s.opts.MaxRetainedBytes-s.retainedBytes:
+		err = core.ErrBusy
+		result = "busy"
+	}
+	if err != nil {
 		snapshot := s.queueSnapshotLocked()
 		s.mu.Unlock()
 		req.Payload.Release()
-		deliver(req, Response{Err: core.ErrStopped})
-		s.observeAdmissionAndQueue("stopped", payloadLen, snapshot)
-		return core.ErrStopped
+		s.observeAdmissionAndQueue(result, payloadLen, snapshot)
+		return err
 	}
-	if int64(payloadLen) > s.opts.MaxQueueBytes-s.queuedBytes {
-		snapshot := s.queueSnapshotLocked()
-		s.mu.Unlock()
-		req.Payload.Release()
-		s.observeAdmissionAndQueue("busy", payloadLen, snapshot)
-		return core.ErrBusy
-	}
-
+	entry := &requestEntry{serviceTask: serviceTask{service: s, req: req}, queued: true, enqueuedAt: time.Now()}
+	entry.req.entry = entry
+	s.appendLocked(entry)
+	s.retainedBytes += req.retainedBytes
+	s.retainedItems++
+	s.requestWG.Add(1)
+	// Install under the queue lock so cancellation cannot race past ownership transfer.
+	entry.watchQueue(s)
+	snapshot := s.queueSnapshotLocked()
+	retained := s.retainedEventLocked()
+	s.mu.Unlock()
+	s.observe(retained)
+	s.observeAdmissionAndQueue("ok", payloadLen, snapshot)
 	select {
-	case s.queue <- req:
-		s.queuedItems++
-		s.queuedBytes += int64(payloadLen)
-		snapshot := s.queueSnapshotLocked()
-		s.mu.Unlock()
-		s.observeAdmissionAndQueue("ok", payloadLen, snapshot)
-		return nil
+	case s.queueReady <- struct{}{}:
 	default:
-		snapshot := s.queueSnapshotLocked()
-		s.mu.Unlock()
-		req.Payload.Release()
-		s.observeAdmissionAndQueue("busy", payloadLen, snapshot)
-		return core.ErrBusy
 	}
+	return nil
 }
 
-// Stop requests pump shutdown, drains queued payloads, and waits only briefly for cooperative handlers.
+// Stop rejects admission and releases queued owners before joining active work.
 func (s *Service) Stop() {
 	s.stopOnce.Do(func() {
 		s.mu.Lock()
 		s.stopped = true
 		s.cancel()
-		for {
-			select {
-			case req := <-s.queue:
-				if s.queuedItems > 0 {
-					s.queuedItems--
-				}
-				s.queuedBytes -= int64(req.Payload.Len())
-				if s.queuedBytes < 0 {
-					s.queuedBytes = 0
-				}
-				deliver(req, Response{Err: core.ErrStopped})
-				req.Payload.Release()
-			default:
-				s.mu.Unlock()
-				select {
-				case <-s.done:
-				case <-time.After(serviceStopGrace):
-				}
-				if s.ownExecutor {
-					_ = s.executor.Stop()
-				}
-				return
-			}
+		var drained []Request
+		for s.head != nil {
+			entry := s.head
+			s.unlinkLocked(entry)
+			entry.stopQueueWatch()
+			drained = append(drained, entry.req)
+		}
+		event := s.queueEvent("stopped", s.queueSnapshotLocked())
+		s.mu.Unlock()
+		s.observe(event)
+		for _, req := range drained {
+			deliver(req, Response{Err: core.ErrStopped})
+			s.releaseRequest(req)
+		}
+		select {
+		case <-s.done:
+		case <-time.After(serviceStopGrace):
+		}
+		if s.ownExecutor {
+			_ = s.executor.Stop()
 		}
 	})
 }
@@ -212,40 +250,36 @@ func (s *Service) pump() {
 		if !s.acquireToken() {
 			return
 		}
-		select {
-		case <-s.ctx.Done():
+		req, ok := s.nextRequest()
+		if !ok {
 			s.releaseToken()
 			return
-		case req := <-s.queue:
-			active, event := s.markDequeued(req)
-			s.observe(event)
-			if !active {
-				s.releaseToken()
-				deliver(req, Response{Err: core.ErrStopped})
-				req.Payload.Release()
-				continue
+		}
+		payloadLen := req.Payload.Len()
+		s.taskWG.Add(1)
+		// The queue owner survives execution and all terminal callbacks; no
+		// pooling or reuse can race a queued-expiry callback that already started.
+		task := &req.entry.serviceTask
+		for {
+			err := s.beforeExecution(req)
+			if err == nil {
+				err = s.executor.Submit(task)
 			}
-			payloadLen := req.Payload.Len()
-			s.taskWG.Add(1)
-			task := &serviceTask{service: s, req: req}
-			for {
-				err := s.executor.Submit(task)
-				if err == nil {
-					break
-				}
-				if errors.Is(err, core.ErrBusy) && s.waitSubmitRetry() {
-					continue
-				}
-				if errors.Is(err, core.ErrBusy) {
-					err = core.ErrStopped
-				}
-				s.taskWG.Done()
-				s.releaseToken()
-				deliver(req, Response{Err: err})
-				req.Payload.Release()
-				s.observeTask(taskResult(err), payloadLen, 0)
+			if err == nil {
 				break
 			}
+			if errors.Is(err, core.ErrBusy) && s.waitSubmitRetry() {
+				continue
+			}
+			if errors.Is(err, core.ErrBusy) {
+				err = core.ErrStopped
+			}
+			s.taskWG.Done()
+			s.releaseToken()
+			deliver(req, Response{Err: err})
+			s.releaseRequest(req)
+			s.observeTask(taskResult(err), payloadLen, 0)
+			break
 		}
 	}
 }
@@ -277,46 +311,83 @@ func (s *Service) waitSubmitRetry() bool {
 	}
 }
 
-func (s *Service) markDequeued(req Request) (bool, core.Event) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.queuedItems > 0 {
-		s.queuedItems--
+// beforeExecution preserves the queue budget through shared-executor admission.
+func (s *Service) beforeExecution(req Request) error {
+	if s.ctx.Err() != nil {
+		return core.ErrStopped
 	}
-	s.queuedBytes -= int64(req.Payload.Len())
-	if s.queuedBytes < 0 {
-		s.queuedBytes = 0
+	if err := req.Context.Err(); err != nil {
+		return requestError(err)
 	}
-	result := "ok"
-	if s.stopped {
-		result = "stopped"
+	if s.opts.QueueTimeout > 0 && req.entry != nil && time.Since(req.entry.enqueuedAt) >= s.opts.QueueTimeout {
+		return core.ErrTimeout
 	}
-	return !s.stopped, s.queueEvent(result, s.queueSnapshotLocked())
+	return nil
 }
 
 func (s *Service) handle(req Request) error {
-	defer req.Payload.Release()
-
+	// Recheck after executor admission: dispatch can race with caller cancellation.
+	if err := s.beforeExecution(req); err != nil {
+		deliver(req, Response{Err: err})
+		return err
+	}
 	ctx := s.ctx
+	if s.opts.CancelRunning {
+		ctx = req.Context
+	}
 	cancel := func() {}
 	if s.opts.Timeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, s.opts.Timeout)
+	} else if s.opts.CancelRunning && req.Context != s.ctx {
+		ctx, cancel = context.WithCancel(ctx)
 	}
 	defer cancel()
-
-	resp, err := s.handler(ctx, req.Payload.Bytes())
-	if ctx.Err() != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		err = core.ErrTimeout
+	// The execution context already has a cancel function. Reuse it to link
+	// service shutdown instead of adding a second cancellation context.
+	if s.opts.CancelRunning && req.Context != s.ctx {
+		stopService := context.AfterFunc(s.ctx, cancel)
+		defer stopService()
 	}
-	if req.Reply == nil && req.Respond == nil {
+
+	if req.entry != nil {
+		s.observe(core.Event{Name: "service_wait", ServiceID: s.ID, ServiceAlias: s.opts.Alias, Result: "ok", Duration: nonNegativeSince(req.entry.enqueuedAt)})
+	}
+	resp, err := s.handler(ctx, req.Payload.Bytes())
+	if ctx.Err() != nil {
+		err = requestError(ctx.Err())
+	}
+	if req.Reply == nil && req.RespondBorrowed == nil {
 		return err
 	}
 
-	reply := Response{Payload: append([]byte(nil), resp...), Err: err}
+	reply := Response{Payload: resp, Err: err}
+	if req.RespondBorrowed == nil {
+		// Asynchronous receivers need a copy that outlives request payload release.
+		reply.Payload = append([]byte(nil), resp...)
+	}
 	// Reply channels are required to be buffered by callers; non-blocking send keeps Stop from
-	// waiting forever when the caller has abandoned a request. Respond runs inline on the worker.
+	// waiting forever when the caller has abandoned a request. RespondBorrowed runs inline on the worker.
 	deliver(req, reply)
 	return err
+}
+
+// releaseRequest returns an admission only when its payload owner finishes.
+func (s *Service) releaseRequest(req Request) {
+	defer s.requestWG.Done()
+	if req.Finish != nil {
+		defer req.Finish()
+	}
+	req.Payload.Release()
+	s.mu.Lock()
+	s.retainedBytes -= req.retainedBytes
+	s.retainedItems--
+	event := s.retainedEventLocked()
+	s.mu.Unlock()
+	s.observe(event)
+}
+
+func (s *Service) retainedEventLocked() core.Event {
+	return core.Event{Name: "service_retained", ServiceID: s.ID, ServiceAlias: s.opts.Alias, Result: "ok", Revision: core.NextStateRevision(), Items: s.retainedItems, Bytes: int(s.retainedBytes), BytesCapacity: s.opts.MaxRetainedBytes}
 }
 
 type queueSnapshot struct {
@@ -324,6 +395,7 @@ type queueSnapshot struct {
 	capacity      int
 	bytes         int64
 	bytesCapacity int64
+	revision      uint64
 }
 
 func (s *Service) queueSnapshot() queueSnapshot {
@@ -345,6 +417,7 @@ func (s *Service) queueSnapshotLocked() queueSnapshot {
 		capacity:      s.opts.QueueSize,
 		bytes:         s.queuedBytes,
 		bytesCapacity: s.opts.MaxQueueBytes,
+		revision:      s.queueRevision,
 	}
 }
 
@@ -371,6 +444,7 @@ func (s *Service) queueEvent(result string, snapshot queueSnapshot) core.Event {
 		ServiceID:     s.ID,
 		ServiceAlias:  s.opts.Alias,
 		Result:        result,
+		Revision:      snapshot.revision,
 		Items:         snapshot.items,
 		Capacity:      snapshot.capacity,
 		Bytes:         int(snapshot.bytes),
@@ -378,12 +452,13 @@ func (s *Service) queueEvent(result string, snapshot queueSnapshot) core.Event {
 	}
 }
 
-func (s *Service) observeInflight(inflight int) {
+func (s *Service) observeInflight(inflight int, revision uint64) {
 	event := core.Event{
 		Name:         "service_inflight",
 		ServiceID:    s.ID,
 		ServiceAlias: s.opts.Alias,
 		Result:       "ok",
+		Revision:     revision,
 		Capacity:     s.opts.Concurrency,
 		Inflight:     inflight,
 	}
@@ -394,6 +469,14 @@ func (s *Service) observeInflight(inflight int) {
 		event.PoolWaiting = stats.Waiting
 	}
 	s.observe(event)
+}
+
+func (s *Service) changeInflight(delta int32) {
+	s.inflightStateMu.Lock()
+	inflight := int(s.inflight.Add(delta))
+	revision := core.NextStateRevision()
+	s.inflightStateMu.Unlock()
+	s.observeInflight(inflight, revision)
 }
 
 func (s *Service) observeTask(result string, payloadBytes int, duration time.Duration) {
@@ -443,8 +526,8 @@ func trySendResponse(ch chan Response, resp Response) {
 }
 
 func deliver(req Request, resp Response) {
-	if req.Respond != nil {
-		req.Respond(resp)
+	if req.RespondBorrowed != nil {
+		req.RespondBorrowed(resp)
 		return
 	}
 	trySendResponse(req.Reply, resp)
@@ -472,8 +555,10 @@ func (t *serviceTask) run() {
 	if s == nil {
 		return
 	}
+	// Release after panic recovery has delivered its terminal response.
+	defer s.releaseRequest(t.req)
 
-	s.observeInflight(int(s.inflight.Add(1)))
+	s.changeInflight(1)
 	payloadLen := t.req.Payload.Len()
 	started := time.Now()
 	result := "ok"
@@ -485,7 +570,7 @@ func (t *serviceTask) run() {
 			})
 		}
 		s.observeTask(result, payloadLen, nonNegativeSince(started))
-		s.observeInflight(int(s.inflight.Add(-1)))
+		s.changeInflight(-1)
 		s.releaseToken()
 		s.taskWG.Done()
 	}()

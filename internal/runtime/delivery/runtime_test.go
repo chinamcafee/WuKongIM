@@ -214,6 +214,140 @@ func TestRuntimeFullQueueWaitsAndHonorsCallerCancellation(t *testing.T) {
 	}
 }
 
+func TestRuntimePreservesSameChannelPlanOrderAcrossWorkers(t *testing.T) {
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseFirst) }) }
+	t.Cleanup(release)
+	var calls atomic.Int64
+	writes := make(chan uint64, 2)
+	runtime := NewRuntime(RuntimeOptions{
+		LocalNodeID: 1,
+		QueueSize:   2,
+		Workers:     2,
+		Presence: planPresenceResolverFunc(func(_ context.Context, _ []onlinedelivery.RecipientTargetBatch) []TargetPresenceResult {
+			switch calls.Add(1) {
+			case 1:
+				close(firstStarted)
+				<-releaseFirst
+			case 2:
+				close(secondStarted)
+			}
+			return []TargetPresenceResult{{Routes: []onlinedelivery.Route{runtimeRouteForTest()}}}
+		}),
+		SessionWriter: localSessionWriterFunc(func(_ context.Context, write LocalSessionWrite) SessionWriteResult {
+			writes <- write.Event.MessageSeq
+			return SessionWriteResult{Disposition: SessionWriteAccepted}
+		}),
+	})
+	startRuntimeForTest(t, runtime)
+
+	first := runtimePlanForTest(1)
+	first.Event.ChannelID, first.Event.ChannelType = "person-a@person-b", 1
+	second := runtimePlanForTest(2)
+	second.Event.ChannelID, second.Event.ChannelType = first.Event.ChannelID, first.Event.ChannelType
+	if err := runtime.EnqueueRecipientDeliveryPlan(context.Background(), first); err != nil {
+		t.Fatalf("first enqueue error = %v", err)
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first same-channel plan did not start")
+	}
+	if err := runtime.EnqueueRecipientDeliveryPlan(context.Background(), second); err != nil {
+		t.Fatalf("second enqueue error = %v", err)
+	}
+
+	select {
+	case <-secondStarted:
+		select {
+		case sequence := <-writes:
+			release()
+			t.Fatalf("same-channel sequence %d bypassed blocked sequence 1", sequence)
+		case <-time.After(time.Second):
+			release()
+			t.Fatal("second same-channel plan started but did not write")
+		}
+	case <-time.After(100 * time.Millisecond):
+		release()
+	}
+
+	for want := uint64(1); want <= 2; want++ {
+		select {
+		case sequence := <-writes:
+			if sequence != want {
+				t.Fatalf("write sequence = %d, want %d", sequence, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for sequence %d", want)
+		}
+	}
+}
+
+func TestRuntimeProcessesCollidingChannelsConcurrently(t *testing.T) {
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseFirst) }) }
+	t.Cleanup(release)
+	var calls atomic.Int64
+	writes := make(chan uint64, 2)
+	runtime := NewRuntime(RuntimeOptions{
+		LocalNodeID: 1,
+		QueueSize:   2,
+		Workers:     2,
+		Presence: planPresenceResolverFunc(func(_ context.Context, _ []onlinedelivery.RecipientTargetBatch) []TargetPresenceResult {
+			if calls.Add(1) == 1 {
+				close(firstStarted)
+				<-releaseFirst
+			}
+			return []TargetPresenceResult{{Routes: []onlinedelivery.Route{runtimeRouteForTest()}}}
+		}),
+		SessionWriter: localSessionWriterFunc(func(_ context.Context, write LocalSessionWrite) SessionWriteResult {
+			writes <- write.Event.MessageSeq
+			return SessionWriteResult{Disposition: SessionWriteAccepted}
+		}),
+	})
+	startRuntimeForTest(t, runtime)
+
+	first := runtimePlanForTest(1)
+	first.Event.ChannelID, first.Event.ChannelType = "wkg-cw77dujng6zosz7j-dv", 2
+	second := runtimePlanForTest(2)
+	second.Event.ChannelID, second.Event.ChannelType = "wku-cw77dujng6zosz7j-1le@wku-cw77dujng6zosz7j-1lh", 1
+	// These retained nightly identities both hashed to worker 19 of 320
+	// (and worker 1 of 2). A blocked group must not stall the unrelated person channel.
+	if err := runtime.EnqueueRecipientDeliveryPlan(context.Background(), first); err != nil {
+		t.Fatalf("first enqueue error = %v", err)
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first cross-channel plan did not start")
+	}
+	if err := runtime.EnqueueRecipientDeliveryPlan(context.Background(), second); err != nil {
+		t.Fatalf("second enqueue error = %v", err)
+	}
+	select {
+	case sequence := <-writes:
+		if sequence != 2 {
+			t.Fatalf("unblocked cross-channel write = %d, want 2", sequence)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("different channel did not retain parallel worker progress")
+	}
+	release()
+	select {
+	case sequence := <-writes:
+		if sequence != 1 {
+			t.Fatalf("released cross-channel write = %d, want 1", sequence)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked channel did not resume")
+	}
+}
+
 func TestRuntimeOwnerPushOwnsPendingAckTransaction(t *testing.T) {
 	writer := &recordingLocalSessionWriter{written: make(chan LocalSessionWrite, 1)}
 	runtime := NewRuntime(RuntimeOptions{LocalNodeID: 1, SessionWriter: writer})
@@ -328,6 +462,62 @@ func TestRuntimeStopClearsTransientAckStateAndAllowsRestart(t *testing.T) {
 	}
 	if err := runtime.Stop(ctx); err != nil {
 		t.Fatalf("second Stop() error = %v", err)
+	}
+}
+
+func TestRuntimeQuiesceWaitsForAcceptedPlanAndPendingRecvackWithoutReset(t *testing.T) {
+	writes := make(chan LocalSessionWrite, 1)
+	runtime := NewRuntime(RuntimeOptions{
+		LocalNodeID: 1,
+		Presence: planPresenceResolverFunc(func(context.Context, []onlinedelivery.RecipientTargetBatch) []TargetPresenceResult {
+			return []TargetPresenceResult{{Routes: []onlinedelivery.Route{runtimeRouteForTest()}}}
+		}),
+		SessionWriter: localSessionWriterFunc(func(_ context.Context, write LocalSessionWrite) SessionWriteResult {
+			writes <- write
+			return SessionWriteResult{Disposition: SessionWriteAccepted}
+		}),
+	})
+	startRuntimeForTest(t, runtime)
+	defer func() { _ = runtime.Stop(context.Background()) }()
+
+	if err := runtime.EnqueueRecipientDeliveryPlan(context.Background(), runtimePlanForTest(74)); err != nil {
+		t.Fatalf("EnqueueRecipientDeliveryPlan() error = %v", err)
+	}
+	var write LocalSessionWrite
+	select {
+	case write = <-writes:
+	case <-time.After(time.Second):
+		t.Fatal("accepted plan did not reach local session writer")
+	}
+	if got := runtime.PendingAckCount(); got != 1 {
+		t.Fatalf("PendingAckCount() = %d, want one pending recvack", got)
+	}
+
+	deadline, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := runtime.Quiesce(deadline); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Quiesce() error = %v, want context deadline exceeded while recvack remains pending", err)
+	}
+	if got := runtime.PendingAckCount(); got != 1 {
+		t.Fatalf("PendingAckCount() after deadline = %d, want preserved pending recvack", got)
+	}
+	if err := runtime.EnqueueRecipientDeliveryPlan(context.Background(), runtimePlanForTest(75)); !errors.Is(err, ErrRuntimeClosed) {
+		t.Fatalf("EnqueueRecipientDeliveryPlan() after Quiesce admission close = %v, want ErrRuntimeClosed", err)
+	}
+
+	if err := runtime.Recvack(context.Background(), Recvack{
+		UID: write.Route.UID, SessionID: write.Route.SessionID,
+		MessageID: write.Event.MessageID, MessageSeq: write.Event.MessageSeq,
+	}); err != nil {
+		t.Fatalf("Recvack() error = %v", err)
+	}
+	finished, finishedCancel := context.WithTimeout(context.Background(), time.Second)
+	defer finishedCancel()
+	if err := runtime.Quiesce(finished); err != nil {
+		t.Fatalf("second Quiesce() error = %v, want nil after recvack", err)
+	}
+	if got := runtime.PendingAckCount(); got != 0 {
+		t.Fatalf("PendingAckCount() after quiesce = %d, want zero", got)
 	}
 }
 

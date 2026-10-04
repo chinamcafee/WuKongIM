@@ -1,0 +1,55 @@
+---
+title: Device Flag
+description: Reference current APP, WEB, PC, SYSTEM, and Device Level values plus connection-conflict boundaries.
+---
+
+Device Flag identifies a client device category. Device Level expresses connection-conflict policy within the same UID and category. Neither is an OS version, concrete device ID, or product role.
+
+## Goal and completion criteria
+
+The product backend chooses a stable `device_flag`, concrete `device_id`, and server-controlled `device_level` for every endpoint and can explain whether same-category devices coexist or use single-active policy.
+
+## Authority
+
+The tables align with `internal/contracts/protocolmeta/types.go` and `pkg/protocol/frame/common.go`. Tests freeze client categories, the server-reserved value, and both conflict levels.
+
+<DeviceFlagTable locale="en" />
+
+## Do not merge these fields
+
+| Field | Question answered |
+| --- | --- |
+| `device_flag` | Is this APP, WEB, PC, or server-side SYSTEM? |
+| `device_id` | Which concrete installation or endpoint in that category? |
+| `device_level` | May endpoints in the same UID/category coexist or use single-active conflict policy? |
+
+Do not use a phone brand, browser user agent, or OS version directly as `device_id`. Generate a stable random identifier and define whether reinstall, cleared storage, device migration, or backup restore creates a new ID.
+
+## Current authentication behavior
+
+`gateway.token_auth_on` defaults to `true`. Gateway reads the stored device token by UID and Device Flag, and the Session adopts that record's Device Level only after the CONNECT token matches exactly. An empty token, missing or cleared device record, or mismatch returns `ReasonAuthFail`.
+
+After a trusted backend writes `device_level=1`, a connection with the matching token therefore adopts Master policy. Before release, still test new Master connection, old Session closure, cross-node conflict, revocation, and reconnect rejection. Do not disable token authentication in production to bypass those checks.
+
+## Integration guidance
+
+- Use different categories when APP, WEB, and PC coexist.
+- Use Slave for multiple same-category endpoints and process RECVACK independently per Session.
+- A backend issues Master for single-active policy; clients never select it.
+- SYSTEM is for trusted server identities; reject it from end-user ingress.
+- Keep provider push token, OS permissions, risk, and revocation in a product device registry; Presence is not a device database.
+
+## Troubleshooting
+
+- **PC renders as a number:** wire value 2 remains authoritative; a log/management String method is not the numeric contract.
+- **Same-category Master does not replace:** inspect the Device Level actually returned by the CONNECT verifier.
+- **Different platforms replace each other:** inspect accidental reuse of one Device Flag.
+- **A device reconnects after logout:** inspect token revocation and Gateway verification rather than Session close alone.
+
+## Security boundary
+
+A device category grants no product permission. SYSTEM is not an “administrator mode” for ordinary clients; restrict it to trusted internal components and reject spoofing at public ingress.
+
+## Next step
+
+Apply these values with the [Device](/en/guide/core-concepts/devices) model, then use [Authentication & Security](/en/guide/integration/authentication) for issuance and revocation.

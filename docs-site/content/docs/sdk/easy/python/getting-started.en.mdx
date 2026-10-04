@@ -1,0 +1,125 @@
+---
+title: Python quickstart
+description: Prepare, install, connect, exchange the first messages, and clean up.
+---
+
+Use Python 3.11+, asyncio, and PyPI **WK_EASYSDK_PYTHON_VERSION** for online messaging. Each client belongs to one event loop.
+
+## 1. Prepare
+
+Follow [authentication and Tokens](/en/guide/integration/authentication) so your trusted backend supplies each user's `uid`, `token`, and `websocketUrl`. Clients connect to the Gateway and do not call WuKongIM HTTP API management endpoints.
+
+Device categories are APP `0`, WEB `1`, and PC/Desktop `2`. **Python defaults to Desktop `2`**; provision the Token for that same device category. The usual development address is `ws://127.0.0.1:5200`. Use `ws://127.0.0.1:5200/ws` only when the listener or proxy configures `/ws`. Use a reachable client address across machines and `wss://` in production.
+
+To see messages first, follow [the official example](/en/sdk/easy/examples#python) with two clients. The steps below integrate the SDK into your application.
+
+## 2. Install the SDK
+
+This tutorial uses [PyPI `wukong-easy-sdk==WK_EASYSDK_PYTHON_VERSION`](https://pypi.org/project/wukong-easy-sdk/WK_EASYSDK_PYTHON_VERSION/) and requires Python 3.11+. The distribution name is `wukong-easy-sdk`; the import name is `wukong_easy_sdk`.
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --index-url https://pypi.org/simple "wukong-easy-sdk==WK_EASYSDK_PYTHON_VERSION"
+```
+
+On Windows PowerShell, replace activation with `.venv\Scripts\Activate.ps1`. The runtime dependency is `websockets>=15.0.1,<18`; `uv.lock` pins development and validation dependencies.
+
+## 3. Connect and listen
+
+This example sends with the configured identity to `WKIM_PEER` and keeps receiving for 10 seconds. Bob must already be online. In a real application, keep the client alive until application shutdown.
+
+```python
+import asyncio
+import os
+
+from wukong_easy_sdk import AuthOptions, WKIM, WKIMChannelType, WKIMEvent
+
+
+async def main():
+    im = WKIM.init(
+        os.environ.get("WKIM_URL", "ws://127.0.0.1:5200"),
+        AuthOptions(uid=os.environ["WKIM_UID"], token=os.environ["WKIM_TOKEN"]),
+    )
+
+    def receive(message):
+        # Pass message["payload"] to your application's UI or bounded queue.
+        # Never write complete messages or Tokens to production logs.
+        print("Message received")
+
+    listener = im.on(WKIMEvent.MESSAGE, receive)
+    im.on(WKIMEvent.ERROR, lambda error: print("EasySDK operation failed"))
+    async with im:
+        ack = await im.send(
+            os.environ["WKIM_PEER"], WKIMChannelType.PERSON,
+            {"type": 1, "content": "Hello from Python!"},
+        )
+        assert ack["reasonCode"] == 1
+        await asyncio.sleep(10)
+    im.off(WKIMEvent.MESSAGE, listener)
+
+
+asyncio.run(main())
+```
+
+`async with im` waits for CONNECT authentication on entry and calls `destroy()` on exit. Use `WKIMChannelType.GROUP` for groups; your backend must establish the Channel and membership first. Payloads accept JSON objects or arrays, encoded as Base64 UTF-8 JSON. Incoming object, JSON-text, and Base64 JSON profiles are supported.
+
+Python parameters use snake_case, while received message and result dictionaries retain JS camelCase. SENDACK includes `messageId`, `messageSeq`, and `reasonCode`; received messages also contain `header`, `channelId`, `channelType`, `fromUid`, a seconds-based `timestamp`, and `payload`. Message IDs are strings and sequences retain full integer precision. `WKIMEvent.CUSTOM_EVENT` provides `id`, `type`, a milliseconds-based `timestamp`, and `data`.
+
+`send()` accepts `client_msg_no`, `header`, `setting`, and `topic` keyword arguments. `header.redDot` defaults to true and preserves an explicit false. Optional message flags and Channel types still depend on server support.
+
+Automatic RECVACK means the message entered the SDK dispatcher, not that application processing or reading completed. See [messaging](/en/guide/integration/messaging) for the distinction between send success, peer reception, and business processing.
+
+## 4. Exchange the first message
+
+Download the matching example source and keep using the same virtual environment:
+
+```sh
+git clone --branch WK_EASYSDK_PYTHON_TAG --depth 1 https://github.com/WuKongIM/WuKongEasySDK-Python.git
+```
+
+In two terminals, set each user's `WKIM_UID`, `WKIM_TOKEN`, `WKIM_PEER`, and optional `WKIM_URL`, then run:
+
+```sh
+python WuKongEasySDK-Python/examples/chat.py
+```
+
+For Alice, set `WKIM_UID=alice` and `WKIM_PEER=bob`; reverse these for Bob. Supply each Token through its trusted environment. Once both display `Connected`, send in both directions. Enter `/quit` to clean up. The example deliberately displays chat content; the SDK is silent by default.
+
+Once both clients are connected, Alice sends to `bob` and Bob checks the sender and content in the message callback. Then Bob sends to `alice`. A send result means the server accepted the request; it is not recipient delivery or a read receipt.
+
+## 5. Clean up
+
+Each instance belongs to one asyncio event loop; there is no global singleton. Sync and async callbacks run serially on a separate task. Async callbacks may `await im.send(...)` to reply, disconnect, or destroy the client. Do not block the event loop or wait for a subsequent event on the same serial dispatcher.
+
+| Operation | Contract |
+| --- | --- |
+| `await im.connect()` | Concurrent callers share authentication; connected calls return the current result |
+| `im.is_connected` | The current connection is authenticated |
+| `im.on(event, callback)` / `im.off(event, callback)` | Retain and remove the original callback; an executing callback may finish |
+| `await im.ping()` | Require a matching response ID, including valid `result: null` |
+| `await im.disconnect()` | Cancel pending requests, socket, heartbeat, and retries; reconnect remains possible |
+| `await im.destroy()` | Permanently close and release listeners; idempotent |
+| Changing account, Token, or URL | Close the old instance and create a new one |
+
+Cancelling one `connect()` waiter does not cancel the shared connection; use `disconnect()` to stop it. Cancelled or timed-out sends release request capacity, but a message that reached the server may still commit.
+
+## 6. Troubleshooting
+
+All `WKIMOptions` durations are seconds: 10 for the total connection deadline, 15 for requests, 25 between heartbeats, 10 for Pong, and 2 for close. An unexpected transport loss after authentication allows up to 5 retries, exponentially increasing from 1 second to a 30-second cap with 20% jitter. First-connect failure, authentication rejection, server-initiated disconnect, protocol errors, event saturation, certificate verification failure, and manual shutdown stop automatic retry.
+
+Defaults allow 1,024 pending requests, 4 MiB of serialized pending request data, 1 MiB per wire message, and 256 queued events with a 4 MiB wire-size budget including the executing event; Python object overhead is additional. Request saturation returns `ErrorCode.QUEUE_FULL`. Event saturation closes the connection without acknowledging messages that could not enter the queue; lifecycle notifications are best effort under overload. Keep callbacks short and apply application backpressure.
+
+There is no offline queue or automatic replay. A timeout or lost SENDACK can leave the commit outcome unknown. Retain `client_msg_no`, reconcile through your backend, then decide whether to retry. `WKIMError.code` retains the server reason or local `ErrorCode`; error text does not echo sensitive responses.
+
+WSS verifies certificate chains and hostnames by default, with a TLS 1.2 minimum. Use `WKIMOptions(ca_file="/path/ca.pem")` for a private CA; the interactive example reads `WKIM_CA_FILE`. There is no verification bypass or automatic system-proxy discovery; supply the reachable Gateway/proxy URL directly.
+
+Logging is off by default. `WKIMOptions(debug_logging=True)` enables only fixed lifecycle metadata, excluding Tokens, Payloads, URLs, raw frames, peer response text, and underlying exception objects.
+
+## Optional: group messaging
+
+Use `WKIMChannelType.GROUP`; no client subscription is needed. A trusted backend creates the group and manages members and permissions; receive via `WKIMEvent.MESSAGE`. Cross-node membership updates require a server with the [membership cache fix](https://github.com/WuKongIM/WuKongIM/commit/2a295e0d9881ef5356728a85d56b052c4b0d9c86); upgrading the Python package cannot repair an older server. Online routes must recover after a Slot leader change, so continuous delivery during migration is not guaranteed. See the [group example](https://github.com/WuKongIM/WuKongEasySDK-Python/blob/527f37c876326e7ad3cc48c89828c4c3ffed09fc/examples/group_chat.py) for the optional application flow.
+
+## Next
+
+Continue with [messaging](/en/guide/integration/messaging) and [production checks](/en/guide/integration/acceptance). For offline recovery, conversations, unread counts, or push, see [SDK selection](/en/sdk). [Versions and validation records](https://github.com/WuKongIM/WuKongIM/blob/main/docs/superpowers/reports/2026-09-08-easysdk-validation-history.md#python) retain the exact environments and scope of past runs.

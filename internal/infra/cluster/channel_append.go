@@ -18,8 +18,8 @@ type ChannelAppendAuthorityNode interface {
 	NodeID() uint64
 	// ResolveChannelAppendAuthority resolves the channel append authority.
 	ResolveChannelAppendAuthority(context.Context, channelruntime.ChannelID) (channelruntime.Meta, error)
-	// GetChannelMetadata reads durable channel metadata used by channelappend recipient fanout.
-	GetChannelMetadata(context.Context, string, int64) (metadb.Channel, error)
+	// GetChannelMetadataAuthoritative reads recipient metadata from the current Slot leader.
+	GetChannelMetadataAuthoritative(context.Context, string, int64) (metadb.Channel, error)
 }
 
 // channelAppendAuthorityInvalidator invalidates one exact append-authority
@@ -71,12 +71,20 @@ func (c *ChannelAppendClient) ResolveAppendAuthority(ctx context.Context, id cha
 	if target.ChannelID != id {
 		return channelappend.AuthorityTarget{}, channelappend.ErrStaleRoute
 	}
-	if metadata, ok := c.metadata.Lookup(id); ok {
-		applyChannelAppendMetadata(&target, metadata)
-		return target, nil
+	// Person recipients are fixed by the canonical channel identity. Mutable
+	// membership must read the current durable version on every routed batch:
+	// API observers update only their own node, so a cache hit elsewhere can
+	// keep delivering to removed members indefinitely. The versioned recipient
+	// snapshot still avoids rereading subscriber pages when membership is stable.
+	const personChannelType = 1
+	if id.Type == personChannelType {
+		if metadata, ok := c.metadata.Lookup(id); ok {
+			applyChannelAppendMetadata(&target, metadata)
+			return target, nil
+		}
 	}
 	cacheGeneration := c.metadata.Generation()
-	channel, err := c.node.GetChannelMetadata(ctx, id.ID, int64(id.Type))
+	channel, err := c.node.GetChannelMetadataAuthoritative(ctx, id.ID, int64(id.Type))
 	if err != nil && !errors.Is(err, metadb.ErrNotFound) {
 		return channelappend.AuthorityTarget{}, mapChannelAppendRouteError(err)
 	}
@@ -84,6 +92,7 @@ func (c *ChannelAppendClient) ResolveAppendAuthority(ctx context.Context, id cha
 		metadata := ChannelAppendMetadata{
 			Large:                     channel.Large != 0,
 			SubscriberMutationVersion: channel.SubscriberMutationVersion,
+			DirectoryProjectionState:  channel.DirectoryProjectionState,
 		}
 		applyChannelAppendMetadata(&target, metadata)
 		c.metadata.StoreIfGeneration(id, metadata, cacheGeneration)
@@ -134,6 +143,7 @@ func channelAppendTargetFromMeta(meta channelruntime.Meta) channelappend.Authori
 		Epoch:           meta.Epoch,
 		LeaderEpoch:     meta.LeaderEpoch,
 		RouteGeneration: meta.RouteGeneration,
+		WriteFenced:     meta.WriteFence.Set(),
 	}
 }
 

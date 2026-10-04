@@ -1,0 +1,188 @@
+---
+title: 运行官方示例
+description: 准备服务端与两个账号，运行八个平台的示例并确认在线双向消息。
+---
+
+先让 Alice 与 Bob 在两个客户端里互发消息，再把对应教程的代码接入应用。以下示例只需要你选择一个平台；两个客户端也可以使用不同平台。
+
+## 1. 准备开发用单节点集群
+
+按 [Docker 部署](/zh/server/deployment/docker)启动 WuKongIM 开发用单节点集群，确认 WebSocket 端口 `5200` 和 WuKongIM HTTP API 端口 `5001` 可达。默认使用 256 Hash Slots。保持服务端运行，在受信开发终端检查：
+
+```bash
+curl -fsS http://127.0.0.1:5001/readyz
+```
+
+就绪请求应成功。开发地址默认是 `ws://127.0.0.1:5200`，仅在 listener 或反向代理配置了 `/ws` 时追加该路径。客户端侧生产连接使用 WSS；管理接口留在可信后端。
+
+## 2. 准备 Alice 与 Bob
+
+**先确定设备类别。** 下方请求以移动端 `0` 为例。Web 改为 `1`，Rust/C#/C++/Python 改为 `2`；两个客户端平台不同，就分别填写各自的值。`alice-token`、`bob-token` 仅用于本机演示。
+
+由受信业务后端为两个用户准备各自的 `uid`、`token` 和 WebSocket 地址。只在本机回环开发环境中，可以由受信终端调用 [`POST /user/token`](/zh/api/product-http/users/setQuickstartUserToken) 建立测试身份。以下以两个原生客户端为例；如果某个用户由 Web example 登录，把该用户的 `device_flag` 改为 `1`：
+
+```bash
+curl -fsS -X POST http://127.0.0.1:5001/user/token \
+  -H 'Content-Type: application/json' \
+  -d '{"uid":"alice","token":"alice-token","device_flag":0,"device_level":1}'
+
+curl -fsS -X POST http://127.0.0.1:5001/user/token \
+  -H 'Content-Type: application/json' \
+  -d '{"uid":"bob","token":"bob-token","device_flag":0,"device_level":1}'
+```
+
+iOS、Android、Flutter 默认 APP `0`，Web 默认 WEB `1`，Rust、C#、C++、Python 默认 PC `2`。默认产品装配会精确校验相同 UID 与设备类别的已存 Token；生产部署仍需保护该接口、实现过期与轮换策略，并单独证明无效、撤销和按业务规则过期的 Token 会被拒绝。
+
+根据客户端运行位置填写 WebSocket 地址：
+
+| 客户端 | 本机开发地址 |
+| --- | --- |
+| 浏览器、Node.js、macOS App、iOS Simulator | `ws://127.0.0.1:5200` |
+| Android Emulator | `ws://10.0.2.2:5200` |
+| 物理手机 | `ws://<开发机局域网 IP>:5200`，并确认防火墙与路由可达 |
+
+## 3. 选择并运行示例
+
+先准备目标平台的开发工具。下面的源码示例固定在指定版本；应用通过包管理器接入时，使用对应快速接入页的安装命令。
+
+### iOS [#ios]
+
+```bash
+git clone https://github.com/WuKongIM/WuKongEasySDK-iOS.git
+cd WuKongEasySDK-iOS
+git checkout WK_EASYSDK_IOS_SOURCE_REF
+swift build -c release
+cd Examples/WuKongIMExample-Unified
+./build.sh macos
+./build.sh ios
+```
+
+先启动一个 iOS Simulator，再运行：
+
+```bash
+./build.sh ios --run
+```
+
+也可以用 `./build.sh macos --run` 启动 macOS 版本。示例中的 iOS ATS 明文例外只用于本地 `ws://` 开发，不能复制到生产 App。
+
+[iOS 快速接入](/zh/sdk/easy/ios/getting-started)
+
+### Android [#android]
+
+```bash
+git clone https://github.com/WuKongIM/WuKongEasySDK-Android.git
+cd WuKongEasySDK-Android
+git checkout WK_EASYSDK_ANDROID_SOURCE_REF
+./gradlew :example:assembleDebug
+./gradlew :example:installDebug
+```
+
+在 API 21+ 设备或模拟器中启动 `example`。Android Emulator 连接宿主机时使用 `ws://10.0.2.2:5200`，不是 `localhost`。需要两个原生身份时使用两台设备或两个独立模拟器；也可以让浏览器 example 作为另一端。
+
+[Android 快速接入](/zh/sdk/easy/android/getting-started)
+
+### Flutter [#flutter]
+
+```bash
+git clone https://github.com/WuKongIM/WuKongEasySDK-Flutter.git
+cd WuKongEasySDK-Flutter
+git checkout WK_EASYSDK_FLUTTER_SOURCE_REF
+flutter pub get
+cd example
+flutter pub get
+flutter devices
+flutter run -d <device-id>
+```
+
+为每个实际发布目标分别运行，不要用 iOS Simulator 结果替代 Android、Web 或桌面端验收。
+
+[Flutter 快速接入](/zh/sdk/easy/flutter/getting-started)
+
+### Web [#javascript]
+
+```bash
+git clone https://github.com/WuKongIM/WuKongEasySDK-JS.git
+cd WuKongEasySDK-JS
+git checkout WK_EASYSDK_JAVASCRIPT_SOURCE_REF
+npm ci
+npm run build
+python3 -m http.server 8080
+```
+
+打开 `http://127.0.0.1:8080/example/`。用两个隔离的浏览器上下文分别填写 Alice 与 Bob；不要在 Console 中打印 Token 或完整 Payload。
+
+[Web 快速接入](/zh/sdk/easy/javascript/getting-started)
+
+### Rust [#rust]
+
+需要 Rust 1.86+。检出与 crates.io WK_EASYSDK_RUST_VERSION 对应的源码：
+
+```bash
+git clone --branch WK_EASYSDK_RUST_TAG --depth 1 https://github.com/WuKongIM/WuKongEasySDK-Rust.git
+cd WuKongEasySDK-Rust
+cargo build --locked --example chat
+```
+
+两个终端分别设置 `WK_WS_URL`、`WK_UID`、`WK_TOKEN`、`WK_PEER_UID`，执行 `cargo run --locked --example chat`。双方连接成功后输入文本，观察接收事件；输入 `/quit` 退出。
+
+[Rust 快速接入](/zh/sdk/easy/rust/getting-started)
+
+### C# [#csharp]
+
+用 [C# 快速接入](/zh/sdk/easy/csharp/getting-started) 的完整 `Program.cs` 创建 `MyChat`，安装公共 NuGet WK_EASYSDK_CSHARP_VERSION。两个终端分别设置 `WUKONGIM_WS_URL`、`WUKONGIM_UID`、`WUKONGIM_TOKEN`：
+
+```bash
+# Alice
+dotnet run --project MyChat -- bob
+# Bob
+dotnet run --project MyChat -- alice
+```
+
+两端显示 `Connected.` 后按 Enter 发送，观察对端的 `Message received.`，完成双向检查后再次按 Enter 退出。
+
+[C# 快速接入](/zh/sdk/easy/csharp/getting-started)
+
+### C++ [#cpp]
+
+按 [C++ 快速接入](/zh/sdk/easy/cpp/getting-started) 用 vcpkg 构建 `my_app`，或用预编译包的 `wukong_chat`。前者设置 `WKIM_URL`、`WKIM_UID`、`WKIM_TOKEN` 后执行 `./build/my_app bob`（Bob 改为 `alice`）；后者设置 `WKIM_TOKEN`，执行 `./build/wukong_chat ws://127.0.0.1:5200 alice bob`。
+
+`my_app` 等两端连接后按 Enter 发送，再按 Enter 退出；`wukong_chat` 允许连续输入消息，`/quit` 退出。Windows 可执行文件位于 `build/Release/` 并带 `.exe` 后缀。
+
+[C++ 快速接入](/zh/sdk/easy/cpp/getting-started)
+
+### Python [#python]
+
+在 Python 3.11+ 虚拟环境中运行：
+
+```bash
+python -m pip install --index-url https://pypi.org/simple "wukong-easy-sdk==WK_EASYSDK_PYTHON_VERSION"
+git clone --branch WK_EASYSDK_PYTHON_TAG --depth 1 https://github.com/WuKongIM/WuKongEasySDK-Python.git
+python WuKongEasySDK-Python/examples/chat.py
+```
+
+运行前分别设置 `WKIM_URL`、`WKIM_UID`、`WKIM_TOKEN`、`WKIM_PEER`。双方出现 `Connected` 后输入文本；`/quit` 退出。
+
+[Python 快速接入](/zh/sdk/easy/python/getting-started)
+
+## 4. 检查结果并退出
+
+1. 两端各自显示连接成功。
+2. Alice 发送后看到服务端发送结果；Bob 的消息事件显示 Alice 的消息。
+3. Bob 回发，Alice 也能收到。
+4. 按平台说明退出或关闭页面，再次进入时没有重复事件或旧连接。
+
+示例界面可以展示测试消息正文，生产日志不要记录 Token 或完整消息。
+
+## 常见问题
+
+**无法连接**：先检查 `/readyz`、设备可达地址与端口。Android Emulator 使用 `10.0.2.2`，真机使用开发机局域网地址。
+
+**认证失败**：核对 UID、Token 和 `device_flag`，两端使用不同 UID。
+
+**发送成功但对端没收到**：确认对端已在线、发送目标是对方 UID，且事件监听已注册。SENDACK 不是对端接收证明。
+
+**离线后缺消息**：EasySDK 不补拉历史；需要业务后端恢复或选择完整版 SDK。
+
+## 下一步
+
+[选择平台接入应用](/zh/sdk/easy)。历史版本、源码与正式包的独立运行结果见[工程验证记录](https://github.com/WuKongIM/WuKongIM/blob/main/docs/superpowers/reports/2026-09-08-easysdk-validation-history.md)；实际部署继续检查 WSS、Token 轮换与故障恢复。

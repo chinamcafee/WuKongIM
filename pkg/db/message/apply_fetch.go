@@ -54,10 +54,13 @@ func (l *ChannelLog) ApplyFetch(ctx context.Context, req ApplyFetchRequest) (App
 
 	batch := l.db.engine.NewBatch()
 	defer batch.Close()
-	if err := l.stageMessageRows(batch, rows); err != nil {
+	if err := l.stageMessageRows(ctx, batch, rows); err != nil {
 		return AppendResult{}, err
 	}
 	if req.Checkpoint != nil {
+		if err := l.channelEntry.stageMQTTActivation(batch, req.Checkpoint, nil, ^uint64(0)); err != nil {
+			return AppendResult{}, err
+		}
 		if err := batch.Set(encodeCheckpointKey(l.key), encodeCheckpoint(*req.Checkpoint)); err != nil {
 			return AppendResult{}, err
 		}
@@ -67,7 +70,11 @@ func (l *ChannelLog) ApplyFetch(ctx context.Context, req ApplyFetchRequest) (App
 			return AppendResult{}, err
 		}
 	}
-	if err := l.stageCatalog(batch); err != nil {
+	if len(rows) > 0 {
+		if err := l.stageCatalogForAppend(batch, rows[0].MessageSeq); err != nil {
+			return AppendResult{}, err
+		}
+	} else if err := l.stageCatalog(batch); err != nil {
 		return AppendResult{}, err
 	}
 	if err := batch.Commit(true); err != nil {

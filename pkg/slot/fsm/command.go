@@ -25,43 +25,57 @@ import (
 const (
 	commandVersion uint8 = 1
 
-	cmdTypeUpsertUser                uint8 = 1
-	cmdTypeUpsertChannel             uint8 = 2
-	cmdTypeDeleteChannel             uint8 = 3
-	cmdTypeUpsertChannelRuntimeMeta  uint8 = 4
-	cmdTypeDeleteChannelRuntimeMeta  uint8 = 5
-	cmdTypeCreateUser                uint8 = 6
-	cmdTypeUpsertDevice              uint8 = 7
-	cmdTypeAddSubscribers            uint8 = 8
-	cmdTypeRemoveSubscribers         uint8 = 9
-	cmdTypeUpsertConversationStates  uint8 = 10
-	cmdTypeTouchConversationActiveAt uint8 = 11
-	cmdTypeClearConversationActiveAt uint8 = 12
+	cmdTypeUpsertUser               uint8 = 1
+	cmdTypeUpsertChannel            uint8 = 2
+	cmdTypeDeleteChannel            uint8 = 3
+	cmdTypeUpsertChannelRuntimeMeta uint8 = 4
+	cmdTypeDeleteChannelRuntimeMeta uint8 = 5
+	cmdTypeCreateUser               uint8 = 6
+	cmdTypeUpsertDevice             uint8 = 7
+	cmdTypeAddSubscribers           uint8 = 8
+	cmdTypeRemoveSubscribers        uint8 = 9
+	// Legacy Link-U conversation commands keep IDs 10-12 and 16; removed
+	// projection command IDs 13/14 remain reserved and must not be reused.
+	cmdTypeAdvanceChannelRetention             uint8 = 15
+	cmdTypeNoop                                uint8 = 19
+	cmdTypeUpsertUserChannelMemberships        uint8 = 44
+	cmdTypeDeleteUserChannelMemberships        uint8 = 45
+	cmdTypeUpsertChannelLatest                 uint8 = 46
+	cmdTypeUpsertChannelLatestBatch            uint8 = 47
+	cmdTypeAppendMessageEvent                  uint8 = 48
+	cmdTypeAppendMessageEventsBatch            uint8 = 49
+	cmdTypeCreateChannel                       uint8 = 50
+	cmdTypePatchChannelBusinessFlags           uint8 = 51
+	cmdTypeAdvanceUserChannelMembershipReadSeq uint8 = 200
+	cmdTypeHideUserChannelMembership           uint8 = 201
+	cmdTypeActivateUserChannelMembership       uint8 = 54
+	cmdTypeUpsertUserCMDChannelMemberships     uint8 = 55
+	cmdTypeAdvanceUserCMDChannelMembershipAcks uint8 = 56
+	cmdTypeTombstoneUserCMDChannelMemberships  uint8 = 57
+	cmdTypeCreateChannelRuntimeMeta            uint8 = 59
+	cmdTypeAdmitPersonDirectoryTaskBatch       uint8 = 63
+	cmdTypeEnsureUserChannelMembershipBatch    uint8 = 64
+	cmdTypeCompletePersonDirectoryTaskBatch    uint8 = 65
+	cmdTypeBindPluginUser                      uint8 = 42
+	cmdTypeUnbindPluginUser                    uint8 = 43
+	cmdTypeUpsertConversationStates            uint8 = 10
+	cmdTypeTouchConversationActiveAt           uint8 = 11
+	cmdTypeClearConversationActiveAt           uint8 = 12
 	// Deprecated: reserved for the removed durable conversation projection. Do not reuse.
 	cmdTypeReservedConversationProjectionUpsert uint8 = 13
 	// Deprecated: reserved for the removed durable conversation projection. Do not reuse.
 	cmdTypeReservedConversationProjectionDelete uint8 = 14
-	cmdTypeAdvanceChannelRetention              uint8 = 15
 	cmdTypeHideConversations                    uint8 = 16
-	cmdTypeNoop                                 uint8 = 19
-	cmdTypeUpsertUserChannelMemberships         uint8 = 44
-	cmdTypeDeleteUserChannelMemberships         uint8 = 45
-	cmdTypeUpsertChannelLatest                  uint8 = 46
-	cmdTypeUpsertChannelLatestBatch             uint8 = 47
-	cmdTypeAppendMessageEvent                   uint8 = 48
-	cmdTypeAppendMessageEventsBatch             uint8 = 49
-	cmdTypeCreateChannel                        uint8 = 50
-	cmdTypePatchChannelBusinessFlags            uint8 = 51
 	cmdTypeApplyDeviceCredential                uint8 = 52
 	cmdTypeUpsertCMDDeviceCursors               uint8 = 53
-	cmdTypeBindPluginUser                       uint8 = 42
-	cmdTypeUnbindPluginUser                     uint8 = 43
 
 	// User field tags.
-	tagUserUID         uint8 = 1
-	tagUserToken       uint8 = 2
-	tagUserDeviceFlag  uint8 = 3
-	tagUserDeviceLevel uint8 = 4
+	tagUserUID            uint8 = 1
+	tagUserToken          uint8 = 2
+	tagUserDeviceFlag     uint8 = 3
+	tagUserDeviceLevel    uint8 = 4
+	tagUserSendBan        uint8 = 5
+	tagUserSendBanVersion uint8 = 6
 
 	// Device field tags.
 	tagDeviceUID               uint8 = 1
@@ -78,14 +92,16 @@ const (
 	tagDeviceTerminationCause  uint8 = 12
 
 	// Channel field tags.
-	tagChannelID            uint8 = 1
-	tagChannelType          uint8 = 2
-	tagChannelBan           uint8 = 3
-	tagChannelDisband       uint8 = 4
-	tagChannelSendBan       uint8 = 5
-	tagChannelAllowStranger uint8 = 6
-	tagChannelLarge         uint8 = 7
-	tagChannelExpireAt      uint8 = 8
+	tagChannelID              uint8 = 1
+	tagChannelType            uint8 = 2
+	tagChannelBan             uint8 = 3
+	tagChannelDisband         uint8 = 4
+	tagChannelSendBan         uint8 = 5
+	tagChannelAllowStranger   uint8 = 6
+	tagChannelLarge           uint8 = 7
+	tagChannelSendBanVersion  uint8 = 10
+	tagChannelPreserveSendBan uint8 = 9
+	tagChannelExpireAt        uint8 = 8
 
 	// Channel runtime metadata field tags.
 	tagRuntimeMetaChannelID            uint8 = 1
@@ -124,12 +140,30 @@ const (
 	tagSubscriberMutationVersion uint8 = 4
 
 	// User channel membership field tags.
-	tagUserChannelMembershipCommandEntry uint8 = 1
-	tagUserChannelMembershipEntryUID     uint8 = 1
-	tagUserChannelMembershipChannelID    uint8 = 2
-	tagUserChannelMembershipChannelType  uint8 = 3
-	tagUserChannelMembershipJoinSeq      uint8 = 4
-	tagUserChannelMembershipUpdatedAt    uint8 = 5
+	tagUserChannelMembershipCommandEntry       uint8 = 1
+	tagUserChannelMembershipEntryUID           uint8 = 1
+	tagUserChannelMembershipChannelID          uint8 = 2
+	tagUserChannelMembershipChannelType        uint8 = 3
+	tagUserChannelMembershipJoinSeq            uint8 = 4
+	tagUserChannelMembershipReadSeq            uint8 = 5
+	tagUserChannelMembershipDeletedSeq         uint8 = 6
+	tagUserChannelMembershipActivatedAt        uint8 = 7
+	tagUserChannelMembershipTombstone          uint8 = 8
+	tagUserChannelMembershipTombstoneAt        uint8 = 9
+	tagUserChannelMembershipSourceVer          uint8 = 10
+	tagUserChannelMembershipUpdatedAt          uint8 = 11
+	tagUserChannelMembershipConversationHidden uint8 = 12
+
+	// User CMD channel membership field tags.
+	tagUserCMDChannelMembershipCommandEntry uint8 = 1
+	tagUserCMDChannelMembershipUID          uint8 = 1
+	tagUserCMDChannelMembershipChannelID    uint8 = 2
+	tagUserCMDChannelMembershipChannelType  uint8 = 3
+	tagUserCMDChannelMembershipStartSeq     uint8 = 4
+	tagUserCMDChannelMembershipAckSeq       uint8 = 5
+	tagUserCMDChannelMembershipTombstone    uint8 = 6
+	tagUserCMDChannelMembershipTombstoneAt  uint8 = 7
+	tagUserCMDChannelMembershipUpdatedAt    uint8 = 8
 
 	// Channel latest field tags.
 	tagChannelLatestChannelID      uint8 = 1
@@ -255,6 +289,22 @@ type commandDecoder func(data []byte) (command, error)
 // To add a new command type, create a struct implementing command,
 // a corresponding encode function, a decoder, and register it here.
 var commandDecoders = map[uint8]commandDecoder{
+	cmdTypeMQTTStorage:                          decodeMQTTStorageCommand,
+	cmdTypeMessageUpdate:                        decodeMessageUpdateCommand,
+	cmdTypeMQTTReclamationIndex:                 decodeMQTTReclamationIndexCommand,
+	cmdTypeMQTTSessionReclamation:               decodeMQTTSessionReclamationCommand,
+	cmdTypeMQTTInboxAdmissionCAS:                decodeMQTTInboxAdmissionCASCommand,
+	cmdTypeMQTTLifecycleMutation:                decodeMQTTLifecycleCommand,
+	cmdTypeMQTTWillCAS:                          decodeMQTTWillCASCommand,
+	cmdTypeMQTTSourceBindingCAS:                 decodeMQTTSourceBindingCASCommand,
+	cmdTypeMQTTSourceBindingRetire:              decodeMQTTSourceBindingRetireCommand,
+	cmdTypeMQTTReplayMarkerClear:                decodeMQTTReplayMarkerClearCommand,
+	cmdTypeMQTTSessionCAS:                       decodeMQTTSessionCASCommand,
+	cmdTypeMQTTWindowMutation:                   decodeMQTTWindowCommand,
+	cmdTypeMQTTDeliveryCursorMutation:           decodeMQTTDeliveryCursorCommand,
+	cmdTypeMQTTSubscriptionMutation:             decodeMQTTSubscriptionCommand,
+	cmdTypeSetSendBan:                           decodeSendBanCommand,
+	cmdTypeChannelInfo:                          decodeChannelInfoCommand,
 	cmdTypeUpsertUser:                           decodeUpsertUser,
 	cmdTypeUpsertChannel:                        decodeUpsertChannel,
 	cmdTypeDeleteChannel:                        decodeDeleteChannel,
@@ -264,13 +314,7 @@ var commandDecoders = map[uint8]commandDecoder{
 	cmdTypeUpsertDevice:                         decodeUpsertDevice,
 	cmdTypeAddSubscribers:                       decodeAddSubscribers,
 	cmdTypeRemoveSubscribers:                    decodeRemoveSubscribers,
-	cmdTypeUpsertConversationStates:             decodeUpsertConversationStates,
-	cmdTypeTouchConversationActiveAt:            decodeTouchConversationActiveAt,
-	cmdTypeClearConversationActiveAt:            decodeClearConversationActiveAt,
-	cmdTypeReservedConversationProjectionUpsert: decodeReservedConversationProjection,
-	cmdTypeReservedConversationProjectionDelete: decodeReservedConversationProjection,
 	cmdTypeAdvanceChannelRetention:              decodeAdvanceChannelRetentionThroughSeq,
-	cmdTypeHideConversations:                    decodeHideConversations,
 	cmdTypeNoop:                                 decodeNoop,
 	cmdTypeUpsertUserChannelMemberships:         decodeUpsertUserChannelMemberships,
 	cmdTypeDeleteUserChannelMemberships:         decodeDeleteUserChannelMemberships,
@@ -280,8 +324,17 @@ var commandDecoders = map[uint8]commandDecoder{
 	cmdTypeAppendMessageEventsBatch:             decodeAppendMessageEventsBatch,
 	cmdTypeCreateChannel:                        decodeCreateChannel,
 	cmdTypePatchChannelBusinessFlags:            decodePatchChannelBusinessFlags,
-	cmdTypeApplyDeviceCredential:                decodeApplyDeviceCredential,
-	cmdTypeUpsertCMDDeviceCursors:               decodeUpsertCMDDeviceCursors,
+	cmdTypeAdvanceUserChannelMembershipReadSeq:  decodeAdvanceUserChannelMembershipReadSeq,
+	cmdTypeHideUserChannelMembership:            decodeHideUserChannelMembership,
+	cmdTypeActivateUserChannelMembership:        decodeActivateUserChannelMembership,
+	cmdTypeUpsertUserCMDChannelMemberships:      decodeUpsertUserCMDChannelMemberships,
+	cmdTypeAdvanceUserCMDChannelMembershipAcks:  decodeAdvanceUserCMDChannelMembershipAcks,
+	cmdTypeTombstoneUserCMDChannelMemberships:   decodeTombstoneUserCMDChannelMemberships,
+	cmdTypeCreateChannelRuntimeMeta:             decodeCreateChannelRuntimeMeta,
+	cmdTypeAdmitPersonDirectoryTaskBatch:        decodeAdmitPersonDirectoryTaskBatch,
+	cmdTypeEnsureUserChannelMembershipBatch:     decodeEnsureUserChannelMembershipBatch,
+	cmdTypeUpsertUserChannelMembershipBatch:     decodeUpsertUserChannelMembershipBatch,
+	cmdTypeCompletePersonDirectoryTaskBatch:     decodeCompletePersonDirectoryTaskBatch,
 	cmdTypeBindPluginUser:                       decodeBindPluginUser,
 	cmdTypeUnbindPluginUser:                     decodeUnbindPluginUser,
 	cmdTypeApplyDelta:                           decodeApplyDelta,
@@ -300,6 +353,14 @@ var commandDecoders = map[uint8]commandDecoder{
 	cmdTypeAbortChannelMigration:                decodeAbortChannelMigration,
 	cmdTypeGarbageCollectMigrationTasks:         decodeGarbageCollectMigrationTasks,
 	cmdTypeCreateChannelMigrationGuarded:        decodeCreateChannelMigrationTaskWithRuntimeGuard,
+	cmdTypeUpsertConversationStates:             decodeUpsertConversationStates,
+	cmdTypeTouchConversationActiveAt:            decodeTouchConversationActiveAt,
+	cmdTypeClearConversationActiveAt:            decodeClearConversationActiveAt,
+	cmdTypeReservedConversationProjectionUpsert: decodeReservedConversationProjection,
+	cmdTypeReservedConversationProjectionDelete: decodeReservedConversationProjection,
+	cmdTypeHideConversations:                    decodeHideConversations,
+	cmdTypeApplyDeviceCredential:                decodeApplyDeviceCredential,
+	cmdTypeUpsertCMDDeviceCursors:               decodeUpsertCMDDeviceCursors,
 }
 
 // DecodeCommandHashSlots returns the logical Hash Slots mutated by one exact
@@ -493,6 +554,9 @@ func EncodeChannelConditionalMutationResult(result *metadb.ChannelConditionalMut
 
 // DecodeChannelConditionalMutationResult decodes whether a conditional channel mutation applied.
 func DecodeChannelConditionalMutationResult(data []byte) (bool, error) {
+	if string(data) == ApplyResultStaleMeta || string(data) == ApplyResultHashSlotFenced {
+		return false, metadb.ErrStaleMeta
+	}
 	if len(data) != len(channelConditionalMutationResultMagic)+1 ||
 		!bytes.HasPrefix(data, channelConditionalMutationResultMagic[:]) {
 		return false, fmt.Errorf("%w: conditional channel mutation result", metadb.ErrCorruptValue)
@@ -554,9 +618,89 @@ type deleteUserChannelMembershipsCmd struct {
 	memberships []metadb.UserChannelMembership
 }
 
+type advanceUserChannelMembershipReadSeqCmd struct {
+	memberships []metadb.UserChannelMembership
+}
+
+func (c *advanceUserChannelMembershipReadSeqCmd) apply(wb *metadb.WriteBatch, hashSlot uint16) error {
+	for _, membership := range c.memberships {
+		if err := wb.AdvanceUserChannelMembershipReadSeq(hashSlot, membership.UID, metadb.ChannelKey{ChannelID: membership.ChannelID, ChannelType: membership.ChannelType}, membership.ReadSeq, membership.UpdatedAt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type hideUserChannelMembershipCmd struct {
+	memberships []metadb.UserChannelMembership
+}
+
+func (c *hideUserChannelMembershipCmd) apply(wb *metadb.WriteBatch, hashSlot uint16) error {
+	for _, membership := range c.memberships {
+		if err := wb.HideUserChannelMembership(hashSlot, membership.UID, metadb.ChannelKey{ChannelID: membership.ChannelID, ChannelType: membership.ChannelType}, membership.DeletedToSeq, membership.UpdatedAt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type activateUserChannelMembershipCmd struct {
+	memberships []metadb.UserChannelMembership
+}
+
+func (c *activateUserChannelMembershipCmd) apply(wb *metadb.WriteBatch, hashSlot uint16) error {
+	for _, membership := range c.memberships {
+		if err := wb.ActivateUserChannelMembership(hashSlot, membership.UID, metadb.ChannelKey{ChannelID: membership.ChannelID, ChannelType: membership.ChannelType}, membership.ActivatedAt, membership.UpdatedAt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *deleteUserChannelMembershipsCmd) apply(wb *metadb.WriteBatch, hashSlot uint16) error {
 	for _, membership := range c.memberships {
-		if err := wb.DeleteUserChannelMembership(hashSlot, membership.UID, metadb.ConversationKey{ChannelID: membership.ChannelID, ChannelType: membership.ChannelType}); err != nil {
+		if err := wb.UpsertUserChannelMembership(hashSlot, membership); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- UserCMDChannelMemberships ---
+
+type upsertUserCMDChannelMembershipsCmd struct {
+	memberships []metadb.UserCMDChannelMembership
+}
+
+func (c *upsertUserCMDChannelMembershipsCmd) apply(wb *metadb.WriteBatch, hashSlot uint16) error {
+	for _, membership := range c.memberships {
+		if err := wb.UpsertUserCMDChannelMembership(hashSlot, membership); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type advanceUserCMDChannelMembershipAcksCmd struct {
+	memberships []metadb.UserCMDChannelMembership
+}
+
+func (c *advanceUserCMDChannelMembershipAcksCmd) apply(wb *metadb.WriteBatch, hashSlot uint16) error {
+	for _, membership := range c.memberships {
+		if err := wb.AdvanceUserCMDChannelMembershipAckSeq(hashSlot, membership); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type tombstoneUserCMDChannelMembershipsCmd struct {
+	memberships []metadb.UserCMDChannelMembership
+}
+
+func (c *tombstoneUserCMDChannelMembershipsCmd) apply(wb *metadb.WriteBatch, hashSlot uint16) error {
+	for _, membership := range c.memberships {
+		if err := wb.TombstoneUserCMDChannelMembership(hashSlot, membership); err != nil {
 			return err
 		}
 	}
@@ -575,30 +719,6 @@ type ChannelLatestBatchItem struct {
 	HashSlot uint16
 	// Latest is the channel-owned latest message projection row.
 	Latest metadb.ChannelLatest
-}
-
-// ConversationStateBatchItem carries one UID-owned conversation state row and its logical hash slot.
-type ConversationStateBatchItem struct {
-	// HashSlot is the logical hash slot that owns State.UID.
-	HashSlot uint16
-	// State is the durable conversation state row.
-	State metadb.ConversationState
-}
-
-// ConversationActivePatchBatchItem carries one UID-owned active patch and its logical hash slot.
-type ConversationActivePatchBatchItem struct {
-	// HashSlot is the logical hash slot that owns Patch.UID.
-	HashSlot uint16
-	// Patch is the active-at mutation for one conversation row.
-	Patch metadb.ConversationActivePatch
-}
-
-// ConversationDeleteBatchItem carries one UID-owned hide request and its logical hash slot.
-type ConversationDeleteBatchItem struct {
-	// HashSlot is the logical hash slot that owns Delete.UID.
-	HashSlot uint16
-	// Delete hides one conversation row.
-	Delete metadb.ConversationDelete
 }
 
 type upsertChannelLatestBatchCmd struct {
@@ -900,12 +1020,11 @@ func EncodeCreateUserCommand(u metadb.User) []byte {
 func encodeUserCommand(cmdType uint8, u metadb.User) []byte {
 	uidLen := len(u.UID)
 	tokenLen := len(u.Token)
-	// header + 2 string fields + 2 int64 fields
+	// header + 2 string fields + 4 numeric fields
 	size := headerSize +
 		tlvOverhead + uidLen +
 		tlvOverhead + tokenLen +
-		tlvOverhead + 8 +
-		tlvOverhead + 8
+		4*(tlvOverhead+8)
 
 	buf := make([]byte, size)
 	off := 0
@@ -918,7 +1037,9 @@ func encodeUserCommand(cmdType uint8, u metadb.User) []byte {
 	off = putStringField(buf, off, tagUserUID, u.UID)
 	off = putStringField(buf, off, tagUserToken, u.Token)
 	off = putInt64Field(buf, off, tagUserDeviceFlag, u.DeviceFlag)
-	_ = putInt64Field(buf, off, tagUserDeviceLevel, u.DeviceLevel)
+	off = putInt64Field(buf, off, tagUserDeviceLevel, u.DeviceLevel)
+	off = putInt64Field(buf, off, tagUserSendBan, u.SendBan)
+	_ = putInt64Field(buf, off, tagUserSendBanVersion, int64(u.SendBanVersion))
 
 	return buf
 }
@@ -940,27 +1061,24 @@ func EncodeCreateChannelCommand(ch metadb.Channel) []byte {
 
 // EncodePatchChannelBusinessFlagsCommand encodes an existing-only partial flag mutation.
 func EncodePatchChannelBusinessFlagsCommand(channelID string, channelType int64, flags metadb.ChannelBusinessFlags) []byte {
-	return encodeChannelCommand(cmdTypePatchChannelBusinessFlags, metadb.Channel{
+	raw := encodeChannelCommand(cmdTypePatchChannelBusinessFlags, metadb.Channel{
 		ChannelID:   channelID,
 		ChannelType: channelType,
 		Ban:         flags.Ban,
 		Disband:     flags.Disband,
 		SendBan:     flags.SendBan,
 	})
+	if flags.PreserveSendBan {
+		raw = appendInt64TLVField(raw, tagChannelPreserveSendBan, 1)
+	}
+	return raw
 }
 
 func encodeChannelCommand(commandType uint8, ch metadb.Channel) []byte {
 	idLen := len(ch.ChannelID)
-	// header + 1 string field + 7 int64 fields
-	size := headerSize +
-		tlvOverhead + idLen +
-		tlvOverhead + 8 +
-		tlvOverhead + 8 +
-		tlvOverhead + 8 +
-		tlvOverhead + 8 +
-		tlvOverhead + 8 +
-		tlvOverhead + 8 +
-		tlvOverhead + 8
+	// header + 1 string field + 7 numeric fields
+	size := headerSize + tlvOverhead + idLen + 7*(tlvOverhead+8)
+	size += tlvOverhead + 8
 
 	buf := make([]byte, size)
 	off := 0
@@ -977,7 +1095,8 @@ func encodeChannelCommand(commandType uint8, ch metadb.Channel) []byte {
 	off = putInt64Field(buf, off, tagChannelSendBan, ch.SendBan)
 	off = putInt64Field(buf, off, tagChannelAllowStranger, ch.AllowStranger)
 	off = putInt64Field(buf, off, tagChannelLarge, ch.Large)
-	_ = putInt64Field(buf, off, tagChannelExpireAt, ch.ExpireAtUnixSeconds)
+	off = putInt64Field(buf, off, tagChannelExpireAt, ch.ExpireAtUnixSeconds)
+	_ = putInt64Field(buf, off, tagChannelSendBanVersion, int64(ch.SendBanVersion))
 
 	return buf
 }
@@ -1095,10 +1214,10 @@ func EncodeUpsertUserChannelMembershipsCommandChecked(memberships []metadb.UserC
 
 // EncodeDeleteUserChannelMembershipsCommand encodes UID-owned membership deletes.
 func EncodeDeleteUserChannelMembershipsCommand(memberships []metadb.UserChannelMembership) []byte {
-	buf := make([]byte, 0, headerSize+len(memberships)*48)
+	buf := make([]byte, 0, headerSize+len(memberships)*96)
 	buf = append(buf, commandVersion, cmdTypeDeleteUserChannelMemberships)
 	for _, membership := range memberships {
-		buf = appendBytesTLVField(buf, tagUserChannelMembershipCommandEntry, encodeUserChannelMembershipEntry(membership, false))
+		buf = appendBytesTLVField(buf, tagUserChannelMembershipCommandEntry, encodeUserChannelMembershipEntry(membership, true))
 	}
 	return buf
 }
@@ -1109,6 +1228,54 @@ func EncodeDeleteUserChannelMembershipsCommandChecked(memberships []metadb.UserC
 		return nil, err
 	}
 	return EncodeDeleteUserChannelMembershipsCommand(memberships), nil
+}
+
+// EncodeAdvanceUserChannelMembershipReadSeqCommand encodes monotonic badge-floor mutations.
+func EncodeAdvanceUserChannelMembershipReadSeqCommand(memberships []metadb.UserChannelMembership) []byte {
+	return encodeUserChannelMembershipMutationCommand(cmdTypeAdvanceUserChannelMembershipReadSeq, memberships)
+}
+
+// EncodeHideUserChannelMembershipCommand encodes visibility-floor and activation-clear mutations.
+func EncodeHideUserChannelMembershipCommand(memberships []metadb.UserChannelMembership) []byte {
+	return encodeUserChannelMembershipMutationCommand(cmdTypeHideUserChannelMembership, memberships)
+}
+
+// EncodeActivateUserChannelMembershipCommand encodes explicit activation mutations.
+func EncodeActivateUserChannelMembershipCommand(memberships []metadb.UserChannelMembership) []byte {
+	return encodeUserChannelMembershipMutationCommand(cmdTypeActivateUserChannelMembership, memberships)
+}
+
+func encodeUserChannelMembershipMutationCommand(commandType uint8, memberships []metadb.UserChannelMembership) []byte {
+	buf := make([]byte, 0, headerSize+len(memberships)*96)
+	buf = append(buf, commandVersion, commandType)
+	for _, membership := range memberships {
+		buf = appendBytesTLVField(buf, tagUserChannelMembershipCommandEntry, encodeUserChannelMembershipEntry(membership, true))
+	}
+	return buf
+}
+
+// EncodeUpsertUserCMDChannelMembershipsCommand encodes CMD directory bindings.
+func EncodeUpsertUserCMDChannelMembershipsCommand(memberships []metadb.UserCMDChannelMembership) []byte {
+	return encodeUserCMDChannelMembershipCommand(cmdTypeUpsertUserCMDChannelMemberships, memberships)
+}
+
+// EncodeAdvanceUserCMDChannelMembershipAcksCommand encodes monotonic CMD acknowledgements.
+func EncodeAdvanceUserCMDChannelMembershipAcksCommand(memberships []metadb.UserCMDChannelMembership) []byte {
+	return encodeUserCMDChannelMembershipCommand(cmdTypeAdvanceUserCMDChannelMembershipAcks, memberships)
+}
+
+// EncodeTombstoneUserCMDChannelMembershipsCommand encodes CMD directory unbinds.
+func EncodeTombstoneUserCMDChannelMembershipsCommand(memberships []metadb.UserCMDChannelMembership) []byte {
+	return encodeUserCMDChannelMembershipCommand(cmdTypeTombstoneUserCMDChannelMemberships, memberships)
+}
+
+func encodeUserCMDChannelMembershipCommand(commandType uint8, memberships []metadb.UserCMDChannelMembership) []byte {
+	buf := make([]byte, 0, headerSize+len(memberships)*96)
+	buf = append(buf, commandVersion, commandType)
+	for _, membership := range memberships {
+		buf = appendBytesTLVField(buf, tagUserCMDChannelMembershipCommandEntry, encodeUserCMDChannelMembershipEntry(membership))
+	}
+	return buf
 }
 
 // EncodeUpsertChannelLatestCommand encodes one channel latest projection upsert.
@@ -1173,74 +1340,6 @@ func encodeChannelLatestBatchItem(item ChannelLatestBatchItem) []byte {
 func validateChannelLatest(latest metadb.ChannelLatest) error {
 	if latest.ChannelID == "" || latest.ChannelType == 0 {
 		return metadb.ErrInvalidArgument
-	}
-	return nil
-}
-
-func validateConversationState(state metadb.ConversationState) error {
-	if err := validateConversationKind(state.Kind); err != nil {
-		return err
-	}
-	if state.UID == "" || state.ChannelID == "" || state.ChannelType == 0 {
-		return metadb.ErrInvalidArgument
-	}
-	return nil
-}
-
-func validateConversationActivePatch(patch metadb.ConversationActivePatch) error {
-	if err := validateConversationKind(patch.Kind); err != nil {
-		return err
-	}
-	if patch.UID == "" || patch.ChannelID == "" || patch.ChannelType == 0 {
-		return metadb.ErrInvalidArgument
-	}
-	return nil
-}
-
-func validateConversationDelete(req metadb.ConversationDelete) error {
-	if err := validateConversationKind(req.Kind); err != nil {
-		return err
-	}
-	if req.UID == "" || req.ChannelID == "" || req.ChannelType == 0 {
-		return metadb.ErrInvalidArgument
-	}
-	return nil
-}
-
-func validateConversationKind(kind metadb.ConversationKind) error {
-	switch kind {
-	case metadb.ConversationKindNormal, metadb.ConversationKindCMD:
-		return nil
-	default:
-		return metadb.ErrInvalidArgument
-	}
-}
-
-func decodeConversationKindTLVValue(value []byte, label string) (metadb.ConversationKind, error) {
-	if len(value) != 8 {
-		return 0, fmt.Errorf("%w: bad %s length", metadb.ErrCorruptValue, label)
-	}
-	raw := binary.BigEndian.Uint64(value)
-	if raw > uint64(^uint8(0)) {
-		return 0, fmt.Errorf("%w: bad %s value %d", metadb.ErrCorruptValue, label, raw)
-	}
-	kind := metadb.ConversationKind(raw)
-	if err := validateConversationKind(kind); err != nil {
-		return 0, fmt.Errorf("%w: bad %s value %d", metadb.ErrCorruptValue, label, raw)
-	}
-	return kind, nil
-}
-
-func validateConversationBatchHashSlot(hashSlot uint16, uid string, hashSlotCount uint16) error {
-	if hashSlotCount == 0 {
-		return fmt.Errorf("%w: hash slot count must not be zero", metadb.ErrInvalidArgument)
-	}
-	if hashSlot >= hashSlotCount {
-		return fmt.Errorf("%w: conversation hash slot %d out of range %d", metadb.ErrInvalidArgument, hashSlot, hashSlotCount)
-	}
-	want := hashslot.HashSlotForKey(uid, hashSlotCount)
-	if hashSlot != want {
-		return fmt.Errorf("%w: conversation hash slot %d does not match uid %q hash slot %d", metadb.ErrInvalidArgument, hashSlot, uid, want)
 	}
 	return nil
 }
@@ -1550,13 +1649,26 @@ func encodeSubscribersCommand(cmdType uint8, channelID string, channelType int64
 }
 
 func encodeUserChannelMembershipEntry(membership metadb.UserChannelMembership, includeState bool) []byte {
-	buf := make([]byte, 0, 64)
+	buf := make([]byte, 0, 112)
 	buf = appendStringTLVField(buf, tagUserChannelMembershipEntryUID, membership.UID)
 	buf = appendStringTLVField(buf, tagUserChannelMembershipChannelID, membership.ChannelID)
 	buf = appendInt64TLVField(buf, tagUserChannelMembershipChannelType, membership.ChannelType)
 	if includeState {
 		buf = appendUint64TLVField(buf, tagUserChannelMembershipJoinSeq, membership.JoinSeq)
+		buf = appendUint64TLVField(buf, tagUserChannelMembershipReadSeq, membership.ReadSeq)
+		buf = appendUint64TLVField(buf, tagUserChannelMembershipDeletedSeq, membership.DeletedToSeq)
+		buf = appendInt64TLVField(buf, tagUserChannelMembershipActivatedAt, membership.ActivatedAt)
+		if membership.Tombstone {
+			buf = appendUint64TLVField(buf, tagUserChannelMembershipTombstone, 1)
+		} else {
+			buf = appendUint64TLVField(buf, tagUserChannelMembershipTombstone, 0)
+		}
+		buf = appendInt64TLVField(buf, tagUserChannelMembershipTombstoneAt, membership.TombstoneAt)
+		buf = appendUint64TLVField(buf, tagUserChannelMembershipSourceVer, membership.SourceVersion)
 		buf = appendInt64TLVField(buf, tagUserChannelMembershipUpdatedAt, membership.UpdatedAt)
+		if membership.ConversationHiddenThroughSeq != 0 {
+			buf = appendUint64TLVField(buf, tagUserChannelMembershipConversationHidden, membership.ConversationHiddenThroughSeq)
+		}
 	}
 	return buf
 }
@@ -1739,50 +1851,20 @@ func decodeConversationStateEntries(data []byte) ([]conversationStateEntry, erro
 	return entries, nil
 }
 
-func decodeConversationActivePatchEntries(data []byte) ([]conversationActivePatchEntry, error) {
-	var entries []conversationActivePatchEntry
-	off := 0
-	for off < len(data) {
-		tag, value, n, err := readTLV(data[off:])
-		if err != nil {
-			return nil, err
-		}
-		off += n
-		switch tag {
-		case tagConversationActivePatchCommandEntry:
-			entry, err := decodeConversationActivePatchEntry(value)
-			if err != nil {
-				return nil, err
-			}
-			entries = append(entries, entry)
-		default:
-			// Unknown tag — skip for forward compatibility.
-		}
+func encodeUserCMDChannelMembershipEntry(membership metadb.UserCMDChannelMembership) []byte {
+	buf := make([]byte, 0, 96)
+	buf = appendStringTLVField(buf, tagUserCMDChannelMembershipUID, membership.UID)
+	buf = appendStringTLVField(buf, tagUserCMDChannelMembershipChannelID, membership.CommandChannelID)
+	buf = appendInt64TLVField(buf, tagUserCMDChannelMembershipChannelType, membership.ChannelType)
+	buf = appendUint64TLVField(buf, tagUserCMDChannelMembershipStartSeq, membership.StartSeq)
+	buf = appendUint64TLVField(buf, tagUserCMDChannelMembershipAckSeq, membership.AckSeq)
+	if membership.Tombstone {
+		buf = appendUint64TLVField(buf, tagUserCMDChannelMembershipTombstone, 1)
+	} else {
+		buf = appendUint64TLVField(buf, tagUserCMDChannelMembershipTombstone, 0)
 	}
-	return entries, nil
-}
-
-func decodeConversationDeleteEntries(data []byte) ([]conversationDeleteEntry, error) {
-	var entries []conversationDeleteEntry
-	off := 0
-	for off < len(data) {
-		tag, value, n, err := readTLV(data[off:])
-		if err != nil {
-			return nil, err
-		}
-		off += n
-		switch tag {
-		case tagConversationDeleteCommandEntry:
-			entry, err := decodeConversationDeleteEntry(value)
-			if err != nil {
-				return nil, err
-			}
-			entries = append(entries, entry)
-		default:
-			// Unknown tag — skip for forward compatibility.
-		}
-	}
-	return entries, nil
+	buf = appendInt64TLVField(buf, tagUserCMDChannelMembershipTombstoneAt, membership.TombstoneAt)
+	return appendInt64TLVField(buf, tagUserCMDChannelMembershipUpdatedAt, membership.UpdatedAt)
 }
 
 func decodeUserChannelMembershipEntries(data []byte, requireState bool) ([]metadb.UserChannelMembership, error) {
@@ -1810,7 +1892,7 @@ func decodeUserChannelMembershipEntries(data []byte, requireState bool) ([]metad
 
 func decodeUserChannelMembershipEntry(data []byte, requireState bool) (metadb.UserChannelMembership, error) {
 	var membership metadb.UserChannelMembership
-	var haveUID, haveChannelID, haveChannelType, haveJoinSeq, haveUpdatedAt bool
+	var haveUID, haveChannelID, haveChannelType, haveJoinSeq, haveReadSeq, haveDeletedSeq, haveActivatedAt, haveTombstone, haveTombstoneAt, haveSourceVersion, haveUpdatedAt bool
 	off := 0
 	for off < len(data) {
 		tag, value, n, err := readTLV(data[off:])
@@ -1837,6 +1919,47 @@ func decodeUserChannelMembershipEntry(data []byte, requireState bool) (metadb.Us
 			}
 			membership.JoinSeq = binary.BigEndian.Uint64(value)
 			haveJoinSeq = true
+		case tagUserChannelMembershipReadSeq:
+			if len(value) != 8 {
+				return metadb.UserChannelMembership{}, fmt.Errorf("%w: bad user channel membership ReadSeq length", metadb.ErrCorruptValue)
+			}
+			membership.ReadSeq = binary.BigEndian.Uint64(value)
+			haveReadSeq = true
+		case tagUserChannelMembershipDeletedSeq:
+			if len(value) != 8 {
+				return metadb.UserChannelMembership{}, fmt.Errorf("%w: bad user channel membership DeletedToSeq length", metadb.ErrCorruptValue)
+			}
+			membership.DeletedToSeq = binary.BigEndian.Uint64(value)
+			haveDeletedSeq = true
+		case tagUserChannelMembershipActivatedAt:
+			if len(value) != 8 {
+				return metadb.UserChannelMembership{}, fmt.Errorf("%w: bad user channel membership ActivatedAt length", metadb.ErrCorruptValue)
+			}
+			membership.ActivatedAt = int64(binary.BigEndian.Uint64(value))
+			haveActivatedAt = true
+		case tagUserChannelMembershipTombstone:
+			if len(value) != 8 || binary.BigEndian.Uint64(value) > 1 {
+				return metadb.UserChannelMembership{}, fmt.Errorf("%w: bad user channel membership Tombstone", metadb.ErrCorruptValue)
+			}
+			membership.Tombstone = binary.BigEndian.Uint64(value) == 1
+			haveTombstone = true
+		case tagUserChannelMembershipTombstoneAt:
+			if len(value) != 8 {
+				return metadb.UserChannelMembership{}, fmt.Errorf("%w: bad user channel membership TombstoneAt length", metadb.ErrCorruptValue)
+			}
+			membership.TombstoneAt = int64(binary.BigEndian.Uint64(value))
+			haveTombstoneAt = true
+		case tagUserChannelMembershipSourceVer:
+			if len(value) != 8 {
+				return metadb.UserChannelMembership{}, fmt.Errorf("%w: bad user channel membership SourceVersion length", metadb.ErrCorruptValue)
+			}
+			membership.SourceVersion = binary.BigEndian.Uint64(value)
+			haveSourceVersion = true
+		case tagUserChannelMembershipConversationHidden:
+			if len(value) != 8 {
+				return metadb.UserChannelMembership{}, fmt.Errorf("%w: bad conversation hidden sequence length", metadb.ErrCorruptValue)
+			}
+			membership.ConversationHiddenThroughSeq = binary.BigEndian.Uint64(value)
 		case tagUserChannelMembershipUpdatedAt:
 			if len(value) != 8 {
 				return metadb.UserChannelMembership{}, fmt.Errorf("%w: bad user channel membership UpdatedAt length", metadb.ErrCorruptValue)
@@ -1847,274 +1970,82 @@ func decodeUserChannelMembershipEntry(data []byte, requireState bool) (metadb.Us
 			// Unknown tag — skip for forward compatibility.
 		}
 	}
-	if !haveUID || !haveChannelID || !haveChannelType || requireState && (!haveJoinSeq || !haveUpdatedAt) {
+	if !haveUID || !haveChannelID || !haveChannelType || requireState && (!haveJoinSeq || !haveReadSeq || !haveDeletedSeq || !haveActivatedAt || !haveTombstone || !haveTombstoneAt || !haveSourceVersion || !haveUpdatedAt) {
 		return metadb.UserChannelMembership{}, fmt.Errorf("%w: incomplete user channel membership record", metadb.ErrCorruptValue)
 	}
 	return membership, nil
 }
 
-func decodeConversationStateEntry(data []byte) (conversationStateEntry, error) {
-	var entry conversationStateEntry
-	state := &entry.state
-	var haveUID, haveKind, haveChannelID, haveChannelType, haveReadSeq, haveDeletedToSeq, haveActiveAt, haveUpdatedAt bool
-	off := 0
-	for off < len(data) {
+func decodeUserCMDChannelMembershipEntries(data []byte) ([]metadb.UserCMDChannelMembership, error) {
+	var memberships []metadb.UserCMDChannelMembership
+	for off := 0; off < len(data); {
 		tag, value, n, err := readTLV(data[off:])
 		if err != nil {
-			return conversationStateEntry{}, err
+			return nil, err
+		}
+		off += n
+		if tag != tagUserCMDChannelMembershipCommandEntry {
+			continue
+		}
+		membership, err := decodeUserCMDChannelMembershipEntry(value)
+		if err != nil {
+			return nil, err
+		}
+		memberships = append(memberships, membership)
+	}
+	return memberships, nil
+}
+
+func decodeUserCMDChannelMembershipEntry(data []byte) (metadb.UserCMDChannelMembership, error) {
+	var membership metadb.UserCMDChannelMembership
+	var haveUID, haveChannelID, haveChannelType, haveStartSeq, haveAckSeq, haveTombstone, haveTombstoneAt, haveUpdatedAt bool
+	for off := 0; off < len(data); {
+		tag, value, n, err := readTLV(data[off:])
+		if err != nil {
+			return metadb.UserCMDChannelMembership{}, err
 		}
 		off += n
 		switch tag {
-		case tagConversationStateEntryUID:
-			state.UID = string(value)
-			haveUID = true
-		case tagConversationEntryKind:
-			kind, err := decodeConversationKindTLVValue(value, "conversation state Kind")
-			if err != nil {
-				return conversationStateEntry{}, err
-			}
-			state.Kind = kind
-			haveKind = true
-		case tagConversationStateEntryChannelID:
-			state.ChannelID = string(value)
-			haveChannelID = true
-		case tagConversationStateEntryChannelType:
+		case tagUserCMDChannelMembershipUID:
+			membership.UID, haveUID = string(value), true
+		case tagUserCMDChannelMembershipChannelID:
+			membership.CommandChannelID, haveChannelID = string(value), true
+		case tagUserCMDChannelMembershipChannelType:
 			if len(value) != 8 {
-				return conversationStateEntry{}, fmt.Errorf("%w: bad conversation ChannelType length", metadb.ErrCorruptValue)
+				return metadb.UserCMDChannelMembership{}, fmt.Errorf("%w: bad user CMD channel membership ChannelType length", metadb.ErrCorruptValue)
 			}
-			state.ChannelType = int64(binary.BigEndian.Uint64(value))
-			haveChannelType = true
-		case tagConversationStateEntryReadSeq:
+			membership.ChannelType, haveChannelType = int64(binary.BigEndian.Uint64(value)), true
+		case tagUserCMDChannelMembershipStartSeq:
 			if len(value) != 8 {
-				return conversationStateEntry{}, fmt.Errorf("%w: bad conversation ReadSeq length", metadb.ErrCorruptValue)
+				return metadb.UserCMDChannelMembership{}, fmt.Errorf("%w: bad user CMD channel membership StartSeq length", metadb.ErrCorruptValue)
 			}
-			state.ReadSeq = binary.BigEndian.Uint64(value)
-			haveReadSeq = true
-		case tagConversationStateEntryDeletedToSeq:
+			membership.StartSeq, haveStartSeq = binary.BigEndian.Uint64(value), true
+		case tagUserCMDChannelMembershipAckSeq:
 			if len(value) != 8 {
-				return conversationStateEntry{}, fmt.Errorf("%w: bad conversation DeletedToSeq length", metadb.ErrCorruptValue)
+				return metadb.UserCMDChannelMembership{}, fmt.Errorf("%w: bad user CMD channel membership AckSeq length", metadb.ErrCorruptValue)
 			}
-			state.DeletedToSeq = binary.BigEndian.Uint64(value)
-			haveDeletedToSeq = true
-		case tagConversationStateEntryActiveAt:
+			membership.AckSeq, haveAckSeq = binary.BigEndian.Uint64(value), true
+		case tagUserCMDChannelMembershipTombstone:
+			if len(value) != 8 || binary.BigEndian.Uint64(value) > 1 {
+				return metadb.UserCMDChannelMembership{}, fmt.Errorf("%w: bad user CMD channel membership Tombstone", metadb.ErrCorruptValue)
+			}
+			membership.Tombstone, haveTombstone = binary.BigEndian.Uint64(value) == 1, true
+		case tagUserCMDChannelMembershipTombstoneAt:
 			if len(value) != 8 {
-				return conversationStateEntry{}, fmt.Errorf("%w: bad conversation ActiveAt length", metadb.ErrCorruptValue)
+				return metadb.UserCMDChannelMembership{}, fmt.Errorf("%w: bad user CMD channel membership TombstoneAt length", metadb.ErrCorruptValue)
 			}
-			state.ActiveAt = int64(binary.BigEndian.Uint64(value))
-			haveActiveAt = true
-		case tagConversationStateEntryUpdatedAt:
+			membership.TombstoneAt, haveTombstoneAt = int64(binary.BigEndian.Uint64(value)), true
+		case tagUserCMDChannelMembershipUpdatedAt:
 			if len(value) != 8 {
-				return conversationStateEntry{}, fmt.Errorf("%w: bad conversation UpdatedAt length", metadb.ErrCorruptValue)
+				return metadb.UserCMDChannelMembership{}, fmt.Errorf("%w: bad user CMD channel membership UpdatedAt length", metadb.ErrCorruptValue)
 			}
-			state.UpdatedAt = int64(binary.BigEndian.Uint64(value))
-			haveUpdatedAt = true
-		case tagConversationStateEntrySparseActive:
-			sparse, err := decodeBoolTLVValue(value, "conversation SparseActive")
-			if err != nil {
-				return conversationStateEntry{}, err
-			}
-			state.SparseActive = sparse
-		case tagConversationStateEntryHashSlot:
-			hashSlot, err := decodeHashSlotTLVValue(value, "conversation HashSlot")
-			if err != nil {
-				return conversationStateEntry{}, err
-			}
-			entry.hashSlot = hashSlot
-			entry.hasHashSlot = true
-		default:
-			// Unknown tag — skip for forward compatibility.
+			membership.UpdatedAt, haveUpdatedAt = int64(binary.BigEndian.Uint64(value)), true
 		}
 	}
-	if !haveUID || !haveKind || !haveChannelID || !haveChannelType || !haveReadSeq || !haveDeletedToSeq || !haveActiveAt || !haveUpdatedAt {
-		return conversationStateEntry{}, fmt.Errorf("%w: incomplete conversation state record", metadb.ErrCorruptValue)
+	if !haveUID || !haveChannelID || !haveChannelType || !haveStartSeq || !haveAckSeq || !haveTombstone || !haveTombstoneAt || !haveUpdatedAt {
+		return metadb.UserCMDChannelMembership{}, fmt.Errorf("%w: incomplete user CMD channel membership record", metadb.ErrCorruptValue)
 	}
-	return entry, nil
-}
-
-func decodeConversationActivePatchEntry(data []byte) (conversationActivePatchEntry, error) {
-	var entry conversationActivePatchEntry
-	patch := &entry.patch
-	var haveUID, haveKind, haveChannelID, haveChannelType bool
-	off := 0
-	for off < len(data) {
-		tag, value, n, err := readTLV(data[off:])
-		if err != nil {
-			return conversationActivePatchEntry{}, err
-		}
-		off += n
-		switch tag {
-		case tagConversationActivePatchEntryUID:
-			patch.UID = string(value)
-			haveUID = true
-		case tagConversationEntryKind:
-			kind, err := decodeConversationKindTLVValue(value, "conversation active patch Kind")
-			if err != nil {
-				return conversationActivePatchEntry{}, err
-			}
-			patch.Kind = kind
-			haveKind = true
-		case tagConversationActivePatchEntryChannelID:
-			patch.ChannelID = string(value)
-			haveChannelID = true
-		case tagConversationActivePatchEntryChannelType:
-			if len(value) != 8 {
-				return conversationActivePatchEntry{}, fmt.Errorf("%w: bad conversation ChannelType length", metadb.ErrCorruptValue)
-			}
-			patch.ChannelType = int64(binary.BigEndian.Uint64(value))
-			haveChannelType = true
-		case tagConversationActivePatchReadSeq:
-			if len(value) != 8 {
-				return conversationActivePatchEntry{}, fmt.Errorf("%w: bad conversation ReadSeq length", metadb.ErrCorruptValue)
-			}
-			patch.ReadSeq = binary.BigEndian.Uint64(value)
-		case tagConversationActivePatchDeletedToSeq:
-			if len(value) != 8 {
-				return conversationActivePatchEntry{}, fmt.Errorf("%w: bad conversation DeletedToSeq length", metadb.ErrCorruptValue)
-			}
-			patch.DeletedToSeq = binary.BigEndian.Uint64(value)
-		case tagConversationActivePatchEntryActiveAt:
-			if len(value) != 8 {
-				return conversationActivePatchEntry{}, fmt.Errorf("%w: bad conversation ActiveAt length", metadb.ErrCorruptValue)
-			}
-			patch.ActiveAt = int64(binary.BigEndian.Uint64(value))
-		case tagConversationActivePatchUpdatedAt:
-			if len(value) != 8 {
-				return conversationActivePatchEntry{}, fmt.Errorf("%w: bad conversation UpdatedAt length", metadb.ErrCorruptValue)
-			}
-			patch.UpdatedAt = int64(binary.BigEndian.Uint64(value))
-		case tagConversationActivePatchEntryMessageSeq:
-			if len(value) != 8 {
-				return conversationActivePatchEntry{}, fmt.Errorf("%w: bad conversation MessageSeq length", metadb.ErrCorruptValue)
-			}
-			patch.MessageSeq = binary.BigEndian.Uint64(value)
-		case tagConversationActivePatchSparseActive:
-			sparse, err := decodeBoolTLVValue(value, "conversation SparseActive")
-			if err != nil {
-				return conversationActivePatchEntry{}, err
-			}
-			patch.SparseActive = sparse
-		case tagConversationActivePatchSparseActiveSet:
-			sparseSet, err := decodeBoolTLVValue(value, "conversation SparseActiveSet")
-			if err != nil {
-				return conversationActivePatchEntry{}, err
-			}
-			patch.SparseActiveSet = sparseSet
-		case tagConversationActivePatchHashSlot:
-			hashSlot, err := decodeHashSlotTLVValue(value, "conversation HashSlot")
-			if err != nil {
-				return conversationActivePatchEntry{}, err
-			}
-			entry.hashSlot = hashSlot
-			entry.hasHashSlot = true
-		default:
-			// Unknown tag — skip for forward compatibility.
-		}
-	}
-	if !haveUID || !haveKind || !haveChannelID || !haveChannelType {
-		return conversationActivePatchEntry{}, fmt.Errorf("%w: incomplete conversation active patch record", metadb.ErrCorruptValue)
-	}
-	return entry, nil
-}
-
-func decodeConversationKeyEntry(data []byte) (metadb.ConversationKey, error) {
-	var key metadb.ConversationKey
-	var haveChannelID, haveChannelType bool
-	off := 0
-	for off < len(data) {
-		tag, value, n, err := readTLV(data[off:])
-		if err != nil {
-			return metadb.ConversationKey{}, err
-		}
-		off += n
-		switch tag {
-		case tagConversationKeyEntryChannelID:
-			key.ChannelID = string(value)
-			haveChannelID = true
-		case tagConversationKeyEntryChannelType:
-			if len(value) != 8 {
-				return metadb.ConversationKey{}, fmt.Errorf("%w: bad conversation ChannelType length", metadb.ErrCorruptValue)
-			}
-			key.ChannelType = int64(binary.BigEndian.Uint64(value))
-			haveChannelType = true
-		default:
-			// Unknown tag — skip for forward compatibility.
-		}
-	}
-	if !haveChannelID || !haveChannelType {
-		return metadb.ConversationKey{}, fmt.Errorf("%w: incomplete conversation key record", metadb.ErrCorruptValue)
-	}
-	return key, nil
-}
-
-func decodeConversationDeleteEntry(data []byte) (conversationDeleteEntry, error) {
-	var entry conversationDeleteEntry
-	req := &entry.delete
-	var haveUID, haveKind, haveChannelID, haveChannelType, haveDeletedToSeq, haveUpdatedAt bool
-	off := 0
-	for off < len(data) {
-		tag, value, n, err := readTLV(data[off:])
-		if err != nil {
-			return conversationDeleteEntry{}, err
-		}
-		off += n
-		switch tag {
-		case tagConversationDeleteEntryUID:
-			req.UID = string(value)
-			haveUID = true
-		case tagConversationEntryKind:
-			kind, err := decodeConversationKindTLVValue(value, "conversation delete Kind")
-			if err != nil {
-				return conversationDeleteEntry{}, err
-			}
-			req.Kind = kind
-			haveKind = true
-		case tagConversationDeleteEntryChannelID:
-			req.ChannelID = string(value)
-			haveChannelID = true
-		case tagConversationDeleteEntryChannelType:
-			if len(value) != 8 {
-				return conversationDeleteEntry{}, fmt.Errorf("%w: bad conversation delete ChannelType length", metadb.ErrCorruptValue)
-			}
-			req.ChannelType = int64(binary.BigEndian.Uint64(value))
-			haveChannelType = true
-		case tagConversationDeleteEntryDeletedToSeq:
-			if len(value) != 8 {
-				return conversationDeleteEntry{}, fmt.Errorf("%w: bad conversation delete DeletedToSeq length", metadb.ErrCorruptValue)
-			}
-			req.DeletedToSeq = binary.BigEndian.Uint64(value)
-			haveDeletedToSeq = true
-		case tagConversationDeleteEntryUpdatedAt:
-			if len(value) != 8 {
-				return conversationDeleteEntry{}, fmt.Errorf("%w: bad conversation delete UpdatedAt length", metadb.ErrCorruptValue)
-			}
-			req.UpdatedAt = int64(binary.BigEndian.Uint64(value))
-			haveUpdatedAt = true
-		case tagConversationDeleteEntryHashSlot:
-			hashSlot, err := decodeHashSlotTLVValue(value, "conversation delete HashSlot")
-			if err != nil {
-				return conversationDeleteEntry{}, err
-			}
-			entry.hashSlot = hashSlot
-			entry.hasHashSlot = true
-		default:
-			// Unknown tag — skip for forward compatibility.
-		}
-	}
-	if !haveUID || !haveKind || !haveChannelID || !haveChannelType || !haveDeletedToSeq || !haveUpdatedAt {
-		return conversationDeleteEntry{}, fmt.Errorf("%w: incomplete conversation delete record", metadb.ErrCorruptValue)
-	}
-	return entry, nil
-}
-
-func decodeUpsertConversationStates(data []byte) (command, error) {
-	entries, err := decodeConversationStateEntries(data)
-	if err != nil {
-		return nil, err
-	}
-	if len(entries) == 0 {
-		return nil, fmt.Errorf("%w: empty conversation state batch", metadb.ErrInvalidArgument)
-	}
-	return &upsertConversationStatesCmd{entries: entries}, nil
+	return membership, nil
 }
 
 func decodeUpsertCMDDeviceCursors(data []byte) (command, error) {
@@ -2148,6 +2079,72 @@ func decodeDeleteUserChannelMemberships(data []byte) (command, error) {
 		return nil, fmt.Errorf("%w: empty user channel membership delete batch", metadb.ErrInvalidArgument)
 	}
 	return &deleteUserChannelMembershipsCmd{memberships: memberships}, nil
+}
+
+func decodeAdvanceUserChannelMembershipReadSeq(data []byte) (command, error) {
+	memberships, err := decodeUserChannelMembershipEntries(data, true)
+	if err != nil {
+		return nil, err
+	}
+	if len(memberships) == 0 {
+		return nil, fmt.Errorf("%w: empty membership read-seq batch", metadb.ErrInvalidArgument)
+	}
+	return &advanceUserChannelMembershipReadSeqCmd{memberships: memberships}, nil
+}
+
+func decodeHideUserChannelMembership(data []byte) (command, error) {
+	memberships, err := decodeUserChannelMembershipEntries(data, true)
+	if err != nil {
+		return nil, err
+	}
+	if len(memberships) == 0 {
+		return nil, fmt.Errorf("%w: empty membership hide batch", metadb.ErrInvalidArgument)
+	}
+	return &hideUserChannelMembershipCmd{memberships: memberships}, nil
+}
+
+func decodeActivateUserChannelMembership(data []byte) (command, error) {
+	memberships, err := decodeUserChannelMembershipEntries(data, true)
+	if err != nil {
+		return nil, err
+	}
+	if len(memberships) == 0 {
+		return nil, fmt.Errorf("%w: empty membership activation batch", metadb.ErrInvalidArgument)
+	}
+	return &activateUserChannelMembershipCmd{memberships: memberships}, nil
+}
+
+func decodeUpsertUserCMDChannelMemberships(data []byte) (command, error) {
+	memberships, err := decodeUserCMDChannelMembershipEntries(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(memberships) == 0 {
+		return nil, fmt.Errorf("%w: empty user CMD channel membership upsert batch", metadb.ErrInvalidArgument)
+	}
+	return &upsertUserCMDChannelMembershipsCmd{memberships: memberships}, nil
+}
+
+func decodeAdvanceUserCMDChannelMembershipAcks(data []byte) (command, error) {
+	memberships, err := decodeUserCMDChannelMembershipEntries(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(memberships) == 0 {
+		return nil, fmt.Errorf("%w: empty user CMD channel membership ack batch", metadb.ErrInvalidArgument)
+	}
+	return &advanceUserCMDChannelMembershipAcksCmd{memberships: memberships}, nil
+}
+
+func decodeTombstoneUserCMDChannelMemberships(data []byte) (command, error) {
+	memberships, err := decodeUserCMDChannelMembershipEntries(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(memberships) == 0 {
+		return nil, fmt.Errorf("%w: empty user CMD channel membership tombstone batch", metadb.ErrInvalidArgument)
+	}
+	return &tombstoneUserCMDChannelMembershipsCmd{memberships: memberships}, nil
 }
 
 func decodeUpsertChannelLatest(data []byte) (command, error) {
@@ -2282,74 +2279,6 @@ func decodeChannelLatestRecord(data []byte) (metadb.ChannelLatest, error) {
 	return latest, nil
 }
 
-func decodeTouchConversationActiveAt(data []byte) (command, error) {
-	entries, err := decodeConversationActivePatchEntries(data)
-	if err != nil {
-		return nil, err
-	}
-	if len(entries) == 0 {
-		return nil, fmt.Errorf("%w: empty conversation active patch batch", metadb.ErrInvalidArgument)
-	}
-	return &touchConversationActiveAtCmd{entries: entries}, nil
-}
-
-func decodeClearConversationActiveAt(data []byte) (command, error) {
-	var kind metadb.ConversationKind
-	var uid string
-	var keys []metadb.ConversationKey
-	var haveKind, haveUID bool
-	off := 0
-	for off < len(data) {
-		tag, value, n, err := readTLV(data[off:])
-		if err != nil {
-			return nil, err
-		}
-		off += n
-		switch tag {
-		case tagClearConversationActiveKind:
-			decoded, err := decodeConversationKindTLVValue(value, "clear conversation active Kind")
-			if err != nil {
-				return nil, err
-			}
-			kind = decoded
-			haveKind = true
-		case tagClearConversationActiveUID:
-			uid = string(value)
-			haveUID = true
-		case tagClearConversationActiveKey:
-			key, err := decodeConversationKeyEntry(value)
-			if err != nil {
-				return nil, err
-			}
-			keys = append(keys, key)
-		default:
-			// Unknown tag — skip for forward compatibility.
-		}
-	}
-	if !haveKind || !haveUID {
-		return nil, fmt.Errorf("%w: missing kind or uid for clear command", metadb.ErrInvalidArgument)
-	}
-	if len(keys) == 0 {
-		return nil, fmt.Errorf("%w: empty clear conversation key batch", metadb.ErrInvalidArgument)
-	}
-	return &clearConversationActiveAtCmd{kind: kind, uid: uid, keys: keys}, nil
-}
-
-func decodeReservedConversationProjection([]byte) (command, error) {
-	return &reservedConversationProjectionCmd{}, nil
-}
-
-func decodeHideConversations(data []byte) (command, error) {
-	entries, err := decodeConversationDeleteEntries(data)
-	if err != nil {
-		return nil, err
-	}
-	if len(entries) == 0 {
-		return nil, fmt.Errorf("%w: empty conversation delete batch", metadb.ErrInvalidArgument)
-	}
-	return &hideConversationsCmd{entries: entries}, nil
-}
-
 // decodeCommand parses a binary-encoded command using the decoder registry.
 func decodeCommand(data []byte) (command, error) {
 	if len(data) < headerSize {
@@ -2416,6 +2345,16 @@ func decodeUser(data []byte) (metadb.User, error) {
 				return metadb.User{}, fmt.Errorf("%w: bad DeviceFlag length", metadb.ErrCorruptValue)
 			}
 			u.DeviceFlag = int64(binary.BigEndian.Uint64(value))
+		case tagUserSendBan:
+			if len(value) != 8 {
+				return metadb.User{}, metadb.ErrCorruptValue
+			}
+			u.SendBan = int64(binary.BigEndian.Uint64(value))
+		case tagUserSendBanVersion:
+			if len(value) != 8 {
+				return metadb.User{}, metadb.ErrCorruptValue
+			}
+			u.SendBanVersion = binary.BigEndian.Uint64(value)
 		case tagUserDeviceLevel:
 			if len(value) != 8 {
 				return metadb.User{}, fmt.Errorf("%w: bad DeviceLevel length", metadb.ErrCorruptValue)
@@ -2513,10 +2452,24 @@ func decodePatchChannelBusinessFlags(data []byte) (command, error) {
 	if err != nil {
 		return nil, err
 	}
+	preserve := false
+	for off := 0; off < len(data); {
+		tag, value, n, err := readTLV(data[off:])
+		if err != nil {
+			return nil, err
+		}
+		off += n
+		if tag == tagChannelPreserveSendBan {
+			if len(value) != 8 || binary.BigEndian.Uint64(value) > 1 {
+				return nil, metadb.ErrCorruptValue
+			}
+			preserve = binary.BigEndian.Uint64(value) == 1
+		}
+	}
 	return &patchChannelBusinessFlagsCmd{
 		channelID:   ch.ChannelID,
 		channelType: ch.ChannelType,
-		flags: metadb.ChannelBusinessFlags{
+		flags: metadb.ChannelBusinessFlags{PreserveSendBan: preserve,
 			Ban:     ch.Ban,
 			Disband: ch.Disband,
 			SendBan: ch.SendBan,
@@ -2561,6 +2514,11 @@ func decodeChannel(data []byte) (metadb.Channel, error) {
 				return metadb.Channel{}, fmt.Errorf("%w: bad AllowStranger length", metadb.ErrCorruptValue)
 			}
 			ch.AllowStranger = int64(binary.BigEndian.Uint64(value))
+		case tagChannelSendBanVersion:
+			if len(value) != 8 {
+				return metadb.Channel{}, metadb.ErrCorruptValue
+			}
+			ch.SendBanVersion = binary.BigEndian.Uint64(value)
 		case tagChannelLarge:
 			if len(value) != 8 {
 				return metadb.Channel{}, fmt.Errorf("%w: bad Large length", metadb.ErrCorruptValue)
@@ -3109,4 +3067,471 @@ func decodeStringSet(data []byte) []string {
 		return nil
 	}
 	return strings.Split(string(data), "\x00")
+}
+
+type ConversationActivePatchBatchItem struct {
+	// HashSlot is the logical hash slot that owns Patch.UID.
+	HashSlot uint16
+	// Patch is the active-at mutation for one conversation row.
+	Patch metadb.ConversationActivePatch
+}
+
+type ConversationDeleteBatchItem struct {
+	// HashSlot is the logical hash slot that owns Delete.UID.
+	HashSlot uint16
+	// Delete hides one conversation row.
+	Delete metadb.ConversationDelete
+}
+
+type ConversationStateBatchItem struct {
+	// HashSlot is the logical hash slot that owns State.UID.
+	HashSlot uint16
+	// State is the durable conversation state row.
+	State metadb.ConversationState
+}
+
+func decodeClearConversationActiveAt(data []byte) (command, error) {
+	var kind metadb.ConversationKind
+	var uid string
+	var keys []metadb.ConversationKey
+	var haveKind, haveUID bool
+	off := 0
+	for off < len(data) {
+		tag, value, n, err := readTLV(data[off:])
+		if err != nil {
+			return nil, err
+		}
+		off += n
+		switch tag {
+		case tagClearConversationActiveKind:
+			decoded, err := decodeConversationKindTLVValue(value, "clear conversation active Kind")
+			if err != nil {
+				return nil, err
+			}
+			kind = decoded
+			haveKind = true
+		case tagClearConversationActiveUID:
+			uid = string(value)
+			haveUID = true
+		case tagClearConversationActiveKey:
+			key, err := decodeConversationKeyEntry(value)
+			if err != nil {
+				return nil, err
+			}
+			keys = append(keys, key)
+		default:
+			// Unknown tag — skip for forward compatibility.
+		}
+	}
+	if !haveKind || !haveUID {
+		return nil, fmt.Errorf("%w: missing kind or uid for clear command", metadb.ErrInvalidArgument)
+	}
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("%w: empty clear conversation key batch", metadb.ErrInvalidArgument)
+	}
+	return &clearConversationActiveAtCmd{kind: kind, uid: uid, keys: keys}, nil
+}
+
+func decodeConversationActivePatchEntries(data []byte) ([]conversationActivePatchEntry, error) {
+	var entries []conversationActivePatchEntry
+	off := 0
+	for off < len(data) {
+		tag, value, n, err := readTLV(data[off:])
+		if err != nil {
+			return nil, err
+		}
+		off += n
+		switch tag {
+		case tagConversationActivePatchCommandEntry:
+			entry, err := decodeConversationActivePatchEntry(value)
+			if err != nil {
+				return nil, err
+			}
+			entries = append(entries, entry)
+		default:
+			// Unknown tag — skip for forward compatibility.
+		}
+	}
+	return entries, nil
+}
+
+func decodeConversationActivePatchEntry(data []byte) (conversationActivePatchEntry, error) {
+	var entry conversationActivePatchEntry
+	patch := &entry.patch
+	var haveUID, haveKind, haveChannelID, haveChannelType bool
+	off := 0
+	for off < len(data) {
+		tag, value, n, err := readTLV(data[off:])
+		if err != nil {
+			return conversationActivePatchEntry{}, err
+		}
+		off += n
+		switch tag {
+		case tagConversationActivePatchEntryUID:
+			patch.UID = string(value)
+			haveUID = true
+		case tagConversationEntryKind:
+			kind, err := decodeConversationKindTLVValue(value, "conversation active patch Kind")
+			if err != nil {
+				return conversationActivePatchEntry{}, err
+			}
+			patch.Kind = kind
+			haveKind = true
+		case tagConversationActivePatchEntryChannelID:
+			patch.ChannelID = string(value)
+			haveChannelID = true
+		case tagConversationActivePatchEntryChannelType:
+			if len(value) != 8 {
+				return conversationActivePatchEntry{}, fmt.Errorf("%w: bad conversation ChannelType length", metadb.ErrCorruptValue)
+			}
+			patch.ChannelType = int64(binary.BigEndian.Uint64(value))
+			haveChannelType = true
+		case tagConversationActivePatchReadSeq:
+			if len(value) != 8 {
+				return conversationActivePatchEntry{}, fmt.Errorf("%w: bad conversation ReadSeq length", metadb.ErrCorruptValue)
+			}
+			patch.ReadSeq = binary.BigEndian.Uint64(value)
+		case tagConversationActivePatchDeletedToSeq:
+			if len(value) != 8 {
+				return conversationActivePatchEntry{}, fmt.Errorf("%w: bad conversation DeletedToSeq length", metadb.ErrCorruptValue)
+			}
+			patch.DeletedToSeq = binary.BigEndian.Uint64(value)
+		case tagConversationActivePatchEntryActiveAt:
+			if len(value) != 8 {
+				return conversationActivePatchEntry{}, fmt.Errorf("%w: bad conversation ActiveAt length", metadb.ErrCorruptValue)
+			}
+			patch.ActiveAt = int64(binary.BigEndian.Uint64(value))
+		case tagConversationActivePatchUpdatedAt:
+			if len(value) != 8 {
+				return conversationActivePatchEntry{}, fmt.Errorf("%w: bad conversation UpdatedAt length", metadb.ErrCorruptValue)
+			}
+			patch.UpdatedAt = int64(binary.BigEndian.Uint64(value))
+		case tagConversationActivePatchEntryMessageSeq:
+			if len(value) != 8 {
+				return conversationActivePatchEntry{}, fmt.Errorf("%w: bad conversation MessageSeq length", metadb.ErrCorruptValue)
+			}
+			patch.MessageSeq = binary.BigEndian.Uint64(value)
+		case tagConversationActivePatchSparseActive:
+			sparse, err := decodeBoolTLVValue(value, "conversation SparseActive")
+			if err != nil {
+				return conversationActivePatchEntry{}, err
+			}
+			patch.SparseActive = sparse
+		case tagConversationActivePatchSparseActiveSet:
+			sparseSet, err := decodeBoolTLVValue(value, "conversation SparseActiveSet")
+			if err != nil {
+				return conversationActivePatchEntry{}, err
+			}
+			patch.SparseActiveSet = sparseSet
+		case tagConversationActivePatchHashSlot:
+			hashSlot, err := decodeHashSlotTLVValue(value, "conversation HashSlot")
+			if err != nil {
+				return conversationActivePatchEntry{}, err
+			}
+			entry.hashSlot = hashSlot
+			entry.hasHashSlot = true
+		default:
+			// Unknown tag — skip for forward compatibility.
+		}
+	}
+	if !haveUID || !haveKind || !haveChannelID || !haveChannelType {
+		return conversationActivePatchEntry{}, fmt.Errorf("%w: incomplete conversation active patch record", metadb.ErrCorruptValue)
+	}
+	return entry, nil
+}
+
+func decodeConversationDeleteEntries(data []byte) ([]conversationDeleteEntry, error) {
+	var entries []conversationDeleteEntry
+	off := 0
+	for off < len(data) {
+		tag, value, n, err := readTLV(data[off:])
+		if err != nil {
+			return nil, err
+		}
+		off += n
+		switch tag {
+		case tagConversationDeleteCommandEntry:
+			entry, err := decodeConversationDeleteEntry(value)
+			if err != nil {
+				return nil, err
+			}
+			entries = append(entries, entry)
+		default:
+			// Unknown tag — skip for forward compatibility.
+		}
+	}
+	return entries, nil
+}
+
+func decodeConversationDeleteEntry(data []byte) (conversationDeleteEntry, error) {
+	var entry conversationDeleteEntry
+	req := &entry.delete
+	var haveUID, haveKind, haveChannelID, haveChannelType, haveDeletedToSeq, haveUpdatedAt bool
+	off := 0
+	for off < len(data) {
+		tag, value, n, err := readTLV(data[off:])
+		if err != nil {
+			return conversationDeleteEntry{}, err
+		}
+		off += n
+		switch tag {
+		case tagConversationDeleteEntryUID:
+			req.UID = string(value)
+			haveUID = true
+		case tagConversationEntryKind:
+			kind, err := decodeConversationKindTLVValue(value, "conversation delete Kind")
+			if err != nil {
+				return conversationDeleteEntry{}, err
+			}
+			req.Kind = kind
+			haveKind = true
+		case tagConversationDeleteEntryChannelID:
+			req.ChannelID = string(value)
+			haveChannelID = true
+		case tagConversationDeleteEntryChannelType:
+			if len(value) != 8 {
+				return conversationDeleteEntry{}, fmt.Errorf("%w: bad conversation delete ChannelType length", metadb.ErrCorruptValue)
+			}
+			req.ChannelType = int64(binary.BigEndian.Uint64(value))
+			haveChannelType = true
+		case tagConversationDeleteEntryDeletedToSeq:
+			if len(value) != 8 {
+				return conversationDeleteEntry{}, fmt.Errorf("%w: bad conversation delete DeletedToSeq length", metadb.ErrCorruptValue)
+			}
+			req.DeletedToSeq = binary.BigEndian.Uint64(value)
+			haveDeletedToSeq = true
+		case tagConversationDeleteEntryUpdatedAt:
+			if len(value) != 8 {
+				return conversationDeleteEntry{}, fmt.Errorf("%w: bad conversation delete UpdatedAt length", metadb.ErrCorruptValue)
+			}
+			req.UpdatedAt = int64(binary.BigEndian.Uint64(value))
+			haveUpdatedAt = true
+		case tagConversationDeleteEntryHashSlot:
+			hashSlot, err := decodeHashSlotTLVValue(value, "conversation delete HashSlot")
+			if err != nil {
+				return conversationDeleteEntry{}, err
+			}
+			entry.hashSlot = hashSlot
+			entry.hasHashSlot = true
+		default:
+			// Unknown tag — skip for forward compatibility.
+		}
+	}
+	if !haveUID || !haveKind || !haveChannelID || !haveChannelType || !haveDeletedToSeq || !haveUpdatedAt {
+		return conversationDeleteEntry{}, fmt.Errorf("%w: incomplete conversation delete record", metadb.ErrCorruptValue)
+	}
+	return entry, nil
+}
+
+func decodeConversationKeyEntry(data []byte) (metadb.ConversationKey, error) {
+	var key metadb.ConversationKey
+	var haveChannelID, haveChannelType bool
+	off := 0
+	for off < len(data) {
+		tag, value, n, err := readTLV(data[off:])
+		if err != nil {
+			return metadb.ConversationKey{}, err
+		}
+		off += n
+		switch tag {
+		case tagConversationKeyEntryChannelID:
+			key.ChannelID = string(value)
+			haveChannelID = true
+		case tagConversationKeyEntryChannelType:
+			if len(value) != 8 {
+				return metadb.ConversationKey{}, fmt.Errorf("%w: bad conversation ChannelType length", metadb.ErrCorruptValue)
+			}
+			key.ChannelType = int64(binary.BigEndian.Uint64(value))
+			haveChannelType = true
+		default:
+			// Unknown tag — skip for forward compatibility.
+		}
+	}
+	if !haveChannelID || !haveChannelType {
+		return metadb.ConversationKey{}, fmt.Errorf("%w: incomplete conversation key record", metadb.ErrCorruptValue)
+	}
+	return key, nil
+}
+
+func decodeConversationKindTLVValue(value []byte, label string) (metadb.ConversationKind, error) {
+	if len(value) != 8 {
+		return 0, fmt.Errorf("%w: bad %s length", metadb.ErrCorruptValue, label)
+	}
+	raw := binary.BigEndian.Uint64(value)
+	if raw > uint64(^uint8(0)) {
+		return 0, fmt.Errorf("%w: bad %s value %d", metadb.ErrCorruptValue, label, raw)
+	}
+	kind := metadb.ConversationKind(raw)
+	if err := validateConversationKind(kind); err != nil {
+		return 0, fmt.Errorf("%w: bad %s value %d", metadb.ErrCorruptValue, label, raw)
+	}
+	return kind, nil
+}
+
+func decodeConversationStateEntry(data []byte) (conversationStateEntry, error) {
+	var entry conversationStateEntry
+	state := &entry.state
+	var haveUID, haveKind, haveChannelID, haveChannelType, haveReadSeq, haveDeletedToSeq, haveActiveAt, haveUpdatedAt bool
+	off := 0
+	for off < len(data) {
+		tag, value, n, err := readTLV(data[off:])
+		if err != nil {
+			return conversationStateEntry{}, err
+		}
+		off += n
+		switch tag {
+		case tagConversationStateEntryUID:
+			state.UID = string(value)
+			haveUID = true
+		case tagConversationEntryKind:
+			kind, err := decodeConversationKindTLVValue(value, "conversation state Kind")
+			if err != nil {
+				return conversationStateEntry{}, err
+			}
+			state.Kind = kind
+			haveKind = true
+		case tagConversationStateEntryChannelID:
+			state.ChannelID = string(value)
+			haveChannelID = true
+		case tagConversationStateEntryChannelType:
+			if len(value) != 8 {
+				return conversationStateEntry{}, fmt.Errorf("%w: bad conversation ChannelType length", metadb.ErrCorruptValue)
+			}
+			state.ChannelType = int64(binary.BigEndian.Uint64(value))
+			haveChannelType = true
+		case tagConversationStateEntryReadSeq:
+			if len(value) != 8 {
+				return conversationStateEntry{}, fmt.Errorf("%w: bad conversation ReadSeq length", metadb.ErrCorruptValue)
+			}
+			state.ReadSeq = binary.BigEndian.Uint64(value)
+			haveReadSeq = true
+		case tagConversationStateEntryDeletedToSeq:
+			if len(value) != 8 {
+				return conversationStateEntry{}, fmt.Errorf("%w: bad conversation DeletedToSeq length", metadb.ErrCorruptValue)
+			}
+			state.DeletedToSeq = binary.BigEndian.Uint64(value)
+			haveDeletedToSeq = true
+		case tagConversationStateEntryActiveAt:
+			if len(value) != 8 {
+				return conversationStateEntry{}, fmt.Errorf("%w: bad conversation ActiveAt length", metadb.ErrCorruptValue)
+			}
+			state.ActiveAt = int64(binary.BigEndian.Uint64(value))
+			haveActiveAt = true
+		case tagConversationStateEntryUpdatedAt:
+			if len(value) != 8 {
+				return conversationStateEntry{}, fmt.Errorf("%w: bad conversation UpdatedAt length", metadb.ErrCorruptValue)
+			}
+			state.UpdatedAt = int64(binary.BigEndian.Uint64(value))
+			haveUpdatedAt = true
+		case tagConversationStateEntrySparseActive:
+			sparse, err := decodeBoolTLVValue(value, "conversation SparseActive")
+			if err != nil {
+				return conversationStateEntry{}, err
+			}
+			state.SparseActive = sparse
+		case tagConversationStateEntryHashSlot:
+			hashSlot, err := decodeHashSlotTLVValue(value, "conversation HashSlot")
+			if err != nil {
+				return conversationStateEntry{}, err
+			}
+			entry.hashSlot = hashSlot
+			entry.hasHashSlot = true
+		default:
+			// Unknown tag — skip for forward compatibility.
+		}
+	}
+	if !haveUID || !haveKind || !haveChannelID || !haveChannelType || !haveReadSeq || !haveDeletedToSeq || !haveActiveAt || !haveUpdatedAt {
+		return conversationStateEntry{}, fmt.Errorf("%w: incomplete conversation state record", metadb.ErrCorruptValue)
+	}
+	return entry, nil
+}
+
+func decodeHideConversations(data []byte) (command, error) {
+	entries, err := decodeConversationDeleteEntries(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("%w: empty conversation delete batch", metadb.ErrInvalidArgument)
+	}
+	return &hideConversationsCmd{entries: entries}, nil
+}
+
+func decodeReservedConversationProjection([]byte) (command, error) {
+	return &reservedConversationProjectionCmd{}, nil
+}
+
+func decodeTouchConversationActiveAt(data []byte) (command, error) {
+	entries, err := decodeConversationActivePatchEntries(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("%w: empty conversation active patch batch", metadb.ErrInvalidArgument)
+	}
+	return &touchConversationActiveAtCmd{entries: entries}, nil
+}
+
+func decodeUpsertConversationStates(data []byte) (command, error) {
+	entries, err := decodeConversationStateEntries(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("%w: empty conversation state batch", metadb.ErrInvalidArgument)
+	}
+	return &upsertConversationStatesCmd{entries: entries}, nil
+}
+
+func validateConversationActivePatch(patch metadb.ConversationActivePatch) error {
+	if err := validateConversationKind(patch.Kind); err != nil {
+		return err
+	}
+	if patch.UID == "" || patch.ChannelID == "" || patch.ChannelType == 0 {
+		return metadb.ErrInvalidArgument
+	}
+	return nil
+}
+
+func validateConversationBatchHashSlot(hashSlot uint16, uid string, hashSlotCount uint16) error {
+	if hashSlotCount == 0 {
+		return fmt.Errorf("%w: hash slot count must not be zero", metadb.ErrInvalidArgument)
+	}
+	if hashSlot >= hashSlotCount {
+		return fmt.Errorf("%w: conversation hash slot %d out of range %d", metadb.ErrInvalidArgument, hashSlot, hashSlotCount)
+	}
+	want := hashslot.HashSlotForKey(uid, hashSlotCount)
+	if hashSlot != want {
+		return fmt.Errorf("%w: conversation hash slot %d does not match uid %q hash slot %d", metadb.ErrInvalidArgument, hashSlot, uid, want)
+	}
+	return nil
+}
+
+func validateConversationDelete(req metadb.ConversationDelete) error {
+	if err := validateConversationKind(req.Kind); err != nil {
+		return err
+	}
+	if req.UID == "" || req.ChannelID == "" || req.ChannelType == 0 {
+		return metadb.ErrInvalidArgument
+	}
+	return nil
+}
+
+func validateConversationKind(kind metadb.ConversationKind) error {
+	switch kind {
+	case metadb.ConversationKindNormal, metadb.ConversationKindCMD:
+		return nil
+	default:
+		return metadb.ErrInvalidArgument
+	}
+}
+
+func validateConversationState(state metadb.ConversationState) error {
+	if err := validateConversationKind(state.Kind); err != nil {
+		return err
+	}
+	if state.UID == "" || state.ChannelID == "" || state.ChannelType == 0 {
+		return metadb.ErrInvalidArgument
+	}
+	return nil
 }

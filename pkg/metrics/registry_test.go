@@ -1,6 +1,9 @@
 package metrics
 
 import (
+	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -8,6 +11,44 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
+
+func TestFreshRegistryScrapeExposesLifecycleZeroCounters(t *testing.T) {
+	reg := New(8, "node-8")
+	recorder := httptest.NewRecorder()
+	reg.Handler().ServeHTTP(recorder, httptest.NewRequest("GET", "/metrics", nil))
+	require.Equal(t, 200, recorder.Code)
+
+	scrape := recorder.Body.String()
+	require.Contains(t, scrape, `wukongim_channelv2_activation_rejected_total{node_id="8",node_name="node-8",reason="max_channels"} 0`)
+	require.Equal(t, 1, strings.Count(scrape, "wukongim_channelv2_activation_rejected_total{"))
+	for _, role := range []string{"leader", "follower"} {
+		require.Contains(t, scrape, `wukongim_channelv2_runtime_load_total{node_id="8",node_name="node-8",role="`+role+`"} 0`)
+		for _, reason := range []string{"idle", "bench"} {
+			require.Contains(t, scrape, `wukongim_channelv2_runtime_eviction_total{node_id="8",node_name="node-8",reason="`+reason+`",role="`+role+`"} 0`)
+		}
+	}
+	require.Equal(t, 2, strings.Count(scrape, "wukongim_channelv2_runtime_load_total{"))
+	require.Equal(t, 4, strings.Count(scrape, "wukongim_channelv2_runtime_eviction_total{"))
+	for _, result := range []string{"created", "already_existing", "error"} {
+		require.Contains(t, scrape, `wukongim_channelv2_meta_created_total{result="`+result+`",slot_id="1"} 0`)
+	}
+	require.Equal(t, 3, strings.Count(scrape, "wukongim_channelv2_meta_created_total{"))
+}
+
+func TestConfiguredRegistryScrapeExposesEveryLogicalSlotZeroCounter(t *testing.T) {
+	reg := NewWithLogicalSlots(8, "node-8", 12)
+	recorder := httptest.NewRecorder()
+	reg.Handler().ServeHTTP(recorder, httptest.NewRequest("GET", "/metrics", nil))
+	require.Equal(t, 200, recorder.Code)
+
+	scrape := recorder.Body.String()
+	for slotID := 1; slotID <= 12; slotID++ {
+		for _, result := range []string{"created", "already_existing", "error"} {
+			require.Contains(t, scrape, `wukongim_channelv2_meta_created_total{result="`+result+`",slot_id="`+strconv.Itoa(slotID)+`"} 0`)
+		}
+	}
+	require.Equal(t, 36, strings.Count(scrape, "wukongim_channelv2_meta_created_total{"))
+}
 
 func TestGatewayMetricsTrackConnectionAndTraffic(t *testing.T) {
 	reg := New(1, "node-1")
@@ -20,6 +61,7 @@ func TestGatewayMetricsTrackConnectionAndTraffic(t *testing.T) {
 	reg.Gateway.MessageReceived("tcp", 12)
 	reg.Gateway.MessageDelivered("tcp", 18)
 	reg.Gateway.FrameHandled("SEND", 5*time.Millisecond)
+	reg.Gateway.TransportWrite("SENDACK", 225*time.Millisecond, nil)
 	reg.Gateway.SetAsyncSendQueue(3, 1024)
 	reg.Gateway.ObserveAsyncSendDispatchWait("wkproto", 2*time.Millisecond)
 	reg.Gateway.ObserveAsyncSendBatch(8, 256, 500*time.Microsecond)
@@ -139,6 +181,11 @@ func TestGatewayMetricsTrackConnectionAndTraffic(t *testing.T) {
 	requireMetricFamily(t, families, "wukongim_gateway_async_send_batch_records")
 	requireMetricFamily(t, families, "wukongim_gateway_async_send_batch_bytes")
 	requireMetricFamily(t, families, "wukongim_gateway_async_send_batch_wait_duration_seconds")
+	transportWrite := requireMetricFamily(t, families, "wukongim_gateway_transport_write_duration_seconds")
+	require.Equal(t, uint64(1), findMetricByLabels(t, transportWrite, map[string]string{
+		"frame_type": "SENDACK",
+		"result":     "ok",
+	}).GetHistogram().GetSampleCount())
 
 	sendacks := requireMetricFamily(t, families, "wukongim_gateway_sendacks_total")
 	require.Equal(t, float64(1), findMetricByLabels(t, sendacks, map[string]string{
@@ -563,6 +610,7 @@ func TestChannelRuntimeMetricsTrackReactorAndWorkerRuntime(t *testing.T) {
 
 	reg.ChannelRuntime.SetReactorMailboxDepth(2, "normal", 9)
 	reg.ChannelRuntime.SetWorkerQueueDepth("store_append", 4)
+	reg.ChannelRuntime.SetWorkerQueueCapacity("store_append", 64)
 	reg.ChannelRuntime.SetWorkerInflight("store_append", 3)
 	reg.ChannelRuntime.SetWorkerInflightPeak("store_append", 7)
 	reg.ChannelRuntime.ObserveAppendBatch(16, 1024, 3*time.Millisecond)
@@ -573,8 +621,11 @@ func TestChannelRuntimeMetricsTrackReactorAndWorkerRuntime(t *testing.T) {
 	reg.ChannelRuntime.ObserveWorkerResult("store_append", "ok", 11*time.Millisecond)
 	reg.ChannelRuntime.ObserveWorkerResult("rpc_pull", "ok", 13*time.Millisecond)
 	reg.ChannelRuntime.ObserveWorkerResult("rpc_pull", "err", 17*time.Millisecond, "timeout")
+	reg.ChannelRuntime.ObserveWorkerAdmission("channelv2-rpc", "rpc_pull_hint", "full")
 	reg.ChannelRuntime.ObserveWorkerBatch("rpc_pull", "ok", 3)
 	reg.ChannelRuntime.SetChannelRuntimeCount(2, "leader", 17)
+	reg.ChannelRuntime.ObserveRuntimeLoad("leader")
+	reg.ChannelRuntime.ObserveRuntimeEviction("leader", "idle")
 	reg.ChannelRuntime.ObserveChannelActivationRejected("max_channels")
 	reg.ChannelRuntime.SetFollowerParkedCount(2, 11)
 	reg.ChannelRuntime.ObserveFollowerRecoveryProbe("ok")
@@ -631,6 +682,10 @@ func TestChannelRuntimeMetricsTrackReactorAndWorkerRuntime(t *testing.T) {
 		"pool":      "store_append",
 	})
 	require.Equal(t, float64(4), workerQueue.GetMetric()[0].GetGauge().GetValue())
+
+	workerQueueCapacity := requireMetricFamily(t, families, "wukongim_channelv2_worker_queue_capacity")
+	require.Len(t, workerQueueCapacity.GetMetric(), 1)
+	require.Equal(t, float64(64), workerQueueCapacity.GetMetric()[0].GetGauge().GetValue())
 
 	workerInflight := requireMetricFamily(t, families, "wukongim_channelv2_worker_inflight")
 	require.Len(t, workerInflight.GetMetric(), 1)
@@ -721,6 +776,17 @@ func TestChannelRuntimeMetricsTrackReactorAndWorkerRuntime(t *testing.T) {
 	})
 	require.Equal(t, float64(1), workerErrors.GetMetric()[0].GetCounter().GetValue())
 
+	workerAdmission := requireMetricFamily(t, families, "wukongim_channelv2_worker_admission_total")
+	require.Len(t, workerAdmission.GetMetric(), 1)
+	workerAdmissionFull := findMetricByLabels(t, workerAdmission, map[string]string{
+		"node_id":   "8",
+		"node_name": "node-8",
+		"pool":      "channelv2-rpc",
+		"kind":      "rpc_pull_hint",
+		"result":    "full",
+	})
+	require.Equal(t, float64(1), workerAdmissionFull.GetCounter().GetValue())
+
 	workerBatch := requireMetricFamily(t, families, "wukongim_channelv2_worker_batch_items")
 	require.Len(t, workerBatch.GetMetric(), 1)
 	workerBatchPull := findMetricByLabels(t, workerBatch, map[string]string{
@@ -807,6 +873,16 @@ func TestChannelRuntimeMetricsTrackReactorAndWorkerRuntime(t *testing.T) {
 		"role":       "leader",
 	})
 	require.Equal(t, float64(17), activeRuntimes.GetMetric()[0].GetGauge().GetValue())
+
+	runtimeLoads := requireMetricFamily(t, families, "wukongim_channelv2_runtime_load_total")
+	require.Equal(t, float64(1), findMetricByLabels(t, runtimeLoads, map[string]string{
+		"node_id": "8", "node_name": "node-8", "role": "leader",
+	}).GetCounter().GetValue())
+
+	runtimeEvictions := requireMetricFamily(t, families, "wukongim_channelv2_runtime_eviction_total")
+	require.Equal(t, float64(1), findMetricByLabels(t, runtimeEvictions, map[string]string{
+		"node_id": "8", "node_name": "node-8", "role": "leader", "reason": "idle",
+	}).GetCounter().GetValue())
 
 	activationRejected := requireMetricFamily(t, families, "wukongim_channelv2_activation_rejected_total")
 	require.Len(t, activationRejected.GetMetric(), 1)
@@ -911,6 +987,35 @@ func TestChannelRuntimeMetricsTrackReactorAndWorkerRuntime(t *testing.T) {
 		"node_name": "node-8",
 		"reason":    "channel-123/raw timeout",
 	}))
+}
+
+func TestChannelRuntimeMetaCreateMetricUsesOnlyBoundedLabels(t *testing.T) {
+	reg := New(8, "node-8")
+	for _, result := range []string{"created", "already_existing", "error"} {
+		reg.ChannelRuntime.ObserveMetaCreate(3, result)
+	}
+	reg.ChannelRuntime.ObserveMetaCreate(3, "channel-123/unbounded")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	created := requireMetricFamily(t, families, "wukongim_channelv2_meta_created_total")
+	require.Len(t, created.GetMetric(), 6)
+	for _, result := range []string{"created", "already_existing", "error"} {
+		baseline := findMetricByLabels(t, created, map[string]string{"slot_id": "1", "result": result})
+		require.Len(t, baseline.GetLabel(), 2, "zero baseline must not expose node, channel, UID, or run labels")
+		require.Equal(t, float64(0), baseline.GetCounter().GetValue())
+
+		metric := findMetricByLabels(t, created, map[string]string{"slot_id": "3", "result": result})
+		require.Len(t, metric.GetLabel(), 2, "meta create metric must not expose node, channel, UID, or run labels")
+		want := float64(1)
+		if result == "error" {
+			want = 2
+		}
+		require.Equal(t, want, metric.GetCounter().GetValue())
+	}
+
+	promoted := requireMetricFamily(t, families, "wukongim_channel_meta_created_total")
+	require.Len(t, promoted.GetMetric(), 6)
 }
 
 func TestSlotAndTransportMetricsTrackProposalsLeaderChangesAndRPCs(t *testing.T) {
@@ -1397,25 +1502,60 @@ func TestStorageMetricsTrackPebbleEngineSnapshot(t *testing.T) {
 	reg := New(15, "node-15")
 
 	reg.Storage.SetPebbleMetrics("channel_log", StoragePebbleObservation{
-		DiskSpaceUsageBytes:          1024,
-		ReadAmplification:            3,
-		MemTableSizeBytes:            2048,
-		MemTableCount:                2,
-		WALFiles:                     1,
-		WALSizeBytes:                 512,
-		WALPhysicalSizeBytes:         768,
-		WALBytesIn:                   300,
-		WALBytesWritten:              400,
-		FlushCount:                   5,
-		FlushesInProgress:            1,
-		CompactionCount:              7,
-		CompactionEstimatedDebtBytes: 4096,
-		CompactionInProgressBytes:    128,
-		CompactionsInProgress:        2,
+		SequencedExactFreshAppends:     2345,
+		DurablePredecessorCacheHits:    2200,
+		DurablePredecessorValidations:  18,
+		DiskSpaceUsageBytes:            1024,
+		ReadAmplification:              3,
+		MemTableSizeBytes:              2048,
+		MemTableCount:                  2,
+		WALFiles:                       1,
+		WALSizeBytes:                   512,
+		WALPhysicalSizeBytes:           768,
+		WALBytesIn:                     300,
+		WALBytesWritten:                400,
+		SSTableSizeBytes:               500,
+		FlushBytesWritten:              600,
+		CompactionBytesRead:            700,
+		CompactionBytesWritten:         800,
+		FlushCount:                     5,
+		FlushesInProgress:              1,
+		CompactionCount:                7,
+		CompactionEstimatedDebtBytes:   4096,
+		CompactionInProgressBytes:      128,
+		CompactionsInProgress:          2,
+		IdempotencyNegativeFilterSkips: 1234,
+		IdempotencyPointReads:          56,
+		WALFsyncCount:                  90,
+		WALFsyncSumNanos:               3_500_000_000,
+		WALFsyncOver100ms:              9,
+		WALFsyncOver1s:                 4,
+		WALFsyncOver5s:                 1,
+		DiskSlowWALEvents:              3,
+		DiskSlowWALMaxNanos:            4_500_000_000,
+		DiskSlowOtherEvents:            2,
+		DiskSlowOtherMaxNanos:          1_250_000_000,
 	})
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
+
+	store := map[string]string{"store": "channel_log"}
+	fsyncCount := requireMetricFamily(t, families, "wukongim_storage_pebble_wal_fsync_count")
+	require.Equal(t, float64(90), findMetricByLabels(t, fsyncCount, store).GetGauge().GetValue())
+	fsyncSeconds := requireMetricFamily(t, families, "wukongim_storage_pebble_wal_fsync_seconds")
+	require.Equal(t, 3.5, findMetricByLabels(t, fsyncSeconds, store).GetGauge().GetValue())
+	fsyncSlow := requireMetricFamily(t, families, "wukongim_storage_pebble_wal_fsync_slow")
+	for threshold, want := range map[string]float64{"100ms": 9, "1s": 4, "5s": 1} {
+		got := findMetricByLabels(t, fsyncSlow, map[string]string{"store": "channel_log", "threshold": threshold}).GetGauge().GetValue()
+		require.Equal(t, want, got, threshold)
+	}
+	diskSlow := requireMetricFamily(t, families, "wukongim_storage_pebble_disk_slow_events")
+	require.Equal(t, float64(3), findMetricByLabels(t, diskSlow, map[string]string{"store": "channel_log", "file": "wal"}).GetGauge().GetValue())
+	require.Equal(t, float64(2), findMetricByLabels(t, diskSlow, map[string]string{"store": "channel_log", "file": "other"}).GetGauge().GetValue())
+	diskSlowMax := requireMetricFamily(t, families, "wukongim_storage_pebble_disk_slow_max_seconds")
+	require.Equal(t, 4.5, findMetricByLabels(t, diskSlowMax, map[string]string{"store": "channel_log", "file": "wal"}).GetGauge().GetValue())
+	require.Equal(t, 1.25, findMetricByLabels(t, diskSlowMax, map[string]string{"store": "channel_log", "file": "other"}).GetGauge().GetValue())
 
 	usage := requireMetricFamily(t, families, "wukongim_storage_pebble_disk_usage_bytes")
 	require.Equal(t, float64(1024), findMetricByLabels(t, usage, map[string]string{"store": "channel_log"}).GetGauge().GetValue())
@@ -1435,6 +1575,14 @@ func TestStorageMetricsTrackPebbleEngineSnapshot(t *testing.T) {
 	require.Equal(t, float64(300), findMetricByLabels(t, walBytesIn, map[string]string{"store": "channel_log"}).GetGauge().GetValue())
 	walBytesWritten := requireMetricFamily(t, families, "wukongim_storage_pebble_wal_bytes_written")
 	require.Equal(t, float64(400), findMetricByLabels(t, walBytesWritten, map[string]string{"store": "channel_log"}).GetGauge().GetValue())
+	sstableSize := requireMetricFamily(t, families, "wukongim_storage_pebble_sstable_size_bytes")
+	require.Equal(t, float64(500), findMetricByLabels(t, sstableSize, map[string]string{"store": "channel_log"}).GetGauge().GetValue())
+	flushBytes := requireMetricFamily(t, families, "wukongim_storage_pebble_flush_bytes_written")
+	require.Equal(t, float64(600), findMetricByLabels(t, flushBytes, map[string]string{"store": "channel_log"}).GetGauge().GetValue())
+	compactionBytesRead := requireMetricFamily(t, families, "wukongim_storage_pebble_compaction_bytes_read")
+	require.Equal(t, float64(700), findMetricByLabels(t, compactionBytesRead, map[string]string{"store": "channel_log"}).GetGauge().GetValue())
+	compactionBytesWritten := requireMetricFamily(t, families, "wukongim_storage_pebble_compaction_bytes_written")
+	require.Equal(t, float64(800), findMetricByLabels(t, compactionBytesWritten, map[string]string{"store": "channel_log"}).GetGauge().GetValue())
 	flushCount := requireMetricFamily(t, families, "wukongim_storage_pebble_flush_count")
 	require.Equal(t, float64(5), findMetricByLabels(t, flushCount, map[string]string{"store": "channel_log"}).GetGauge().GetValue())
 	flushesInProgress := requireMetricFamily(t, families, "wukongim_storage_pebble_flushes_in_progress")
@@ -1447,6 +1595,16 @@ func TestStorageMetricsTrackPebbleEngineSnapshot(t *testing.T) {
 	require.Equal(t, float64(128), findMetricByLabels(t, compactionBytes, map[string]string{"store": "channel_log"}).GetGauge().GetValue())
 	compactionsInProgress := requireMetricFamily(t, families, "wukongim_storage_pebble_compactions_in_progress")
 	require.Equal(t, float64(2), findMetricByLabels(t, compactionsInProgress, map[string]string{"store": "channel_log"}).GetGauge().GetValue())
+	exactFresh := requireMetricFamily(t, families, "wukongim_storage_message_exact_fresh_appends")
+	require.Equal(t, float64(2345), findMetricByLabels(t, exactFresh, map[string]string{"store": "channel_log"}).GetGauge().GetValue())
+	predecessorHits := requireMetricFamily(t, families, "wukongim_storage_message_predecessor_cache_hits")
+	require.Equal(t, float64(2200), findMetricByLabels(t, predecessorHits, map[string]string{"store": "channel_log"}).GetGauge().GetValue())
+	predecessorValidations := requireMetricFamily(t, families, "wukongim_storage_message_predecessor_durable_validations")
+	require.Equal(t, float64(18), findMetricByLabels(t, predecessorValidations, map[string]string{"store": "channel_log"}).GetGauge().GetValue())
+	idempotencySkips := requireMetricFamily(t, families, "wukongim_storage_message_idempotency_negative_filter_skips")
+	require.Equal(t, float64(1234), findMetricByLabels(t, idempotencySkips, map[string]string{"store": "channel_log"}).GetGauge().GetValue())
+	idempotencyReads := requireMetricFamily(t, families, "wukongim_storage_message_idempotency_point_reads")
+	require.Equal(t, float64(56), findMetricByLabels(t, idempotencyReads, map[string]string{"store": "channel_log"}).GetGauge().GetValue())
 }
 
 func TestStorageMetricsTrackChannelEntrySnapshot(t *testing.T) {
@@ -1560,6 +1718,7 @@ func TestRegistryExposesMessageMetrics(t *testing.T) {
 	reg.Message.ObserveMetaRefresh("cache_hit", 3*time.Millisecond)
 	reg.Message.ObserveAppend("local", "ok", 5*time.Millisecond)
 	reg.Message.ObserveAppendError("channelplane", "timeout")
+	reg.Message.ObserveSendBatchStage("permission", "ok", 2, 5*time.Millisecond)
 	reg.Message.ObserveEventAppend("cache", "stream.delta", "ok", 2*time.Millisecond)
 	reg.Message.ObserveEventAppendStage("finish_batch", "ok", "finish_batch_build", 4*time.Millisecond)
 	reg.Message.ObserveEventPropose("finish_batch", "ok", 3, 8*time.Millisecond)
@@ -1585,6 +1744,12 @@ func TestRegistryExposesMessageMetrics(t *testing.T) {
 	requireMetricFamily(t, families, "wukongim_message_append_total")
 	requireMetricFamily(t, families, "wukongim_message_append_duration_seconds")
 	requireMetricFamily(t, families, "wukongim_message_append_errors_total")
+	sendBatchStage := requireMetricFamily(t, families, "wukongim_message_send_batch_stage_item_duration_seconds")
+	sendBatchStageMetric := findMetricByLabels(t, sendBatchStage, map[string]string{
+		"node_id": "1", "node_name": "n1", "stage": "permission", "result": "ok",
+	}).GetHistogram()
+	require.Equal(t, uint64(2), sendBatchStageMetric.GetSampleCount())
+	require.Equal(t, 0.010, sendBatchStageMetric.GetSampleSum())
 	eventAppend := requireMetricFamily(t, families, "wukongim_message_event_append_total")
 	require.Equal(t, float64(1), findMetricByLabels(t, eventAppend, map[string]string{
 		"node_id":    "1",
@@ -1680,10 +1845,53 @@ func TestRegistryExposesIdleChannelAppendWriterState(t *testing.T) {
 	}).GetHistogram().GetSampleSum())
 }
 
+func TestRegistryExposesClosedTerminalResultPartitions(t *testing.T) {
+	reg := New(12, "node-12")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	delivery := requireMetricFamily(t, families, "wukongim_delivery_recipient_worker_process_total")
+	for _, result := range []string{"ok", "panic", "timeout", "canceled", "error", "retry_exhausted", "unknown"} {
+		require.Equal(t, float64(0), findMetricByLabels(t, delivery, map[string]string{
+			"node_id": "12", "node_name": "node-12", "result": result,
+		}).GetCounter().GetValue())
+	}
+	postCommit := requireMetricFamily(t, families, "wukongim_channelappend_effect_total")
+	for _, result := range []string{
+		"ok", "mixed", "canceled", "timeout", "backpressured", "channel_busy", "route_not_ready",
+		"stale_route", "stale_completion", "not_authority", "not_leader", "channel_not_found",
+		"append_result_missing", "append_failed", "commit_failed", "invalid_subscribers", "invalid_cursor",
+		"unsupported", "auth_fail", "invalid_request", "system_error", "other",
+	} {
+		require.Equal(t, float64(0), findMetricByLabels(t, postCommit, map[string]string{
+			"node_id": "12", "node_name": "node-12", "stage": "post_commit", "result": result,
+		}).GetCounter().GetValue())
+	}
+}
+
+func TestRegistryNormalizesTerminalResultPartitions(t *testing.T) {
+	reg := New(12, "node-12")
+	reg.Delivery.ObserveRecipientWorkerProcess("unbounded-result", 1, time.Millisecond)
+	reg.ChannelAppend.ObserveEffect("post_commit", "unbounded-result", 1, time.Millisecond)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	delivery := requireMetricFamily(t, families, "wukongim_delivery_recipient_worker_process_total")
+	require.Equal(t, float64(1), findMetricByLabels(t, delivery, map[string]string{
+		"node_id": "12", "node_name": "node-12", "result": "unknown",
+	}).GetCounter().GetValue())
+	postCommit := requireMetricFamily(t, families, "wukongim_channelappend_effect_total")
+	require.Equal(t, float64(1), findMetricByLabels(t, postCommit, map[string]string{
+		"node_id": "12", "node_name": "node-12", "stage": "post_commit", "result": "other",
+	}).GetCounter().GetValue())
+}
+
 func TestRegistryExposesChannelAppendMetrics(t *testing.T) {
 	reg := New(12, "node-12")
 	reg.ChannelAppend.ObserveRouter("local", "ok", 8, 3*time.Millisecond)
 	reg.ChannelAppend.ObserveRouter("remote", "backpressured", 4, 5*time.Millisecond)
+	reg.ChannelAppend.ObserveRouter("batch", "ok", 8, 7*time.Millisecond)
+	reg.ChannelAppend.SetRouterGroupPressure(17, 192)
 	reg.ChannelAppend.ObserveLocalAdmission("accepted", 8)
 	reg.ChannelAppend.ObserveLocalAdmission("backpressured", 4)
 	reg.ChannelAppend.SetWriterPressure(3, 1024, 9, 1024, 7, 2, 5, 11, 64, 3, true)
@@ -1691,6 +1899,7 @@ func TestRegistryExposesChannelAppendMetrics(t *testing.T) {
 	reg.ChannelAppend.ObserveEffectPool("append", "full", 16, 16, true)
 	reg.ChannelAppend.ObserveEffect("append", "ok", 8, 4*time.Millisecond)
 	reg.ChannelAppend.ObserveEffect("post_commit", "route_not_ready", 1, 6*time.Millisecond)
+	reg.ChannelAppend.ObserveIdempotencyRecovery(5, 2, 1)
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -1702,6 +1911,20 @@ func TestRegistryExposesChannelAppendMetrics(t *testing.T) {
 		"path":      "remote",
 		"result":    "backpressured",
 	}).GetCounter().GetValue())
+	routerItemDuration := requireMetricFamily(t, families, "wukongim_channelappend_router_item_duration_seconds")
+	routerBatchItems := findMetricByLabels(t, routerItemDuration, map[string]string{
+		"node_id": "12", "node_name": "node-12", "path": "batch", "result": "ok",
+	}).GetHistogram()
+	require.Equal(t, uint64(8), routerBatchItems.GetSampleCount())
+	require.Equal(t, 0.056, routerBatchItems.GetSampleSum())
+	routerGroupInflight := requireMetricFamily(t, families, "wukongim_channelappend_router_group_inflight")
+	require.Equal(t, float64(17), findMetricByLabels(t, routerGroupInflight, map[string]string{
+		"node_id": "12", "node_name": "node-12",
+	}).GetGauge().GetValue())
+	routerGroupCapacity := requireMetricFamily(t, families, "wukongim_channelappend_router_group_capacity")
+	require.Equal(t, float64(192), findMetricByLabels(t, routerGroupCapacity, map[string]string{
+		"node_id": "12", "node_name": "node-12",
+	}).GetGauge().GetValue())
 
 	admission := requireMetricFamily(t, families, "wukongim_channelappend_local_admission_total")
 	require.Equal(t, float64(1), findMetricByLabels(t, admission, map[string]string{
@@ -1775,7 +1998,18 @@ func TestRegistryExposesChannelAppendMetrics(t *testing.T) {
 		"stage":     "append",
 	}).GetGauge().GetValue())
 
-	for _, family := range []*dto.MetricFamily{router, admission, state, handoffDepth, handoffCapacity, retryQueue, retryContended, effect, poolSubmit, poolInflight, poolCapacity, poolSaturated} {
+	idempotencyRecovery := requireMetricFamily(t, families, "wukongim_channelappend_idempotency_recovery_items_total")
+	require.Equal(t, float64(5), findMetricByLabels(t, idempotencyRecovery, map[string]string{
+		"node_id": "12", "node_name": "node-12", "result": "recovered",
+	}).GetCounter().GetValue())
+	require.Equal(t, float64(2), findMetricByLabels(t, idempotencyRecovery, map[string]string{
+		"node_id": "12", "node_name": "node-12", "result": "unresolved",
+	}).GetCounter().GetValue())
+	require.Equal(t, float64(1), findMetricByLabels(t, idempotencyRecovery, map[string]string{
+		"node_id": "12", "node_name": "node-12", "result": "lookup_error",
+	}).GetCounter().GetValue())
+
+	for _, family := range []*dto.MetricFamily{router, admission, state, handoffDepth, handoffCapacity, retryQueue, retryContended, effect, poolSubmit, poolInflight, poolCapacity, poolSaturated, idempotencyRecovery} {
 		for _, metric := range family.GetMetric() {
 			requireNoMetricLabel(t, metric, "uid")
 			requireNoMetricLabel(t, metric, "channel_id")
@@ -2152,487 +2386,72 @@ func TestAntsPoolMetricsNilSafe(t *testing.T) {
 	m.SetUsage("channelappend", "effect", 1, 2, 3)
 }
 
-func TestConversationMetricsTrackListShapeAndLatency(t *testing.T) {
+func TestConversationMetricsTrackMembershipDirectoryAndHydration(t *testing.T) {
 	reg := New(11, "node-11")
 
-	reg.Conversation.ObserveList("ok", true, 12*time.Millisecond, 2, 1, 2, 0, 0)
+	reg.Conversation.ObserveDirectoryList("ok", false, 12*time.Millisecond, 8, 3, 2, 1)
+	reg.Conversation.ObserveHydrationBatch("ok", 7*time.Millisecond, 6, 2, 6)
+	reg.Conversation.ObserveMembershipMutation("ordinary", "upsert", 4)
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
 
-	total := requireMetricFamily(t, families, "wukongim_conversation_list_total")
+	total := requireMetricFamily(t, families, "wukongim_conversation_directory_list_total")
 	require.Equal(t, float64(1), findMetricByLabels(t, total, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-		"more":      "true",
+		"node_id": "11", "node_name": "node-11", "result": "ok", "done": "false",
 	}).GetCounter().GetValue())
-
-	duration := requireMetricFamily(t, families, "wukongim_conversation_list_duration_seconds")
-	require.Equal(t, uint64(1), findMetricByLabels(t, duration, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-		"more":      "true",
-	}).GetHistogram().GetSampleCount())
-
-	returned := requireMetricFamily(t, families, "wukongim_conversation_list_returned_items")
-	require.Equal(t, float64(2), findMetricByLabels(t, returned, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-		"more":      "true",
+	scanned := requireMetricFamily(t, families, "wukongim_conversation_directory_scanned_candidates")
+	require.Equal(t, float64(8), findMetricByLabels(t, scanned, map[string]string{
+		"node_id": "11", "node_name": "node-11", "result": "ok", "done": "false",
 	}).GetHistogram().GetSampleSum())
-
-	sparseItems := requireMetricFamily(t, families, "wukongim_conversation_list_sparse_items")
-	require.Equal(t, float64(1), findMetricByLabels(t, sparseItems, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-		"more":      "true",
-	}).GetHistogram().GetSampleSum())
-
-	lastMessageLoads := requireMetricFamily(t, families, "wukongim_conversation_list_last_message_loads")
-	require.Equal(t, float64(2), findMetricByLabels(t, lastMessageLoads, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-		"more":      "true",
-	}).GetHistogram().GetSampleSum())
-
-	lastMessageErrors := requireMetricFamily(t, families, "wukongim_conversation_list_last_message_errors")
-	require.Equal(t, float64(0), findMetricByLabels(t, lastMessageErrors, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-		"more":      "true",
-	}).GetHistogram().GetSampleSum())
-
-	activeIndexStaleSkips := requireMetricFamily(t, families, "wukongim_conversation_list_active_index_stale_skips")
-	require.Equal(t, float64(0), findMetricByLabels(t, activeIndexStaleSkips, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-		"more":      "true",
-	}).GetHistogram().GetSampleSum())
-
-	requireNoMetricFamily(t, families, "wukongim_conversation_list_scanned_memberships")
-	requireNoMetricFamily(t, families, "wukongim_conversation_list_last_message_hits")
-}
-
-func TestConversationMetricsTrackSyncShapeAndLatency(t *testing.T) {
-	reg := New(11, "node-11")
-
-	reg.Conversation.ObserveSync("ok", true, true, 25*time.Millisecond, 3, 2, 4*time.Millisecond)
-	reg.Conversation.ObserveSync("unexpected-database-label", false, false, -time.Second, -1, -2, 0)
-
-	families, err := reg.Gather()
-	require.NoError(t, err)
-
-	total := requireMetricFamily(t, families, "wukongim_conversation_sync_total")
-	require.Equal(t, float64(1), findMetricByLabels(t, total, map[string]string{
-		"node_id":      "11",
-		"node_name":    "node-11",
-		"result":       "ok",
-		"only_unread":  "true",
-		"with_recents": "true",
-	}).GetCounter().GetValue())
-	require.Equal(t, float64(1), findMetricByLabels(t, total, map[string]string{
-		"node_id":      "11",
-		"node_name":    "node-11",
-		"result":       "error",
-		"only_unread":  "false",
-		"with_recents": "false",
-	}).GetCounter().GetValue())
-
-	duration := requireMetricFamily(t, families, "wukongim_conversation_sync_duration_seconds")
-	require.Equal(t, uint64(1), findMetricByLabels(t, duration, map[string]string{
-		"node_id":      "11",
-		"node_name":    "node-11",
-		"result":       "ok",
-		"only_unread":  "true",
-		"with_recents": "true",
-	}).GetHistogram().GetSampleCount())
-	require.Equal(t, float64(0), findMetricByLabels(t, duration, map[string]string{
-		"node_id":      "11",
-		"node_name":    "node-11",
-		"result":       "error",
-		"only_unread":  "false",
-		"with_recents": "false",
-	}).GetHistogram().GetSampleSum())
-
-	returned := requireMetricFamily(t, families, "wukongim_conversation_sync_returned_items")
+	returned := requireMetricFamily(t, families, "wukongim_conversation_directory_returned_items")
 	require.Equal(t, float64(3), findMetricByLabels(t, returned, map[string]string{
-		"node_id":      "11",
-		"node_name":    "node-11",
-		"result":       "ok",
-		"only_unread":  "true",
-		"with_recents": "true",
+		"node_id": "11", "node_name": "node-11", "result": "ok", "done": "false",
 	}).GetHistogram().GetSampleSum())
-
-	overlay := requireMetricFamily(t, families, "wukongim_conversation_sync_overlay_items")
-	require.Equal(t, float64(2), findMetricByLabels(t, overlay, map[string]string{
-		"node_id":      "11",
-		"node_name":    "node-11",
-		"result":       "ok",
-		"only_unread":  "true",
-		"with_recents": "true",
+	unresolved := requireMetricFamily(t, families, "wukongim_conversation_directory_unresolved")
+	require.Equal(t, float64(1), findMetricByLabels(t, unresolved, map[string]string{
+		"node_id": "11", "node_name": "node-11", "result": "ok", "done": "false",
 	}).GetHistogram().GetSampleSum())
-
-	recentLoad := requireMetricFamily(t, families, "wukongim_conversation_sync_recent_load_duration_seconds")
-	require.Equal(t, uint64(1), findMetricByLabels(t, recentLoad, map[string]string{
-		"node_id":     "11",
-		"node_name":   "node-11",
-		"result":      "ok",
-		"only_unread": "true",
-	}).GetHistogram().GetSampleCount())
-
-	for _, family := range []*dto.MetricFamily{total, duration, returned, overlay, recentLoad} {
-		for _, metric := range family.GetMetric() {
-			requireNoMetricLabel(t, metric, "uid")
-			requireNoMetricLabel(t, metric, "channel_id")
-			requireNoMetricLabel(t, metric, "channelID")
-			requireNoMetricLabel(t, metric, "device_id")
-			requireNoMetricLabel(t, metric, "client_msg_no")
-		}
-	}
-}
-
-func TestConversationMetricsTrackAuthorityCountersAndLowCardinalityLabels(t *testing.T) {
-	reg := New(11, "node-11")
-
-	reg.Conversation.ObserveAuthorityAdmit("timeout")
-	reg.Conversation.ObserveAuthorityCachePressure("admit", "cache_pressure")
-	reg.Conversation.ObserveAuthorityList("route_not_ready")
-	reg.Conversation.ObserveAuthorityHandoff("drained")
-
-	families, err := reg.Gather()
-	require.NoError(t, err)
-
-	admit := requireMetricFamily(t, families, "wukongim_conversation_authority_admit_total")
-	require.Equal(t, float64(1), findMetricByLabels(t, admit, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "timeout",
+	remoteCalls := requireMetricFamily(t, families, "wukongim_conversation_hydration_remote_batch_calls")
+	require.Equal(t, float64(2), findMetricByLabels(t, remoteCalls, map[string]string{
+		"node_id": "11", "node_name": "node-11", "result": "ok",
+	}).GetHistogram().GetSampleSum())
+	localReads := requireMetricFamily(t, families, "wukongim_conversation_hydration_local_reads")
+	require.Equal(t, float64(6), findMetricByLabels(t, localReads, map[string]string{
+		"node_id": "11", "node_name": "node-11", "result": "ok",
+	}).GetHistogram().GetSampleSum())
+	mutationRows := requireMetricFamily(t, families, "wukongim_conversation_membership_mutation_rows_total")
+	require.Equal(t, float64(4), findMetricByLabels(t, mutationRows, map[string]string{
+		"node_id": "11", "node_name": "node-11", "directory": "ordinary", "operation": "upsert",
 	}).GetCounter().GetValue())
 
-	pressure := requireMetricFamily(t, families, "wukongim_conversation_authority_cache_pressure_total")
-	require.Equal(t, float64(1), findMetricByLabels(t, pressure, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"phase":     "admit",
-		"result":    "cache_pressure",
-	}).GetCounter().GetValue())
-
-	list := requireMetricFamily(t, families, "wukongim_conversation_authority_list_total")
-	require.Equal(t, float64(1), findMetricByLabels(t, list, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "route_not_ready",
-	}).GetCounter().GetValue())
-
-	handoff := requireMetricFamily(t, families, "wukongim_conversation_authority_handoff_total")
-	require.Equal(t, float64(1), findMetricByLabels(t, handoff, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "drained",
-	}).GetCounter().GetValue())
-
-	for _, family := range []*dto.MetricFamily{admit, pressure, list, handoff} {
+	for _, family := range []*dto.MetricFamily{total, scanned, returned, unresolved, remoteCalls, localReads, mutationRows} {
 		for _, metric := range family.GetMetric() {
 			requireNoMetricLabel(t, metric, "uid")
 			requireNoMetricLabel(t, metric, "channel_id")
 			requireNoMetricLabel(t, metric, "channelID")
 		}
 	}
-	requireNoMetricFamily(t, families, "wukongim_conversation_authority_uid")
-	requireNoMetricFamily(t, families, "wukongim_conversation_authority_channel_id")
+	requireNoMetricFamily(t, families, "wukongim_conversation_active_cache_rows")
+	requireNoMetricFamily(t, families, "wukongim_conversation_authority_admit_total")
+	requireNoMetricFamily(t, families, "wukongim_conversation_sync_total")
 }
 
-func TestConversationMetricsPreinitializeActiveConservationBaselines(t *testing.T) {
+func TestConversationMetricsNormalizeInvalidInputs(t *testing.T) {
 	reg := New(11, "node-11")
+	reg.Conversation.ObserveDirectoryList("unexpected", true, -time.Second, -1, -2, -3, -4)
+	reg.Conversation.ObserveHydrationBatch("unexpected", -time.Second, -1, -2, -3)
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
-	flushRows := requireMetricFamily(t, families, "wukongim_conversation_active_flush_rows_total")
-	for _, labels := range []map[string]string{
-		{"result": "ok", "stage": "selected", "reason": "none"},
-		{"result": "ok", "stage": "persisted", "reason": "none"},
-		{"result": "ok", "stage": "skipped", "reason": "active_cooldown"},
-		{"result": "ok", "stage": "skipped", "reason": "delete_barrier"},
-		{"result": "ok", "stage": "cleared", "reason": "none"},
-		{"result": "ok", "stage": "requeued", "reason": "version_conflict"},
-		{"result": "ok", "stage": "superseded", "reason": "stale_snapshot"},
-	} {
-		labels["node_id"] = "11"
-		labels["node_name"] = "node-11"
-		require.Zero(t, findMetricByLabels(t, flushRows, labels).GetCounter().GetValue())
-	}
-	dirtyMutations := requireMetricFamily(t, families, "wukongim_conversation_active_dirty_mutations_total")
-	for _, event := range []string{"became_dirty", "cooldown_suppressed"} {
-		require.Zero(t, findMetricByLabels(t, dirtyMutations, map[string]string{
-			"node_id": "11", "node_name": "node-11", "event": event,
-		}).GetCounter().GetValue())
-	}
-	pressureEvents := requireMetricFamily(t, families, "wukongim_conversation_active_pressure_events_total")
-	require.Zero(t, findMetricByLabels(t, pressureEvents, map[string]string{
-		"node_id": "11", "node_name": "node-11", "event": "signal_received",
-	}).GetCounter().GetValue())
-}
-
-func TestConversationMetricsTrackActiveCacheAndFlush(t *testing.T) {
-	reg := New(11, "node-11")
-
-	reg.Conversation.SetActiveCache(ConversationActiveCacheSample{
-		Revision: 1, Rows: 12, DirtyRows: 5, DirtyQueueRows: 5, DirtyAgeBuckets: 3,
-		OldestDirtyAge: 2 * time.Second, PressureDraining: true,
-		NormalRows: 8, NormalDirtyRows: 2, CMDRows: 4, CMDDirtyRows: 3,
-	})
-	reg.Conversation.ObserveActiveMutation(4, 2, 3, 1)
-	reg.Conversation.ObserveActiveMutationLock("ok", time.Millisecond, 2*time.Millisecond, 3*time.Millisecond)
-	reg.Conversation.ObserveActiveFlush(ConversationActiveFlushSample{
-		Result:                "ok",
-		Selected:              6,
-		Persisted:             3,
-		Skipped:               1,
-		DeleteFenced:          2,
-		Cleared:               2,
-		VersionConflicts:      1,
-		Superseded:            1,
-		Requeued:              1,
-		LaneWaitDuration:      time.Millisecond,
-		SelectDuration:        2 * time.Millisecond,
-		FilterDuration:        3 * time.Millisecond,
-		PersistDuration:       4 * time.Millisecond,
-		ClearDuration:         5 * time.Millisecond,
-		ClearLockWaitDuration: time.Millisecond,
-		ClearApplyDuration:    4 * time.Millisecond,
-		Duration:              7 * time.Millisecond,
-	})
-	reg.Conversation.ObserveActiveFlush(ConversationActiveFlushSample{
-		Result:         "error",
-		FailureStage:   "filter",
-		Selected:       2,
-		Requeued:       2,
-		FilterDuration: time.Millisecond,
-		Duration:       time.Millisecond,
-	})
-	reg.Conversation.ObserveActiveFlush(ConversationActiveFlushSample{
-		Result:          "error",
-		FailureStage:    "persist",
-		Selected:        2,
-		DeleteFenced:    1,
-		Requeued:        1,
-		FilterDuration:  time.Millisecond,
-		PersistDuration: time.Millisecond,
-		Duration:        2 * time.Millisecond,
-	})
-	reg.Conversation.ObserveActivePressure("signal_received", 6*time.Millisecond)
-
-	families, err := reg.Gather()
-	require.NoError(t, err)
-
-	rows := requireMetricFamily(t, families, "wukongim_conversation_active_cache_rows")
-	require.Equal(t, float64(12), findMetricByLabels(t, rows, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-	}).GetGauge().GetValue())
-
-	dirty := requireMetricFamily(t, families, "wukongim_conversation_active_cache_dirty_rows")
-	require.Equal(t, float64(5), findMetricByLabels(t, dirty, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-	}).GetGauge().GetValue())
-	dirtyQueue := requireMetricFamily(t, families, "wukongim_conversation_active_cache_dirty_queue_rows")
-	require.Equal(t, float64(5), findMetricByLabels(t, dirtyQueue, map[string]string{
-		"node_id": "11", "node_name": "node-11",
-	}).GetGauge().GetValue())
-	dirtyAgeBuckets := requireMetricFamily(t, families, "wukongim_conversation_active_cache_dirty_age_buckets")
-	require.Equal(t, float64(3), findMetricByLabels(t, dirtyAgeBuckets, map[string]string{
-		"node_id": "11", "node_name": "node-11",
-	}).GetGauge().GetValue())
-
-	age := requireMetricFamily(t, families, "wukongim_conversation_active_cache_oldest_dirty_age_seconds")
-	require.Equal(t, float64(2), findMetricByLabels(t, age, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-	}).GetGauge().GetValue())
-	pressureDraining := requireMetricFamily(t, families, "wukongim_conversation_active_pressure_draining")
-	require.Equal(t, float64(1), findMetricByLabels(t, pressureDraining, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-	}).GetGauge().GetValue())
-
-	kindRows := requireMetricFamily(t, families, "wukongim_conversation_active_cache_kind_rows")
-	require.Equal(t, float64(8), findMetricByLabels(t, kindRows, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"kind":      "normal",
-	}).GetGauge().GetValue())
-	require.Equal(t, float64(4), findMetricByLabels(t, kindRows, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"kind":      "cmd",
-	}).GetGauge().GetValue())
-
-	kindDirtyRows := requireMetricFamily(t, families, "wukongim_conversation_active_cache_kind_dirty_rows")
-	require.Equal(t, float64(2), findMetricByLabels(t, kindDirtyRows, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"kind":      "normal",
-	}).GetGauge().GetValue())
-	require.Equal(t, float64(3), findMetricByLabels(t, kindDirtyRows, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"kind":      "cmd",
-	}).GetGauge().GetValue())
-
-	total := requireMetricFamily(t, families, "wukongim_conversation_active_flush_total")
-	require.Equal(t, float64(1), findMetricByLabels(t, total, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-	}).GetCounter().GetValue())
-
-	flushRows := requireMetricFamily(t, families, "wukongim_conversation_active_flush_rows")
-	require.Equal(t, float64(6), findMetricByLabels(t, flushRows, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-		"kind":      "selected",
+	duration := requireMetricFamily(t, families, "wukongim_conversation_directory_list_duration_seconds")
+	require.Zero(t, findMetricByLabels(t, duration, map[string]string{
+		"node_id": "11", "node_name": "node-11", "result": "error", "done": "true",
 	}).GetHistogram().GetSampleSum())
-	flushRowsTotal := requireMetricFamily(t, families, "wukongim_conversation_active_flush_rows_total")
-	require.Equal(t, float64(3), findMetricByLabels(t, flushRowsTotal, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-		"stage":     "persisted",
-		"reason":    "none",
-	}).GetCounter().GetValue())
-	require.Equal(t, float64(1), findMetricByLabels(t, flushRowsTotal, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-		"stage":     "skipped",
-		"reason":    "active_cooldown",
-	}).GetCounter().GetValue())
-	require.Equal(t, float64(2), findMetricByLabels(t, flushRowsTotal, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-		"stage":     "skipped",
-		"reason":    "delete_barrier",
-	}).GetCounter().GetValue())
-	require.Equal(t, float64(1), findMetricByLabels(t, flushRowsTotal, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "error",
-		"stage":     "skipped",
-		"reason":    "delete_barrier",
-	}).GetCounter().GetValue())
-	require.Equal(t, float64(1), findMetricByLabels(t, flushRowsTotal, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "error",
-		"stage":     "requeued",
-		"reason":    "persist_error",
-	}).GetCounter().GetValue())
-	require.Equal(t, float64(1), findMetricByLabels(t, flushRowsTotal, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-		"stage":     "requeued",
-		"reason":    "version_conflict",
-	}).GetCounter().GetValue())
-	require.Equal(t, float64(1), findMetricByLabels(t, flushRowsTotal, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-		"stage":     "superseded",
-		"reason":    "stale_snapshot",
-	}).GetCounter().GetValue())
-	require.Equal(t, float64(2), findMetricByLabels(t, flushRowsTotal, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "error",
-		"stage":     "requeued",
-		"reason":    "filter_error",
-	}).GetCounter().GetValue())
-	dirtyMutations := requireMetricFamily(t, families, "wukongim_conversation_active_dirty_mutations_total")
-	require.Equal(t, float64(4), findMetricByLabels(t, dirtyMutations, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"event":     "became_dirty",
-	}).GetCounter().GetValue())
-	cacheLock := requireMetricFamily(t, families, "wukongim_conversation_active_cache_lock_duration_seconds")
-	require.Equal(t, uint64(1), findMetricByLabels(t, cacheLock, map[string]string{
-		"node_id": "11", "node_name": "node-11", "result": "ok", "phase": "wait",
-	}).GetHistogram().GetSampleCount())
-	require.Equal(t, float64(3), findMetricByLabels(t, flushRows, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-		"kind":      "persisted",
+	items := requireMetricFamily(t, families, "wukongim_conversation_hydration_batch_items")
+	require.Zero(t, findMetricByLabels(t, items, map[string]string{
+		"node_id": "11", "node_name": "node-11", "result": "error",
 	}).GetHistogram().GetSampleSum())
-	require.Equal(t, float64(3), findMetricByLabels(t, flushRows, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-		"kind":      "flushed",
-	}).GetHistogram().GetSampleSum())
-
-	duration := requireMetricFamily(t, families, "wukongim_conversation_active_flush_duration_seconds")
-	require.Equal(t, uint64(1), findMetricByLabels(t, duration, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-	}).GetHistogram().GetSampleCount())
-	stageDuration := requireMetricFamily(t, families, "wukongim_conversation_active_flush_stage_duration_seconds")
-	require.Equal(t, uint64(1), findMetricByLabels(t, stageDuration, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"result":    "ok",
-		"stage":     "persist",
-	}).GetHistogram().GetSampleCount())
-	require.Equal(t, uint64(1), findMetricByLabels(t, stageDuration, map[string]string{
-		"node_id": "11", "node_name": "node-11", "result": "ok", "stage": "clear_lock_wait",
-	}).GetHistogram().GetSampleCount())
-	require.Equal(t, uint64(1), findMetricByLabels(t, stageDuration, map[string]string{
-		"node_id": "11", "node_name": "node-11", "result": "ok", "stage": "clear_apply",
-	}).GetHistogram().GetSampleCount())
-	pressureEvents := requireMetricFamily(t, families, "wukongim_conversation_active_pressure_events_total")
-	require.Equal(t, float64(1), findMetricByLabels(t, pressureEvents, map[string]string{
-		"node_id":   "11",
-		"node_name": "node-11",
-		"event":     "signal_received",
-	}).GetCounter().GetValue())
-}
-
-func TestConversationMetricsRejectDelayedActiveCacheSnapshot(t *testing.T) {
-	reg := New(11, "node-11")
-	reg.Conversation.SetActiveCache(ConversationActiveCacheSample{
-		Revision: 2, Rows: 20, DirtyRows: 10, OldestDirtyAge: 2 * time.Second, PressureDraining: true,
-		NormalRows: 12, NormalDirtyRows: 6, CMDRows: 8, CMDDirtyRows: 4,
-	})
-	reg.Conversation.SetActiveCache(ConversationActiveCacheSample{
-		Revision: 1, Rows: 1, DirtyRows: 0, OldestDirtyAge: 0, PressureDraining: false,
-		NormalRows: 1,
-	})
-
-	families, err := reg.Gather()
-	require.NoError(t, err)
-	rows := requireMetricFamily(t, families, "wukongim_conversation_active_cache_rows")
-	require.Equal(t, float64(20), findMetricByLabels(t, rows, map[string]string{
-		"node_id": "11", "node_name": "node-11",
-	}).GetGauge().GetValue())
-	pressure := requireMetricFamily(t, families, "wukongim_conversation_active_pressure_draining")
-	require.Equal(t, float64(1), findMetricByLabels(t, pressure, map[string]string{
-		"node_id": "11", "node_name": "node-11",
-	}).GetGauge().GetValue())
-	normalRows := requireMetricFamily(t, families, "wukongim_conversation_active_cache_kind_rows")
-	require.Equal(t, float64(12), findMetricByLabels(t, normalRows, map[string]string{
-		"node_id": "11", "node_name": "node-11", "kind": "normal",
-	}).GetGauge().GetValue())
 }
 
 func requireMetricFamily(t *testing.T, families []*dto.MetricFamily, name string) *dto.MetricFamily {
@@ -2724,4 +2543,31 @@ func hasMetricByLabels(family *dto.MetricFamily, want map[string]string) bool {
 		}
 	}
 	return false
+}
+
+func TestConversationMetricsExposeZeroMembershipWritesAfterRestart(t *testing.T) {
+	reg := New(11, "node-11")
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	family := requireMetricFamily(t, families, "wukongim_conversation_membership_mutation_rows_total")
+	require.Len(t, family.GetMetric(), 12)
+	for _, metric := range family.GetMetric() {
+		require.Zero(t, metric.GetCounter().GetValue())
+	}
+}
+
+// Scheduler latency separates CPU starvation from storage queueing: a goroutine
+// that is runnable but not running shows up here, not in commit stage timings.
+func TestFreshRegistryScrapeExposesGoSchedulerLatency(t *testing.T) {
+	reg := New(8, "node-8")
+	recorder := httptest.NewRecorder()
+	reg.Handler().ServeHTTP(recorder, httptest.NewRequest("GET", "/metrics", nil))
+	require.Equal(t, 200, recorder.Code)
+
+	scrape := recorder.Body.String()
+	require.Contains(t, scrape, "go_sched_latencies_seconds_bucket{")
+	require.Contains(t, scrape, "go_sched_latencies_seconds_count")
+	// Default Go runtime families stay available for existing dashboards.
+	require.Contains(t, scrape, "go_goroutines ")
+	require.Contains(t, scrape, "go_memstats_alloc_bytes ")
 }

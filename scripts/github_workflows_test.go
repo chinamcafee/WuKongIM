@@ -12,20 +12,111 @@ import (
 )
 
 var workflowCatalog = map[string]string{
-	"cloud-sim-analyze.yml":      "Agent Tool - Analyze Cloud Simulation",
-	"cloud-sim-cleanup.yml":      "Safety Automation - Reconcile Cloud Simulation Resources",
-	"cloud-sim-monitor.yml":      "Safety Automation - Patrol Cloud Simulation Runs",
-	"cloud-sim-oidc-subject.yml": "Agent Tool - Configure Cloud Simulation OIDC Subject",
-	"cloud-sim-provision.yml":    "Agent Tool - Provision Cloud Simulation",
-	"issue-agent-engineer.yml":   "Agent Tool - Issue Engineer",
-	"issue-agent-pr-signal.yml":  "Safety Automation - Issue Agent PR Signal",
-	"issue-agent.yml":            "Safety Automation - GitHub Issue Agent",
-	"review-agent-pr-signal.yml": "Safety Automation - Review Agent PR Signal",
-	"review-agent-run.yml":       "Agent Tool - Review Pull Request",
-	"review-agent.yml":           "Safety Automation - Review Agent Controller",
-	"linku-v3-ci.yml":            "Safety Automation - Link-U v3 CI",
-	"docker.yml":                 "Safety Automation - Publish Docker Images",
-	"go-ossf-slsa3-publish.yml":  "Safety Automation - Publish SLSA Go Release",
+	"docker.yml":                               "Safety Automation - Publish Docker Images",
+	"linku-v3-ci.yml":                          "Safety Automation - Link-U v3 CI",
+	"go-ossf-slsa3-publish.yml":                "Safety Automation - Publish SLSA Go Release",
+	"conversation-qps-diagnose.yml":            "Agent Tool - Diagnose Conversation QPS",
+	"conversation-qps-gate.yml":                "Safety Automation - Conversation QPS Release Gate",
+	"easy-sdk-web-docs-sync.yml":               "Safety Automation - Propose Web EasySDK Documentation Upgrade",
+	"binary-release-publish.yml":               "Safety Automation - Publish WuKongIM Binaries",
+	"chat-lifecycle-rehearsal.yml":             "Agent Tool - Start Chat Lifecycle Rehearsal",
+	"chat-lifecycle-rehearsal-finalize.yml":    "Safety Automation - Finalize Chat Lifecycle Rehearsals",
+	"chat-lifecycle-formal.yml":                "Safety Automation - Start Fresh Formal Chat Lifecycle",
+	"chat-lifecycle-formal-finalize.yml":       "Safety Automation - Finalize Formal Chat Lifecycle Runs",
+	"chat-lifecycle-stop.yml":                  "Agent Tool - Stop Chat Lifecycle Request",
+	"cloud-deployment-activate.yml":            "Agent Tool - Activate Cloud Deployment",
+	"cloud-deployment-bundle.yml":              "Agent Tool - Build Cloud Deployment Bundle",
+	"cloud-lease-analyze.yml":                  "Agent Tool - Analyze Chat Lifecycle Cloud Lease",
+	"cloud-lease-observe.yml":                  "Agent Tool - Inspect Cloud Lease",
+	"cloud-lease-oidc-setup.yml":               "Agent Tool - Configure Cloud Lease OIDC Roles",
+	"cloud-lease-provision.yml":                "Agent Tool - Provision Cloud Lease",
+	"cloud-lease-release.yml":                  "Safety Automation - Release Cloud Leases",
+	"cloud-sim-analyze.yml":                    "Agent Tool - Analyze Cloud Simulation",
+	"cloud-sim-cleanup.yml":                    "Safety Automation - Reconcile Cloud Simulation Resources",
+	"cloud-sim-monitor.yml":                    "Safety Automation - Patrol Cloud Simulation Runs",
+	"cloud-sim-oidc-subject.yml":               "Agent Tool - Configure Cloud Simulation OIDC Subject",
+	"cloud-sim-provision.yml":                  "Agent Tool - Provision Cloud Simulation",
+	"docker-image-publish.yml":                 "Safety Automation - Publish Docker Images",
+	"docs-cdn-certificate.yml":                 "Safety Automation - Renew Documentation CDN Certificate",
+	"docs-pages.yml":                           "Safety Automation - Publish Documentation to GitHub Pages",
+	"easysdk-release-acceptance.yml":           "Safety Automation - EasySDK Released Package Acceptance",
+	"issue-agent-engineer.yml":                 "Agent Tool - Issue Engineer",
+	"issue-agent-pr-signal.yml":                "Safety Automation - Issue Agent PR Signal",
+	"issue-agent.yml":                          "Safety Automation - GitHub Issue Agent",
+	"manager-browser-smoke.yml":                "Safety Automation - Manager Browser Smoke",
+	"native-package-preview.yml":               "Safety Automation - Validate Native Package Preview",
+	"review-agent-pr-signal.yml":               "Safety Automation - Review Agent PR Signal",
+	"review-agent-run.yml":                     "Agent Tool - Review Pull Request",
+	"review-agent.yml":                         "Safety Automation - Review Agent Controller",
+	"three-node-chat-lifecycle-regression.yml": "Safety Automation - Three-Node Chat Lifecycle Regression",
+}
+
+func TestConversationQPSDiagnosticWorkflowIsReadOnlyAndBindsProduct(t *testing.T) {
+	raw := readWorkflow(t, "conversation-qps-diagnose.yml")
+	var w struct {
+		On          map[string]any    `yaml:"on"`
+		Permissions map[string]string `yaml:"permissions"`
+		Jobs        map[string]struct {
+			RunsOn      string `yaml:"runs-on"`
+			Timeout     int    `yaml:"timeout-minutes"`
+			Environment any    `yaml:"environment"`
+		} `yaml:"jobs"`
+	}
+	require.NoError(t, yaml.Unmarshal(raw, &w))
+	require.Len(t, w.On, 1)
+	require.Contains(t, w.On, "workflow_dispatch")
+	require.Equal(t, map[string]string{"contents": "read"}, w.Permissions)
+	require.Len(t, w.Jobs, 1)
+	require.Equal(t, "ubuntu-24.04", w.Jobs["diagnose"].RunsOn)
+	require.Equal(t, 40, w.Jobs["diagnose"].Timeout)
+	require.Nil(t, w.Jobs["diagnose"].Environment)
+	s := string(raw)
+	require.NotContains(t, s, "secrets.")
+	require.NotContains(t, s, "continue-on-error:")
+	for _, guard := range []string{
+		`[[ "$(git rev-parse HEAD)" == "$PRODUCT_SHA" ]]`,
+		`git merge-base --is-ancestor "$PRODUCT_SHA" origin/main`,
+		`[[ "$(uname -m)" == x86_64 && "$(nproc)" == 4 ]]`,
+		`== "$EXPECTED_BINARY_SHA256" ]]`,
+		`go build -tags=e2e`,
+		`TestConversationQPSMixedAttribution`,
+		`if: always()`,
+		`retention-days: 90`,
+		`if: ${{ inputs.run_release_matrix }}`,
+		`validate-conversation-qps-report.jq`,
+	} {
+		require.Contains(t, s, guard)
+	}
+	require.Less(t, strings.Index(s, "go build -tags=e2e"), strings.Index(s, "path: diagnostic-harness"))
+	for _, guard := range []string{
+		`if: ${{ inputs.comparison_sha != '' }}`,
+		`[[ "$(git rev-parse HEAD)" == "$COMPARISON_SHA" ]]`,
+		`git merge-base --is-ancestor "$COMPARISON_SHA" origin/main`,
+		`WK_E2E_PRODUCT_SHA: ${{ inputs.comparison_sha }}`,
+		`WK_E2E_BINARY: ${{ runner.temp }}/conversation-mixed/comparison/wukongim-e2e`,
+		`WK_E2E_CONVERSATION_MIXED_REPORT: ${{ runner.temp }}/conversation-mixed/comparison/report.json`,
+	} {
+		require.Contains(t, s, guard)
+	}
+	require.Less(t, strings.Index(s, "Collect comparison windows"), strings.Index(s, "Collect three fixed windows"))
+	require.Equal(t, 2, strings.Count(s, "-run '^TestConversationQPSMixedAttribution$' -count=1 -timeout=12m -p=1"))
+
+}
+
+func TestCloudLeaseProvisionRejectsGitHubOwnedRepairPlans(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join(repoRoot(t), ".github", "workflows", "cloud-lease-provision.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, want := range []string{
+		`plan_stage="$(jq -er '.tags.stage // ""' "$RUNNER_TEMP/plan.json")"`,
+		`[[ "$plan_stage" != repair ]]`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generic Provision workflow still permits GitHub-owned repair acquisition; missing %q", want)
+		}
+	}
 }
 
 var externalActionPattern = regexp.MustCompile(
@@ -79,6 +170,148 @@ func TestGitHubWorkflowExternalActionsUseFullCommitPins(t *testing.T) {
 	}
 }
 
+func TestDocsPagesWorkflowPublishesOnlyVerifiedStaticExport(t *testing.T) {
+	raw := readFile(
+		t,
+		filepath.Join(repoRoot(t), ".github", "workflows", "docs-pages.yml"),
+	)
+	for _, want := range []string{
+		"bun install --frozen-lockfile",
+		"bun run verify",
+		"DOCS_SITE_URL: https://docs.githubim.com",
+		"test ! -e docs-site/out/CNAME",
+		"test -f docs-site/out/.nojekyll",
+		"path: docs-site/out",
+		"include-hidden-files: true",
+		"name: github-pages",
+		"pages: write",
+		"id-token: write",
+	} {
+		require.Contains(t, raw, want)
+	}
+	require.NotContains(t, raw, "pull_request_target:")
+	require.NotContains(t, raw, "secrets.")
+	require.NotContains(t, raw, "enablement:")
+}
+
+func TestEasySDKAndroidEmulatorScriptHasIndependentCommands(t *testing.T) {
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Uses string `yaml:"uses"`
+				With struct {
+					Script string `yaml:"script"`
+				} `yaml:"with"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	require.NoError(
+		t,
+		yaml.Unmarshal(readWorkflow(t, "easysdk-release-acceptance.yml"), &workflow),
+	)
+
+	found := false
+	for _, step := range workflow.Jobs["android-release"].Steps {
+		if !strings.HasPrefix(step.Uses, "reactivecircus/android-emulator-runner@") {
+			continue
+		}
+		found = true
+		for lineNumber, line := range strings.Split(step.With.Script, "\n") {
+			require.Falsef(
+				t,
+				strings.HasSuffix(strings.TrimSpace(line), `\`),
+				"android-emulator-runner executes script line %d independently; move multiline commands into a helper script",
+				lineNumber+1,
+			)
+		}
+	}
+	require.True(t, found, "EasySDK Android emulator step not found")
+}
+
+func TestEasySDKFlutterReleaseSmokeIsBounded(t *testing.T) {
+	root := repoRoot(t)
+	workflow := string(readWorkflow(t, "easysdk-release-acceptance.yml"))
+	helperPath := filepath.Join(
+		root,
+		"test",
+		"easysdk-release",
+		"flutter",
+		"run-release-smoke.sh",
+	)
+
+	require.Contains(
+		t,
+		workflow,
+		`"${GITHUB_WORKSPACE}/test/easysdk-release/flutter/run-release-smoke.sh"`,
+		"the Flutter release smoke must use its bounded runner",
+	)
+	require.NotContains(
+		t,
+		workflow,
+		"flutter test integration_test/release_smoke_test.dart",
+		"the workflow must not use the flaky iOS integration-test launcher",
+	)
+	require.Contains(
+		t,
+		workflow,
+		"test/easysdk-release/flutter/release_smoke_app.dart",
+		"the released example must build the receipt-writing smoke app",
+	)
+
+	helper := readFile(t, helperPath)
+	require.Contains(
+		t,
+		helper,
+		`FLUTTER_RELEASE_SMOKE_BUILD_TIMEOUT_SECONDS:-480`,
+		"the Flutter example build must have an independent deadline",
+	)
+	require.Contains(t, helper, "FLUTTER_RELEASE_SMOKE_TIMEOUT")
+	require.Contains(t, helper, "flutter build ios --simulator")
+	require.Contains(t, helper, "xcrun simctl install")
+	require.Contains(t, helper, "xcrun simctl launch")
+	require.Contains(t, helper, "release-smoke-config.json")
+	require.Contains(t, helper, "release-smoke.json")
+	require.NotContains(
+		t,
+		helper,
+		"SIMCTL_CHILD_",
+		"Flutter does not reliably expose simctl child variables through Platform.environment",
+	)
+	require.NotContains(t, helper, "flutter test")
+	require.NotContains(
+		t,
+		helper,
+		"FLUTTER_RELEASE_SMOKE_RETRY",
+		"a retry must use a fresh runner instead of reusing degraded runtime state",
+	)
+
+	appBody := readFile(
+		t,
+		filepath.Join(filepath.Dir(helperPath), "release_smoke_app.dart"),
+	)
+	require.Contains(
+		t,
+		appBody,
+		"await sdk.connect().timeout(",
+		"the SDK connection must have its own Dart-level deadline",
+	)
+	require.Contains(t, appBody, "Directory.systemTemp")
+	require.Contains(t, appBody, "release-smoke-config.json")
+	require.Contains(t, appBody, "await configFile.delete()")
+	require.NotContains(t, appBody, "Platform.environment")
+	require.Contains(t, appBody, "FLUTTER_RELEASE_SMOKE_PASS")
+	preparer := readFile(
+		t,
+		filepath.Join(filepath.Dir(helperPath), "prepare-release-example.mjs"),
+	)
+	require.NotContains(
+		t,
+		preparer,
+		"integration_test",
+		"the receipt app must not retain the flaky integration-test dependency",
+	)
+}
+
 func TestLegacyAutomaticTestWorkflowsAreAbsent(t *testing.T) {
 	root := repoRoot(t)
 	for _, name := range []string{"ci.yml", "nightly.yml"} {
@@ -93,8 +326,7 @@ func TestOnlyCatalogedSafetyWorkflowsUseAutomaticTriggers(t *testing.T) {
 	automatic := map[string]struct{}{
 		"issues": {}, "issue_comment": {}, "pull_request": {},
 		"pull_request_target": {}, "pull_request_review": {},
-		"pull_request_review_comment": {}, "push": {}, "release": {},
-		"schedule": {}, "workflow_run": {},
+		"pull_request_review_comment": {}, "schedule": {}, "workflow_run": {},
 	}
 	for file, name := range workflowCatalog {
 		var workflow struct {

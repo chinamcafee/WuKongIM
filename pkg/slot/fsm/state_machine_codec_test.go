@@ -1,7 +1,6 @@
 package fsm
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -216,7 +215,7 @@ func TestDecodeAdvanceChannelRetentionThroughSeqCommand(t *testing.T) {
 func TestEncodeDecodeEdgeCases(t *testing.T) {
 	tests := []metadb.User{
 		{UID: "", Token: "", DeviceFlag: 0, DeviceLevel: 0},
-		{UID: "u", Token: "t", DeviceFlag: 0, DeviceLevel: 0},
+		{UID: "u", Token: "t", DeviceFlag: 0, DeviceLevel: 0, SendBan: 1, SendBanVersion: math.MaxUint64},
 		{UID: "u", Token: "t", DeviceFlag: math.MaxInt64, DeviceLevel: math.MaxInt64},
 		{UID: "u", Token: "t", DeviceFlag: math.MinInt64, DeviceLevel: -1},
 		{UID: strings.Repeat("x", 1024), Token: strings.Repeat("y", 2048), DeviceFlag: 1, DeviceLevel: 2},
@@ -234,7 +233,7 @@ func TestEncodeDecodeEdgeCases(t *testing.T) {
 }
 
 func TestEncodeDecodeChannelStatusFlags(t *testing.T) {
-	want := metadb.Channel{ChannelID: "c-status", ChannelType: 2, Ban: 1, Disband: 1, SendBan: 1, AllowStranger: 1, Large: 1}
+	want := metadb.Channel{ChannelID: "c-status", ChannelType: 2, Ban: 1, Disband: 1, SendBan: 1, SendBanVersion: math.MaxUint64, AllowStranger: 1, Large: 1}
 	decoded, err := decodeCommand(EncodeUpsertChannelCommand(want))
 	if err != nil {
 		t.Fatalf("decodeCommand(): %v", err)
@@ -260,33 +259,6 @@ func TestEncodeDecodeChannelEdgeCases(t *testing.T) {
 		if !ok || cmd.channel.ChannelID != channel.ChannelID || cmd.channel.ChannelType != channel.ChannelType || cmd.channel.Ban != channel.Ban {
 			t.Fatalf("decoded channel = %#v, want %#v", decoded, channel)
 		}
-	}
-}
-
-func TestConversationBatchCheckedEncoderRejectsOwnedHashSlotMismatch(t *testing.T) {
-	const hashSlotCount uint16 = 256
-	uidForFive := uidForHashSlot(t, hashSlotCount, 5)
-	uidForSeven := uidForHashSlot(t, hashSlotCount, 7)
-
-	_, err := EncodeUpsertConversationStateBatchCommandChecked(hashSlotCount, []ConversationStateBatchItem{
-		{HashSlot: 7, State: metadb.ConversationState{UID: uidForFive, Kind: metadb.ConversationKindNormal, ChannelID: "g", ChannelType: 2}},
-	})
-	if !errors.Is(err, metadb.ErrInvalidArgument) {
-		t.Fatalf("EncodeUpsertConversationStateBatchCommandChecked() error = %v, want ErrInvalidArgument", err)
-	}
-
-	_, err = EncodeTouchConversationActiveAtBatchCommandChecked(hashSlotCount, []ConversationActivePatchBatchItem{
-		{HashSlot: 5, Patch: metadb.ConversationActivePatch{UID: uidForSeven, Kind: metadb.ConversationKindNormal, ChannelID: "g", ChannelType: 2}},
-	})
-	if !errors.Is(err, metadb.ErrInvalidArgument) {
-		t.Fatalf("EncodeTouchConversationActiveAtBatchCommandChecked() error = %v, want ErrInvalidArgument", err)
-	}
-
-	_, err = EncodeHideConversationBatchCommandChecked(hashSlotCount, []ConversationDeleteBatchItem{
-		{HashSlot: 5, Delete: metadb.ConversationDelete{UID: uidForSeven, Kind: metadb.ConversationKindNormal, ChannelID: "g", ChannelType: 2}},
-	})
-	if !errors.Is(err, metadb.ErrInvalidArgument) {
-		t.Fatalf("EncodeHideConversationBatchCommandChecked() error = %v, want ErrInvalidArgument", err)
 	}
 }
 

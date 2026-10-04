@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TIMESTAMP="${WK_BENCH_MESSAGE_EVENT_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
 OUT_DIR="${WK_BENCH_MESSAGE_EVENT_OUT_DIR:-$ROOT_DIR/docs/development/perf-runs/${TIMESTAMP}-three-node-message-event}"
-WK_BENCH_BIN="${WK_BENCH_BIN:-$ROOT_DIR/data/wkbench-message-event/wkbench}"
+WK_CLI_BIN="${WK_CLI_BIN:-$ROOT_DIR/data/wkbench-message-event/wkcli}"
 START_SCRIPT="${WK_BENCH_THREE_NODE_START_SCRIPT:-$ROOT_DIR/scripts/start-wukongim-three-nodes.sh}"
 READY_TIMEOUT="${WK_BENCH_THREE_NODE_READY_TIMEOUT:-90}"
 START_CLUSTER=1
@@ -45,7 +45,7 @@ scripts/start-wukongim-three-nodes.sh, then runs:
 
 Options:
   --out-dir DIR              Evidence output directory.
-  --wkbench-bin PATH         wkbench binary path. Default: data/wkbench-message-event/wkbench.
+  --wkcli-bin PATH         wkcli binary path. Default: data/wkbench-message-event/wkcli.
   --no-start                 Use an already-running cluster.
   --no-clean                 Keep existing node data when starting the cluster.
   --start-script PATH        Three-node startup script.
@@ -169,9 +169,9 @@ while [[ $# -gt 0 ]]; do
       OUT_DIR="$2"
       shift 2
       ;;
-    --wkbench-bin)
-      [[ $# -ge 2 ]] || die '--wkbench-bin requires a value'
-      WK_BENCH_BIN="$2"
+    --wkcli-bin)
+      [[ $# -ge 2 ]] || die '--wkcli-bin requires a value'
+      WK_CLI_BIN="$2"
       shift 2
       ;;
     --no-start)
@@ -305,20 +305,20 @@ cleanup() {
 trap cleanup EXIT
 
 ensure_wkbench_binary() {
-  if [[ -x "$WK_BENCH_BIN" ]]; then
+  if [[ -x "$WK_CLI_BIN" ]]; then
     local newer_source
-    newer_source="$(find "$ROOT_DIR/cmd/wkbench" "$ROOT_DIR/internal/bench" -type f -newer "$WK_BENCH_BIN" -print -quit)"
+    newer_source="$(find "$ROOT_DIR/cmd/wkcli" "$ROOT_DIR/internal/bench" -type f -newer "$WK_CLI_BIN" -print -quit)"
     if [[ -z "$newer_source" ]]; then
       return
     fi
-    log "rebuilding stale wkbench: $WK_BENCH_BIN"
+    log "rebuilding stale wkcli: $WK_CLI_BIN"
   else
-    log "building wkbench: $WK_BENCH_BIN"
+    log "building wkcli: $WK_CLI_BIN"
   fi
-  mkdir -p "$(dirname "$WK_BENCH_BIN")"
+  mkdir -p "$(dirname "$WK_CLI_BIN")"
   (
     cd "$ROOT_DIR"
-    GOWORK="${GOWORK:-off}" go build -o "$WK_BENCH_BIN" ./cmd/wkbench
+    GOWORK="${GOWORK:-off}" go build -o "$WK_CLI_BIN" ./cmd/wkcli
   )
 }
 
@@ -497,7 +497,7 @@ classify_metrics() {
       } >"$out"
       continue
     fi
-    "$WK_BENCH_BIN" metrics classify --before "$before" --after "$after" >"$out" 2>&1 || true
+    "$WK_CLI_BIN" bench metrics classify --before "$before" --after "$after" >"$out" 2>&1 || true
   done
 }
 
@@ -777,7 +777,7 @@ run_message_event() {
   local exit_status=0
   mkdir -p "$report_dir"
   local cmd=(
-    "$WK_BENCH_BIN" capacity message-event
+    "$WK_CLI_BIN" bench capacity message-event
     --api "$API_ADDRS"
     --run-id "$RUN_ID"
     --channels "$CHANNELS"

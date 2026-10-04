@@ -2,6 +2,9 @@ package webhook
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"sync"
 	"time"
@@ -51,6 +54,10 @@ type RuntimeOptions struct {
 	QueueSize int
 	// Workers bounds concurrent sender calls per event queue.
 	Workers int
+	// NotifyBatchMaxItems bounds optional HTTP grouping of durable msg.notify records; default 1 preserves Link-U IDs.
+	NotifyBatchMaxItems int
+	// NotifyBatchMaxWait bounds coalescing before claims; the original records are already durable.
+	NotifyBatchMaxWait time.Duration
 	// OnlineBatchMaxItems limits user.onlinestatus records sent in one request.
 	OnlineBatchMaxItems int
 	// OnlineBatchMaxWait bounds how long user.onlinestatus waits for adjacent records.
@@ -87,6 +94,12 @@ type Runtime struct {
 func New(opts RuntimeOptions) (*Runtime, error) {
 	if opts.Sender == nil || opts.QueueSize <= 0 || opts.Workers <= 0 {
 		return nil, workqueue.ErrInvalidConfig
+	}
+	if opts.NotifyBatchMaxItems < 0 || opts.NotifyBatchMaxWait < 0 {
+		return nil, workqueue.ErrInvalidConfig
+	}
+	if opts.NotifyBatchMaxItems == 0 {
+		opts.NotifyBatchMaxItems = 1
 	}
 	if opts.OnlineBatchMaxWait < 0 || opts.RequestTimeout <= 0 {
 		return nil, workqueue.ErrInvalidConfig
@@ -358,6 +371,15 @@ func (r *Runtime) runOutboxDispatcher(ctx context.Context, outbox *DurableOutbox
 		case <-outbox.Wake():
 		case <-poll.C:
 		}
+		if r.opts.NotifyBatchMaxItems > 1 && r.opts.NotifyBatchMaxWait > 0 {
+			timer := time.NewTimer(r.opts.NotifyBatchMaxWait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
 		entries, err := outbox.ClaimDue(time.Now())
 		if err != nil {
 			if errors.Is(err, ErrOutboxClosed) || ctx.Err() != nil {
@@ -366,13 +388,30 @@ func (r *Runtime) runOutboxDispatcher(ctx context.Context, outbox *DurableOutbox
 			r.observeSend("outbox", resultOutboxError, 0, 0, 0, err)
 			continue
 		}
+		var notify []OutboxEntry
+		flush := func() {
+			if len(notify) == 1 {
+				r.dispatchOutboxEntry(ctx, outbox, notify[0])
+			} else if len(notify) > 1 {
+				r.dispatchOutboxNotifyBatch(ctx, outbox, notify)
+			}
+			notify = nil
+		}
 		for _, entry := range entries {
 			if ctx.Err() != nil {
 				outbox.ReleaseClaim(entry.ID)
 				continue
 			}
-			r.dispatchOutboxEntry(ctx, outbox, entry)
+			if r.opts.NotifyBatchMaxItems > 1 && entry.Event == EventMsgNotify {
+				notify = append(notify, entry)
+				if len(notify) >= r.opts.NotifyBatchMaxItems {
+					flush()
+				}
+			} else {
+				r.dispatchOutboxEntry(ctx, outbox, entry)
+			}
 		}
+		flush()
 	}
 }
 
@@ -631,5 +670,63 @@ func waitForStop(ctx context.Context, stopCh <-chan struct{}) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// dispatchOutboxNotifyBatch retains per-record identity and marks each WAL outcome.
+// The request ID identifies this exact group; event_id is stable across regrouping.
+func (r *Runtime) dispatchOutboxNotifyBatch(ctx context.Context, outbox *DurableOutbox, entries []OutboxEntry) {
+	body := make([]map[string]json.RawMessage, 0, len(entries))
+	hash := sha256.New()
+	attempt := 1
+	for _, entry := range entries {
+		var items []map[string]json.RawMessage
+		if err := json.Unmarshal(entry.Body, &items); err != nil {
+			for _, e := range entries {
+				r.dispatchOutboxEntry(ctx, outbox, e)
+			}
+			return
+		}
+		hash.Write([]byte(entry.ID))
+		hash.Write([]byte{0})
+		attempt = max(attempt, entry.Attempt+1)
+		id, _ := json.Marshal(entry.ID)
+		for _, item := range items {
+			item["event_id"] = id
+			body = append(body, item)
+		}
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		for _, e := range entries {
+			r.dispatchOutboxEntry(ctx, outbox, e)
+		}
+		return
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, r.opts.RequestTimeout)
+	started := time.Now()
+	err = r.sender.Send(attemptCtx, SendRequest{ID: "wh_batch_" + hex.EncodeToString(hash.Sum(nil)), Event: EventMsgNotify, Body: encoded, Attempt: attempt})
+	cancel()
+	for _, entry := range entries {
+		if ctx.Err() != nil {
+			outbox.ReleaseClaim(entry.ID)
+			continue
+		}
+		result := resultOK
+		var markErr error
+		if err == nil {
+			markErr = outbox.MarkDelivered(entry, time.Now())
+		} else {
+			var dead bool
+			dead, markErr = outbox.MarkFailed(entry, r.opts.RetryMaxAttempts, time.Now())
+			result = resultRetry
+			if dead {
+				result = resultDeadLetter
+			}
+		}
+		if markErr != nil {
+			result = resultOutboxError
+		}
+		r.observeSend(entry.Event, result, entry.Items, entry.Attempt+1, time.Since(started), errors.Join(err, markErr))
 	}
 }

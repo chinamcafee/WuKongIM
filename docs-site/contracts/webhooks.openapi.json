@@ -1,0 +1,629 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "WuKongIM Outbound Webhooks",
+    "version": "3.0.0-beta-snapshot",
+    "description": "Synchronous before-send admission and three asynchronous notification events.",
+    "x-i18n": {
+      "zh": {
+        "title": "WuKongIM 出站 Webhook",
+        "description": "同步发送前准入与三个异步通知事件。"
+      }
+    }
+  },
+  "x-wukongim-scope": "outbound-webhooks-beta",
+  "tags": [
+    {
+      "name": "Messages",
+      "description": "Committed messages and offline-recipient candidates.",
+      "x-i18n": {
+        "zh": {
+          "description": "已提交消息与离线接收候选。"
+        }
+      }
+    },
+    {
+      "name": "Presence",
+      "description": "Legacy-compatible user presence strings.",
+      "x-i18n": {
+        "zh": {
+          "description": "兼容格式的用户在线状态字符串。"
+        }
+      }
+    }
+  ],
+  "webhooks": {
+    "msg.notify": {
+      "post": {
+        "operationId": "onMessageNotify",
+        "summary": "Receive committed messages",
+        "description": "Receives one bounded batch of committed durable messages.",
+        "x-i18n": {
+          "zh": {
+            "summary": "接收已提交消息",
+            "description": "接收一批有界的已提交持久消息。"
+          }
+        },
+        "tags": [
+          "Messages"
+        ],
+        "security": [],
+        "x-wukongim-delivery": "durable-WAL-outbox-at-least-once",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MsgNotifyEvent"
+          },
+          {
+            "name": "X-WK-Webhook-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Stable durable request identity; deduplicate before acknowledging.",
+            "x-i18n": {
+              "zh": {
+                "description": "稳定的持久化请求标识；确认前应去重。"
+              }
+            }
+          },
+          {
+            "name": "X-WK-Webhook-Attempt",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "One-based delivery attempt.",
+            "x-i18n": {
+              "zh": {
+                "description": "从 1 开始的投递尝试次数。"
+              }
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/WebhookMessage"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "default": {
+            "$ref": "#/components/responses/RetryableFailure"
+          },
+          "2XX": {
+            "$ref": "#/components/responses/Accepted"
+          }
+        }
+      }
+    },
+    "msg.offline.v2": {
+      "post": {
+        "operationId": "onMessageOffline",
+        "summary": "Receive offline-recipient candidates",
+        "description": "Receives one committed message and one bounded UID chunk, either plain or gzip-compressed.",
+        "x-i18n": {
+          "zh": {
+            "summary": "接收离线接收候选",
+            "description": "接收一条已提交消息与一批有界 UID；UID 为明文数组或 gzip 压缩形式。"
+          }
+        },
+        "tags": [
+          "Messages"
+        ],
+        "security": [],
+        "x-wukongim-delivery": "durable-WAL-outbox-at-least-once",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MsgOfflineEvent"
+          },
+          {
+            "name": "X-WK-Webhook-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Stable durable request identity; deduplicate before acknowledging.",
+            "x-i18n": {
+              "zh": {
+                "description": "稳定的持久化请求标识；确认前应去重。"
+              }
+            }
+          },
+          {
+            "name": "X-WK-Webhook-Attempt",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "One-based delivery attempt.",
+            "x-i18n": {
+              "zh": {
+                "description": "从 1 开始的投递尝试次数。"
+              }
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OfflineWebhook"
+              }
+            }
+          }
+        },
+        "responses": {
+          "default": {
+            "$ref": "#/components/responses/RetryableFailure"
+          },
+          "2XX": {
+            "$ref": "#/components/responses/Accepted"
+          }
+        }
+      }
+    },
+    "user.onlinestatus": {
+      "post": {
+        "operationId": "onUserOnlineStatus",
+        "summary": "Receive user presence changes",
+        "description": "Receives a bounded, best-effort array of legacy status strings derived from active sessions on the UID owner's current node; it is not cluster-global presence.",
+        "x-i18n": {
+          "zh": {
+            "summary": "接收用户在线状态变化",
+            "description": "接收一批有界、尽力而为的兼容状态字符串；它们来自 UID Owner 当前节点的活跃会话，不是集群全局在线状态。"
+          }
+        },
+        "tags": [
+          "Presence"
+        ],
+        "security": [],
+        "x-wukongim-delivery": "best-effort-memory-queue",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserOnlineStatusEvent"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "description": "uid-deviceFlag-online-sessionID-deviceOnlineCount-totalOnlineCount; parse the final five numeric fields from the right because UID may contain hyphens"
+                }
+              },
+              "example": [
+                "alice-1-1-42-1-2"
+              ]
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Accepted"
+          },
+          "default": {
+            "$ref": "#/components/responses/RetryableFailure"
+          }
+        }
+      }
+    },
+    "msg.before_send": {
+      "post": {
+        "operationId": "onMessageBeforeSend",
+        "summary": "Decide whether to send",
+        "description": "Synchronously inspect the final payload before submission. Parent cancellation wins; explicit denial never fails open.",
+        "x-i18n": {
+          "zh": {
+            "summary": "决定是否发送消息",
+            "description": "提交前同步检查最终内容。原请求取消优先，明确拒绝不会失败放行。"
+          }
+        },
+        "tags": [
+          "Messages"
+        ],
+        "security": [],
+        "x-wukongim-delivery": "synchronous-bounded-no-retry",
+        "parameters": [
+          {
+            "name": "event",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "const": "msg.before_send",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BeforeSendRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Explicit decision, limited to 64 KiB.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BeforeSendDecision"
+                },
+                "examples": {
+                  "allow": {
+                    "value": {
+                      "allow": true
+                    }
+                  },
+                  "replace": {
+                    "value": {
+                      "allow": true,
+                      "payload": "bmV3"
+                    }
+                  },
+                  "reject": {
+                    "value": {
+                      "allow": false,
+                      "reason_code": 200
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Callback error handled by on_error; redirects are not followed."
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "MsgNotifyEvent": {
+        "name": "event",
+        "in": "query",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "const": "msg.notify"
+        }
+      },
+      "MsgOfflineEvent": {
+        "name": "event",
+        "in": "query",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "const": "msg.offline.v2"
+        }
+      },
+      "UserOnlineStatusEvent": {
+        "name": "event",
+        "in": "query",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "const": "user.onlinestatus"
+        }
+      }
+    },
+    "schemas": {
+      "WebhookMessageHeader": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "no_persist",
+          "red_dot",
+          "sync_once"
+        ],
+        "properties": {
+          "no_persist": {
+            "type": "integer",
+            "const": 0
+          },
+          "red_dot": {
+            "type": "integer",
+            "enum": [
+              0,
+              1
+            ]
+          },
+          "sync_once": {
+            "type": "integer",
+            "enum": [
+              0,
+              1
+            ]
+          }
+        }
+      },
+      "WebhookMessageFields": {
+        "type": "object",
+        "required": [
+          "header",
+          "setting",
+          "expire",
+          "message_id",
+          "message_idstr",
+          "client_msg_no",
+          "message_seq",
+          "from_uid",
+          "channel_id",
+          "channel_type",
+          "server_timestamp_ms",
+          "payload"
+        ],
+        "properties": {
+          "header": {
+            "$ref": "#/components/schemas/WebhookMessageHeader"
+          },
+          "setting": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "topic": {
+            "type": "string"
+          },
+          "expire": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "message_id": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "message_idstr": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "client_msg_no": {
+            "type": "string"
+          },
+          "message_seq": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "from_uid": {
+            "type": "string"
+          },
+          "channel_id": {
+            "type": "string"
+          },
+          "channel_type": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "payload": {
+            "oneOf": [
+              {
+                "type": "string",
+                "contentEncoding": "base64"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "server_timestamp_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Original durable server occurrence time in Unix milliseconds."
+          },
+          "event_id": {
+            "type": "string",
+            "description": "Original outbox item ID when notify batching is explicitly enabled."
+          }
+        }
+      },
+      "WebhookMessage": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/WebhookMessageFields"
+          }
+        ],
+        "unevaluatedProperties": false
+      },
+      "OfflineWebhook": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/WebhookMessageFields"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "source_id": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "schema_version": {
+                "type": "integer",
+                "const": 2
+              }
+            },
+            "oneOf": [
+              {
+                "required": [
+                  "offline_targets"
+                ],
+                "properties": {
+                  "offline_targets": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "uid",
+                        "device_flag"
+                      ],
+                      "properties": {
+                        "uid": {
+                          "type": "string"
+                        },
+                        "device_flag": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 255
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "required": [
+                  "compress",
+                  "compress_offline_targets"
+                ],
+                "properties": {
+                  "compress": {
+                    "type": "string",
+                    "const": "gzip"
+                  },
+                  "compress_offline_targets": {
+                    "type": "string",
+                    "contentEncoding": "base64",
+                    "description": "Base64 of gzip(JSON device-target array)."
+                  }
+                }
+              }
+            ],
+            "required": [
+              "schema_version"
+            ]
+          }
+        ],
+        "unevaluatedProperties": false
+      },
+      "BeforeSendRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "from_uid",
+          "channel_id",
+          "channel_type",
+          "client_msg_no",
+          "payload",
+          "no_persist",
+          "sync_once"
+        ],
+        "properties": {
+          "from_uid": {
+            "type": "string"
+          },
+          "channel_id": {
+            "type": "string",
+            "description": "Canonical source channel, including generated subscriber-scoped source channels."
+          },
+          "channel_type": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "client_msg_no": {
+            "type": "string",
+            "description": "Caller-provided retry identity; may be empty when the caller omitted it."
+          },
+          "payload": {
+            "type": "string",
+            "contentEncoding": "base64"
+          },
+          "no_persist": {
+            "type": "boolean"
+          },
+          "sync_once": {
+            "type": "boolean"
+          }
+        }
+      },
+      "BeforeSendDecision": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "allow"
+            ],
+            "properties": {
+              "allow": {
+                "const": true
+              },
+              "payload": {
+                "type": "string",
+                "contentEncoding": "base64",
+                "minLength": 4,
+                "maxLength": 43692
+              },
+              "reason_code": {
+                "const": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "allow"
+            ],
+            "properties": {
+              "allow": {
+                "const": false
+              },
+              "reason_code": {
+                "type": "integer",
+                "minimum": 128,
+                "maximum": 255
+              }
+            }
+          }
+        ],
+        "description": "A denial with invalid optional fields still rejects using NotAllowSend (11). Malformed decisions use on_error."
+      }
+    },
+    "responses": {
+      "Accepted": {
+        "description": "Any HTTP 2xx acknowledges successful asynchronous delivery.",
+        "x-i18n": {
+          "zh": {
+            "description": "异步投递以任何 HTTP 2xx 确认成功。"
+          }
+        }
+      },
+      "RetryableFailure": {
+        "description": "Critical events remain in the durable outbox with bounded backoff; exhausted attempts become replayable dead letters. Presence remains best effort.",
+        "x-i18n": {
+          "zh": {
+            "description": "关键事件保留在持久 outbox 中并退避重试，超过次数后成为可重放死信；在线状态仍尽力投递。"
+          }
+        }
+      }
+    }
+  }
+}

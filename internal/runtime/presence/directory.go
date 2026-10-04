@@ -18,7 +18,9 @@ const (
 // Directory stores authoritative presence routes for locally led hash slots.
 type Directory struct {
 	// localNodeID optionally verifies that incoming RouteTarget values point here.
-	localNodeID      uint64
+	localNodeID uint64
+	// requireRecovery prevents empty newly installed authority state from proving offline.
+	requireRecovery  bool
 	credentialFences CredentialFenceLoader
 	// shards spreads hash-slot authority state across independent locks.
 	shards []directoryShard
@@ -62,6 +64,10 @@ type authoritySlot struct {
 	// receives an explicit acknowledgement. Equal-version retries therefore
 	// cannot incorrectly report completion after a transient owner failure.
 	credentialActions map[credentialActionKey]credentialAction
+	// recovered and recoveryOrder bound positive and negative UID reconstruction proofs.
+	recovered     map[string]struct{}
+	recoveryOrder []string
+	recoveryNext  int
 }
 
 type pendingRoute struct {
@@ -110,8 +116,9 @@ func NewDirectory(opts DirectoryOptions) *Directory {
 	}
 	d := &Directory{
 		localNodeID:      opts.LocalNodeID,
-		credentialFences: opts.CredentialFences,
+		requireRecovery:  opts.RequireRecovery,
 		shards:           make([]directoryShard, shardCount),
+		credentialFences: opts.CredentialFences,
 	}
 	for i := range d.shards {
 		d.shards[i].slots = make(map[uint16]*authoritySlot)
@@ -376,6 +383,9 @@ func (d *Directory) EndpointsByUID(target RouteTarget, uid string) ([]Route, err
 	if err != nil {
 		return nil, err
 	}
+	if d.requireRecovery && !slot.recoveryReady([]string{uid}) {
+		return nil, ErrRouteNotReady
+	}
 	return slot.endpointsByUIDLocked(uid), nil
 }
 
@@ -388,6 +398,9 @@ func (d *Directory) EndpointsByUIDs(target RouteTarget, uids []string) ([]Route,
 	slot, err := d.validateTargetLocked(shard, target)
 	if err != nil {
 		return nil, err
+	}
+	if d.requireRecovery && !slot.recoveryReady(uids) {
+		return nil, ErrRouteNotReady
 	}
 	var routes []Route
 	for _, uid := range uids {
@@ -441,6 +454,10 @@ func (d *Directory) EndpointsByTargets(groups []EndpointLookupGroup) []EndpointL
 			slot, err := d.validateTargetLocked(shard, group.Target)
 			if err != nil {
 				results[groupIndex].Err = err
+				continue
+			}
+			if d.requireRecovery && !slot.recoveryReady(group.UIDs) {
+				results[groupIndex].Err = ErrRouteNotReady
 				continue
 			}
 			for _, uid := range group.UIDs {

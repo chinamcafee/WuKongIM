@@ -439,3 +439,14 @@ func decodeReceivePacket(t *testing.T, body []byte) *pluginproto.RecvPacket {
 	require.NoError(t, packet.Unmarshal(body))
 	return &packet
 }
+
+func TestReceiveProjectsConfiguredCommandSuffix(t *testing.T) {
+	codec := channelid.CommandCodec{Suffix: "__commands"}
+	app := &App{commandChannels: codec}
+	event := pluginevents.ReceiveOffline{UID: "uu1", FromUID: "____system", ChannelType: 1, ChannelID: codec.ToCommandChannel(channelid.EncodePersonChannel("uu1", "____system"))}
+	packet := app.receivePacketFromOfflineEvent(event)
+	require.Equal(t, "____system", packet.ChannelId)
+	event.ChannelType = 2
+	event.ChannelID = codec.ToCommandChannel("group")
+	require.Equal(t, "group", app.receivePacketFromOfflineEvent(event).ChannelId)
+}

@@ -1,29 +1,19 @@
 package app
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"time"
 
-	"github.com/WuKongIM/WuKongIM/internal/contracts/messageevents"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/channelappend"
 	runtimedelivery "github.com/WuKongIM/WuKongIM/internal/runtime/delivery"
 	conversationusecase "github.com/WuKongIM/WuKongIM/internal/usecase/conversation"
-	deliveryusecase "github.com/WuKongIM/WuKongIM/internal/usecase/delivery"
 	"github.com/WuKongIM/WuKongIM/internal/usecase/message"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 )
 
 const defaultDeliveryRetryMaxAttempts = 3
 const defaultDeliveryRetryBackoff = 10 * time.Millisecond
-
-var errOnlineDeliveryCommittedSubmitUnsupported = errors.New("internal/app: committed delivery submission requires a canonical recipient plan")
-
-type onlineDeliveryUsecaseAdapter struct {
-	// runtime owns recipient feedback after channelappend produces canonical plans.
-	runtime *runtimedelivery.Runtime
-}
 
 type deliveryMessageObserver struct {
 	// app records non-fatal delivery sink failures for tests and diagnostics.
@@ -79,6 +69,20 @@ func (o deliveryMessageObserver) ObserveChannelAppendRouter(event channelappend.
 	o.app.metrics.ChannelAppend.ObserveRouter(event.Path, event.Result, event.Items, event.Duration)
 }
 
+func (o deliveryMessageObserver) SetChannelAppendRouterGroupPressure(event channelappend.RouterGroupPressureObservation) {
+	if o.app == nil || o.app.metrics == nil {
+		return
+	}
+	o.app.metrics.ChannelAppend.SetRouterGroupPressure(event.Inflight, event.Capacity)
+}
+
+func (o deliveryMessageObserver) ObserveMessageSendBatchStage(event message.SendBatchStageObservation) {
+	if o.app == nil || o.app.metrics == nil {
+		return
+	}
+	o.app.metrics.Message.ObserveSendBatchStage(event.Stage, event.Result, event.Items, event.Duration)
+}
+
 func (o deliveryMessageObserver) ObserveChannelAppendLocalAdmission(event channelappend.LocalAdmissionObservation) {
 	if o.app == nil || o.app.metrics == nil {
 		return
@@ -132,6 +136,17 @@ func (o deliveryMessageObserver) ObserveChannelAppendEffect(event channelappend.
 	o.app.metrics.ChannelAppend.ObserveEffect(event.Stage, event.Result, event.Items, event.Duration)
 }
 
+func (o deliveryMessageObserver) ObserveChannelAppendIdempotencyRecovery(event channelappend.IdempotencyRecoveryObservation) {
+	if o.app == nil || o.app.metrics == nil {
+		return
+	}
+	o.app.metrics.ChannelAppend.ObserveIdempotencyRecovery(
+		event.RecoveredItems,
+		event.UnresolvedItems,
+		event.LookupErrorItems,
+	)
+}
+
 func (o deliveryMessageObserver) ObserveChannelAppendPostCommitFailure(event channelappend.PostCommitFailureObservation) {
 	if o.app == nil {
 		return
@@ -175,9 +190,7 @@ func channelAppendPostCommitFailureFields(event channelappend.PostCommitFailureO
 }
 
 func isExpectedPostCommitRouteFailure(err error) bool {
-	return errors.Is(err, conversationusecase.ErrStaleRoute) ||
-		errors.Is(err, conversationusecase.ErrNotLeader) ||
-		errors.Is(err, conversationusecase.ErrRouteNotReady) ||
+	return errors.Is(err, conversationusecase.ErrRouteNotReady) ||
 		errors.Is(err, channelappend.ErrStaleRoute) ||
 		errors.Is(err, channelappend.ErrNotLeader) ||
 		errors.Is(err, channelappend.ErrRouteNotReady)
@@ -210,24 +223,18 @@ func (a *App) recordDeliveryError(err error) {
 	}
 }
 
-// SubmitCommitted is retained only for the temporary delivery-usecase facade.
-// Channelappend is the sole production producer of canonical delivery plans.
-func (a onlineDeliveryUsecaseAdapter) SubmitCommitted(context.Context, messageevents.MessageCommitted) error {
-	return errOnlineDeliveryCommittedSubmitUnsupported
-}
-
-func (a onlineDeliveryUsecaseAdapter) Recvack(ctx context.Context, cmd deliveryusecase.RecvackCommand) error {
-	if a.runtime == nil {
-		return nil
+func (o deliveryMessageObserver) ObserveSendPermissionCount(kind string, n int) {
+	if o.app != nil && o.app.metrics != nil {
+		o.app.metrics.Message.ObserveSendPermissionCount(kind, n)
 	}
-	return a.runtime.Recvack(ctx, runtimedelivery.Recvack{
-		UID: cmd.UID, SessionID: cmd.SessionID, MessageID: cmd.MessageID, MessageSeq: cmd.MessageSeq,
-	})
 }
-
-func (a onlineDeliveryUsecaseAdapter) SessionClosed(ctx context.Context, cmd deliveryusecase.SessionClosedCommand) error {
-	if a.runtime == nil {
-		return nil
+func (o deliveryMessageObserver) ObserveSendPermissionStage(stage, result string, d time.Duration) {
+	if o.app != nil && o.app.metrics != nil {
+		o.app.metrics.Message.ObserveSendPermissionStage(stage, result, d)
 	}
-	return a.runtime.SessionClosed(ctx, runtimedelivery.SessionClosed{UID: cmd.UID, SessionID: cmd.SessionID})
+}
+func (o deliveryMessageObserver) ObserveSendBanRejection(scope string, n int) {
+	if o.app != nil && o.app.metrics != nil {
+		o.app.metrics.Message.ObserveSendBanRejection(scope, n)
+	}
 }

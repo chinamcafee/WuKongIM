@@ -392,55 +392,76 @@ func (s *Shard) GetActiveChannelMigrationTask(ctx context.Context, channelID str
 	return task, true, nil
 }
 
-// ListActiveChannelMigrationTasks returns active migration tasks in active-index order.
+// ChannelMigrationTaskCursor resumes the active index after one Channel.
+type ChannelMigrationTaskCursor struct {
+	ChannelID   string
+	ChannelType int64
+}
+
+// ListActiveChannelMigrationTasks returns the first active migration page.
 func (s *Shard) ListActiveChannelMigrationTasks(ctx context.Context, limit int) ([]ChannelMigrationTask, error) {
+	tasks, _, _, err := s.ListActiveChannelMigrationTaskPage(ctx, ChannelMigrationTaskCursor{}, limit)
+	return tasks, err
+}
+
+// ListActiveChannelMigrationTaskPage reads at most limit index rows. The cursor
+// survives task completion and a removed row; done restarts the next fair pass.
+func (s *Shard) ListActiveChannelMigrationTaskPage(ctx context.Context, after ChannelMigrationTaskCursor, limit int) ([]ChannelMigrationTask, ChannelMigrationTaskCursor, bool, error) {
 	if err := s.check(ctx); err != nil {
-		return nil, err
+		return nil, after, false, err
+	}
+	if after.ChannelID == "" && after.ChannelType != 0 {
+		return nil, after, false, dberrors.ErrInvalidArgument
 	}
 	if limit <= 0 {
-		return nil, nil
+		return nil, after, true, nil
 	}
 	prefix := encodeChannelMigrationActiveIndexPrefix(s.hashSlot)
 	span := keycodec.NewPrefixSpan(prefix)
+	if after.ChannelID != "" {
+		if err := validateKeyString(after.ChannelID); err != nil {
+			return nil, after, false, err
+		}
+		span.Start = append(encodeChannelMigrationActiveIndexKey(s.hashSlot, after.ChannelID, after.ChannelType), 0)
+	}
 	iter, err := s.db.engine.NewIter(engine.Span{Start: span.Start, End: span.End}, engine.IterOptions{})
 	if err != nil {
-		return nil, err
+		return nil, after, false, err
 	}
 	defer iter.Close()
 
 	tasks := make([]ChannelMigrationTask, 0, limit)
-	for ok := iter.First(); ok; ok = iter.Next() {
+	ok := iter.First()
+	for scanned := 0; ok && scanned < limit; scanned++ {
 		if err := contextErr(ctx); err != nil {
-			return nil, err
+			return nil, after, false, err
 		}
-		channelID, channelType, ok := decodeChannelMigrationActiveIndexKey(prefix, iter.Key())
-		if !ok {
-			return nil, dberrors.ErrCorruptValue
+		channelID, channelType, valid := decodeChannelMigrationActiveIndexKey(prefix, iter.Key())
+		if !valid {
+			return nil, after, false, dberrors.ErrCorruptValue
 		}
 		value, err := iter.Value()
 		if err != nil {
-			return nil, err
+			return nil, after, false, err
 		}
 		taskID := string(value)
 		if err := validateKeyString(taskID); err != nil {
-			return nil, dberrors.ErrCorruptValue
+			return nil, after, false, dberrors.ErrCorruptValue
 		}
 		task, exists, err := s.GetChannelMigrationTask(ctx, channelID, channelType, taskID)
 		if err != nil {
-			return nil, err
+			return nil, after, false, err
 		}
-		if !exists || !task.IsActive() {
-			continue
+		after = ChannelMigrationTaskCursor{ChannelID: channelID, ChannelType: channelType}
+		if exists && task.IsActive() {
+			tasks = append(tasks, task)
 		}
-		tasks = append(tasks, task)
-		if len(tasks) >= limit {
-			break
-		}
+		ok = iter.Next()
 	}
 	if err := iter.Error(); err != nil {
-		return nil, err
+		return nil, after, false, err
 	}
-	return tasks, nil
+	return tasks, after, !ok, nil
 }
 
 // ListChannelMigrationTasks returns all migration tasks in primary-key order.

@@ -162,10 +162,29 @@ func TestNewWiresPluginUsecaseAsMessageSender(t *testing.T) {
 	require.NotErrorIs(t, err, pluginusecase.ErrMessageSenderRequired)
 }
 
+func TestNewWiresConfiguredSystemUIDIntoPluginMessageSender(t *testing.T) {
+	submitter := &recordingAppMessageSubmitter{result: message.SendResult{Reason: message.ReasonSuccess}}
+	app, err := newTestApp(t, Config{
+		DataDir: t.TempDir(),
+		Cluster: clusterpkg.Config{NodeID: 1},
+		Message: MessageConfig{SystemUID: "custom-system"},
+		Plugin:  PluginConfig{Enable: true, HotReload: false},
+	}, WithCluster(&fakeCluster{}), WithGateway(nil), WithMessages(message.New(message.Options{Submitter: submitter})))
+	require.NoError(t, err)
+
+	_, err = app.plugins.SendMessage(context.Background(), &pluginproto.SendReq{
+		ChannelId: "g1", ChannelType: 2, Payload: []byte("hello"),
+	}, "wk.sender")
+
+	require.NoError(t, err)
+	require.Equal(t, 1, submitter.calls)
+	require.Equal(t, "custom-system", submitter.last.FromUID)
+}
+
 func TestNewWiresPluginUsecaseAsChannelMessageReader(t *testing.T) {
 	cluster := &fakeManagerCluster{
 		nodeID: 1,
-		conversationMessages: map[metadb.ConversationKey][]channelruntime.Message{
+		conversationMessages: map[metadb.ChannelKey][]channelruntime.Message{
 			{ChannelID: "g1", ChannelType: 2}: {{
 				MessageID:   321,
 				MessageSeq:  7,
@@ -252,15 +271,27 @@ func TestNewWiresPluginUsecaseAsChannelOwnerReader(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, resp.GetClusterChannelBelongNodeResps(), 1)
 	require.Equal(t, uint64(3), resp.GetClusterChannelBelongNodeResps()[0].GetNodeId())
+
+	// The old append cache can survive a leader change when plugin HTTP
+	// forwards never enter the message router's failure invalidation path.
+	cluster.channelRuntimeMetas = map[metadb.ChannelKey]metadb.ChannelRuntimeMeta{
+		{ChannelID: "g1", ChannelType: 2}: {ChannelID: "g1", ChannelType: 2, Leader: 2},
+	}
+	resp, err = app.plugins.ClusterChannelsBelongNode(context.Background(), &pluginproto.ClusterChannelBelongNodeReq{
+		Channels: []*pluginproto.Channel{{ChannelId: "g1", ChannelType: 2}},
+	}, "wk.cluster")
+	require.NoError(t, err)
+	require.Len(t, resp.GetClusterChannelBelongNodeResps(), 1)
+	require.Equal(t, uint64(2), resp.GetClusterChannelBelongNodeResps()[0].GetNodeId())
 }
 
 func TestNewWiresPluginUsecaseAsConversationReader(t *testing.T) {
 	cluster := &fakeManagerCluster{
 		nodeID: 1,
-		conversationPages: map[string][]metadb.ConversationState{
+		membershipPages: map[string][]metadb.UserChannelMembership{
 			"u1": {
-				{UID: "u1", Kind: metadb.ConversationKindNormal, ChannelID: "g1", ChannelType: 2, ActiveAt: 2},
-				{UID: "u1", Kind: metadb.ConversationKindNormal, ChannelID: "p1", ChannelType: 1, ActiveAt: 1},
+				{UID: "u1", ChannelID: "g1", ChannelType: 2, ActivatedAt: 2},
+				{UID: "u1", ChannelID: "p1", ChannelType: 1, ActivatedAt: 1},
 			},
 		},
 	}
@@ -363,6 +394,14 @@ func TestPluginRuntimeAdapterPreservesRuntimeFields(t *testing.T) {
 	require.True(t, plugins[0].ReplySync)
 	require.Equal(t, 101, plugins[0].PID)
 	require.Equal(t, lastSeenAt, plugins[0].LastSeenAt)
+}
+
+func TestPluginRuntimeAdapterDoesNotCreateUnknownPluginOnClose(t *testing.T) {
+	runtime := pluginhost.NewRuntime(pluginhost.RuntimeOptions{Registry: pluginhost.NewRegistry()})
+	adapter := pluginRuntimeAdapter{runtime: runtime}
+
+	require.NoError(t, adapter.MarkClosed(context.Background(), "__wukongim_plugin_host_ready__"))
+	require.Empty(t, adapter.List())
 }
 
 func TestPluginLifecycleStartsBeforeChannelAppendAndStopsAfter(t *testing.T) {

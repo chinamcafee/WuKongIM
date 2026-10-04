@@ -1,0 +1,98 @@
+---
+title: MQTT 部署与排障
+description: 配置一致的集群入口，理解逻辑配额，按公开信号定位接入问题。
+---
+
+<Callout type="warn" title="开发预览">
+  MQTT 默认关闭。完整 Linux、故障和负载验收尚未完成；逻辑配额不代表硬件容量、吞吐或在线人数保证。
+</Callout>
+
+## 部署条件
+
+所有承接 MQTT 流量的节点开启 `mqtt.enable`，使用匹配候选版本及工具，保持 namespace 一致。namespace 是稳定 ClientID 命名空间，不能随意修改以清理会话。遵守当前候选的停机升级约束；集成前 MQTT 开发候选数据不能直接视为升级来源，使用启用 MQTT 前的数据或单独验证的迁移。
+
+单节点集群同样使用 256 个 hash slots。多节点部署仍需 Slot quorum 和内部通信；负载均衡不替代接管隔离证明。旧 Owner 无法证明停止时，即使其他 Slot 有 quorum，新 CONNECT 仍可能失败。
+
+默认监听 `0.0.0.0:1883`；教程限制在回环地址。对外使用上游 TLS 终止，保护明文后端网络。`mqtts://` 指向 TLS 代理，`mqtt://` 指向原始 TCP，不能关闭证书验证。MQTT WebSocket 使用独立监听；已有 WKProto / JSON-RPC 监听不能接收 MQTT 帧。
+
+字段、环境变量和范围统一维护在[配置参考](/zh/server/configuration/reference)。同时保留[认证配置](/zh/server/configuration/security)。
+
+## 浏览器 WebSocket 接入
+
+保持 `mqtt.enable=true`，在原有 `gateway.listeners` 数组中追加：
+
+```toml
+{ name = "mqtt-ws", network = "websocket", address = "127.0.0.1:1884", transport = "gnet", protocol = "mqtt", path = "/mqtt" }
+```
+
+这是数组中的一个内联表项，不是完整 TOML 文件。每个监听使用独立地址。`WK_GATEWAY_LISTENERS` 以 JSON 替换整个数组，需保留仍使用的 WKProto 监听。MQTT WebSocket 共用 TCP 的认证、Topic、限额和持久会话；切换传输不会创建新的 MQTT namespace。IM `/route` 响应不发布该地址，由业务后端提供 URL。
+
+安装 MQTT.js 5.16.0 的浏览器应用可使用后端签发的凭证连接：
+
+```js
+import mqtt from 'mqtt';
+
+const client = mqtt.connect('ws://127.0.0.1:1884/mqtt', {
+  protocolVersion: 5,
+  clientId: 'alice-browser-01',
+  username: credentials.uid,
+  password: credentials.token,
+  clean: true,
+  reconnectPeriod: 0,
+  properties: {
+    sessionExpiryInterval: 0,
+    userProperties: { 'wk.device_flag': '1' },
+  },
+});
+client.on('error', () => console.error('MQTT connection failed'));
+```
+
+`credentials` 来自可信业务后端，后端登记相同 WEB 设备类别的 Token。先注册接收事件，再发送；Topic 和确认规则见[快速开始](/zh/guide/tutorials/mqtt)。持久恢复需保留稳定 ClientID 并遵守[会话与 QoS 条件](/zh/api/client-protocols/mqtt/sessions-and-qos)。
+
+MQTT.js 自动提供大小写敏感的 `mqtt` WebSocket 子协议并发送二进制数据。监听返回 `mqtt`；缺少或不匹配的子协议返回 HTTP 400，错误路径返回 HTTP 404。文本数据会关闭连接；支持二进制 continuation、跨消息拆包和单消息合包。控制 ping/pong/close 帧保留普通 WebSocket 行为。这些要求来自 [MQTT 5 第 6 节](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html)。
+
+HTTPS 页面通过 TLS 代理使用 `wss://`。代理需转发 `/mqtt`、HTTP Upgrade 和子协议头，并保护明文后端监听。该传输不提供原生 TLS 或 WebSocket 压缩。
+
+## 备份与迁移
+
+`wkcli db export` 的 JSONL 格式尚不支持 MQTT 持久状态，包括 ClientID/UID 绑定、订阅、未完成交换、Will、共享回放和容量记录。发现这些数据时，导出在创建或覆盖输出目录前拒绝操作。关闭 MQTT 开关或等待 Session 过期不会解除这一限制。
+
+保留原数据，使用匹配版本的原生备份与恢复流程。不要通过删除 MQTT 表、回放或恢复记录来绕过拒绝；这些数据可能仍承担投递责任或保存身份绑定。
+
+## 配额如何生效
+
+| 边界 | 默认值 | 运维含义 |
+| --- | --- | --- |
+| 每会话逻辑积压 | 10000 条 / 64 MiB | 慢 ACK、离线和回放占用责任；不是物理磁盘用量 |
+| 持久 QoS 1 窗口 | 64 | 同时受客户端 Receive Maximum 限制 |
+| 单节点共享存储预留 | 8 GiB | 共享原文和未来回放副本的逻辑预留 |
+| 集群副本预留合计 | 64 GiB | 所有存储节点一致，包括未开启 MQTT 监听的节点 |
+| 入站报文 | 1 MiB | 包含编码开销；客户端下行包上限另行生效 |
+| 离线会话有效期 | 最长 24 小时 | 可调低，超出配置或硬上限被拒绝 |
+
+正文由多个会话共享时，在每个保留副本上计一次。普通历史、WAL、压缩整理和物理放大不计入逻辑限制。容量满限制新责任，保留已接收回放与未知结果，确认退休后才释放预留。不能靠删除数据或关闭连接声称容量已回收。
+
+大群评估同时观察成员数、在线客户端数、消息速率、ACK 延迟、积压与磁盘余量。十万群成员不等于十万在线连接，演示或局部结果不能推广为容量保证。
+
+## 按现象定位
+
+| 现象 | 先检查 |
+| --- | --- |
+| TCP 拒绝或超时 | MQTT 开关、监听、TLS 代理和网络；浏览器是否误用 TCP |
+| WebSocket 握手拒绝 | 精确路径、大小写敏感的 `mqtt` 子协议、TLS 代理 Upgrade 转发 |
+| CONNECT 被拒绝 | MQTT 5、UID/Token/设备类别、ClientID、恰好一个 `wk.device_flag` |
+| SUBACK 拒绝 | 规范 base64url、自己收件箱、群成员资格、是否使用通配符 |
+| 发布失败或关闭 | `wk.client_msg_no`、保留属性、Retain/QoS、权限、大小、逻辑配额 |
+| PUBACK 成功但未收到 | 接收端连接、订阅、权限、QoS、过期、窗口与 ACK；提交不等于接收 |
+| 重连无旧订阅 | 原 UID/ClientID/namespace、`clean=false`、非零有效期、Session Present |
+| 重复消息 | QoS 1 正常可能重复；检查 MessageID 去重和是否换编号重试 |
+| Will 未出现 | 正常 DISCONNECT 取消、Delay/断开判定、当前权限、代次、未知责任 |
+| 分区后 CONNECT 失败 | 旧 Owner 隔离证据、节点通信、Slot 权威及恢复；避免无限重连施压 |
+
+保留时间、节点、脱敏 ClientID、Topic、Reason Code、Session Present、MessageID 和公开指标。不要记录 Token 或敏感 payload。业务重试遵守[幂等键约定](/zh/api/client-protocols/mqtt/messages)。
+
+## 公开观测
+
+开启 metrics 后，从 `/metrics` 观察 `wukongim_mqtt_subscription_closures_total`、`wukongim_mqtt_storage_bytes`、`wukongim_mqtt_storage_events_total`、`wukongim_mqtt_owner_work` 和 `wukongim_mqtt_consumer_work`。计数器可能重复计尝试，不是唯一连接数、消息数或回收证明。
+
+先关联指标与客户端观测，再读取有界日志。见[健康与监控](/zh/server/operations/health-and-monitoring)和[故障排查](/zh/server/operations/troubleshooting)。

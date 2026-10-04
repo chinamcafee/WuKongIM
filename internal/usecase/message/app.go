@@ -5,46 +5,113 @@ import (
 	"time"
 
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
+	runtimechannelid "github.com/WuKongIM/WuKongIM/pkg/protocol/channelid"
 )
 
 // Options configures the message usecase.
 type Options struct {
+	// PermissionObserver reports bounded policy planning and evaluation.
+	PermissionObserver PermissionObserver
+	// Updates owns durable payload replacements and edit progress.
+	Updates UpdateStore
+	// ContentEpoch changes after a successful cluster restore.
+	ContentEpoch func(context.Context) (uint64, error)
+	// UpdateHints and UpdateSubscribers support bounded post-commit notification.
+	UpdateHints       UpdateHintSender
+	UpdateSubscribers UpdateSubscribers
+	// UpdateCommitted schedules body-free work after durable success; it must not block on delivery.
+	UpdateCommitted func(metadb.MessageUpdate)
+	// CommandChannelSuffix selects command IDs; empty retains the legacy default.
+	CommandChannelSuffix string
 	// Submitter owns channel-authority send routing and append admission.
 	Submitter Submitter
+	// BatchAdmission optionally separates prepared admission from durable completion.
+	BatchAdmission BatchAdmission
+	// LookupReader executes authority-fenced indexed reads for exact message queries.
+	LookupReader CommittedMessageReader
 	// Reader owns compatible channel message sync reads.
 	Reader ChannelMessageReader
+	// PersistedReader supplies disk-only conversation previews; never falls back to Reader.
+	PersistedReader ChannelMessageBatchReader
+	// Memberships authorizes ordinary message pulls and supplies visibility floors.
+	Memberships SyncMembershipStore
+	// ChannelState rejects terminally disbanded channels during ordinary pulls.
+	ChannelState SyncChannelStateStore
+	// EventNotifications and EventSubscribers deliver accepted public stream events.
+	EventNotifications EventNotificationSender
+	EventSubscribers   UpdateSubscribers
+	// EventNotificationResult observes incomplete fanout without publishing identities.
+	EventNotificationResult func(error)
 	// EventStore owns durable message event projection reads and writes.
 	EventStore MessageEventStore
 	// PermissionStore provides authoritative membership and channel reads for send authorization.
+	// SendBatch may call it concurrently for independent items.
 	PermissionStore PermissionStore
+	// PermissionBatchStore optionally groups raw permission facts by authority.
+	// Mandatory sending restrictions always use this fresh batch path.
+	PermissionBatchStore PermissionBatchStore
+	// PersonDirectory establishes both UID-owned memberships before the first
+	// persistent ordinary append to a canonical person channel.
+	PersonDirectory PersonDirectoryEnsurer
 	// SendHook optionally mutates or rejects permission-accepted sends before append admission.
 	SendHook SendHook
 	// PersonalSendAuthorizer checks current external account admission after plugin mutation.
 	PersonalSendAuthorizer PersonalSendAuthorizer
+	// BeforeSendWebhook evaluates final payloads independently of plugin skip controls.
+	BeforeSendWebhook *BeforeSendWebhook
 	// SystemUIDs identifies internal system senders that bypass business permissions.
 	SystemUIDs SystemUIDChecker
 	// PersonWhitelistEnabled enables receiver-side personal allowlist checks.
 	PersonWhitelistEnabled bool
 	// SystemDeviceID identifies trusted system-device sessions after SendBan passes.
 	SystemDeviceID string
-	// PermissionCacheTTL enables a bounded read-through permission cache. Zero keeps reads uncached.
+	// PermissionCacheTTL caches auxiliary membership facts only; send bans and
+	// terminal source-channel state always use fresh authority. Zero disables caching.
 	PermissionCacheTTL time.Duration
 	// Now supplies wall time for permission cache expiry.
 	Now func() time.Time
+	// SendBatchObserver receives bounded stage timing without entry-specific details.
+	SendBatchObserver SendBatchObserver
 }
 
 // App is a thin message facade over channel append submission and sync reads.
 type App struct {
-	submitter              Submitter
-	reader                 ChannelMessageReader
-	eventStore             MessageEventStore
+	permissionObserver PermissionObserver
+	updates            UpdateStore
+	contentEpoch       func(context.Context) (uint64, error)
+	updateHints        UpdateHintSender
+	updateSubscribers  UpdateSubscribers
+	updateCommitted    func(metadb.MessageUpdate)
+	// commandChannels applies the deployment suffix without process-global state.
+	commandChannels         runtimechannelid.CommandCodec
+	submitter               Submitter
+	batchAdmission          BatchAdmission
+	reader                  ChannelMessageReader
+	persistedReader         ChannelMessageBatchReader
+	lookupReader            CommittedMessageReader
+	memberships             SyncMembershipStore
+	channelState            SyncChannelStateStore
+	eventStore              MessageEventStore
+	eventNotifications      EventNotificationSender
+	eventSubscribers        UpdateSubscribers
+	eventNotificationResult func(error)
+	// eventNotificationSlots caps active request-owned fanouts; there is no waiting queue.
+	eventNotificationSlots chan struct{}
 	permissions            PermissionStore
+	// permissionBatch performs one authoritative, batch-scoped metadata read
+	// including mandatory policies regardless of the auxiliary cache TTL.
+	permissionBatch PermissionBatchStore
+	// permissionAuthority bypasses the optional cache for user and channel policy.
+	permissionAuthority    PermissionStore
+	personDirectory        PersonDirectoryEnsurer
 	sendHook               SendHook
 	personalSendAuthorizer PersonalSendAuthorizer
+	beforeSendWebhook      *BeforeSendWebhook
 	systemUIDs             SystemUIDChecker
 	personWhitelistEnabled bool
 	systemDeviceID         string
 	now                    func() time.Time
+	sendBatchObserver      SendBatchObserver
 }
 
 // New creates a message App.
@@ -53,18 +120,93 @@ func New(opts Options) *App {
 		opts.Now = time.Now
 	}
 	permissions := newPermissionCache(opts.PermissionStore, opts.PermissionCacheTTL, opts.Now)
+	permissionBatch := opts.PermissionBatchStore
 	return &App{
-		submitter:              opts.Submitter,
-		reader:                 opts.Reader,
-		eventStore:             opts.EventStore,
-		permissions:            permissions,
-		sendHook:               opts.SendHook,
-		personalSendAuthorizer: opts.PersonalSendAuthorizer,
-		systemUIDs:             opts.SystemUIDs,
-		personWhitelistEnabled: opts.PersonWhitelistEnabled,
-		systemDeviceID:         opts.SystemDeviceID,
-		now:                    opts.Now,
+		permissionObserver: opts.PermissionObserver,
+		updates:            opts.Updates,
+		contentEpoch:       opts.ContentEpoch,
+		updateHints:        opts.UpdateHints, updateSubscribers: opts.UpdateSubscribers,
+		updateCommitted:         opts.UpdateCommitted,
+		commandChannels:         runtimechannelid.CommandCodec{Suffix: opts.CommandChannelSuffix},
+		submitter:               opts.Submitter,
+		batchAdmission:          opts.BatchAdmission,
+		reader:                  opts.Reader,
+		persistedReader:         opts.PersistedReader,
+		lookupReader:            opts.LookupReader,
+		memberships:             opts.Memberships,
+		channelState:            opts.ChannelState,
+		eventStore:              opts.EventStore,
+		eventNotifications:      opts.EventNotifications,
+		eventSubscribers:        opts.EventSubscribers,
+		eventNotificationResult: opts.EventNotificationResult,
+		eventNotificationSlots:  make(chan struct{}, 4),
+		permissions:             permissions,
+		permissionBatch:         permissionBatch,
+		permissionAuthority:     opts.PermissionStore,
+		personDirectory:         opts.PersonDirectory,
+		sendHook:                opts.SendHook,
+		beforeSendWebhook:       opts.BeforeSendWebhook,
+		systemUIDs:              opts.SystemUIDs,
+		personWhitelistEnabled:  opts.PersonWhitelistEnabled,
+		systemDeviceID:          opts.SystemDeviceID,
+		now:                     opts.Now,
+		sendBatchObserver:       opts.SendBatchObserver,
+		personalSendAuthorizer:  opts.PersonalSendAuthorizer,
 	}
+}
+
+// SendBatchStageObservation describes one low-cardinality SendBatch stage.
+type SendBatchStageObservation struct {
+	// Stage is permission, pre_append, or submitter.
+	Stage string
+	// Result is ok or error.
+	Result string
+	// Items is the number of input items owned by the stage.
+	Items int
+	// Duration is the synchronous stage latency.
+	Duration time.Duration
+}
+
+// SendBatchObserver receives entry-agnostic SendBatch stage observations.
+type SendBatchObserver interface {
+	// ObserveMessageSendBatchStage records one bounded stage observation.
+	ObserveMessageSendBatchStage(SendBatchStageObservation)
+}
+
+// SyncMembershipStore reads UID-owned ordinary membership state for message pulls.
+// Implementations must support concurrent reads and honor context cancellation.
+type SyncMembershipStore interface {
+	GetUserChannelMembership(ctx context.Context, uid, channelID string, channelType int64) (metadb.UserChannelMembership, bool, error)
+}
+
+// SyncChannelStateStore reads terminal channel business state for message pull.
+// Implementations must support concurrent reads and honor context cancellation.
+type SyncChannelStateStore interface {
+	GetChannelForMessagePull(ctx context.Context, channelID string, channelType int64) (metadb.Channel, error)
+}
+
+// SyncMembershipReadResult preserves one authoritative membership lookup, including absence.
+type SyncMembershipReadResult struct {
+	Membership metadb.UserChannelMembership
+	Found      bool
+	Err        error
+}
+
+// SyncMembershipBatchStore reads a bounded UID-owned batch in input order.
+// Errors must not be represented as missing memberships.
+type SyncMembershipBatchStore interface {
+	GetUserChannelMemberships(context.Context, string, []ChannelID) ([]SyncMembershipReadResult, error)
+}
+
+// SyncChannelStateReadResult preserves authoritative terminal state or its read error.
+type SyncChannelStateReadResult struct {
+	Channel metadb.Channel
+	Err     error
+}
+
+// SyncChannelStateBatchStore reads bounded channel state without a permission cache.
+type SyncChannelStateBatchStore interface {
+	GetChannelsForMessagePull(context.Context, []ChannelID) ([]SyncChannelStateReadResult, error)
 }
 
 // ResetAfterRestore invalidates optional read-through authorization results so
@@ -78,11 +220,90 @@ func (a *App) ResetAfterRestore() {
 	}
 }
 
-// PermissionStore provides authoritative membership and channel reads for send authorization.
+// PermissionStore provides authoritative membership and channel reads for send
+// authorization. Implementations must support concurrent calls.
 type PermissionStore interface {
 	GetChannelForPermission(ctx context.Context, channelID string, channelType int64) (metadb.Channel, error)
 	ContainsChannelSubscriber(ctx context.Context, channelID string, channelType int64, uid string) (bool, error)
 	HasChannelSubscribers(ctx context.Context, channelID string, channelType int64) (bool, error)
+}
+
+// PermissionReadKind identifies one raw authorization fact. The usecase keeps
+// policy evaluation local and asks infrastructure only for authoritative data.
+type PermissionReadKind uint8
+
+const (
+	PermissionReadChannel PermissionReadKind = iota + 1
+	PermissionReadSubscriberContains
+	PermissionReadSubscriberHasAny
+	// PermissionReadUserSendPolicy reads UID-owned policy without credentials.
+	PermissionReadUserSendPolicy
+)
+
+// PermissionRead describes one channel-owned authorization metadata lookup.
+type PermissionRead struct {
+	Kind        PermissionReadKind
+	ChannelID   string
+	ChannelType int64
+	UID         string
+}
+
+// PermissionReadResult is aligned with one PermissionRead.
+type PermissionReadResult struct {
+	UserPolicy metadb.SendBanResult
+	Channel    metadb.Channel
+	Found      bool
+	Value      bool
+	Err        error
+}
+
+// PermissionBatchStore reads independent permission facts through a bounded
+// authoritative batch while preserving result alignment.
+type PermissionBatchStore interface {
+	ReadPermissionsBatch(context.Context, []PermissionRead) []PermissionReadResult
+}
+
+// PersonDirectoryEnsurer admits durable discovery projection work for a
+// canonical person channel before its first persistent ordinary message.
+type PersonDirectoryEnsurer interface {
+	AdmitPersonChannelDirectory(ctx context.Context, channelID string, channelType int64) error
+}
+
+// PersonDirectoryAdmission identifies one canonical person directory whose
+// durable admission must complete before its SEND can proceed.
+type PersonDirectoryAdmission struct {
+	Context     context.Context
+	ChannelID   string
+	ChannelType int64
+	// ChannelFact is the authoritative channel read already used by this
+	// SendBatch's permission decision. It is request-scoped and must never be
+	// retained as a cross-request readiness proof.
+	ChannelFact *PersonDirectoryChannelFact
+}
+
+// PersonDirectoryChannelFact carries one request-scoped authoritative channel
+// observation from permission evaluation into directory admission.
+type PersonDirectoryChannelFact struct {
+	Found   bool
+	Channel metadb.Channel
+}
+
+// PersonDirectoryBatchEnsurer admits one bounded wave and preserves exact
+// result alignment without creating caller-owned goroutines per channel.
+type PersonDirectoryBatchEnsurer interface {
+	AdmitPersonChannelDirectories([]PersonDirectoryAdmission) []error
+}
+
+// PersonDirectoryAdmissionOutcome is one result in a completed durable wave.
+type PersonDirectoryAdmissionOutcome struct {
+	Index int
+	Err   error
+}
+
+// PersonDirectoryWaveEnsurer emits serialized waves as independently sealed
+// durable batches finish, then returns only after every admission is final.
+type PersonDirectoryWaveEnsurer interface {
+	AdmitPersonChannelDirectoryWaves([]PersonDirectoryAdmission, func([]PersonDirectoryAdmissionOutcome))
 }
 
 // SystemUIDChecker identifies internal system senders that bypass business permissions.

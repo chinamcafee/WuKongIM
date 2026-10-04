@@ -1,0 +1,81 @@
+---
+title: JavaScript / Web API 参考
+description: 按管理器快速查找 wukongimjssdk 常用配置、监听器、Provider 和模型。
+---
+
+本页是常用入口速查，不替代各任务页面。根单例是 `WKSDK.shared()`。
+
+## `WKSDK` 与配置
+
+| API | 用途 |
+| --- | --- |
+| `WKSDK.shared()` | 当前页面上下文的 SDK 单例 |
+| `config.uid` / `config.token` | 当前用户身份 |
+| `config.addr` | WebSocket 地址 |
+| `config.deviceFlag` | `0` App、`1` Web、`2` PC |
+| `config.provider` | 业务数据源集合 |
+| `connect()` / `disconnect()` | 连接和停止连接 |
+| `register(type, factory)` | 注册自定义消息正文 |
+| `newChannel` / `newMessageText` | 创建常用模型的便捷方法 |
+
+## `ConnectManager`
+
+| API | 用途 |
+| --- | --- |
+| `addConnectStatusListener` | 监听连接状态 |
+| `removeConnectStatusListener` | 移除状态监听 |
+| `addConnectDelayListener` | 监听心跳延迟 |
+| `removeConnectDelayListener` | 移除延迟监听 |
+| `status` | 当前 `ConnectStatus` |
+
+状态：`Disconnect`、`Connected`、`Connecting`、`ConnectFail`、`ConnectKick`。
+
+## `ChatManager`
+
+| API | 用途 |
+| --- | --- |
+| `send(content, channel, setting?)` | 发送消息并返回本地 `Message` |
+| `sendWithOptions(content, channel, options)` | 带高级选项发送 |
+| `addMessageListener` / `removeMessageListener` | 监听所有收发消息 |
+| `addMessageStatusListener` / `removeMessageStatusListener` | 监听服务器发送结果 |
+| `syncMessages(channel, options)` | 通过 Provider 同步消息 |
+| `syncMessageExtras` | 同步消息扩展数据 |
+
+## `ConversationManager`
+
+| API | 用途 |
+| --- | --- |
+| `sync(filter?)` | 从业务 Provider 同步会话 |
+| `conversations` | 当前内存会话列表 |
+| `findConversation(channel)` | 查找一个会话 |
+| `createEmptyConversation(channel)` | 创建空会话 |
+| `removeConversation(channel)` | 移除内存列表项 |
+| `getAllUnreadCount()` | 统计总未读数 |
+| `addConversationListener` / `removeConversationListener` | 监听列表变化 |
+
+## `ChannelManager`
+
+| API | 用途 |
+| --- | --- |
+| `fetchChannelInfo(channel)` | 通过 Provider 获取资料 |
+| `getChannelInfo(channel)` | 读取缓存资料 |
+| `addListener` / `removeListener` | 监听资料变化 |
+| `syncSubscribes(channel)` | 同步群订阅者 |
+| `getSubscribes(channel)` | 读取缓存订阅者 |
+
+## 常用 Provider
+
+| 配置 | 返回值 |
+| --- | --- |
+| `connectAddrCallback` | 通过 callback 返回 WebSocket 地址 |
+| `channelInfoCallback` | `Promise<ChannelInfo>` |
+| `syncSubscribersCallback` | `Promise<Subscriber[]>` |
+| `syncConversationsCallback` | `Promise<Conversation[]>` |
+| `syncMessagesCallback` | `Promise<Message[]>` |
+| `messageUploadTaskCallback` | `MessageTask` |
+
+## 常用模型
+
+`Channel`、`ChannelInfo`、`Subscriber`、`Message`、`MessageContent`、`MessageText`、`MessageImage`、`Conversation`、`SyncOptions`、`SendOptions`。
+
+常用频道类型：`ChannelTypePerson`、`ChannelTypeGroup`。本地消息状态：`MessageStatus.Wait`、`MessageStatus.Normal`、`MessageStatus.Fail`。

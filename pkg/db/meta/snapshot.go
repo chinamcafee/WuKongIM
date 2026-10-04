@@ -11,6 +11,7 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/dberrors"
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/engine"
+	"github.com/WuKongIM/WuKongIM/pkg/db/internal/keycodec"
 	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 )
 
@@ -367,6 +368,16 @@ func (db *MetaDB) ImportHashSlotSnapshotPreservingMigrationMeta(ctx context.Cont
 
 // DeleteHashSlotData removes all metadata for one hash slot.
 func (db *MetaDB) DeleteHashSlotData(ctx context.Context, hashSlot uint16) error {
+	return db.deleteHashSlotData(ctx, hashSlot, nil)
+}
+
+// deleteLegacySlotData atomically removes a legacy one-to-one physical Slot's
+// hash-slot data and its state-machine applied watermark.
+func (db *MetaDB) deleteLegacySlotData(ctx context.Context, slotID uint64) error {
+	return db.deleteHashSlotData(ctx, uint16(slotID), encodeSlotAppliedIndexKey(slotID))
+}
+
+func (db *MetaDB) deleteHashSlotData(ctx context.Context, hashSlot uint16, slotAppliedKey []byte) error {
 	if err := checkSnapshotDB(ctx, db); err != nil {
 		return err
 	}
@@ -378,6 +389,11 @@ func (db *MetaDB) DeleteHashSlotData(ctx context.Context, hashSlot uint16) error
 	defer batch.Close()
 	for _, span := range hashSlotAllDataSpans(slot) {
 		if err := batch.DeleteRange(engine.Span{Start: span.Start, End: span.End}); err != nil {
+			return err
+		}
+	}
+	if len(slotAppliedKey) != 0 {
+		if err := batch.Delete(slotAppliedKey); err != nil {
 			return err
 		}
 	}
@@ -396,7 +412,7 @@ func (db *MetaDB) importHashSlotSnapshot(ctx context.Context, snap SlotSnapshot,
 	if err != nil {
 		return err
 	}
-	decoded, err := decodeSlotSnapshotPayload(snap.Data)
+	decoded, body, err := parseSlotSnapshotPayload(snap.Data)
 	if err != nil {
 		return err
 	}
@@ -415,10 +431,13 @@ func (db *MetaDB) importHashSlotSnapshot(ctx context.Context, snap SlotSnapshot,
 			}
 		}
 	}
-	for _, entry := range decoded.Entries {
-		if err := db.stageSlotSnapshotEntry(batch, entry, normalized, preserveMigrationMeta); err != nil {
+	if err := visitParsedSlotSnapshotPayload(decoded, body, func(key, value []byte) error {
+		if err := contextErr(ctx); err != nil {
 			return err
 		}
+		return db.stageSlotSnapshotEntry(batch, snapshotEntry{Key: key, Value: value}, normalized, preserveMigrationMeta)
+	}); err != nil {
+		return err
 	}
 	if err := batch.Commit(true); err != nil {
 		return err
@@ -509,11 +528,22 @@ func (db *MetaDB) stageSlotSnapshotEntry(batch *engine.Batch, entry snapshotEntr
 }
 
 func snapshotEntryInHashSlots(key []byte, hashSlots []HashSlot) bool {
+	// Row, index, and system spans are exact five-byte prefixes: metadata
+	// domain, hash-slot partition, uint16 slot, and space. Decode that common
+	// prefix once instead of allocating all candidate spans for every row.
+	// This intentionally validates namespace ownership only, not row schemas.
+	if len(key) < 5 || key[0] != byte(keycodec.DomainMeta) || key[1] != byte(keycodec.PartitionHashSlot) {
+		return false
+	}
+	switch keycodec.Space(key[4]) {
+	case keycodec.SpaceRow, keycodec.SpaceIndex, keycodec.SpaceSystem:
+	default:
+		return false
+	}
+	owner := HashSlot(binary.BigEndian.Uint16(key[2:4]))
 	for _, hashSlot := range hashSlots {
-		for _, span := range hashSlotAllDataSpans(hashSlot) {
-			if bytesInSpan(key, span) {
-				return true
-			}
+		if owner == hashSlot {
+			return true
 		}
 	}
 	return false

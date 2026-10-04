@@ -1,0 +1,147 @@
+---
+title: HarmonyOS 快速开始
+description: 安装 @wukong/wkim 1.1.7，连接用户并完成第一条在线文本消息。
+---
+
+这一页只做一件事：让两个在线 HarmonyOS 客户端互相发送一条文本消息。
+
+## 前置条件
+
+- 业务服务端已为 `alice` 和 `bob` 返回各自的 `uid`、`token` 和 `host:port`；
+- 两个独立的应用进程或设备。`WKIM.shared` 是进程单例；
+- 工程使用 HarmonyOS NEXT，并已声明 `ohos.permission.INTERNET` 和 `ohos.permission.GET_NETWORK_INFO`。
+
+## 1. 安装
+
+在工程目录固定版本：
+
+```bash
+ohpm install @wukong/wkim@1.1.7
+```
+
+## 2. 导入并初始化
+
+```typescript
+import { Context } from '@kit.AbilityKit'
+import { WKIM } from '@wukong/wkim'
+import {
+  ConnectionInfo,
+  WKChannel,
+  WKChannelType,
+  WKConnectStatus,
+  WKMsg,
+  WKSendMsgResult,
+  WKSyncConversation
+} from '@wukong/wkim/src/main/ets/entity/Bean'
+import { WKTextContent } from '@wukong/wkim/src/main/ets/model/WKTextContent'
+
+const im = WKIM.shared
+await im.init(bootstrap.uid, bootstrap.token, bootstrap.address, appContext as Context)
+```
+
+`bootstrap.address` 形如 `im.example.com:5100`，不要带 `tcp://`、`http://` 或 `https://`。
+
+## 3. 提供会话同步
+
+连接完成前，SDK 会向业务服务端同步最近会话：
+
+```typescript
+im.config.provider.syncConversationCallback = async (
+  lastMsgSeqs: string,
+  msgCount: number,
+  version: number
+): Promise<WKSyncConversation> => {
+  return conversationApi.sync(lastMsgSeqs, msgCount, version)
+}
+```
+
+如果只是测试从未使用过的开发账号，可以暂时返回空结果：
+
+```typescript
+const result = new WKSyncConversation()
+result.uid = bootstrap.uid
+result.conversations = []
+return result
+```
+
+已有聊天数据的账号必须返回真实会话和最近消息。
+
+## 4. 监听连接和消息
+
+把监听器保存为属性或应用级常量，移除时必须传入同一个函数对象：
+
+```typescript
+const connectionListener = (
+  status: number,
+  reasonCode?: number,
+  info?: ConnectionInfo
+) => {
+  if (status === WKConnectStatus.syncCompleted) {
+    console.info(`WuKongIM ready on node ${info?.nodeId ?? '-'}`)
+  } else if (status === WKConnectStatus.fail) {
+    console.error(`connect failed: ${reasonCode ?? '-'}`)
+  } else if (status === WKConnectStatus.kicked) {
+    requireLoginAgain()
+  }
+}
+
+const sendStatusListener = (
+  clientSeq: number,
+  messageId: string,
+  messageSeq: number,
+  reasonCode: number
+) => {
+  if (reasonCode === WKSendMsgResult.success) {
+    markMessageSent(clientSeq, messageId, messageSeq)
+  } else {
+    markMessageFailed(clientSeq, reasonCode)
+  }
+}
+
+const newMessagesListener = (messages: WKMsg[]) => {
+  messages.forEach((message) => {
+    if (message.messageContent instanceof WKTextContent) {
+      console.info(`${message.fromUID}: ${message.messageContent.content}`)
+    }
+  })
+}
+
+im.connectionManager().addConnectStatusListener(connectionListener)
+im.messageManager().addSendStatusListener(sendStatusListener)
+im.messageManager().addNewMsgListener(newMessagesListener)
+```
+
+`success` 表示连接协议成功，之后还有 `syncing` 和 `syncCompleted`。等到 `syncCompleted` 再开放发送按钮。
+
+## 5. 连接并发送文本
+
+```typescript
+im.connectionManager().connection()
+```
+
+Alice 到达 `syncCompleted` 后向 Bob 发送：
+
+```typescript
+im.messageManager().send(
+  new WKTextContent('你好，Bob'),
+  new WKChannel('bob', WKChannelType.personal)
+)
+```
+
+`send()` 没有 Promise 返回值。服务端是否接受消息，以 `sendStatusListener` 中的 `reasonCode` 为准。
+
+## 预期结果
+
+1. Alice 和 Bob 都到达 `syncCompleted`；
+2. Alice 的发送回调得到 `WKSendMsgResult.success`；
+3. Bob 的新消息监听器打印“你好，Bob”。
+
+页面或应用服务结束时移除监听：
+
+```typescript
+im.connectionManager().removeConnectStatusListener(connectionListener)
+im.messageManager().removeSendStatusListener(sendStatusListener)
+im.messageManager().removeNewMsgListener(newMessagesListener)
+```
+
+下一步阅读[连接管理](/zh/sdk/harmonyos/connection)和[消息管理](/zh/sdk/harmonyos/messages)。

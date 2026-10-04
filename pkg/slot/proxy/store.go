@@ -3,6 +3,8 @@ package proxy
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 	metafsm "github.com/WuKongIM/WuKongIM/pkg/slot/fsm"
@@ -12,19 +14,20 @@ import (
 // Store provides business-level distributed storage APIs
 // built on top of the cluster metadata proposal port.
 type Store struct {
-	cluster                       Cluster
-	db                            *metadb.DB
-	userConversationActiveOverlay UserConversationActiveOverlay
-}
-
-// UserConversationActiveOverlay exposes hot UID-owned active hints that have
-// not been durably folded into the slot state yet.
-type UserConversationActiveOverlay interface {
-	// ListHotUserConversationActive returns hot hints ordered by active_at.
-	// A negative limit requests the complete bounded hot set for the UID.
-	ListHotUserConversationActive(ctx context.Context, uid string, limit int) ([]metadb.UserConversationActiveHint, error)
-	SubmitHints(ctx context.Context, hints []metadb.UserConversationActiveHint) error
-	RemoveHints(ctx context.Context, barriers []metadb.UserConversationDeleteBarrier) error
+	// permissionGateMu makes permit assignment and waiting-position release atomic.
+	// Assigned callers occupy execution capacity even before they resume.
+	permissionGateMu    sync.Mutex
+	permissionExecuting int
+	permissionWaiters   []*sendPermissionWaiter
+	// permissionWaitingBytes sums queued remote envelope sizes; guarded by permissionGateMu.
+	permissionWaitingBytes int
+	permissionWaiting      atomic.Int64
+	permissionInflight     atomic.Int64
+	permissionObserver     SendPermissionObserver
+	cluster                Cluster
+	db                     *metadb.DB
+	// messageUpdateObserver observes serving edit reads; nil disables timing.
+	messageUpdateObserver MessageUpdateReadObserver
 }
 
 // New creates a Store.
@@ -34,22 +37,26 @@ func New(cluster Cluster, db *metadb.DB) *Store {
 	return store
 }
 
-// NewChannelMetadataStore creates the channel/member subset and registers only
-// its non-conflicting authoritative RPC services.
-func NewChannelMetadataStore(cluster Cluster, db *metadb.DB) *Store {
+// NewChannelMetadataStore creates the runtime metadata subset, including device
+// credential reads, and registers only promoted non-conflicting RPC services.
+func NewChannelMetadataStore(cluster Cluster, db *metadb.DB, observers ...MessageUpdateReadObserver) *Store {
 	store := &Store{cluster: cluster, db: db}
+	if len(observers) != 0 && observers[0] != nil && observers[0].MessageUpdateReadObservationEnabled() {
+		store.messageUpdateObserver = observers[0]
+	}
 	registerSelectedStoreRPCHandlers(cluster, []storeRPCRegistration{
+		{serviceID: cmdDeviceRPCServiceID, handler: store.handleCMDDeviceReadRPC},
+		{serviceID: identityRPCServiceID, handler: store.handleDeviceIdentityRPC},
+		{serviceID: runtimeMetaRPCServiceID, handler: store.handleRuntimeMetaRPC},
 		{serviceID: subscriberRPCServiceID, handler: store.handleSubscriberRPC},
 		{serviceID: channelRPCServiceID, handler: store.handleChannelRPC},
+		{serviceID: permissionBatchRPCServiceID, handler: store.handlePermissionBatchRPC},
+		{serviceID: sendPermissionRPCServiceID, handler: store.handleSendPermissionRPC},
+		{serviceID: membershipRPCServiceID, handler: store.handleMembershipRPC},
+		{serviceID: messageUpdateRPCServiceID, handler: store.handleMessageUpdateReadRPC},
+		{serviceID: mqttReadRPCServiceID, handler: store.handleMQTTReadRPC},
 	})
 	return store
-}
-
-func (s *Store) RegisterUserConversationActiveOverlay(overlay UserConversationActiveOverlay) {
-	if s == nil {
-		return
-	}
-	s.userConversationActiveOverlay = overlay
 }
 
 func (s *Store) HashSlotTableVersion() uint64 {

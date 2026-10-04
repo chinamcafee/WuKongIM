@@ -1,0 +1,206 @@
+---
+title: iOS quickstart
+description: Install the pinned SDK version, obtain credentials from your backend, exchange online messages, and clean up.
+---
+
+This tutorial uses **WK_EASYSDK_IOS_VERSION** to exchange online messages between Alice and Bob in separate clients. WebSocket JSON-RPC CONNECT authenticates the connection.
+
+## 1. Prepare
+
+Prepare the following:
+
+- Set the iOS deployment target to **iOS 15 or later**. The package manifest declares iOS 13, but the public `WuKongEasySDK` class in `v1.1.1` is marked `@available(iOS 15.0, ...)`, so this tutorial uses the more conservative API limit.
+- Use an Xcode toolchain that supports Swift 5.7 packages.
+- Run a WuKongIM single-node cluster or multi-node cluster whose `/readyz` is healthy and whose WebSocket Gateway is reachable from the device.
+- Have the product backend return `uid`, a short-lived `token`, and `websocketUrl` separately for Alice and Bob.
+
+Read [Identity & Token](/en/guide/integration/authentication) first. Never embed a fixed token in the app, source repository, logs, or screenshots.
+
+To see messages first, follow [the official example](/en/sdk/easy/examples#ios) with two clients. The steps below integrate the SDK into your application.
+
+The default device category is **APP `0`**. Store the Token with the same `device_flag` on your backend: APP is `0`, WEB is `1`, and PC is `2`.
+
+## 2. Install the SDK
+
+### Swift Package Manager
+
+In Xcode, choose **File → Add Package Dependencies** and enter:
+
+```text
+https://github.com/WuKongIM/WuKongEasySDK-iOS.git
+```
+
+Choose **Exact Version** and enter `WK_EASYSDK_IOS_VERSION`. If the project owns a `Package.swift`, use an exact rule:
+
+```swift
+dependencies: [
+    .package(
+        url: "https://github.com/WuKongIM/WuKongEasySDK-iOS.git",
+        exact: "WK_EASYSDK_IOS_VERSION"
+    )
+]
+```
+
+## 3. Connect and listen
+
+Map the product-backend response into an application model. The real implementation obtains this over HTTPS and does not call WuKongIM HTTP API management routes from the client:
+
+```swift
+struct IMBootstrap: Decodable {
+    let uid: String
+    let token: String
+    let websocketUrl: String
+}
+```
+
+`websocketUrl` may use `ws://` during local development. In production, the product backend selects and returns a `wss://` address.
+
+The following object registers listeners before connecting. On exit it removes each listener with the returned `EventListener`, preventing duplicate handling after a view is opened again.
+
+```swift
+import Combine
+import Foundation
+import WuKongEasySDK
+
+@MainActor
+final class EasyChatClient: ObservableObject {
+    @Published private(set) var isConnected = false
+    @Published private(set) var messages: [Message] = []
+
+    private var sdk: WuKongEasySDK?
+    private var listeners: [EventListener] = []
+
+    func start(with bootstrap: IMBootstrap) async throws {
+        stop()
+
+        let config = try WuKongConfig(
+            serverUrl: bootstrap.websocketUrl,
+            uid: bootstrap.uid,
+            token: bootstrap.token,
+            connectionTimeout: 15,
+            requestTimeout: 15,
+            maxReconnectAttempts: 5,
+            enableDebugLogging: false,
+            logLevel: .error,
+            enableJsonLogging: false // Also disable JSON summaries in production.
+        )
+        let sdk = WuKongEasySDK(config: config)
+
+        listeners.append(sdk.onConnect { [weak self] _ in
+            Task { @MainActor in self?.isConnected = true }
+        })
+        listeners.append(sdk.onDisconnect { [weak self] _ in
+            Task { @MainActor in
+                self?.isConnected = false
+                print("WuKongEasySDK disconnected")
+            }
+        })
+        listeners.append(sdk.onMessage { [weak self] message in
+            Task { @MainActor in
+                guard self?.messages.contains(where: { $0.messageId == message.messageId }) == false
+                else { return }
+                self?.messages.append(message)
+                if let self, self.messages.count > 100 {
+                    self.messages.removeFirst(self.messages.count - 100)
+                }
+            }
+        })
+        listeners.append(sdk.onError { _ in
+            print("WuKongEasySDK operation failed")
+        })
+
+        self.sdk = sdk
+        do {
+            try await sdk.connect()
+        } catch {
+            stop() // Release the socket and listeners after timeout, auth, or network failure.
+            throw error
+        }
+    }
+
+    func sendText(to uid: String, text: String) async throws -> SendResult {
+        guard let sdk, isConnected else { throw WuKongError.notConnected }
+
+        let payload: MessagePayload = [
+            "type": 1,
+            "version": 1,
+            "content": text
+        ]
+        return try await sdk.send(
+            channelId: uid,
+            channelType: .person,
+            payload: payload
+        )
+    }
+
+    func stop() {
+        if let sdk {
+            listeners.forEach { sdk.removeListener($0) }
+            sdk.disconnect()
+        }
+        listeners.removeAll()
+        messages.removeAll()
+        sdk = nil
+        isConnected = false
+    }
+
+    deinit {
+        // The view or application lifecycle should still call stop() explicitly.
+    }
+}
+```
+
+Do not discard the anonymous closure passed to `onMessage`: `removeListener` needs the listener object returned during registration. The sample bounds connection and request handling at 15 seconds and calls `stop()` after failure; automatic reconnect is capped at 5 attempts, while the UI remains not ready. In SwiftUI, let a higher-level `@StateObject` own `EasyChatClient` and call `stop()` on logout or when the application-level owner exits.
+
+## 4. Exchange the first message
+
+`productAPI.fetchIMBootstrap()` is your application login API; `chatClient` is the `EasyChatClient` created above. This is an integration snippet; use the [official example](/en/sdk/easy/examples#ios) for a runnable app.
+
+The device flag and payload shape are compatible with the current server. After product login, obtain Alice's `IMBootstrap` and start the client:
+
+```swift
+let aliceBootstrap = try await productAPI.fetchIMBootstrap()
+try await chatClient.start(with: aliceBootstrap)
+
+_ = try await chatClient.sendText(
+    to: "bob",
+    text: "Hello from iOS EasySDK"
+)
+print("SEND completed")
+```
+
+The returned `SendResult` means Alice received a server result for the send. Bob must independently observe the same product payload through `onMessage`; a local list insertion is not proof of peer receipt.
+
+1. Sign in as Alice and Bob on two devices or in two independent app processes.
+2. Enable send only after both sides observe `onConnect`.
+3. Have Alice send to the person Channel `bob`, retaining `messageId` and `messageSeq`.
+4. On Bob, verify `fromUid == "alice"`, the Channel, and the payload in `onMessage`.
+5. Send from Bob to Alice and prove the reverse direction.
+6. Leave the view or sign out, call `stop()`, and confirm that no duplicate listener or background connection remains.
+
+## 5. Clean up
+
+Call `chatClient.stop()` when signing out or destroying the connection owner. It removes each `EventListener` and calls `disconnect()`. Reopening a page should not create another application connection. The example keeps only the latest 100 messages for display, not durable history.
+
+## 6. Troubleshooting
+
+- **The compiler says the API requires iOS 15:** raise the deployment target to iOS 15; do not rely only on the lower platform declaration in `Package.swift`.
+- **Connection or authentication fails:** reach the returned address from the device network, inspect WSS, certificates, and proxy Upgrade, then refresh the short-lived token. Never return a container-only address to the phone.
+- **SEND or RECV cannot decode the payload:** confirm the server includes the EasySDK JSON-RPC compatibility implementation and the proxy does not rewrite messages. The pinned release sends objects; the server accepts object and Base64 input and emits object RECV.
+- **The device category is unexpected:** ensure product code has not overridden `.app`, then compare APP `0`, WEB `1`, and PC `2`; do not carry forward an older literal.
+- **Messages appear more than once:** register listeners only once and merge realtime and later synchronized results by `messageId`.
+- **Alice gets a send result but Bob sees nothing:** inspect Alice's send result, Bob's realtime connection, and the product's later offline-sync path separately. Do not automatically resend a message that may already be committed.
+
+## Alternative installation: CocoaPods
+
+```ruby
+target 'YourApp' do
+  pod 'WuKongEasySDK', 'WK_EASYSDK_IOS_VERSION'
+end
+```
+
+Run `pod install`, then open the `.xcworkspace`. Choose one installation method, not both.
+
+## Next
+
+Continue with [messaging](/en/guide/integration/messaging) and [production checks](/en/guide/integration/acceptance). For offline recovery, conversations, unread counts, or push, see [SDK selection](/en/sdk). [Versions and validation records](https://github.com/WuKongIM/WuKongIM/blob/main/docs/superpowers/reports/2026-09-08-easysdk-validation-history.md#ios) retain the exact environments and scope of past runs.

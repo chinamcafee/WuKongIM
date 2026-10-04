@@ -23,8 +23,8 @@ resources, run a GitHub workflow, bootstrap hosts through CloudShell, or fix
 code automatically. The Alibaba workflows and local analysis command now
 implement those operations behind the provider and remediation boundaries
 proven here. A cloud workload
-uses the black-box `wkbench run` and `wkbench worker`
-path; `wkbench dev-sim` remains a local development convenience and is not the
+uses the black-box `wkcli bench run` and `wkcli bench worker`
+path; `wkcli bench dev-sim` remains a local development convenience and is not the
 cloud orchestration path.
 
 ## 1. Build the Phase 1 executables

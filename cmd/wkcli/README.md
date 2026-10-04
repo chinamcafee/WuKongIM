@@ -1,6 +1,6 @@
 # wkcli
 
-`wkcli` is the extensible operations CLI for WuKongIM. The root package stays
+`wkcli` is the single operator utility for WuKongIM, including operations, benchmarks, offline database transfer, and original v2 migration. The root package stays
 thin: root wiring owns shared IO, exit-code handling, and subcommand
 registration; each feature command lives in its own directory.
 
@@ -14,11 +14,40 @@ Current commands:
 
 | Command | Purpose |
 | --- | --- |
+| `version` | Reports the version, source commit, and build source; supports `--output json`. |
+| `bench` | [Distributed workloads, workers, capacity tests, and reports](internal/benchmark/README.md). |
+| `db` | [Offline query, REPL, import, export, and diff](internal/database/README.md). |
+| `migrate` | [Original v2-to-v3 offline migration and independent verification](internal/migrate/README.md). |
 | `context` | Manages named WuKongIM server API contexts. |
 | `bench send` | Runs a lightweight WKProto SEND/SENDACK benchmark using `pkg/client`. |
 | `top` | Reads live internal runtime pressure snapshots. |
 | `sim` | Runs a long-lived internal real-traffic simulator. |
 | `node` | Operates dynamic nodes through manager HTTP. |
+
+## Installation and migration from separate binaries
+
+Official Linux/macOS binary archives and the `wukongim` APT/RPM package include
+`wkcli` at the same version and source commit as the server. Build from source
+with `GOWORK=off go build -o ./bin/wkcli ./cmd/wkcli`.
+
+| Removed executable | Replacement |
+| --- | --- |
+| `wkbench <args>` | `wkcli bench <args>` |
+| `wkdb <args>` | `wkcli db <args>` |
+| `wkmigrate <args>` | `wkcli migrate <args>` |
+
+There are no legacy executable aliases. Update external scripts as well as
+binary paths: the subcommand is a separate argument, including worker/systemd
+invocations. Repository helper scripts now accept `WK_CLI_BIN` and, where
+available, `--wkcli-bin`; migration rehearsal pins `--wkcli-sha256`.
+
+Each family retains its argument grammar, JSON/report schemas and exit codes.
+For `db`, put global flags before the database verb, for example
+`wkcli db --data-dir ./node1 --format json query "show tables"`.
+Database `import` writes an offline target; inspection remains read-only.
+Benchmark schemas, metric names and systemd unit names retain their existing
+`wkbench` identifiers. `sim` and `bench dev-sim` retain separate behavior.
+Cloud lifecycle and Issue/Review Agent executables remain internal tools.
 
 ## Top
 
@@ -82,7 +111,7 @@ Use `--context-dir` to point tests or local experiments at an isolated store.
 
 `bench send` is a lightweight direct WKProto benchmark. It is intended for quick
 client-side SEND/SENDACK throughput checks and does not replace the full
-black-box `cmd/wkbench` scenario runner.
+black-box `cmd/wkcli` scenario runner.
 
 ```bash
 go run ./cmd/wkcli bench send \

@@ -1,3 +1,4 @@
+import { t } from '../i18n'
 import  { MessageContent } from "wukongimjssdk";
 
 
@@ -44,7 +45,7 @@ export class CustomMessage extends MessageContent {
     // 重写 conversationDigest，这个是现实在最近会话列表的消息摘要
     get conversationDigest() {
 
-        return "[订单消息]"
+        return t('orderDigest')
     }
   
 }

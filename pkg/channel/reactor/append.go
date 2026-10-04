@@ -38,6 +38,27 @@ func (r *Reactor) validateAppendEvent(ctx context.Context, rc *runtimeChannel, e
 			return err
 		}
 	}
+	if event.MQTTAnchor != nil {
+		if event.MQTTSourceActivation || event.MQTTRetirement != nil {
+			return ch.ErrInvalidConfig
+		}
+		if err := r.validateMQTTAnchorControl(rc, event); err != nil {
+			return err
+		}
+	}
+	if event.MQTTRetirement != nil {
+		if event.MQTTSourceActivation {
+			return ch.ErrInvalidConfig
+		}
+		if err := r.validateMQTTRetirementControl(rc, event); err != nil {
+			return err
+		}
+	}
+	if event.MQTTSourceActivation {
+		if err := r.validateMQTTSourceControl(rc, event); err != nil {
+			return err
+		}
+	}
 	if _, ok := rc.waiters[event.OpID]; ok {
 		return ch.ErrInvalidConfig
 	}
@@ -72,6 +93,9 @@ func (r *Reactor) validateAppendEvent(ctx context.Context, rc *runtimeChannel, e
 			rc.state.Leader,
 		)
 	}
+	if err := r.validateAppendRouteFence(rc, event.Append); err != nil {
+		return err
+	}
 	if r.appendAdmissionGuard != nil {
 		err := r.appendAdmissionGuard.AllowChannelAppend(ctx, ch.AppendAdmissionRequest{
 			ChannelID:   rc.state.ID,
@@ -87,37 +111,75 @@ func (r *Reactor) validateAppendEvent(ctx context.Context, rc *runtimeChannel, e
 	return nil
 }
 
+// validateAppendRouteFence binds prepared work to the installed durable authority.
+// It performs no metadata I/O and never upgrades a caller's expected version.
+func (r *Reactor) validateAppendRouteFence(rc *runtimeChannel, req ch.AppendBatchRequest) error {
+	if req.ExpectedRouteGeneration == 0 {
+		return nil
+	}
+	if r.cfg.QuorumLog == nil || req.ExpectedChannelEpoch == 0 || req.ExpectedLeaderEpoch == 0 ||
+		normalizedCommitMode(req.CommitMode) != ch.CommitModeQuorum {
+		return ch.ErrInvalidConfig
+	}
+	if rc.state.ID != req.ChannelID || rc.quorumAuthority.ID.ChannelEpoch != req.ExpectedChannelEpoch ||
+		rc.quorumAuthority.ID.LeaderTerm != req.ExpectedLeaderEpoch ||
+		rc.quorumAuthority.ID.FenceVersion != req.ExpectedRouteGeneration {
+		return ch.ErrStaleMeta
+	}
+	return nil
+}
+
 func newAppendRequest(event Event, admittedAt time.Time) appendRequest {
+	var anchor *ch.MQTTReplayAnchorRequest
+	var retirement *ch.MQTTReplayRetirementRequest
+	if event.MQTTAnchor != nil {
+		owned := event.MQTTAnchor.Clone()
+		anchor = &owned
+	}
+	if event.MQTTRetirement != nil {
+		owned := event.MQTTRetirement.Clone()
+		retirement = &owned
+	}
 	return appendRequest{
-		opID:       event.OpID,
-		req:        event.Append,
-		future:     event.Future,
-		ctx:        event.Context,
-		enqueuedAt: admittedAt,
-		records:    appendRecordsFromMessages(event.Append.Messages, admittedAt),
-		commitMode: normalizedCommitMode(event.Append.CommitMode),
+		mqttAnchor:           anchor,
+		mqttRetirement:       retirement,
+		opID:                 event.OpID,
+		req:                  event.Append,
+		future:               event.Future,
+		ctx:                  event.Context,
+		enqueuedAt:           admittedAt,
+		records:              appendRecordsFromMessages(event.Append.Messages, admittedAt, event.Append.PayloadsImmutable),
+		commitMode:           normalizedCommitMode(event.Append.CommitMode),
+		mqttSourceActivation: event.MQTTSourceActivation,
 	}
 }
 
-func appendRecordsFromMessages(messages []ch.Message, admittedAt time.Time) []ch.Record {
+func appendRecordsFromMessages(messages []ch.Message, admittedAt time.Time, payloadsImmutable bool) []ch.Record {
 	records := make([]ch.Record, len(messages))
 	for i, msg := range messages {
 		serverTimestampMS := msg.ServerTimestampMS
 		if serverTimestampMS == 0 {
 			serverTimestampMS = admittedAt.UnixMilli()
 		}
+		payload := msg.Payload
+		metadata := msg.PublicationMetadata
+		if !payloadsImmutable {
+			payload = append([]byte(nil), msg.Payload...)
+			metadata = append([]byte(nil), metadata...)
+		}
 		records[i] = ch.Record{
-			ID:                msg.MessageID,
-			Setting:           msg.Setting,
-			Topic:             msg.Topic,
-			Expire:            msg.Expire,
-			RedDot:            msg.RedDot,
-			FromUID:           msg.FromUID,
-			ClientMsgNo:       msg.ClientMsgNo,
-			Payload:           append([]byte(nil), msg.Payload...),
-			SizeBytes:         len(msg.Payload),
-			ServerTimestampMS: serverTimestampMS,
-			SyncOnce:          msg.SyncOnce,
+			ID:                  msg.MessageID,
+			Setting:             msg.Setting,
+			FromUID:             msg.FromUID,
+			ClientMsgNo:         msg.ClientMsgNo,
+			Payload:             payload,
+			PublicationMetadata: metadata,
+			SizeBytes:           len(msg.Payload) + len(metadata),
+			ServerTimestampMS:   serverTimestampMS,
+			SyncOnce:            msg.SyncOnce,
+			RedDot:              msg.RedDot,
+			Expire:              msg.Expire,
+			Topic:               msg.Topic,
 		}
 	}
 	return records
@@ -178,6 +240,48 @@ func (r *Reactor) handleStoreAppendResult(result worker.Result) {
 	}
 }
 
+func (r *Reactor) handleQuorumCommitResult(result worker.Result) {
+	rc, err := r.lookupLoadedChannel(result.Fence.ChannelKey)
+	if err != nil {
+		return
+	}
+	batch := rc.appendInflight
+	current := batch != nil && batch.batchOpID == result.Fence.OpID
+	if !current {
+		return
+	}
+	commitErr := result.Err
+	var committed machine.QuorumCommittedResult
+	committed.Fence = result.Fence
+	if commitErr == nil {
+		if result.QuorumCommit == nil {
+			commitErr = ch.ErrInvalidConfig
+		} else {
+			receipt := result.QuorumCommit.Receipt
+			recordCount := uint64(len(batch.records))
+			if receipt.Authority != batch.authority || receipt.CommandID != batch.commandID || receipt.First == 0 ||
+				recordCount == 0 || receipt.Last < receipt.First || receipt.Last-receipt.First+1 != recordCount || receipt.HW != receipt.Last {
+				commitErr = ch.ErrLogConflict
+			} else {
+				committed.First = receipt.First
+				committed.Last = receipt.Last
+				committed.HW = receipt.HW
+			}
+		}
+	}
+	committed.Err = commitErr
+	now := time.Now()
+	r.observeAppendStoreCompleted(rc, *batch, now, committed.First, commitErr)
+	oldHW := rc.state.HW
+	decision := rc.state.ApplyQuorumCommitted(committed)
+	if commitErr == nil {
+		r.markAppendHWAdvanced(rc, oldHW, rc.state.HW, now)
+		r.afterSuccessfulQuorumCommit(rc, now)
+	}
+	r.completeReplies(rc, decision.Replies, nil)
+	r.finishAppendInflightBatch(rc, commitErr, now)
+}
+
 func appendStoredResultFromWorker(result worker.Result) machine.AppendStoredResult {
 	stored := machine.AppendStoredResult{Fence: result.Fence, Err: result.Err}
 	if result.StoreAppend == nil {
@@ -188,6 +292,7 @@ func appendStoredResultFromWorker(result worker.Result) machine.AppendStoredResu
 	}
 	stored.BaseOffset = result.StoreAppend.BaseOffset
 	stored.LastOffset = result.StoreAppend.LastOffset
+	stored.Outcome = result.StoreAppend.Outcome
 	return stored
 }
 
@@ -196,6 +301,7 @@ func (r *Reactor) afterSuccessfulLeaderAppendStored(rc *runtimeChannel, batchOpI
 	r.markAppendActivity(rc, now)
 	rc.lifecycle.version = rc.state.LEO
 	r.syncFollowerMatches(rc)
+	r.releaseRecentRecordsAcknowledgedByAllFollowers(rc)
 	for _, follower := range rc.lifecycle.followers {
 		if follower == nil || follower.match >= rc.state.LEO {
 			continue
@@ -207,6 +313,14 @@ func (r *Reactor) afterSuccessfulLeaderAppendStored(rc *runtimeChannel, batchOpI
 	}
 	r.sendPullHintsForAppend(rc, now)
 	r.scheduleLaggingFollowerResumeHints(rc, now)
+}
+
+func (r *Reactor) afterSuccessfulQuorumCommit(rc *runtimeChannel, now time.Time) {
+	// Durable quorum owns replication and repair. Do not duplicate its payloads
+	// in the legacy pull cache; compatibility pulls can read the durable store.
+	r.markAppendActivity(rc, now)
+	rc.lifecycle.version = rc.state.LEO
+	r.scheduleLifecycleFromState(rc, now)
 }
 
 func (r *Reactor) finishAppendInflightBatch(rc *runtimeChannel, appendErr error, now time.Time) {

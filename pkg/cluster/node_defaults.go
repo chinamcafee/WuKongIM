@@ -2,14 +2,18 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 
 	channelruntime "github.com/WuKongIM/WuKongIM/pkg/channel"
+	channelreplication "github.com/WuKongIM/WuKongIM/pkg/channel/replication"
 	channelstore "github.com/WuKongIM/WuKongIM/pkg/channel/store"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/channels"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/control"
 	clusternet "github.com/WuKongIM/WuKongIM/pkg/cluster/net"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/propose"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/routing"
+	messagedb "github.com/WuKongIM/WuKongIM/pkg/db/message"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 	metafsm "github.com/WuKongIM/WuKongIM/pkg/slot/fsm"
 )
@@ -19,7 +23,6 @@ func (n *Node) ensureDefaultRuntime() (bool, error) {
 		if err := n.ensureDefaultTransport(); err != nil {
 			return false, err
 		}
-		n.registerPendingRPCHandlers()
 		controlPeers := n.defaultControlRuntimePeers()
 		raftTransport := control.NewRaftTransportWithOptions(n.transportClient, control.RaftTransportOptions{Observer: n.cfg.Transport.Observer})
 		runtime, err := control.NewRuntime(control.RuntimeConfig{
@@ -67,7 +70,11 @@ func (n *Node) ensureDefaultRuntime() (bool, error) {
 			Slots:     n.defaultSlotProposer,
 			Forward:   forward,
 		})
+		n.defaultProposer = true
 	}
+	// Recreated Slot proxies replace their pending handlers before registration;
+	// registering earlier would bind the new server to a closed metadata store.
+	n.registerPendingRPCHandlers()
 	createdDefaultChannels := false
 	if n.channels == nil {
 		storeFactory := n.defaultChannelStore
@@ -79,6 +86,38 @@ func (n *Node) ensureDefaultRuntime() (bool, error) {
 		var transport *channels.TransportClient
 		if n.transportClient != nil {
 			transport = channels.NewTransportClient(n.transportClient)
+		}
+		storeAdapter, err := channelreplication.NewStoreAdapter(channelreplication.StoreAdapterConfig{
+			Factory: storeFactory, MaxBatchItems: channelreplication.MaxExchangeBatchItems,
+			MaxBatchBytes: channelreplication.MaxExchangeBatchBytes,
+		})
+		if err != nil {
+			if createdStoreFactory {
+				_ = storeFactory.Close()
+			}
+			return false, err
+		}
+		peerLink, err := channels.NewQuorumPeerLink(channelruntime.NodeID(n.cfg.NodeID), n.transportClient)
+		if err != nil {
+			if createdStoreFactory {
+				_ = storeFactory.Close()
+			}
+			return false, err
+		}
+		var replicationObserver channelreplication.StageObserver
+		if n.cfg.Channel.Observer != nil {
+			replicationObserver, _ = n.cfg.Channel.Observer.(channelreplication.StageObserver)
+		}
+		quorumRuntime, err := channelreplication.NewRuntime(channelreplication.RuntimeConfig{
+			LocalNode: channelruntime.NodeID(n.cfg.NodeID), Store: storeAdapter, Link: peerLink,
+			Goroutines: n.cfg.Goroutines, MaxChannels: n.cfg.Channel.MaxChannels,
+			MaxVoters: int(n.cfg.Channel.ReplicaCount), Observer: replicationObserver,
+		})
+		if err != nil {
+			if createdStoreFactory {
+				_ = storeFactory.Close()
+			}
+			return false, err
 		}
 		service, err := channels.NewService(channels.Config{
 			LocalNode:                     channelruntime.NodeID(n.cfg.NodeID),
@@ -97,13 +136,16 @@ func (n *Node) ensureDefaultRuntime() (bool, error) {
 			FollowerRecoveryProbeInterval: n.cfg.Channel.FollowerRecoveryProbeInterval,
 			FollowerRecoveryProbeJitter:   n.cfg.Channel.FollowerRecoveryProbeJitter,
 			Observer:                      n.cfg.Channel.Observer,
+			Goroutines:                    n.cfg.Goroutines,
 			AppendAdmissionGuard:          n.channelDataPlaneLease,
 			Store:                         storeFactory,
 			Transport:                     transport,
+			QuorumLog:                     quorumRuntime.Log(),
 			MetaSource:                    n.defaultChannelMetaSource(),
 			MigrationStore:                n.defaultChannelMigrationStore(),
 		})
 		if err != nil {
+			_ = quorumRuntime.Close(context.Background())
 			if createdStoreFactory {
 				_ = storeFactory.Close()
 			}
@@ -118,10 +160,17 @@ func (n *Node) ensureDefaultRuntime() (bool, error) {
 			} else {
 				n.channelRPCGateway.Replace(service)
 			}
+			if n.channelQuorumGateway == nil {
+				n.channelQuorumGateway = channels.NewQuorumExchangeGateway(quorumRuntime.ExchangeServer())
+				channels.RegisterQuorumExchangeHandlerOn(n.transportServer, n.channelQuorumGateway)
+			} else {
+				n.channelQuorumGateway.Replace(quorumRuntime.ExchangeServer())
+			}
 		}
 		n.channels = service
 		n.defaultChannels = true
 		n.defaultChannelStore = storeFactory
+		n.defaultChannelReplication = quorumRuntime
 		createdDefaultChannels = true
 	}
 	return createdDefaultChannels, nil
@@ -131,12 +180,17 @@ func (n *Node) newDefaultChannelStore() *channelstore.MessageDBFactory {
 	return channelstore.NewMessageDBFactoryWithOptions(
 		n.defaultChannelStorePath(),
 		channelstore.MessageDBFactoryOptions{
+			MQTTStorage: messagedb.MQTTStorageOptions{
+				NodeBytes: n.cfg.Storage.MQTTNodeBytes, ClusterBytes: n.cfg.Storage.MQTTClusterBytes,
+				Adjust: n.adjustMQTTStorage, Members: n.mqttStorageMembers, Observer: n.cfg.Storage.MQTTStorageObserver,
+			},
 			CommitFlushWindow: n.cfg.Storage.CommitFlushWindow,
 			CommitMaxRequests: n.cfg.Storage.CommitMaxRequests,
 			CommitMaxRecords:  n.cfg.Storage.CommitMaxRecords,
 			CommitMaxBytes:    n.cfg.Storage.CommitMaxBytes,
 			CommitShards:      n.cfg.Storage.CommitShards,
 			CommitObserver:    n.cfg.Storage.CommitObserver,
+			DiskSlowThreshold: n.cfg.Storage.DiskSlowThreshold,
 			Logger:            namedLogger(n.cfg.Logger, "message_db"),
 		},
 	)
@@ -159,7 +213,6 @@ func (n *Node) ensureDefaultTransport() error {
 		NodeID:    n.cfg.NodeID,
 		Discovery: n.discovery,
 		Observer:  n.cfg.Transport.Observer,
-		PoolSize:  1000,
 	})
 	n.slotStatusCaller = n.transportClient
 	n.defaultTransport = true
@@ -262,13 +315,19 @@ func (n *Node) defaultChannelMetaSource() channels.ChannelMetaSource {
 		return nil
 	}
 	var observer channels.AppendStageObserver
+	var batchObserver channels.MetaCreateBatchObserver
 	if n.cfg.Channel.Observer != nil {
 		observer, _ = n.cfg.Channel.Observer.(channels.AppendStageObserver)
+		batchObserver, _ = n.cfg.Channel.Observer.(channels.MetaCreateBatchObserver)
 	}
 	store := defaultChannelRuntimeMetaStore{node: n, observer: observer}
 	return channels.NewSlotMetaSource(store, channels.SlotMetaSourceOptions{
-		Placement: channels.NewSlotPlacementResolver(n.router, &n.channelDataNodes, int(n.cfg.Channel.ReplicaCount)),
-		Observer:  observer,
+		Placement:     channels.NewSlotPlacementResolver(n.router, &n.channelDataNodes, int(n.cfg.Channel.ReplicaCount)),
+		Router:        n.router,
+		BatchStore:    store,
+		BatchObserver: batchObserver,
+		Goroutines:    n.cfg.Goroutines,
+		Observer:      observer,
 	})
 }
 
@@ -285,24 +344,192 @@ func (n *Node) defaultChannelMigrationStore() *channels.MigrationStore {
 	})
 }
 
-// defaultChannelRuntimeMetaStore reads Slot-owned channel metadata and writes through Node.Propose.
+// defaultChannelRuntimeMetaStore reads Slot-owned channel metadata and writes through Node proposals.
 type defaultChannelRuntimeMetaStore struct {
 	node     *Node
 	observer channels.AppendStageObserver
+}
+
+// CreateChannelRuntimeMetaBatch submits one bounded command-59 proposal and
+// returns authoritative identity-bound outcomes aligned to items.
+func (s defaultChannelRuntimeMetaStore) CreateChannelRuntimeMetaBatch(ctx context.Context, expected routing.Route, items []channels.RuntimeMetaCreateItem) ([]channels.RuntimeMetaCreateResult, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	if s.node == nil {
+		return nil, ErrNotStarted
+	}
+	if err := s.validateRuntimeMetaBatchRoute(items, expected); err != nil {
+		return nil, err
+	}
+	fsmItems := make([]metafsm.CreateChannelRuntimeMetaBatchItem, len(items))
+	for i, item := range items {
+		fsmItems[i] = metafsm.CreateChannelRuntimeMetaBatchItem{HashSlot: item.HashSlot, Meta: item.Meta}
+	}
+	command, err := metafsm.EncodeCreateChannelRuntimeMetaBatchCommandChecked(fsmItems)
+	if err != nil {
+		return nil, err
+	}
+	ctx = propose.WithStageObserver(ctx, s.observer)
+	data, err := s.node.ProposeResult(ctx, ProposeRequest{
+		Command: command,
+		Target: ProposeTarget{
+			HashSlot: items[0].HashSlot, HasHashSlot: true,
+			SlotID: expected.SlotID, HasSlotID: true,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	decoded, err := metafsm.DecodeCreateChannelRuntimeMetaBatchResult(data)
+	if err != nil || len(decoded) != len(items) {
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: runtime metadata batch result count", metadb.ErrCorruptValue)
+	}
+	type identity struct {
+		hashSlot    uint16
+		channelID   string
+		channelType int64
+	}
+	byIdentity := make(map[identity]metafsm.CreateChannelRuntimeMetaBatchResult, len(decoded))
+	for _, result := range decoded {
+		key := identity{hashSlot: result.HashSlot, channelID: result.ChannelID, channelType: result.ChannelType}
+		if _, exists := byIdentity[key]; exists {
+			return nil, fmt.Errorf("%w: duplicate runtime metadata batch result", metadb.ErrCorruptValue)
+		}
+		byIdentity[key] = result
+	}
+	results := make([]channels.RuntimeMetaCreateResult, len(items))
+	for i, item := range items {
+		key := identity{hashSlot: item.HashSlot, channelID: item.Meta.ChannelID, channelType: item.Meta.ChannelType}
+		result, ok := byIdentity[key]
+		if !ok {
+			return nil, fmt.Errorf("%w: missing runtime metadata batch result", metadb.ErrCorruptValue)
+		}
+		delete(byIdentity, key)
+		results[i] = channels.RuntimeMetaCreateResult{
+			HashSlot: result.HashSlot, ChannelID: result.ChannelID, ChannelType: result.ChannelType, Created: result.Created,
+		}
+	}
+	if len(byIdentity) != 0 {
+		return nil, fmt.Errorf("%w: extra runtime metadata batch result", metadb.ErrCorruptValue)
+	}
+	return results, nil
+}
+
+// BatchGetChannelRuntimeMetas performs one aligned authoritative reread after
+// the command-59 future has resolved.
+func (s defaultChannelRuntimeMetaStore) BatchGetChannelRuntimeMetas(ctx context.Context, _ routing.Route, items []channels.RuntimeMetaCreateItem) ([]channels.RuntimeMetaReadResult, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	if s.node == nil || s.node.defaultSlotProxy == nil {
+		return nil, ErrNotStarted
+	}
+	if _, err := s.validateRuntimeMetaBatchItems(items); err != nil {
+		return nil, err
+	}
+	keys := make([]metadb.ChannelKey, len(items))
+	for i, item := range items {
+		keys[i] = metadb.ChannelKey{ChannelID: item.Meta.ChannelID, ChannelType: item.Meta.ChannelType}
+	}
+	metas, err := s.node.defaultSlotProxy.BatchGetChannelRuntimeMetas(ctx, keys)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]channels.RuntimeMetaReadResult, len(keys))
+	for i, key := range keys {
+		meta, ok := metas[key]
+		if !ok {
+			results[i].Err = metadb.ErrNotFound
+			continue
+		}
+		if meta.ChannelID != key.ChannelID || meta.ChannelType != key.ChannelType {
+			results[i].Err = metadb.ErrCorruptValue
+			continue
+		}
+		results[i].Meta = meta
+	}
+	return results, nil
+}
+
+// BatchReadChannelRuntimeMetas reads arbitrary channel identities through the
+// Slot proxy and returns one outcome aligned with every key.
+func (s defaultChannelRuntimeMetaStore) BatchReadChannelRuntimeMetas(ctx context.Context, keys []metadb.ChannelKey) ([]channels.RuntimeMetaReadResult, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	if s.node == nil || s.node.defaultSlotProxy == nil {
+		return nil, ErrNotStarted
+	}
+	reads, err := s.node.defaultSlotProxy.ReadChannelRuntimeMetadataBatch(ctx, keys)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]channels.RuntimeMetaReadResult, len(keys))
+	for i, key := range keys {
+		if reads[i].Err != nil {
+			results[i].Err = reads[i].Err
+			continue
+		}
+		meta := reads[i].Meta
+		if meta.ChannelID != key.ChannelID || meta.ChannelType != key.ChannelType {
+			results[i].Err = metadb.ErrCorruptValue
+			continue
+		}
+		results[i].Meta = meta
+	}
+	return results, nil
+}
+
+func (s defaultChannelRuntimeMetaStore) validateRuntimeMetaBatchRoute(items []channels.RuntimeMetaCreateItem, expected routing.Route) error {
+	routes, err := s.validateRuntimeMetaBatchItems(items)
+	if err != nil {
+		return err
+	}
+	for _, route := range routes {
+		if route.SlotID != expected.SlotID || route.Leader != expected.Leader ||
+			route.LeaderTerm != expected.LeaderTerm || route.ConfigEpoch != expected.ConfigEpoch ||
+			route.Revision != expected.Revision {
+			return fmt.Errorf("%w: runtime metadata batch route changed", metadb.ErrStaleMeta)
+		}
+	}
+	return nil
+}
+
+func (s defaultChannelRuntimeMetaStore) validateRuntimeMetaBatchItems(items []channels.RuntimeMetaCreateItem) ([]Route, error) {
+	if len(items) == 0 || len(items) > metafsm.MaxCreateChannelRuntimeMetaBatchItems {
+		return nil, metadb.ErrInvalidArgument
+	}
+	keys := make([]string, len(items))
+	for i, item := range items {
+		keys[i] = item.Meta.ChannelID
+	}
+	routes, err := s.node.RouteKeys(keys)
+	if err != nil {
+		return nil, err
+	}
+	if len(routes) != len(items) {
+		return nil, fmt.Errorf("%w: aligned runtime metadata batch routes", metadb.ErrCorruptValue)
+	}
+	for i, route := range routes {
+		if route.HashSlot != items[i].HashSlot {
+			return nil, fmt.Errorf("%w: runtime metadata batch hash-slot changed", metadb.ErrStaleMeta)
+		}
+	}
+	return routes, nil
 }
 
 func (s defaultChannelRuntimeMetaStore) GetChannelRuntimeMeta(ctx context.Context, channelID string, channelType int64) (metadb.ChannelRuntimeMeta, error) {
 	if err := ctxErr(ctx); err != nil {
 		return metadb.ChannelRuntimeMeta{}, err
 	}
-	if s.node == nil || s.node.defaultSlotMetaDB == nil {
+	if s.node == nil || s.node.defaultSlotProxy == nil {
 		return metadb.ChannelRuntimeMeta{}, ErrNotStarted
 	}
-	route, err := s.node.RouteKey(channelID)
-	if err != nil {
-		return metadb.ChannelRuntimeMeta{}, err
-	}
-	return s.node.defaultSlotMetaDB.ForHashSlot(route.HashSlot).GetChannelRuntimeMeta(ctx, channelID, channelType)
+	return s.node.defaultSlotProxy.GetChannelRuntimeMeta(ctx, channelID, channelType)
 }
 
 func (s defaultChannelRuntimeMetaStore) UpsertChannelRuntimeMeta(ctx context.Context, meta metadb.ChannelRuntimeMeta) error {
@@ -318,6 +545,11 @@ func (s defaultChannelRuntimeMetaStore) UpsertChannelRuntimeMeta(ctx context.Con
 		Command: metafsm.EncodeUpsertChannelRuntimeMetaCommand(meta),
 	})
 }
+
+var _ channels.RuntimeMetaReader = defaultChannelRuntimeMetaStore{}
+var _ channels.RuntimeMetaBatchReader = defaultChannelRuntimeMetaStore{}
+var _ channels.RuntimeMetaBatchStore = defaultChannelRuntimeMetaStore{}
+var _ channels.RuntimeMetaWriter = defaultChannelRuntimeMetaStore{}
 
 // defaultChannelMigrationStore adapts Slot-owned migration commands to Node.Propose.
 type defaultChannelMigrationStore struct {
@@ -381,8 +613,18 @@ func (n *Node) discardDefaultChannels() {
 	if n == nil || !n.defaultChannels {
 		return
 	}
+	if n.channelRPCGateway != nil {
+		n.channelRPCGateway.Clear()
+	}
+	if n.channelQuorumGateway != nil {
+		n.channelQuorumGateway.Clear()
+	}
 	if n.channels != nil {
 		_ = n.channels.Close()
+	}
+	if n.defaultChannelReplication != nil {
+		_ = n.defaultChannelReplication.Close(context.Background())
+		n.defaultChannelReplication = nil
 	}
 	n.channels = nil
 	n.defaultChannels = false
@@ -398,6 +640,7 @@ func (n *Node) discardDefaultSlots() {
 		_ = n.defaultSlotRuntime.Close()
 		n.defaultSlotRuntime = nil
 	}
+	n.slotRaftDiagnostics = nil
 	n.slotStatusRuntime = nil
 	if n.defaultSlotRaftDB != nil {
 		_ = n.defaultSlotRaftDB.Close()
@@ -410,6 +653,10 @@ func (n *Node) discardDefaultSlots() {
 	n.defaultSlotProxy = nil
 	n.defaultSlotProposer = nil
 	n.slots = nil
+	if n.defaultTaskExecutor {
+		n.tasks = nil
+		n.defaultTaskExecutor = false
+	}
 	if n.defaultPreferredLeaderReconciler {
 		n.preferredLeaderReconciler = nil
 		n.defaultPreferredLeaderReconciler = false
@@ -446,6 +693,7 @@ func (n *Node) discardDefaultTransport() {
 	n.defaultTransport = false
 	n.registeredRPCHandlers = nil
 	n.channelRPCGateway = nil
+	n.channelQuorumGateway = nil
 	n.mu.Unlock()
 	if client != nil {
 		client.Stop()

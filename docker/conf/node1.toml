@@ -5,11 +5,12 @@ data_dir = "/var/lib/wukongim"
 [cluster]
 listen_addr = "0.0.0.0:7000"
 hash_slot_count = 256
-initial_slot_count = 10
+# Applied only during first initialization; existing clusters retain their persisted Slot count.
+initial_slot_count = 12
 slot_replica_n = 3
 slot_tick_interval = "50ms"
 slot_heartbeat_tick = 2
-slot_election_tick = 20
+slot_election_tick = 40
 channel_append_batch_max_records = 128
 channel_append_batch_max_wait = "250us"
 commit_coordinator_flush_window = "1ms"
@@ -71,7 +72,7 @@ token_auth_enabled = true
 token_auth_timeout = "3s"
 gnet_multicore = true
 gnet_num_event_loop = 4
-runtime_async_send_workers = 128
+runtime_async_send_workers = 1000
 runtime_async_send_queue_capacity = 131072
 
 [[gateway.listeners]]
@@ -116,7 +117,7 @@ sample_rate = 1.0
 [delivery]
 # Maximum recipient-authority delivery batches processed concurrently by this node.
 # This is independent from channel_append.recipient_authority_dispatch_concurrency.
-recipient_worker_concurrency = 100
+recipient_worker_concurrency = 320
 
 [message]
 permission_cache_ttl = "30s"

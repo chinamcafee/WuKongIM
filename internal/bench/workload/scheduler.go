@@ -12,35 +12,44 @@ func runScheduledMessages(ctx context.Context, totalMessages int, interval time.
 // runSequentialMessagesWithinWindow preserves the zero/one-concurrency path
 // while refusing to start another operation after the measured window closes.
 // The operation already in flight is allowed to settle as the single phase
-// tail covered by the coordinator timeout budget.
+// tail owned by the following bounded drain.
 func runSequentialMessagesWithinWindow(ctx context.Context, duration time.Duration, totalMessages int, interval time.Duration, sleep func(context.Context, time.Duration) error, send func(context.Context, int) error) error {
+	var stopAt time.Time
+	if duration > 0 {
+		stopAt = time.Now().Add(duration)
+	}
+	return runSequentialMessagesUntil(ctx, stopAt, totalMessages, interval, sleep, send)
+}
+
+// runSequentialMessagesUntil closes admission at stopAt while allowing the
+// one operation admitted before that instant to reach its terminal outcome.
+func runSequentialMessagesUntil(ctx context.Context, stopAt time.Time, totalMessages int, interval time.Duration, sleep func(context.Context, time.Duration) error, send func(context.Context, int) error) error {
 	if totalMessages <= 0 {
 		return nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	stopAt := time.Now().Add(duration)
 	for offset := 0; offset < totalMessages; offset++ {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		if offset > 0 && duration > 0 && !time.Now().Before(stopAt) {
+		if !stopAt.IsZero() && !time.Now().Before(stopAt) {
 			return nil
 		}
 		if err := send(ctx, offset); err != nil {
 			return err
 		}
-		if duration > 0 && !time.Now().Before(stopAt) {
+		if !stopAt.IsZero() && !time.Now().Before(stopAt) {
 			return nil
 		}
 		if interval <= 0 || sleep == nil {
 			continue
 		}
 		wait := interval
-		if duration > 0 {
+		if !stopAt.IsZero() {
 			remaining := time.Until(stopAt)
 			if remaining <= 0 {
 				return nil
@@ -63,10 +72,20 @@ func runScheduledMessagesByKey(ctx context.Context, totalMessages int, interval 
 }
 
 func runScheduledMessagesByKeyWithStats(ctx context.Context, totalMessages int, interval time.Duration, maxConcurrency int, keyForOffset func(int) string, send func(context.Context, int) error, stats *scheduledMessageStats) error {
-	return runScheduledMessagesByKeyLimitWithStats(ctx, totalMessages, interval, maxConcurrency, 1, keyForOffset, send, stats)
+	return runScheduledMessagesByKeyLimitUntilWithStats(ctx, totalMessages, interval, maxConcurrency, 1, time.Time{}, keyForOffset, send, stats)
 }
 
 func runScheduledMessagesByKeyLimitWithStats(ctx context.Context, totalMessages int, interval time.Duration, maxConcurrency int, maxInFlightPerKey int, keyForOffset func(int) string, send func(context.Context, int) error, stats *scheduledMessageStats) error {
+	return runScheduledMessagesByKeyLimitUntilWithStats(ctx, totalMessages, interval, maxConcurrency, maxInFlightPerKey, time.Time{}, keyForOffset, send, stats)
+}
+
+// runScheduledMessagesByKeyUntilWithStats uses one caller-owned admission
+// deadline across concurrently started workload shards.
+func runScheduledMessagesByKeyUntilWithStats(ctx context.Context, totalMessages int, interval time.Duration, maxConcurrency int, stopAt time.Time, keyForOffset func(int) string, send func(context.Context, int) error, stats *scheduledMessageStats) error {
+	return runScheduledMessagesByKeyLimitUntilWithStats(ctx, totalMessages, interval, maxConcurrency, 1, stopAt, keyForOffset, send, stats)
+}
+
+func runScheduledMessagesByKeyLimitUntilWithStats(ctx context.Context, totalMessages int, interval time.Duration, maxConcurrency int, maxInFlightPerKey int, stopAt time.Time, keyForOffset func(int) string, send func(context.Context, int) error, stats *scheduledMessageStats) error {
 	if totalMessages <= 0 {
 		return nil
 	}
@@ -84,8 +103,7 @@ func runScheduledMessagesByKeyLimitWithStats(ctx context.Context, totalMessages 
 	}
 
 	startAt := time.Now()
-	var stopAt time.Time
-	if interval > 0 {
+	if stopAt.IsZero() && interval > 0 {
 		stopAt = startAt.Add(interval * time.Duration(totalMessages))
 	}
 	if stats != nil {
@@ -106,6 +124,8 @@ func runScheduledMessagesByKeyLimitWithStats(ctx context.Context, totalMessages 
 }
 
 type scheduledMessageStats struct {
+	// dispatchLag observes admission lateness against the original arrival clock.
+	dispatchLag                   func(time.Duration)
 	Planned                       uint64
 	Enqueued                      uint64
 	Dispatched                    uint64
@@ -287,10 +307,11 @@ func (s *scheduledMessageScheduler) enqueueDue(now time.Time) {
 }
 
 func (s *scheduledMessageScheduler) dispatch(ctx context.Context, doneCh chan<- scheduledMessageResult) {
-	if s.windowExpired(time.Now()) {
-		return
-	}
 	for s.active < s.maxConcurrency {
+		// Admission work can consume the remaining window within one batch.
+		if s.windowExpired(time.Now()) {
+			return
+		}
 		task, ok := s.nextDispatchableTask()
 		if !ok {
 			if s.stats != nil && s.pendingCount > 0 {
@@ -304,6 +325,7 @@ func (s *scheduledMessageScheduler) dispatch(ctx context.Context, doneCh chan<- 
 		}
 		if s.stats != nil {
 			s.stats.Dispatched++
+			s.stats.observeDispatchLag(time.Since(s.startAt.Add(s.interval * time.Duration(task.offset))))
 		}
 		s.observeStats()
 		if task.key != "" {
@@ -326,6 +348,10 @@ func (s *scheduledMessageScheduler) done(now time.Time) bool {
 }
 
 func (s *scheduledMessageScheduler) nextTimer(now time.Time) (*time.Timer, <-chan time.Time) {
+	// Closed windows only wait for admitted work or cancellation, never a past deadline.
+	if s.windowClosed {
+		return nil, nil
+	}
 	var next time.Time
 	if s.nextOffset < s.totalMessages && !s.windowExpired(now) {
 		if s.interval > 0 {

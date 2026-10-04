@@ -1,0 +1,279 @@
+---
+title: C++ quickstart
+description: Prepare, install, connect, exchange the first messages, and clean up.
+---
+
+Use C++17, CMake, and WuKongEasySDK **WK_EASYSDK_CPP_VERSION** for online messaging. The main path uses the WuKongIM-maintained vcpkg registry; alternative installation methods follow the tutorial.
+
+## 1. Prepare
+
+Follow [Authentication & Tokens](/en/guide/integration/authentication) to obtain each user's `uid`, `token`, and `websocketUrl` from your trusted application backend. Clients connect only to Gateway and never call WuKongIM HTTP API management endpoints. Wire device flags are APP `0`, WEB `1`, PC/Desktop `2`; C++ defaults to Desktop, so the backend must store the Token under the same device category.
+
+The default development server example uses `ws://127.0.0.1:5200` with path `/`. Use `ws://127.0.0.1:5200/ws` only when your listener or proxy is configured for `/ws`. Across machines, use a client-reachable address; production uses `wss://`. Shared setup is in [Run Official Examples](/en/sdk/easy/examples).
+
+Use [the shared example setup](/en/sdk/easy/examples) for the server, test accounts, and reachable addresses, then continue with installation below.
+
+## 2. Install the SDK
+
+Install [vcpkg](https://learn.microsoft.com/en-us/vcpkg/get_started/get-started)
+and set `VCPKG_ROOT` to its directory. Keep Git, CMake 3.20+ and a C++17 compiler
+available (Visual Studio 2022 on Windows, Xcode command-line tools on macOS,
+GCC/Clang on Linux). The tested vcpkg revision is
+`WK_EASYSDK_CPP_VCPKG_BASELINE`.
+
+In your application directory, create `vcpkg.json`:
+
+```json
+{"dependencies": ["wukong-easy-sdk"]}
+```
+
+`vcpkg-configuration.json`:
+
+```json
+{
+  "default-registry": {
+    "kind": "git",
+    "repository": "https://github.com/microsoft/vcpkg",
+    "baseline": "WK_EASYSDK_CPP_VCPKG_BASELINE"
+  },
+  "registries": [
+    {
+      "kind": "git",
+      "repository": "https://github.com/WuKongIM/WuKongEasySDK-CPP.git",
+      "baseline": "WK_EASYSDK_CPP_REGISTRY_BASELINE",
+      "packages": [
+        "wukong-easy-sdk"
+      ]
+    }
+  ]
+}
+```
+
+Add the following `CMakeLists.txt` next to your own `main.cpp`:
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(my_app LANGUAGES CXX)
+find_package(WuKongEasySDK WK_EASYSDK_CPP_CMAKE_VERSION CONFIG REQUIRED)
+add_executable(my_app main.cpp)
+target_link_libraries(my_app PRIVATE WuKongEasySDK::WuKongEasySDK)
+```
+
+
+
+
+vcpkg installs the SDK, Boost, OpenSSL and JSON automatically. The first build
+may compile dependencies and take several minutes; this is not a prebuilt
+archive. The SDK port is a static library; on Windows, distribute dependency
+DLLs copied beside the application when using `x64-windows`.
+
+This public Git registry is maintained by WuKongIM in this repository. It is
+not Microsoft's curated catalog: copy the registry configuration as well as
+the dependency manifest. SDK source is pinned to
+`WK_EASYSDK_CPP_SOURCE_REF`, independently of the registry baseline.
+Commit both JSON files to reproduce dependency selection. Existing projects
+should merge these entries into their manifests instead of overwriting them.
+
+[Independent consumer example](https://github.com/WuKongIM/WuKongEasySDK-CPP/tree/main/examples/vcpkg-consumer) · [Registry maintenance](https://github.com/WuKongIM/WuKongEasySDK-CPP/blob/main/docs/VCPKG.md)
+
+## 3. Connect and listen
+
+Save the complete program below as `main.cpp`. Set your own `WKIM_URL`, `WKIM_UID`, and `WKIM_TOKEN`; the first argument is the peer UID.
+
+```cpp
+#include <wukong/wkim.hpp>
+#include <cstdlib>
+#include <iostream>
+
+int main(int argc, char** argv) {
+    const char* token = std::getenv("WKIM_TOKEN");
+    const char* url = std::getenv("WKIM_URL");
+    const char* uid = std::getenv("WKIM_UID");
+    if (!token || !url || !uid || argc != 2) return 2;
+    try {
+        wukong::Options options;
+        options.connectionTimeout = std::chrono::seconds(10);
+        options.requestTimeout = std::chrono::seconds(15);
+        wukong::WKIM im(url, {uid, token}, options);
+
+        auto messageListener = im.on(wukong::WKIMEvent::Message,
+            [](const wukong::Json& message) {
+                // Copy message.at("payload") into your application's UI/event queue.
+                // This callback runs on the SDK I/O thread.
+                (void)message;
+                std::cout << "Message received\n";
+            });
+        auto errorListener = im.on(wukong::WKIMEvent::Error,
+            [](const wukong::Json&) {
+                // Dispatch a sanitized failure state to the application.
+            });
+
+        im.connect().get();
+        std::cout << "Connected. Start the peer, then press Enter to send.\n";
+        std::cin.get();
+        wukong::SendOptions sendOptions;
+        // Supply a stable clientMsgNo when the application needs reconciliation.
+        auto ack = im.send(argv[1], wukong::WKIMChannelType::Person,
+                          {{"type", 1}, {"content", "Hello from C++!"}},
+                          sendOptions).get();
+        if (ack.reasonCode == 1) std::cout << "SEND completed\n";
+        std::cin.get();
+
+        im.off(messageListener);
+        im.off(errorListener);
+        im.disconnect().get();
+        im.destroy().get();
+    } catch (const wukong::Error&) {
+        std::cerr << "EasySDK operation failed\n";
+        return 1;
+    }
+}
+```
+
+`connect()` succeeds only after authentication. For group messages, use `WKIMChannelType::Group` after your backend creates the Channel and membership. Payload accepts a JSON object or array, encoded as Base64 UTF-8 JSON. Incoming objects, JSON text, and Base64 JSON are supported. Message IDs stay strings to preserve 64-bit precision.
+
+Send results contain `messageId`, `messageSeq`, and `reasonCode`. Receive events additionally contain `header`, second-based `timestamp`, `channelId`, `channelType`, `fromUid`, and `payload`. Automatic RECVACK includes `messageId` and `messageSeq`; this is a transport receipt, not a business read receipt. See [Messaging](/en/guide/integration/messaging) for the distinction between send completion, receipt, and application processing.
+
+## 4. Exchange the first message
+
+```sh
+# Linux / macOS
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release --parallel 2
+```
+
+```powershell
+# Windows / Visual Studio 2022
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows
+cmake --build build --config Release --parallel 2
+```
+
+After building, run in two terminals with their respective credentials:
+
+```sh
+# Alice
+./build/my_app bob
+# Bob
+./build/my_app alice
+```
+
+On Windows use `build/Release/my_app.exe`. When both show `Connected`, press Enter on each to send. Check `SEND completed` and the peer’s `Message received`; press Enter again after checking both directions to exit.
+
+Once both clients are connected, Alice sends to `bob` and Bob checks the sender and content in the message callback. Then Bob sends to `alice`. A send result means the server accepted the request; it is not recipient delivery or a read receipt.
+
+## 5. Clean up
+
+Each instance owns one identity and one I/O thread, with no global singleton. Public operations support concurrent application threads; events are dispatched serially on the I/O thread. A callback may enqueue an asynchronous operation, but **must never wait on an SDK future**. Dispatch UI updates and slow work to your application's executor.
+
+| Operation | Semantics |
+| --- | --- |
+| `on(...)` / `off(listenerId)` | Retain and remove listener IDs; callbacks already selected for dispatch may still finish |
+| `connect()` | Concurrent callers share one authentication attempt; connected calls return the current result |
+| `disconnect()` | Cancel pending requests, socket, heartbeat, and reconnect; reconnect is allowed afterwards |
+| `destroy()` | Terminal shutdown; later operations reject; repeated calls are safe |
+| Destructor | Initiates cleanup and joins the thread; callback-owned destruction exits the thread after callback completion |
+| Change identity, Token, or URL | Shut down the old instance and create a new one |
+
+Captured application state must outlive client shutdown. Capture the client through `weak_ptr` to avoid ownership cycles. Removing a listener alone does not permit freeing captured state until shutdown finishes. Socket cancellation bounds cleanup without waiting for the peer's close handshake.
+
+## 6. Troubleshooting
+
+Defaults are a 10-second total connection deadline, 15-second request deadline, 25-second ping interval, and 10-second pong timeout. A same-ID `result: null` acknowledges heartbeat. After a previously authenticated connection is lost, retry at most five times with exponential delay from 1 second to a 30-second cap and jitter. Initial connect failures return to the caller; authentication rejection, server-requested disconnect, malformed protocol, and manual exit stop automatic retries.
+
+Defaults allow 1,024 pending requests, separate 4 MiB command and WebSocket write queues, and 1 MiB per wire message. Capacity failures use `ErrorCode::QueueFull`; local errors are negative, while server reason codes are preserved by `Error::code()`. A timeout or lost connection can leave send delivery unknown; reconcile through `clientMsgNo`. The SDK does not queue offline or automatically resend.
+
+WSS verifies the certificate chain and hostname and requires TLS 1.2+. Use `Options::caFile` for a private PEM CA; the console also reads `WKIM_CA_FILE`. There is no certificate-verification bypass. The SDK is default-silent and never logs Tokens, payloads, URLs, raw frames, server response text, or underlying error objects.
+
+Receive `id`, `type`, millisecond-based `timestamp`, and `data` through `WKIMEvent::CustomEvent`; JSON-string data is parsed. Event reception depends on the server producing that notification.
+
+## Alternative installation: prebuilt archives
+
+To skip dependency compilation, download the matching ZIP and `SHA256SUMS` from [C++ SDK WK_EASYSDK_CPP_TAG Release](https://github.com/WuKongIM/WuKongEasySDK-CPP/releases/tag/WK_EASYSDK_CPP_TAG), verify its SHA-256 and extract it. You only need CMake 3.20+ and a compatible C++ development environment; no separate vcpkg installation is required.
+
+| Archive suffix | Consumer environment |
+| --- | --- |
+| `linux-x64-gcc13.zip` | Ubuntu 24.04 x64, GCC 13, libstdc++ C++11 ABI, glibc 2.39+ |
+| `macos-arm64-appleclang.zip` | macOS 14+ arm64, Apple Clang, libc++ |
+| `windows-x64-msvc143-md.zip` | Windows x64, Visual Studio 2022 v143; Release `/MD`, Debug `/MDd` |
+
+Names start with `WuKongEasySDK-CPP-WK_EASYSDK_CPP_VERSION-`. Each archive includes Debug/Release static SDK libraries, Boost/JSON headers, OpenSSL libraries, licenses and a minimal example. From the extracted directory:
+
+```sh
+# Linux / macOS
+cmake -S example -B build -DCMAKE_TOOLCHAIN_FILE="$PWD/wukong-sdk.cmake" -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release --parallel 2
+ctest --test-dir build -C Release --output-on-failure
+```
+
+```powershell
+# Windows / Visual Studio 2022
+cmake -S example -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$PWD/wukong-sdk.cmake"
+cmake --build build --config Release --parallel 2
+ctest --test-dir build -C Release --output-on-failure
+```
+
+`wukong_example` verifies initialization and destruction; `wukong_chat` supports interactive messaging with the Alice/Bob credentials below. For your application, retain the `find_package` and `target_link_libraries` above and point CMake's toolchain option to the extracted `wukong-sdk.cmake`.
+
+OpenSSL is static on Unix and uses bundled DLLs on Windows. Deploy Windows applications with the DLLs CMake copies beside the executable and a compatible Visual C++ Redistributable. Debug runtimes are for development only. **For WSS with prebuilt packages, supply a maintained CA bundle explicitly via `Options::caFile` (`WKIM_CA_FILE` in the chat example)**; do not depend on OpenSSL's build-machine default certificate path.
+
+`BUILD_INFO.json` identifies the SDK source, registry and packaging commits; `FILES.sha256.json` verifies extracted content. Upgrade into a separate directory, check hashes, rebuild in a new build directory and rerun acceptance. Update the application and dependencies together and retain the previous version for rollback. Use vcpkg/source for other compilers, architectures, CRTs or dependency combinations; binary dependencies cannot be mixed arbitrarily.
+
+Fresh jobs download each platform's ZIP and compile Debug/Release consumers at a different path, running lifecycle checks and 26 WS/WSS scenarios per configuration. Linux/macOS also use the pinned WuKongIM server to verify bidirectional messaging, reconnect and presence cleanup. Windows evidence uses the protocol fixture, not a Windows server. See [prebuilt package documentation](https://github.com/WuKongIM/WuKongEasySDK-CPP/blob/v0.1.0/docs/PREBUILT.md) for compatibility and release acceptance.
+
+## Alternative installation: build from source
+
+Requirements: CMake 3.20+, a C++17 compiler, Boost 1.74+, OpenSSL 1.1.1+, and nlohmann/json 3.11+. Products should use maintained dependency versions with current security fixes.
+
+```sh
+git clone https://github.com/WuKongIM/WuKongEasySDK-CPP.git
+cd WuKongEasySDK-CPP
+git checkout WK_EASYSDK_CPP_SOURCE_REF
+
+# macOS
+brew install cmake boost openssl@3 nlohmann-json
+# Ubuntu / Debian
+sudo apt-get install g++ cmake libboost-dev libssl-dev nlohmann-json3-dev
+
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release --parallel 2
+ctest --test-dir build -C Release --output-on-failure
+```
+
+Run only the dependency command for your platform. Without an installed JSON package, CMake fetches the exact upstream 3.11.3 commit. For offline builds, preinstall dependencies and set `WUKONG_FETCH_JSON=OFF`.
+
+Windows uses Visual Studio 2022 and vcpkg; the repository's `vcpkg.json` pins the baseline:
+
+```powershell
+git -C "$env:VCPKG_ROOT" fetch origin WK_EASYSDK_CPP_VCPKG_BASELINE
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows
+cmake --build build --config Release --parallel 2
+ctest --test-dir build -C Release --output-on-failure
+```
+
+Add the source to your application's CMake:
+
+```cmake
+add_subdirectory(external/WuKongEasySDK-CPP)
+target_link_libraries(my_app PRIVATE WuKongEasySDK::WuKongEasySDK)
+```
+
+Alternatively, run `cmake --install build --config Release --prefix /path/to/sdk-prefix`, use `find_package(WuKongEasySDK WK_EASYSDK_CPP_CMAKE_VERSION CONFIG REQUIRED)` downstream, and point `CMAKE_PREFIX_PATH` at the installation. The static-library export preserves its dependencies; Windows distribution must include any required dynamic dependencies.
+
+## Run the archive or source chat example
+
+In two terminals, supply each user's backend-issued Token through `WKIM_TOKEN`, then run:
+
+```sh
+# Alice's terminal
+./build/wukong_chat ws://127.0.0.1:5200 alice bob
+# Bob's terminal
+./build/wukong_chat ws://127.0.0.1:5200 bob alice
+```
+
+After both print `Connected`, enter text, observe `Message` on the other side, and send a reply. `SEND completed` means SENDACK succeeded. Enter `/quit` to disconnect and release resources. On Windows, use `build/Release/wukong_chat.exe`.
+
+The example intentionally displays business message content; the SDK itself emits no logs. Do not pipe the example terminal into production log collection.
+
+## Next
+
+Continue with [messaging](/en/guide/integration/messaging) and [production checks](/en/guide/integration/acceptance). For offline recovery, conversations, unread counts, or push, see [SDK selection](/en/sdk). [Versions and validation records](https://github.com/WuKongIM/WuKongIM/blob/main/docs/superpowers/reports/2026-09-08-easysdk-validation-history.md#cpp) retain the exact environments and scope of past runs.

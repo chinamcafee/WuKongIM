@@ -31,6 +31,13 @@ func (g *ServiceGateway) Replace(service *Service) {
 	g.current.Store(service)
 }
 
+// Clear fails new calls closed while an owning runtime is absent.
+func (g *ServiceGateway) Clear() {
+	if g != nil {
+		g.current.Store(nil)
+	}
+}
+
 // Server exposes the gateway itself as the stable replication endpoint.
 func (g *ServiceGateway) Server() channeltransport.Server { return g }
 
@@ -89,6 +96,28 @@ func (g *ServiceGateway) handleForwardLastVisible(
 		return LastVisibleResponse{}, err
 	}
 	return service.handleForwardLastVisible(ctx, request)
+}
+
+func (g *ServiceGateway) handleForwardConversationHeads(
+	ctx context.Context,
+	request ConversationHeadsRequest,
+) (ConversationHeadsResponse, error) {
+	service, err := g.service()
+	if err != nil {
+		return ConversationHeadsResponse{}, err
+	}
+	return service.handleForwardConversationHeads(ctx, request)
+}
+
+func (g *ServiceGateway) handleForwardCommittedReads(
+	ctx context.Context,
+	request CommittedReadsRequest,
+) (CommittedReadsResponse, error) {
+	service, err := g.service()
+	if err != nil {
+		return CommittedReadsResponse{}, err
+	}
+	return service.handleForwardCommittedReads(ctx, request)
 }
 
 // HandlePull forwards replication pulls to the current service.

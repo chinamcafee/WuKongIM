@@ -8,12 +8,14 @@ type SendBatchHandler = gatewaytypes.SendBatchHandler
 type SessionActivator = gatewaytypes.SessionActivator
 type SessionActivationRollbacker = gatewaytypes.SessionActivationRollbacker
 type Context = gatewaytypes.Context
+type TransportCloser = gatewaytypes.TransportCloser
 type Observer = gatewaytypes.Observer
 type SessionErrorObserver = gatewaytypes.SessionErrorObserver
 type AsyncSendObserver = gatewaytypes.AsyncSendObserver
 type AsyncAuthObserver = gatewaytypes.AsyncAuthObserver
 type AsyncSendAdmissionObserver = gatewaytypes.AsyncSendAdmissionObserver
 type TransportPressureObserver = gatewaytypes.TransportPressureObserver
+type TransportWriteObserver = gatewaytypes.TransportWriteObserver
 type ConnectionEvent = gatewaytypes.ConnectionEvent
 type AuthEvent = gatewaytypes.AuthEvent
 type AuthFailureClassifier = gatewaytypes.AuthFailureClassifier
@@ -26,5 +28,9 @@ type AsyncAuthAdmissionEvent = gatewaytypes.AsyncAuthAdmissionEvent
 type AsyncAuthWaitEvent = gatewaytypes.AsyncAuthWaitEvent
 type AsyncSendAdmissionEvent = gatewaytypes.AsyncSendAdmissionEvent
 type TransportPressureEvent = gatewaytypes.TransportPressureEvent
+type TransportWriteEvent = gatewaytypes.TransportWriteEvent
 type AsyncSendBatchEvent = gatewaytypes.AsyncSendBatchEvent
 type AsyncSendDispatchWaitEvent = gatewaytypes.AsyncSendDispatchWaitEvent
+
+// DeferredSendBatchHandler separates preparation and ordered result publication.
+type DeferredSendBatchHandler = gatewaytypes.DeferredSendBatchHandler

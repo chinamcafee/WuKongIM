@@ -1,3 +1,4 @@
+import { Buffer } from "buffer";
 import { EventPacket, RecvPacket, SendPacket, Setting, StreamFlag } from './proto';
 import WKSDK from './index';
 import { MessageContentType } from "./const"

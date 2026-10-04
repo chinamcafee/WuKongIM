@@ -24,6 +24,7 @@ func TestChannelAppendClientMapsResolvedMetaToAuthorityTarget(t *testing.T) {
 			Epoch:           11,
 			LeaderEpoch:     7,
 			RouteGeneration: 23,
+			WriteFence:      channelruntime.WriteFence{Token: "migration-1", Version: 1},
 		},
 		channel: metadb.Channel{
 			ChannelID:                 channelID.ID,
@@ -42,12 +43,12 @@ func TestChannelAppendClientMapsResolvedMetaToAuthorityTarget(t *testing.T) {
 		t.Fatalf("node calls/id = %d/%#v, want one canonical resolve", node.calls, node.lastID)
 	}
 	if target.ChannelID != channelID || target.ChannelKey != "2:room" || target.LeaderNodeID != 3 || target.Epoch != 11 || target.LeaderEpoch != 7 || target.RouteGeneration != 23 ||
-		!target.Large || target.SubscriberMutationVersion != 19 {
+		!target.WriteFenced || !target.Large || target.SubscriberMutationVersion != 19 {
 		t.Fatalf("target = %#v, want mapped authority fields", target)
 	}
 }
 
-func TestChannelAppendClientCachesRecipientMetadata(t *testing.T) {
+func TestChannelAppendClientRefreshesGroupRecipientMetadata(t *testing.T) {
 	channelID := channelappend.ChannelID{ID: "room", Type: 2}
 	node := &channelAppendNodeForTest{
 		nodeID: 1,
@@ -83,11 +84,11 @@ func TestChannelAppendClientCachesRecipientMetadata(t *testing.T) {
 		t.Fatalf("second ResolveAppendAuthority() error = %v", err)
 	}
 
-	if node.metadataCalls != 1 {
-		t.Fatalf("GetChannelMetadata calls = %d, want 1 cached lookup", node.metadataCalls)
+	if node.metadataCalls != 2 {
+		t.Fatalf("GetChannelMetadata calls = %d, want 2 authoritative reads", node.metadataCalls)
 	}
-	if !first.Large || first.SubscriberMutationVersion != 19 || !second.Large || second.SubscriberMutationVersion != 19 {
-		t.Fatalf("targets = %#v %#v, want cached recipient metadata", first, second)
+	if !first.Large || first.SubscriberMutationVersion != 19 || second.Large || second.SubscriberMutationVersion != 20 {
+		t.Fatalf("targets = %#v %#v, want current recipient metadata", first, second)
 	}
 }
 
@@ -182,6 +183,32 @@ func TestChannelAppendClientForwardsRemoteResultsWithoutInterpretation(t *testin
 	}
 }
 
+func TestChannelAppendClientFailsWholeRemoteBatchBeforeTransport(t *testing.T) {
+	t.Parallel()
+
+	items := []channelappend.SendBatchItem{{}, {}}
+	var client *ChannelAppendClient
+	results := client.ForwardSendBatch(context.Background(), channelappend.AuthorityTarget{}, items)
+	if len(results) != len(items) {
+		t.Fatalf("unwired result count = %d, want %d", len(results), len(items))
+	}
+	for index, result := range results {
+		if !errors.Is(result.Err, channelappend.ErrRouteNotReady) {
+			t.Fatalf("unwired result[%d] error = %v, want %v", index, result.Err, channelappend.ErrRouteNotReady)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	client = NewChannelAppendClient(nil, &channelAppendRemoteForTest{}, nil)
+	results = client.ForwardSendBatch(ctx, channelappend.AuthorityTarget{}, items)
+	for index, result := range results {
+		if !errors.Is(result.Err, context.Canceled) {
+			t.Fatalf("canceled result[%d] error = %v, want %v", index, result.Err, context.Canceled)
+		}
+	}
+}
+
 func TestChannelAppendClientInvalidatesExactFailedAuthority(t *testing.T) {
 	id := channelappend.ChannelID{ID: "stale", Type: 2}
 	node := &channelAppendNodeForTest{}
@@ -233,7 +260,7 @@ func (n *channelAppendNodeForTest) ResolveChannelAppendAuthority(_ context.Conte
 	return n.meta, nil
 }
 
-func (n *channelAppendNodeForTest) GetChannelMetadata(context.Context, string, int64) (metadb.Channel, error) {
+func (n *channelAppendNodeForTest) GetChannelMetadataAuthoritative(context.Context, string, int64) (metadb.Channel, error) {
 	n.metadataCalls++
 	if n.err != nil {
 		return metadb.Channel{}, n.err

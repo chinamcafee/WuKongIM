@@ -1,8 +1,8 @@
 package message
 
 import (
-	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/dberrors"
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/engine"
@@ -12,12 +12,33 @@ import (
 type MessageDB struct {
 	// engine is the shared physical message store closed by this domain.
 	engine *engine.DB
+	// mqttStorage owns bounded replica reservations reconstructed before admission.
+	mqttStorage *mqttStorageBudget
 	// registry owns canonical entries and database operation admission.
 	registry *channelRegistry
-	// latestIndex tracks the versioned background backfill required by global latest-message reads.
-	latestIndex       *latestMessageIndexState
-	latestIndexCtx    context.Context
-	latestIndexCancel context.CancelFunc
+	// latestIndex tracks canonical global-index startup readiness.
+	latestIndex *latestMessageIndexState
+	// idempotencyNegativeFilterSkips counts durable negative point reads avoided
+	// across all active and reclaimed channels since this DB opened.
+	idempotencyNegativeFilterSkips atomic.Uint64
+	// idempotencyPointReads counts possible membership hits verified durably.
+	idempotencyPointReads atomic.Uint64
+	// sequencedExactFreshAppends counts fresh exact proposals whose allocator
+	// proof permits redundant future-key absence reads to be omitted.
+	sequencedExactFreshAppends atomic.Uint64
+	// durablePredecessorValidations counts exact predecessor checks that fall
+	// back to the complete durable proof after a canonical warm-state miss.
+	durablePredecessorValidations atomic.Uint64
+	// durablePredecessorCacheHits counts fresh exact extensions validated from
+	// the committed canonical or warm tail without durable predecessor reads.
+	durablePredecessorCacheHits atomic.Uint64
+	// ordinaryIndexEpoch fences absence proofs across backup imports, whose
+	// raw batches do not write through existing canonical channel entries.
+	ordinaryIndexEpoch atomic.Uint64
+	// retentionGeneration and retentionWriters fence retention reads across all
+	// typed mutations and raw imports without blocking foreground readers.
+	retentionGeneration atomic.Uint64
+	retentionWriters    atomic.Int64
 
 	// closeOnce ensures the physical engine closes exactly once.
 	closeOnce sync.Once
@@ -27,13 +48,10 @@ type MessageDB struct {
 
 // NewDB creates a MessageDB backed by engine.
 func NewDB(engine *engine.DB) *MessageDB {
-	latestIndexCtx, latestIndexCancel := context.WithCancel(context.Background())
 	db := &MessageDB{
-		engine:            engine,
-		registry:          newChannelRegistry(),
-		latestIndex:       newLatestMessageIndexState(),
-		latestIndexCtx:    latestIndexCtx,
-		latestIndexCancel: latestIndexCancel,
+		engine:      engine,
+		registry:    newChannelRegistry(),
+		latestIndex: newLatestMessageIndexState(),
 	}
 	db.initializeLatestMessageIndex()
 	return db
@@ -57,9 +75,6 @@ func (db *MessageDB) closeWithBeforeEngineClose(before func()) error {
 		return nil
 	}
 	db.closeOnce.Do(func() {
-		if db.latestIndexCancel != nil {
-			db.latestIndexCancel()
-		}
 		if db.registry != nil {
 			db.registry.beginClose()
 			db.registry.waitForDrain()

@@ -1,0 +1,172 @@
+{
+  "config_only": [
+    {
+      "Key": "FQEBAEEYF428c5++FQE=",
+      "Value": "bGVnYWN5LXBsdWdpbg=="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQI=",
+      "Value": null
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQM=",
+      "Value": null
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQY=",
+      "Value": "AAAAAA=="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQc=",
+      "Value": null
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQg=",
+      "Value": null
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQk=",
+      "Value": "AAAAAA=="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQo=",
+      "Value": "eyJmaXh0dXJlX3NlY3JldCI6InN5bnRoZXRpYy1kby1ub3QtbG9nIn0="
+    }
+  ],
+  "descriptor": [
+    {
+      "Key": "FQEBAEEYF428c5++FQE=",
+      "Value": "bGVnYWN5LXBsdWdpbg=="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQI=",
+      "Value": "TGVnYWN5IGRlc2NyaXB0b3I="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQM=",
+      "Value": "eyJ0eXBlIjoib2JqZWN0In0="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQY=",
+      "Value": "AAAAAA=="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQc=",
+      "Value": null
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQg=",
+      "Value": null
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQk=",
+      "Value": "AAAAAA=="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQo=",
+      "Value": null
+    }
+  ],
+  "disabled_send": [
+    {
+      "Key": "FQEBAEEYF428c5++FQE=",
+      "Value": "bGVnYWN5LXBsdWdpbg=="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQI=",
+      "Value": null
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQM=",
+      "Value": null
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQY=",
+      "Value": "AAAAAg=="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQc=",
+      "Value": null
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQg=",
+      "Value": "WyJTZW5kIl0="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQk=",
+      "Value": "AAAAAA=="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQo=",
+      "Value": null
+    }
+  ],
+  "global_persist": [
+    {
+      "Key": "FQEBAEEYF428c5++FQE=",
+      "Value": "bGVnYWN5LXBsdWdpbg=="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQI=",
+      "Value": null
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQM=",
+      "Value": null
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQY=",
+      "Value": "AAAAAA=="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQc=",
+      "Value": null
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQg=",
+      "Value": "WyJQZXJzaXN0QWZ0ZXIiXQ=="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQk=",
+      "Value": "AAAAAA=="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQo=",
+      "Value": null
+    }
+  ],
+  "global_send": [
+    {
+      "Key": "FQEBAEEYF428c5++FQE=",
+      "Value": "bGVnYWN5LXBsdWdpbg=="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQI=",
+      "Value": null
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQM=",
+      "Value": null
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQY=",
+      "Value": "AAAAAA=="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQc=",
+      "Value": null
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQg=",
+      "Value": "WyJTZW5kIl0="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQk=",
+      "Value": "AAAAAA=="
+    },
+    {
+      "Key": "FQEBAEEYF428c5++FQo=",
+      "Value": null
+    }
+  ]
+}

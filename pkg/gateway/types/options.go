@@ -5,19 +5,24 @@ import (
 	"strings"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/gateway/protocol"
 	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 )
 
 type Options struct {
-	Handler        Handler
-	Authenticator  Authenticator
-	Observer       Observer
-	DefaultSession SessionOptions
-	Runtime        RuntimeOptions
-	Transport      TransportOptions
-	Listeners      []ListenerOptions
-	Logger         wklog.Logger
+	Handler Handler
+	// PacketHandler owns independent protocol entry callbacks; nil keeps those listeners unavailable.
+	PacketHandler PacketHandler
+	// PacketProtocols registers independent wire adapters before listener construction.
+	PacketProtocols []protocol.PacketAdapter
+	Authenticator   Authenticator
+	Observer        Observer
+	DefaultSession  SessionOptions
+	Runtime         RuntimeOptions
+	Transport       TransportOptions
+	Listeners       []ListenerOptions
+	Logger          wklog.Logger
 }
 
 // TransportOptions groups transport-specific gateway runtime tuning.
@@ -47,6 +52,12 @@ type ListenerOptions struct {
 	Path      string
 	Transport string
 	Protocol  string
+	// ProxyProtocolTrustedCIDRs lists the TCP peers allowed to supply PROXY v1/v2
+	// source addresses. Direct/PROXY detection is always enabled. Empty accepts
+	// assertions from any peer, so reported client addresses are not verified.
+	// A nonempty list restricts assertions to controlled proxy egress networks;
+	// direct traffic remains accepted from any peer.
+	ProxyProtocolTrustedCIDRs []string `json:"proxy_protocol_trusted_cidrs,omitempty"`
 }
 
 type SessionOptions struct {
@@ -56,6 +67,7 @@ type SessionOptions struct {
 	// AsyncSendBatchMaxWait bounds how long a SEND shard waits to collect adjacent frames.
 	AsyncSendBatchMaxWait time.Duration
 	// AsyncSendBatchMaxRecords caps SEND frames in one gateway micro-batch.
+	// The default is 128 to bound downstream burst amplification under sustained high QPS.
 	AsyncSendBatchMaxRecords int
 	// AsyncSendBatchMaxBytes caps payload bytes in one gateway micro-batch.
 	AsyncSendBatchMaxBytes int
@@ -68,25 +80,29 @@ type RuntimeOptions struct {
 	Goroutines *goruntimeregistry.Registry
 	// AsyncSendWorkers sets the worker count used to dispatch SEND frames asynchronously.
 	AsyncSendWorkers int
-	// AsyncSendQueueCapacity sets the maximum queued SEND frame count before admission fails.
+	// AsyncSendQueueCapacity bounds reserved SEND records. Deferred handlers count
+	// queued, executing and completed-but-unpublished frames in the same budget.
 	AsyncSendQueueCapacity int
 	// AsyncAuthWorkers sets the worker count used to process CONNECT authentication asynchronously.
 	AsyncAuthWorkers int
 	// AsyncAuthQueueCapacity sets the maximum queued CONNECT authentication count before admission fails.
 	AsyncAuthQueueCapacity int
+	// AsyncPacketMaxBytes caps independent protocol bytes retained by auth and
+	// ordered dispatch, including executing work. Zero defaults to 64 MiB.
+	AsyncPacketMaxBytes int
 	// AsyncPoolReleaseTimeout bounds how long async worker pools wait for graceful release.
 	AsyncPoolReleaseTimeout time.Duration
 }
 
 const (
-	defaultAsyncSendWorkers        = 128
+	defaultAsyncSendWorkers        = 1000
 	defaultAsyncSendQueueCapacity  = 128 * 1024
 	defaultAsyncAuthWorkers        = 16
 	defaultAsyncAuthQueueCapacity  = 8 * 1024
 	defaultAsyncPoolReleaseTimeout = 100 * time.Millisecond
 
 	defaultAsyncSendBatchMaxWait    = time.Millisecond
-	defaultAsyncSendBatchMaxRecords = 512
+	defaultAsyncSendBatchMaxRecords = 128
 	defaultAsyncSendBatchMaxBytes   = 512 * 1024
 )
 
@@ -108,6 +124,7 @@ func DefaultRuntimeOptions() RuntimeOptions {
 		AsyncSendQueueCapacity:  defaultAsyncSendQueueCapacity,
 		AsyncAuthWorkers:        defaultAsyncAuthWorkers,
 		AsyncAuthQueueCapacity:  defaultAsyncAuthQueueCapacity,
+		AsyncPacketMaxBytes:     64 << 20,
 		AsyncPoolReleaseTimeout: defaultAsyncPoolReleaseTimeout,
 	}
 }
@@ -127,6 +144,10 @@ func (o *Options) Validate() error {
 		o.Listeners[i].Path = strings.TrimSpace(o.Listeners[i].Path)
 		o.Listeners[i].Transport = strings.TrimSpace(o.Listeners[i].Transport)
 		o.Listeners[i].Protocol = strings.TrimSpace(o.Listeners[i].Protocol)
+
+		if _, err := ParseProxyProtocolTrustedCIDRs(o.Listeners[i].ProxyProtocolTrustedCIDRs); err != nil {
+			return fmt.Errorf("gateway: listener %q: %w", o.Listeners[i].Name, err)
+		}
 
 		name := o.Listeners[i].Name
 		network := o.Listeners[i].Network
@@ -158,7 +179,7 @@ func (o *Options) Validate() error {
 			return ErrListenerProtocolEmpty
 		}
 	}
-	if o.Handler == nil {
+	if o.Handler == nil && o.PacketHandler == nil {
 		return ErrNilHandler
 	}
 	return nil
@@ -208,6 +229,9 @@ func NormalizeRuntimeOptions(opt RuntimeOptions) RuntimeOptions {
 	}
 	if opt.AsyncAuthWorkers <= 0 {
 		opt.AsyncAuthWorkers = def.AsyncAuthWorkers
+	}
+	if opt.AsyncPacketMaxBytes <= 0 {
+		opt.AsyncPacketMaxBytes = def.AsyncPacketMaxBytes
 	}
 	if opt.AsyncAuthQueueCapacity <= 0 {
 		opt.AsyncAuthQueueCapacity = def.AsyncAuthQueueCapacity

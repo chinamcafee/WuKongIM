@@ -2,6 +2,10 @@ package engine
 
 // MetricsSnapshot is a stable, Pebble-neutral view of one local storage engine.
 type MetricsSnapshot struct {
+	// BlockCacheHits counts block reads served from the engine cache.
+	BlockCacheHits int64
+	// BlockCacheMisses counts block reads that missed the engine cache.
+	BlockCacheMisses int64
 	// DiskSpaceUsageBytes is the engine's local disk usage, including live and obsolete files.
 	DiskSpaceUsageBytes uint64
 	// ReadAmplification is the current LSM read amplification estimate.
@@ -20,6 +24,14 @@ type MetricsSnapshot struct {
 	WALBytesIn uint64
 	// WALBytesWritten is the physical bytes written to the WAL.
 	WALBytesWritten uint64
+	// SSTableSizeBytes is the current physical size of live SSTables across all levels.
+	SSTableSizeBytes uint64
+	// FlushBytesWritten is the cumulative bytes written to SSTables by flushes.
+	FlushBytesWritten uint64
+	// CompactionBytesRead is the cumulative SSTable bytes read by compactions.
+	CompactionBytesRead uint64
+	// CompactionBytesWritten is the cumulative SSTable bytes written by compactions.
+	CompactionBytesWritten uint64
 	// FlushCount is the number of completed flushes since this engine opened.
 	FlushCount int64
 	// FlushesInProgress is the current number of flushes in progress.
@@ -32,6 +44,12 @@ type MetricsSnapshot struct {
 	CompactionInProgressBytes int64
 	// CompactionsInProgress is the current number of compactions in progress.
 	CompactionsInProgress int64
+	// WriteStalls aggregates Pebble write stalls since this engine opened.
+	WriteStalls StallSnapshot
+	// WALFsync summarizes WAL fsync latency since open.
+	WALFsync WALFsyncSnapshot
+	// DiskSlow aggregates slow disk operation reports since open.
+	DiskSlow DiskSlowSnapshot
 }
 
 // MetricsSnapshot returns a stable storage-engine metrics snapshot.
@@ -44,7 +62,22 @@ func (e *DB) MetricsSnapshot() MetricsSnapshot {
 	if metrics == nil {
 		return MetricsSnapshot{}
 	}
+	var sstableSizeBytes uint64
+	var flushBytesWritten uint64
+	var compactionBytesRead uint64
+	var compactionBytesWritten uint64
+	for i := range metrics.Levels {
+		level := metrics.Levels[i]
+		if level.TablesSize > 0 {
+			sstableSizeBytes += uint64(level.TablesSize)
+		}
+		flushBytesWritten += level.TableBytesFlushed
+		compactionBytesRead += level.TableBytesRead
+		compactionBytesWritten += level.TableBytesCompacted
+	}
 	return MetricsSnapshot{
+		BlockCacheHits:               metrics.BlockCache.Hits,
+		BlockCacheMisses:             metrics.BlockCache.Misses,
 		DiskSpaceUsageBytes:          metrics.DiskSpaceUsage(),
 		ReadAmplification:            metrics.ReadAmp(),
 		MemTableSizeBytes:            metrics.MemTable.Size,
@@ -54,11 +87,18 @@ func (e *DB) MetricsSnapshot() MetricsSnapshot {
 		WALPhysicalSizeBytes:         metrics.WAL.PhysicalSize,
 		WALBytesIn:                   metrics.WAL.BytesIn,
 		WALBytesWritten:              metrics.WAL.BytesWritten,
+		SSTableSizeBytes:             sstableSizeBytes,
+		FlushBytesWritten:            flushBytesWritten,
+		CompactionBytesRead:          compactionBytesRead,
+		CompactionBytesWritten:       compactionBytesWritten,
 		FlushCount:                   metrics.Flush.Count,
 		FlushesInProgress:            metrics.Flush.NumInProgress,
 		CompactionCount:              metrics.Compact.Count,
 		CompactionEstimatedDebtBytes: metrics.Compact.EstimatedDebt,
 		CompactionInProgressBytes:    metrics.Compact.InProgressBytes,
 		CompactionsInProgress:        metrics.Compact.NumInProgress,
+		WriteStalls:                  e.stalls.snapshot(),
+		WALFsync:                     walFsyncSummary(metrics.LogWriter.FsyncLatency),
+		DiskSlow:                     e.disk.snapshot(),
 	}
 }

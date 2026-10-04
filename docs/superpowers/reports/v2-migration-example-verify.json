@@ -1,0 +1,20 @@
+{
+  "status": "offline_verified",
+  "cutover_ready": false,
+  "selection_digest": "1b4408cb1166733cf5f2f06b5be4b1fcfafe7af30f014064711ebebb63303698",
+  "digest": "5c1653a6a2b3d92f203cbaa9ddef699b2bb1477d80266944fe4944def0bb92ec",
+  "nodes": 1,
+  "verified_message_replicas": 4,
+  "verified_metadata_replicas": {
+    "channel": 4,
+    "channel_runtime_meta": 2,
+    "device": 2,
+    "message_event_applied": 1,
+    "message_event_cursor": 1,
+    "message_event_state": 1,
+    "subscriber": 6,
+    "user": 2,
+    "user_channel_membership": 2,
+    "user_cmd_channel_membership": 2
+  }
+}

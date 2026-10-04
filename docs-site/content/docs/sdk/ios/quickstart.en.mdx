@@ -1,0 +1,126 @@
+---
+title: iOS Quickstart
+description: Install WuKongIMSDK 1.1.1, connect a user, and exchange the first online text message.
+---
+
+This page has one goal: exchange a text message between two online iOS clients. Add conversations, channel profiles, and offline synchronization after this works.
+
+## Prerequisites
+
+- Your application server returns a `uid`, `token`, `host`, and `port` for both `alice` and `bob`.
+- You have two separate app processes or devices. `WKSDK` is a singleton and cannot represent two signed-in users in one process.
+- CocoaPods works in your Objective-C project.
+
+## 1. Install
+
+Pin the version in your `Podfile`:
+
+```ruby
+pod 'WuKongIMSDK', '1.1.1'
+```
+
+Then run:
+
+```bash
+pod install
+```
+
+Open the generated `.xcworkspace` from now on.
+
+## 2. Configure and connect
+
+Create one object that owns the connection and message delegates:
+
+```objc
+#import <WuKongIMSDK/WuKongIMSDK.h>
+
+@interface IMClient : NSObject <WKConnectionManagerDelegate, WKChatManagerDelegate>
+- (void)startWithUID:(NSString *)uid
+               token:(NSString *)token
+                host:(NSString *)host
+                port:(uint16_t)port;
+- (void)sendText:(NSString *)text toUID:(NSString *)uid;
+@end
+
+@implementation IMClient
+
+- (void)startWithUID:(NSString *)uid
+               token:(NSString *)token
+                host:(NSString *)host
+                port:(uint16_t)port {
+    WKOptions *options = [WKOptions new];
+    options.host = host;
+    options.port = port;
+    options.isDebug = NO;
+    options.connectInfo = [WKConnectInfo initWithUID:uid
+                                               token:token
+                                                name:@""
+                                              avatar:@""];
+    [WKSDK shared].options = options;
+
+    [[WKSDK shared].connectionManager addDelegate:self];
+    [[WKSDK shared].chatManager addDelegate:self];
+    [[WKSDK shared].connectionManager connect];
+}
+
+- (void)onConnectStatus:(WKConnectStatus)status reasonCode:(WKReason)reasonCode {
+    if (status == WKConnected) {
+        NSLog(@"WuKongIM connected");
+    } else if (status == WKDisconnected) {
+        NSLog(@"WuKongIM disconnected, reason: %ld", (long)reasonCode);
+    }
+}
+```
+
+`connect` only starts the attempt. The client is ready to send after the delegate reports `WKConnected`.
+
+## 3. Send a text message
+
+After Alice connects, send to Bob's UID:
+
+```objc
+- (void)sendText:(NSString *)text toUID:(NSString *)uid {
+    WKTextContent *content = [[WKTextContent alloc] initWithContent:text];
+    WKChannel *channel = [WKChannel personWithChannelID:uid];
+    [[WKSDK shared].chatManager sendMessage:content channel:channel];
+}
+```
+
+Call it with:
+
+```objc
+[client sendText:@"Hello, Bob" toUID:@"bob"];
+```
+
+## 4. Observe the result
+
+Use the same delegate for local send-state changes and incoming messages:
+
+```objc
+- (void)onMessageUpdate:(WKMessage *)message left:(NSInteger)left {
+    if (message.status == WK_MESSAGE_SUCCESS) {
+        NSLog(@"message sent: %@", message.clientMsgNo);
+    } else if (message.status == WK_MESSAGE_FAIL) {
+        NSLog(@"message failed: %@", message.clientMsgNo);
+    }
+}
+
+- (void)onRecvMessages:(WKMessage *)message left:(NSInteger)left {
+    if ([message.content isKindOfClass:[WKTextContent class]]) {
+        WKTextContent *text = (WKTextContent *)message.content;
+        NSLog(@"%@ says: %@", message.fromUid, text.content);
+    }
+}
+
+@end
+```
+
+## Expected result
+
+1. Alice and Bob both report `WKConnected`.
+2. Alice receives `WK_MESSAGE_SUCCESS` in `onMessageUpdate`.
+3. Bob prints “Hello, Bob” from `onRecvMessages`.
+
+If connection fails, make sure `host` has no `http://` or `https://` prefix and `port` is the client persistent-connection port. If sending produces no result, verify that Bob is online, the UID is correct, and sending happens after `WKConnected`.
+
+Continue with [Connection](/en/sdk/ios/connection) and [Messages](/en/sdk/ios/messages).

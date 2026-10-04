@@ -15,6 +15,7 @@ import (
 
 func TestServerServesHealthReadyAndBenchTargetSurface(t *testing.T) {
 	srv := New(Options{
+		Users: &recordingUserUsecase{},
 		Readyz: func(context.Context) (bool, any) {
 			return true, map[string]any{"ready": true}
 		},
@@ -131,7 +132,7 @@ func TestServerServesEmbeddedDemoWithoutMaskingProductRoutes(t *testing.T) {
 	if contentType := demoRec.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/html") {
 		t.Fatalf("GET /demo/ content type = %q, want text/html", contentType)
 	}
-	if body := demoRec.Body.String(); !strings.Contains(body, "悟空IM演示程序") {
+	if body := demoRec.Body.String(); !strings.Contains(body, "WuKongIM Demo") {
 		t.Fatalf("GET /demo/ body does not contain demo title: %q", body)
 	}
 
@@ -220,6 +221,9 @@ func TestBenchMutationRoutesWriteConfiguredBenchData(t *testing.T) {
 	decodeJSON(t, resp, err, &caps)
 	if !caps.Supports.ChannelSubscribersBatch || !caps.Supports.ChannelSubscriberRemovalsBatch {
 		t.Fatalf("capabilities supports = %+v, want subscriber add and removal batches", caps.Supports)
+	}
+	if got := caps.Supports.ChannelTypes; len(got) != 2 || got[0] != "person" || got[1] != "group" {
+		t.Fatalf("channel types = %v, want person and group", got)
 	}
 
 	var channelResp mutationResponse

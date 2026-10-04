@@ -25,8 +25,19 @@ The keywords `MUST`, `MUST NOT`, `SHOULD`, and `MAY` define requirement levels:
 ## Before You Work
 
 - Development SHOULD use a Git worktree with its working copy located in the .worktrees directory
-- Before reading or changing a package, you MUST check that package for a
-  `FLOW.md` and read it when present.
+- After a task branch is fully merged into its target branch, you MUST remove
+  its clean worktree and delete the original local task branch as part of delivery.
+  Verify that the target contains the branch tip before cleanup, and preserve
+  any uncommitted work. Do not force-delete unmerged branches.
+- Before deeply analyzing or changing a package, you MUST read every applicable
+  `FLOW.md`. Broad repository discovery and symbol search do not trigger this
+  requirement. A FLOW with `scope: package` applies only to its directory; a
+  FLOW with `scope: subtree` also applies to descendants. A FLOW without valid
+  scope metadata is invalid and MUST NOT be used as context.
+- `FLOW.md` is advisory module navigation. It MUST NOT override this file,
+  executable code, schemas, or tests. Use
+  `docs/development/FLOW_INDEX.md` only for discovery; read applicable FLOW
+  files directly before package work.
 - If a change makes an applicable `FLOW.md` inaccurate, update it in the same
   change.
 - More specific `AGENTS.md` files in a target subtree add to or override this
@@ -79,6 +90,24 @@ app -> access/usecase/runtime/infra/pkg
 - Performance-sensitive designs MUST consider CPU, memory, allocations,
   contention, queue bounds, backpressure, and fanout at the expected scale.
 
+### Release Notes
+
+- A release request MUST include publication to the applicable signed native
+  package channel in `WuKongIM/packages`, followed by public APT/RPM client
+  verification of the exact target version. Docker images, GitHub Release
+  assets, and documentation alone MUST NOT be reported as a complete release.
+  Follow `docs/development/RELEASING.md`; if the applicable channel is disabled
+  or publication fails, report the release as incomplete.
+- User-visible changes MUST add a concise user/operator-facing entry to the
+  root `CHANGELOG.md` under `Unreleased`.
+- A pull request MAY omit a Changelog entry only when its description explains
+  why no user-visible behavior changes and a maintainer applies the
+  `skip-changelog` label.
+- Before creating a release tag, maintainers MUST move the applicable entries
+  into the exact version heading required by `CHANGELOG.md`. Release Workflows
+  MUST fail before publishing any artifact when that version section is
+  missing, duplicated, empty, or malformed.
+
 ### Configuration
 
 - The primary configuration file is `wukongim.toml` in TOML format.
@@ -97,6 +126,9 @@ app -> access/usecase/runtime/infra/pkg
 
 ### Test Policy
 
+- NEVER write unit tests after you write code.
+- Highly prefer E2E tests as the sole testing mechanism. Use them to verify complex features work. At the end of E2E tests, produce a verifiable and repeatable artifact.
+- If you must test a system in isolation, FIRST write all the ways it could fail, THEN write the code.
 - You MUST run at least the tests directly related to the change.
 - Unit tests MUST remain fast. Tests that simulate realistic elapsed time or
   external integration MUST use the `integration` build tag.
@@ -105,9 +137,6 @@ app -> access/usecase/runtime/infra/pkg
   MUST live in `*_integration_test.go` with the `integration` build tag.
   Static source/configuration contracts, parsers, AWK/JQ transforms, help
   output, and no-background dry runs SHOULD remain in the default unit tier.
-- Development SHOULD default to unit tests. Integration and E2E suites SHOULD
-  run only when the change affects those behaviors or the task explicitly
-  requires them.
 - Repository-wide Go gates MUST NOT use root `./...`. Go ignores `.gitignore`
   during package discovery and may include local packages under `tmp/` or
   `web/node_modules/`.
@@ -161,6 +190,19 @@ app -> access/usecase/runtime/infra/pkg
   Its control code, Workflows, policy, schemas, prompts, and instruction files
   are protected from automated changes. Every Codex task freezes applicable
   `AGENTS.md` and `FLOW.md` digests from its exact source revision.
+- `.github/review-agent/policy.json` MUST remain the sole machine-executable
+  authority for Review Agent check arguments, limits, and path selection.
+  Instructions, Skills, prompts, and Workflows MUST reference named checks
+  instead of copying their commands.
+- `.agents/skill-tests.json` MUST remain the sole catalog of focused
+  repository-Skill tests. Only its explicitly registered, contract-validated
+  commands may run; automation MUST NOT discover and execute arbitrary files
+  from Skill directories.
+- Changes under `.agents/skills/` MUST pass the `agent-artifact-contracts` and
+  `skill-focused-contracts` named checks.
+- Changes to any `FLOW.md`, its validator, the generated FLOW index, Agent FLOW
+  context discovery, or this governing rule MUST pass the
+  `flow-doc-contracts` named check.
 
 ## GitHub Actions tools
 
@@ -175,9 +217,9 @@ authorization, Review Agent evidence, retry, and monitoring contracts.
 | `.agents/` | Repository-local agent skills and support files. |
 | `.github/` | CI workflows and cloud-simulation support. |
 | `cmd/wukongim/` | Product entrypoint that loads configuration and starts `internal/app`. |
-| `cmd/wkbench/` | Black-box benchmark CLI. |
-| `cmd/wkcli/`, `cmd/wkdb/` | Operations and local read-only storage diagnostics. |
-| `cmd/wkcloud*/`, `cmd/wkanalysis/` | Cloud simulation, deployment, validation, viewing, and analysis tools. |
+| `cmd/wkcli/` | Unified operator CLI: operations, black-box benchmarks, offline database inspection/transfer, and original v2-to-v3 migration. |
+| `cmd/wkchatlifecycle/` | Fixed Run Plan materialization, Lease selector, and rehearsal-report validation. |
+| `cmd/wkcloud*/`, `cmd/wkanalysis/` | Cloud lease identity/lifecycle, simulation, deployment, validation, viewing, and analysis tools. |
 | `cmd/wkissueagent/` | JSON-only GitHub Actions entrypoint for the stateless Issue Agent. |
 | `cmd/wkreviewcheck/` | Frozen selector-only helper for composite Review Agent checks. |
 | `internal/access/` | HTTP, gateway, node RPC, manager, plugin, and cloud-analysis entry adapters. |
@@ -195,5 +237,13 @@ authorization, Review Agent evidence, retry, and monitoring contracts.
 | `scripts/` | Repository automation, E2E gates, and cloud-simulation helpers. |
 | `docker/` | Development clusters, simulation, and observability configurations. |
 | `web/` | Manager React/Vite source. |
+| `demo/` | One-command loopback Demo launcher and process-level acceptance. |
+| `demo/shared/` | Shared catalog navigation and link styles for the six Demo frontends. |
 | `demo/chatdemo/` | Embedded chat demo Vue/Vite source. |
+| `demo/home/` | Dependency-free Demo catalog, embedded bundle build and loopback preview. |
+| `demo/agentdemo/` | Task assistant UI, bounded tool-calling backend and process-level acceptance. |
+| `demo/streamdemo/` | Embedded EasySDK streaming chat demo, local model relay, and browser acceptance. |
+| `demo/supportdemo/` | Embedded customer support UI, loopback Demo business backend, and process-level acceptance. |
+| `demo/mqttdemo/` | Embedded smart-store UI, browser MQTT WebSocket clients, provisioning backend, and browser acceptance. |
+| `demo/livedemo/` | Embedded live-room UI, browser transient SDK interactions, loopback moderation backend, and browser acceptance. |
 | `resources/` | Repository resources used by product and tooling. |

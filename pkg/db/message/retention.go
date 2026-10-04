@@ -22,15 +22,28 @@ func (l *ChannelLog) loadRetentionState(ctx context.Context) (RetentionState, bo
 	if err := ctx.Err(); err != nil {
 		return RetentionState{}, false, err
 	}
-	value, ok, err := l.db.engine.Get(encodeRetentionStateKey(l.key))
-	if err != nil || !ok {
-		return RetentionState{}, ok, err
+	if l.db.engine.IsClosed() {
+		return RetentionState{}, false, dberrors.ErrClosed
 	}
-	state, err := decodeRetentionState(value)
+	generation, cacheable := l.db.retentionReadGeneration()
+	if cached := l.retentionRead.Load(); cacheable && cached != nil && cached.generation == generation {
+		return cached.state, cached.present, nil
+	}
+	value, ok, err := l.db.engine.Get(encodeRetentionStateKey(l.key))
 	if err != nil {
 		return RetentionState{}, false, err
 	}
-	return state, true, nil
+	var state RetentionState
+	if ok {
+		state, err = decodeRetentionState(value)
+		if err != nil {
+			return RetentionState{}, false, err
+		}
+	}
+	if current, idle := l.db.retentionReadGeneration(); cacheable && idle && current == generation {
+		l.retentionRead.Store(&retentionReadState{generation: generation, state: state, present: ok})
+	}
+	return state, ok, nil
 }
 
 // StoreRetentionState stores durable local retention progress.
@@ -45,6 +58,8 @@ func (l *ChannelLog) StoreRetentionState(ctx context.Context, state RetentionSta
 	if err := validateRetentionState(state); err != nil {
 		return err
 	}
+	finishMutation := l.db.beginRetentionMutation()
+	defer finishMutation()
 	batch := l.db.engine.NewBatch()
 	defer batch.Close()
 	if err := batch.Set(encodeRetentionStateKey(l.key), encodeRetentionState(state)); err != nil {
@@ -81,9 +96,13 @@ func (l *ChannelLog) trimPrefixThroughLimit(ctx context.Context, throughSeq uint
 	if throughSeq == 0 {
 		return RetentionTrimResult{}, nil
 	}
+	finishMutation := l.db.beginRetentionMutation()
+	defer finishMutation()
 
 	l.appendMu.Lock()
 	defer l.appendMu.Unlock()
+	l.checkpointMu.Lock()
+	defer l.checkpointMu.Unlock()
 
 	leo, err := l.loadLEOLocked(ctx)
 	if err != nil {
@@ -99,6 +118,27 @@ func (l *ChannelLog) trimPrefixThroughLimit(ctx context.Context, throughSeq uint
 	if !adoptBoundary && throughSeq > state.LocalRetentionThroughSeq {
 		return RetentionTrimResult{}, dberrors.ErrCorruptState
 	}
+	requestedThrough := throughSeq
+	activation, err := readMQTTActivationEvidence(l.db.engine, l.key)
+	if err != nil {
+		return RetentionTrimResult{}, err
+	}
+	if activation.present && !activation.sourcePresent {
+		if state.PhysicalRetentionThroughSeq > activation.manifest.BaseOffset {
+			return RetentionTrimResult{}, dberrors.ErrCorruptState
+		}
+		throughSeq = min(throughSeq, activation.manifest.BaseOffset)
+	}
+	protection, protected, err := l.channelEntry.loadMQTTSourceState(ctx)
+	if err != nil {
+		return RetentionTrimResult{}, err
+	}
+	if protected {
+		if state.PhysicalRetentionThroughSeq > protection.CopiedThrough {
+			return RetentionTrimResult{}, dberrors.ErrCorruptState
+		}
+		throughSeq = min(throughSeq, protection.CopiedThrough)
+	}
 
 	startSeq := state.PhysicalRetentionThroughSeq + 1
 	if startSeq == 0 {
@@ -109,9 +149,14 @@ func (l *ChannelLog) trimPrefixThroughLimit(ctx context.Context, throughSeq uint
 	if opts.MaxMessages > 0 {
 		readOpts.Limit = opts.MaxMessages + 1
 	}
-	rows, err := l.readRows(ctx, startSeq, throughSeq, readOpts)
-	if err != nil {
-		return RetentionTrimResult{}, err
+	var rows []messageRow
+	// A zero protected boundary means no rows are eligible. readRows uses zero
+	// as an unbounded upper limit, so never pass that sentinel to a trim scan.
+	if throughSeq >= startSeq {
+		rows, err = l.readRows(ctx, startSeq, throughSeq, readOpts)
+		if err != nil {
+			return RetentionTrimResult{}, err
+		}
 	}
 	deleteRows := rows
 	result := RetentionTrimResult{}
@@ -124,11 +169,11 @@ func (l *ChannelLog) trimPrefixThroughLimit(ctx context.Context, throughSeq uint
 	}
 
 	next := state
-	if adoptBoundary && throughSeq > next.LocalRetentionThroughSeq {
-		next.LocalRetentionThroughSeq = throughSeq
+	if adoptBoundary && requestedThrough > next.LocalRetentionThroughSeq {
+		next.LocalRetentionThroughSeq = requestedThrough
 	}
-	if adoptBoundary && throughSeq > next.RetainedMaxSeq {
-		next.RetainedMaxSeq = throughSeq
+	if adoptBoundary && requestedThrough > next.RetainedMaxSeq {
+		next.RetainedMaxSeq = requestedThrough
 	}
 	if leo > next.RetainedMaxSeq {
 		next.RetainedMaxSeq = leo
@@ -138,7 +183,7 @@ func (l *ChannelLog) trimPrefixThroughLimit(ctx context.Context, throughSeq uint
 	defer batch.Close()
 	for _, row := range deleteRows {
 		msg := messageFromRow(row)
-		if err := l.stageDeleteMessage(batch, msg); err != nil {
+		if err := l.stageMessageDeletion(batch, msg, true); err != nil {
 			return RetentionTrimResult{}, err
 		}
 		result.DeletedThroughSeq = msg.MessageSeq
@@ -163,8 +208,12 @@ func (l *ChannelLog) trimPrefixThroughLimit(ctx context.Context, throughSeq uint
 	if err := batch.Commit(true); err != nil {
 		return RetentionTrimResult{}, err
 	}
-	l.leo.Store(maxUint64(leo, next.RetainedMaxSeq))
+	nextLEO := maxUint64(leo, next.RetainedMaxSeq)
+	l.leo.Store(nextLEO)
 	l.loaded.Store(true)
+	if nextLEO != leo {
+		l.clearDurableProposalTailLocked()
+	}
 	return result, nil
 }
 

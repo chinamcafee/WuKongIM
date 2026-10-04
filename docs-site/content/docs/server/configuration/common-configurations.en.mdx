@@ -1,0 +1,93 @@
+---
+title: Common Configurations
+description: Find settings by startup, client access, Manager, and logging; expand complete defaults when needed.
+---
+
+Choose a task first. `WK_` environment values override TOML; expand the complete field, environment, and defaults reference below.
+
+<Callout type="info" title="Every deployment is a cluster">
+  A one-node deployment is a single-node cluster. Every scenario requires `node.id`, `node.data_dir`, and `cluster.listen_addr`; configuration changes usually require a node restart.
+</Callout>
+
+<Cards>
+  <Card title="Start a node" description="Identity, storage, and peers." href="/en/server/configuration/common-configurations#startup" />
+  <Card title="Connect clients" description="Gateway, API, and tokens." href="/en/server/configuration/common-configurations#client-access" />
+  <Card title="Open Manager" description="Listener, JWT, and access." href="/en/server/configuration/common-configurations#manager-access" />
+  <Card title="Inspect logs" description="Levels and cleanup after diagnosis." href="/en/server/configuration/common-configurations#logging" />
+</Cards>
+
+## Frequently used settings
+
+<section id="startup" className="scroll-m-28">
+
+### Start a node
+
+| <span className="whitespace-nowrap">Use</span> | Setting and result |
+| --- | --- |
+| <span className="whitespace-nowrap">Identity</span> | `node.id`: Non-zero and unique; never change after data exists |
+| <span className="whitespace-nowrap">Storage</span> | `node.data_dir`: Exclusive, writable storage on a persistent, backed-up disk |
+| <span className="whitespace-nowrap">Peers</span> | `cluster.listen_addr`: Local listener; peers need real reachable addresses, never wildcards |
+
+Choose static `cluster.nodes` or non-empty `cluster.seeds`. JSON environment lists **replace the whole list**.
+
+</section>
+
+<section id="client-access" className="scroll-m-28">
+
+### Connect clients
+
+| <span className="whitespace-nowrap">Use</span> | Setting and result |
+| --- | --- |
+| <span className="whitespace-nowrap">Clients</span> | `gateway.listeners`: Omission listens on all interfaces: TCP `5100` / WSMux `5200`; an explicit empty list disables Gateway |
+| <span className="whitespace-nowrap">API</span> | `api.listen_addr`: Omitted or empty disables WuKongIM HTTP API; configure Gateway and Manager separately |
+
+Keep `gateway.token_auth_on=true`. CONNECT exactly matches the stored device token for the same `UID + device_flag`; empty, missing, or mismatched tokens return `ReasonAuthFail`. WuKongIM HTTP API still needs a trusted network or external auth.
+
+</section>
+
+<section id="manager-access" className="scroll-m-28">
+
+### Open Manager
+
+| <span className="whitespace-nowrap">Use</span> | Setting and result |
+| --- | --- |
+| <span className="whitespace-nowrap">Listener</span> | `manager.listen_addr`: omitted or empty disables Manager; use loopback / private networks with SSH or HTTPS |
+| <span className="whitespace-nowrap">JWT</span> | `manager.auth_on`: omission defaults to `false`; set `true` in production with `manager.jwt_secret` and `manager.users` |
+
+**Verify:** replace example credentials, sign in, and grant only required resources and actions.
+
+</section>
+
+<section id="logging" className="scroll-m-28">
+
+### Inspect logs
+
+`log.level` defaults to `info`; choices are `debug`, `info`, `warn`, and `error`. Use `debug` temporarily for diagnosis, then restore the previous level.
+
+</section>
+
+<details>
+  <summary>Complete common fields, defaults, and environment mappings</summary>
+
+This page keeps only the settings most often consulted for startup, client access, and daily operations. Each setting can be provided through TOML or an environment variable; when both are present, the environment variable overrides the file value. See the [Configuration Reference](/en/server/configuration/reference) for every field and its exact semantics.
+
+| Setting (TOML / environment) | Purpose | Defaults and cautions |
+| --- | --- | --- |
+| [`node.id`](/en/server/configuration/cluster)<br />`WK_NODE_ID` | Identifies this node as the stable identity used by messages and cluster state. | Required at startup, non-zero, and unique within the cluster; do not change it after data exists. |
+| [`node.data_dir`](/en/server/configuration/storage)<br />`WK_NODE_DATA_DIR` | Stores this node's durable Controller, Slot, Channel, and related data. | Required at startup; the directory must be writable and should reside on persistent, backed-up storage. |
+| [`cluster.listen_addr`](/en/server/configuration/cluster)<br />`WK_CLUSTER_LISTEN_ADDR` | Listens for Cluster RPC between nodes. | Required at startup; it may bind `0.0.0.0`, but the address given to peers must be reachable and must not be a wildcard. |
+| [`cluster.nodes`](/en/server/configuration/cluster)<br />`WK_CLUSTER_NODES` | Defines the static Controller voter list, with each entry containing a node `id` and cluster `addr`. | When `cluster.seeds` is also unset, omission or an empty list falls back to an implicit single-node cluster; it cannot be combined with non-empty `cluster.seeds`. The environment value must be JSON and replaces the whole list. |
+| [`cluster.slot_replica_n`](/en/server/configuration/cluster)<br />`WK_CLUSTER_SLOT_REPLICA_N` | Sets the voter replicas for each Slot Raft Group when the cluster is first initialized. | `0` derives the static voter count, or uses `1` during seed joining; existing clusters follow persisted Controller state. |
+| [`gateway.listeners`](/en/server/configuration/networking)<br />`WK_GATEWAY_LISTENERS` | Defines the TCP or WebSocket listeners used by clients. | Omission opens WKProto TCP on `0.0.0.0:5100` and WSMux on `0.0.0.0:5200`; an explicit empty list disables Gateway. The environment value must be JSON. |
+| [`gateway.token_auth_on`](/en/server/configuration/security)<br />`WK_GATEWAY_TOKEN_AUTH_ON` | Requires a CONNECT token to exactly match the stored device token for the same UID and `device_flag`. | Defaults to `true`; an empty token, missing record, or mismatch returns `ReasonAuthFail`. Disable only temporarily during a controlled compatibility migration. |
+| [`api.listen_addr`](/en/server/configuration/networking)<br />`WK_API_LISTEN_ADDR` | Listens for the WuKongIM HTTP API, including health and switch-controlled metrics, debug, and related HTTP routes. | Omission or an empty value disables this HTTP service; it does not create client Gateway or Manager listeners. |
+| [`manager.listen_addr`](/en/server/configuration/security)<br />`WK_MANAGER_LISTEN_ADDR` | Listens for the separate Manager administration service. | Omission or an empty value disables Manager; bind loopback or a management address, use SSH tunneling or a private HTTPS proxy, and enable authentication. |
+| [`manager.auth_on`](/en/server/configuration/security)<br />`WK_MANAGER_AUTH_ON` | Requires JWT login authentication for Manager routes. | Omission is `false`; when `true`, both `manager.jwt_secret` and `manager.users` are required. |
+| [`log.level`](/en/server/configuration/observability)<br />`WK_LOG_LEVEL` | Sets the minimum application log level that is recorded. | Defaults to `info`; allowed values are `debug`, `info`, `warn`, and `error`. Avoid leaving `debug` enabled after production troubleshooting. |
+
+</details>
+
+## Continue reading
+
+- See the [Configuration overview](/en/server/configuration) for file lookup, environment overrides, and list replacement.
+- See the [Configuration Reference](/en/server/configuration/reference) for seed joining, channel replicas, metrics, webhooks, and every other setting.

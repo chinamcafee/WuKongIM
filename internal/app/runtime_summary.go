@@ -61,6 +61,7 @@ func (r managementRuntimeSummaryReader) localRuntimeSummary(ctx context.Context,
 		ChannelRuntime:     r.localChannelRuntimeSummary(),
 	}
 	if r.app != nil {
+		summary.Version = r.app.buildVersion
 		if snapshots, ok := r.app.cluster.(interface {
 			LocalControlSnapshot(context.Context) (control.Snapshot, error)
 		}); ok && snapshots != nil {
@@ -130,9 +131,9 @@ func (w managementGatewayDrainWriter) setLocalDrainMode(ctx context.Context, nod
 	return managementRuntimeSummaryReader{app: w.app, localNodeID: w.localNodeID}.localRuntimeSummary(ctx, nodeID), nil
 }
 
-func (s managerConnectionRPCService) ListConnections(ctx context.Context, req managementusecase.ListConnectionsRequest) ([]managementusecase.Connection, error) {
+func (s managerConnectionRPCService) ListConnections(ctx context.Context, req managementusecase.ListConnectionsRequest) (managementusecase.ListConnectionsResponse, error) {
 	if s.reads == nil {
-		return nil, managementusecase.ErrConnectionReaderUnavailable
+		return managementusecase.ListConnectionsResponse{}, managementusecase.ErrConnectionReaderUnavailable
 	}
 	return s.reads.ListConnections(ctx, req)
 }

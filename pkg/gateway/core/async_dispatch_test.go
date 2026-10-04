@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"errors"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -53,12 +52,15 @@ func TestServerAsyncSendDispatchRejectsWhenQueueFull(t *testing.T) {
 	}
 
 	state := asyncSendTestState(srv, 1)
+	adapter := &sendackRecordingProtocol{}
+	state.listener.adapter = adapter
+	state.conn = &asyncAuthRecordingConn{}
 	state.markOpenDispatched()
 	state.markOpenComplete()
 
 	done := make(chan struct{})
 	go func() {
-		srv.dispatchSendFrameAsync(state, "", &frame.SendPacket{})
+		srv.dispatchSendFrameAsync(state, "", &frame.SendPacket{ClientSeq: 7, ClientMsgNo: "overflow"})
 		close(done)
 	}()
 
@@ -72,17 +74,43 @@ func TestServerAsyncSendDispatchRejectsWhenQueueFull(t *testing.T) {
 	if got := handler.frames(); got != 1 {
 		t.Fatalf("handler frames = %d, want async queue full rejection without synchronous fallback", got)
 	}
-	if !state.isClosed() {
-		t.Fatal("state was not closed after async queue overflow")
+	// Overload is per-SEND backpressure: the connection stays open and the
+	// client receives a retryable rate-limit SENDACK for the rejected frame.
+	if state.isClosed() {
+		t.Fatal("state closed after async queue overflow, want per-SEND rejection")
 	}
-	errs := handler.counting.sessionErrors()
-	if len(errs) != 1 || !errors.Is(errs[0], gatewaytypes.ErrAsyncDispatchQueueFull) {
-		t.Fatalf("session errors = %v, want ErrAsyncDispatchQueueFull", errs)
+	acks := adapter.sendacks()
+	if len(acks) != 1 {
+		t.Fatalf("sendacks = %d, want 1", len(acks))
 	}
-	reasons := handler.counting.closeReasons()
-	if len(reasons) == 0 || reasons[0] != gatewaytypes.CloseReasonAsyncDispatchQueueFull {
-		t.Fatalf("close reasons = %v, want %q", reasons, gatewaytypes.CloseReasonAsyncDispatchQueueFull)
+	if acks[0].ReasonCode != frame.ReasonSystemBusy || acks[0].ClientSeq != 7 || acks[0].ClientMsgNo != "overflow" {
+		t.Fatalf("sendack = %+v, want ReasonSystemBusy echoing client seq and msg no", acks[0])
 	}
+	if reasons := handler.counting.closeReasons(); len(reasons) != 0 {
+		t.Fatalf("close reasons = %v, want none", reasons)
+	}
+}
+
+// sendackRecordingProtocol captures SENDACK frames encoded for one session.
+type sendackRecordingProtocol struct {
+	asyncAuthEncodeOnlyProtocol
+	mu   sync.Mutex
+	acks []frame.SendackPacket
+}
+
+func (p *sendackRecordingProtocol) Encode(_ session.Session, f frame.Frame, _ session.OutboundMeta) ([]byte, error) {
+	if ack, ok := f.(*frame.SendackPacket); ok {
+		p.mu.Lock()
+		p.acks = append(p.acks, *ack)
+		p.mu.Unlock()
+	}
+	return []byte("sendack"), nil
+}
+
+func (p *sendackRecordingProtocol) sendacks() []frame.SendackPacket {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]frame.SendackPacket(nil), p.acks...)
 }
 
 func TestServerAsyncSendDispatchRejectsFullQueueBeforePayloadClone(t *testing.T) {
@@ -127,8 +155,12 @@ func TestServerAsyncSendDispatchRejectsFullQueueBeforePayloadClone(t *testing.T)
 		return asyncSendTestState(srv, 1)
 	}
 
+	// Baseline includes the rate-limit SENDACK attempt made before closing, so
+	// only a payload clone can push the rejection path above it.
 	baseline := testing.AllocsPerRun(1000, func() {
-		newState().close(gatewaytypes.CloseReasonAsyncDispatchQueueFull, gatewaytypes.ErrAsyncDispatchQueueFull)
+		st := newState()
+		_ = srv.writeImmediateFrame(st, "", &frame.SendackPacket{ReasonCode: frame.ReasonSystemBusy})
+		st.close(gatewaytypes.CloseReasonAsyncDispatchQueueFull, gatewaytypes.ErrAsyncDispatchQueueFull)
 	})
 	actual := testing.AllocsPerRun(1000, func() {
 		srv.dispatchSendFrameAsync(newState(), "", packet)
@@ -252,11 +284,56 @@ func TestSendExecutorUsesRuntimeWorkerCountAndCapacity(t *testing.T) {
 	if got, want := executor.workers, 4; got != want {
 		t.Fatalf("send executor workers = %d, want %d", got, want)
 	}
-	if got, want := executor.workers, 4; got != want {
+	if got, want := executor.shards, 16; got != want {
 		t.Fatalf("send executor shards = %d, want %d", got, want)
 	}
 	if got, want := executor.totalCapacity(), 16; got != want {
 		t.Fatalf("send executor capacity = %d, want %d", got, want)
+	}
+}
+
+func TestSendExecutorDoesNotSerializeUnrelatedSessionsOnWorkerSlot(t *testing.T) {
+	handler := newSessionIsolationAsyncSendHandler()
+	srv := &Server{
+		dispatcher: newDispatcher(handler),
+		options: gatewaytypes.Options{
+			DefaultSession: gatewaytypes.SessionOptions{
+				AsyncSendBatchMaxRecords: 1,
+				AsyncSendBatchMaxBytes:   1024,
+			},
+		},
+	}
+	executor, err := newSendExecutor(srv, gatewaytypes.RuntimeOptions{
+		AsyncSendWorkers:        2,
+		AsyncSendQueueCapacity:  64,
+		AsyncPoolReleaseTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("new send executor: %v", err)
+	}
+	defer func() {
+		handler.releaseFirst()
+		executor.stop()
+	}()
+
+	// Session IDs 1 and 3 collide when worker slots are also used as the two
+	// ordering shards. They are unrelated sessions and must be able to use the
+	// two available workers independently.
+	if !executor.submit(asyncSendTestState(srv, 1), "", &frame.SendPacket{ClientMsgNo: "first"}) {
+		t.Fatal("first submit rejected")
+	}
+	select {
+	case <-handler.firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first session did not enter handler")
+	}
+	if !executor.submit(asyncSendTestState(srv, 3), "", &frame.SendPacket{ClientMsgNo: "second"}) {
+		t.Fatal("second submit rejected")
+	}
+	select {
+	case <-handler.secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("unrelated second session was serialized behind the first session")
 	}
 }
 
@@ -271,11 +348,11 @@ func TestSendExecutorBoundsMailboxCapacityAcrossShards(t *testing.T) {
 	}
 	defer executor.stop()
 
-	if got, want := executor.workers, 4; got != want {
+	if got, want := executor.shards, 10; got != want {
 		t.Fatalf("send executor shards = %d, want %d", got, want)
 	}
-	if got, want := executor.shardCapacity, 3; got != want {
-		t.Fatalf("send executor shard capacity = %d, want ceil(10/4)=3", got)
+	if got, want := executor.shardCapacity, 1; got != want {
+		t.Fatalf("send executor shard capacity = %d, want ceil(10/10)=1", got)
 	}
 	if got, want := executor.totalCapacity(), 10; got != want {
 		t.Fatalf("send executor total capacity = %d, want %d", got, want)
@@ -392,7 +469,7 @@ func TestAsyncSendBatchOptionsUseDefaults(t *testing.T) {
 	if got, want := opt.AsyncSendBatchMaxWait, time.Millisecond; got != want {
 		t.Fatalf("AsyncSendBatchMaxWait = %s, want %s", got, want)
 	}
-	if got, want := opt.AsyncSendBatchMaxRecords, 512; got != want {
+	if got, want := opt.AsyncSendBatchMaxRecords, 128; got != want {
 		t.Fatalf("AsyncSendBatchMaxRecords = %d, want %d", got, want)
 	}
 	if got, want := opt.AsyncSendBatchMaxBytes, 512*1024; got != want {
@@ -409,7 +486,7 @@ func TestAsyncSendBatchOptionsCanDisableWaitButNotBounds(t *testing.T) {
 	if opt.AsyncSendBatchMaxWait != 0 {
 		t.Fatalf("AsyncSendBatchMaxWait = %s, want 0", opt.AsyncSendBatchMaxWait)
 	}
-	if got, want := opt.AsyncSendBatchMaxRecords, 512; got != want {
+	if got, want := opt.AsyncSendBatchMaxRecords, 128; got != want {
 		t.Fatalf("AsyncSendBatchMaxRecords = %d, want %d", got, want)
 	}
 	if got, want := opt.AsyncSendBatchMaxBytes, 512*1024; got != want {
@@ -546,6 +623,32 @@ func TestSendExecutorObserverTracksQueueWaitAndBatch(t *testing.T) {
 	}
 	if waits[0].Duration <= 0 {
 		t.Fatalf("dispatch wait = %s, want > 0", waits[0].Duration)
+	}
+}
+
+func TestSendExecutorQueueSnapshotRevisionsTrackMutationsAcrossExecutors(t *testing.T) {
+	first := &sendExecutor{capacity: 4}
+	if !first.reserve() {
+		t.Fatal("first reserve rejected")
+	}
+	reserved := first.queueSnapshot()
+	if reserved.Depth != 1 || reserved.Revision == 0 {
+		t.Fatalf("reserved snapshot = %+v, want depth 1 and a non-zero revision", reserved)
+	}
+
+	first.consume(1)
+	drained := first.queueSnapshot()
+	if drained.Depth != 0 || drained.Revision <= reserved.Revision {
+		t.Fatalf("drained snapshot = %+v, want depth 0 and revision > %d", drained, reserved.Revision)
+	}
+
+	second := &sendExecutor{capacity: 4}
+	if !second.reserve() {
+		t.Fatal("second executor reserve rejected")
+	}
+	rebuilt := second.queueSnapshot()
+	if rebuilt.Depth != 1 || rebuilt.Revision <= drained.Revision {
+		t.Fatalf("rebuilt snapshot = %+v, want depth 1 and revision > %d", rebuilt, drained.Revision)
 	}
 }
 
@@ -1104,6 +1207,23 @@ type blockingAsyncSendFrameHandler struct {
 	release   chan struct{}
 }
 
+type sessionIsolationAsyncSendHandler struct {
+	firstStarted  chan struct{}
+	secondStarted chan struct{}
+	firstRelease  chan struct{}
+	firstOnce     sync.Once
+	secondOnce    sync.Once
+	releaseOnce   sync.Once
+}
+
+func newSessionIsolationAsyncSendHandler() *sessionIsolationAsyncSendHandler {
+	return &sessionIsolationAsyncSendHandler{
+		firstStarted:  make(chan struct{}),
+		secondStarted: make(chan struct{}),
+		firstRelease:  make(chan struct{}),
+	}
+}
+
 func newBlockingAsyncSendFrameHandler() *blockingAsyncSendFrameHandler {
 	return &blockingAsyncSendFrameHandler{
 		started: make(chan struct{}),
@@ -1289,6 +1409,33 @@ func (h *blockingAsyncSendFrameHandler) OnSessionError(ctx gatewaytypes.Context,
 
 func (h *blockingAsyncSendFrameHandler) frames() uint64 {
 	return h.counting.frames.Load()
+}
+
+func (h *sessionIsolationAsyncSendHandler) OnListenerError(string, error) {}
+func (h *sessionIsolationAsyncSendHandler) OnSessionOpen(gatewaytypes.Context) error {
+	return nil
+}
+func (h *sessionIsolationAsyncSendHandler) OnFrame(_ gatewaytypes.Context, f frame.Frame) error {
+	send, _ := f.(*frame.SendPacket)
+	if send == nil {
+		return nil
+	}
+	switch send.ClientMsgNo {
+	case "first":
+		h.firstOnce.Do(func() { close(h.firstStarted) })
+		<-h.firstRelease
+	case "second":
+		h.secondOnce.Do(func() { close(h.secondStarted) })
+	}
+	return nil
+}
+func (h *sessionIsolationAsyncSendHandler) OnSessionClose(gatewaytypes.Context) error {
+	return nil
+}
+func (h *sessionIsolationAsyncSendHandler) OnSessionError(gatewaytypes.Context, error) {}
+
+func (h *sessionIsolationAsyncSendHandler) releaseFirst() {
+	h.releaseOnce.Do(func() { close(h.firstRelease) })
 }
 
 type blockingRecordingAsyncSendBatchHandler struct {

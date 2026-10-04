@@ -1,7 +1,11 @@
 # bench_churn AGENTS
 
 This scenario proves that wkbench identity-swap churn keeps group membership
-aligned with the replacement connection.
+aligned with the replacement connection in an authenticated three-node cluster.
+It also proves each Bench Token creation or rotation is visible on the first
+CONNECT through every node, including a non-replica. Use two Slot replicas and
+256 hash slots, require exact AuthFail for incorrect or replaced Tokens, keep
+Gateway Token authentication enabled, and use all-node HTTP readiness.
 
 Run it with:
 

@@ -1,0 +1,70 @@
+---
+title: Release checks
+description: Verify a six-step messaging loop, then test SDK-specific recovery, security, and rollback.
+---
+
+Goal: prove the production messaging loop and recovery from critical failures with real clients, server configuration, and application APIs.
+
+## 1. Freeze the versions
+
+Record exact SDK versions and lockfiles, the server version and configuration, and client/device/network coverage. Include login, token, history, conversation, and media APIs plus data changes and rollback. Release dependencies, configuration, and lockfiles as one change unit.
+
+## 2. Run the six-step messaging loop
+
+Use Alice and Bob in independent clients. Retain screenshots or redacted results, with expected and actual outcomes for each step.
+
+<div className="tutorial-diagram">
+
+```mermaid
+flowchart TD
+  login["1. Sign in on both clients<br/>reach send-ready state"] --> send["2. Alice sends<br/>check the server result"]
+  send --> receive["3. Bob receives<br/>shown exactly once"]
+  receive --> reply["4. Bob replies<br/>Alice checks reception"]
+  reply --> network["5. Disconnect and reconnect<br/>verify the chosen SDK path"]
+  network --> logout["6. Sign out and back in<br/>isolate accounts and local data"]
+```
+
+</div>
+
+Sending, live reception, and offline synchronization are **different events**. Verify each separately.
+
+## 3. Verify the SDK's recovery path
+
+| Integration | Step 5 acceptance |
+| --- | --- |
+| Full SDK | Disconnect Bob, send another message from Alice, then reconnect and restore persistent messages; verify order, deduplication, conversations, and unread |
+| EasySDK online path | Verify disconnect/reconnect/error callbacks, listener removal, and instance destruction; do not assume automatic offline sync |
+| EasySDK with product history | Also verify your backend's history fetch, deduplication, conversations, and unread; promise these only after implementing them |
+
+Ordinary and command-style NoPersist have no persistent history and cannot prove offline recovery.
+
+## 4. Meet the release criteria
+
+| Required check | Passing condition |
+| --- | --- |
+| Identity and network | Invalid, revoked, and wrong-UID tokens rejected; product expiry enforced; TLS/WSS and no client management credentials |
+| Messaging and connection | Correct results and UI for sending, failure, timeout, retry, duplicates, network changes, and restart |
+| Capacity and diagnosis | Target online users, message rate, and group size reached; queues/retries/degradation bounded; metrics and redacted logs support diagnosis |
+| Data and rollback | Account isolation, upgrades, and recovery rehearsed; rollback uses compatible data or a complete previous-generation backup |
+
+<details>
+  <summary>Additional checks for product features</summary>
+
+| Feature in use | Verify |
+| --- | --- |
+| Multiple devices and conversations | Latest message, unread, deletion, and multi-device convergence; clear UI for foreground/background, kick-out, and token invalidation |
+| Media | Upload failure, cancellation, timeout, URL permissions, and file cleanup |
+| Local persistence | Backup, encryption, logout cleanup, and upgrade migration |
+| Operations APIs | WuKongIM HTTP API, Manager, and diagnostics behind protected management boundaries, without direct public exposure |
+
+Your backend rotates or revokes expired tokens. CONNECT does not automatically inspect expiry inside the token string. Test the mechanism you actually deploy, beyond a client-side timer.
+
+</details>
+
+<Callout type="warn" title="Stop release on these failures">
+  Incomplete identity or network boundaries, tokens/full messages in logs, unrecoverable critical failures, missed capacity targets or absent rate-limit/degradation policy, or irreversible data changes without a reviewed forward-repair plan.
+</Callout>
+
+Start with a small rollout. Observe connection success, send failures, latency, sync errors, queue levels, and storage errors before expanding traffic.
+
+Next: [Health & Monitoring](/en/server/operations/health-and-monitoring) and [Upgrade & Migration](/en/server/operations/upgrade-and-migration). See [Authentication & Security](/en/api/authentication) for security boundaries.

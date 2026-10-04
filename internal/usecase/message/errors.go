@@ -7,6 +7,14 @@ import (
 )
 
 var (
+	// ErrAppendNotSubmitted is exact whole-invocation non-submission evidence.
+	ErrAppendNotSubmitted = channelappend.ErrAppendNotSubmitted
+	// ErrSyncPageScanBudget fails closed when a visible page cannot be proved
+	// within the fixed scan budget; it must never become a false end-of-history.
+	ErrSyncPageScanBudget = errors.New("internal/message: visible history page scan budget exceeded")
+	// ErrSyncPageScanInvalid rejects a non-progressing or out-of-bounds raw scan.
+	ErrSyncPageScanInvalid = errors.New("internal/message: invalid history scan progress")
+
 	// ErrInvalidCommand reports a malformed send command.
 	ErrInvalidCommand = channelappend.ErrInvalidCommand
 	// ErrSyncLoginUIDRequired reports that a legacy message sync request has no login UID.
@@ -17,6 +25,18 @@ var (
 	ErrSyncChannelTypeRequired = errors.New("channel_type不能为空！")
 	// ErrMessageReaderRequired reports that channel message sync is not configured.
 	ErrMessageReaderRequired = errors.New("internal/message: message reader required")
+	// ErrSyncMembershipRequired rejects pulls without a live UID membership.
+	ErrSyncMembershipRequired = errors.New("internal/message: valid channel membership required")
+	// ErrSyncChannelDisbanded rejects pulls from a terminal channel identity.
+	ErrSyncChannelDisbanded = errors.New("internal/message: channel disbanded")
+	// ErrSyncBatchItemsRequired reports an empty batch message-pull request.
+	ErrSyncBatchItemsRequired = errors.New("internal/message: batch message sync items required")
+	// ErrSyncBatchTooLarge reports a batch above the bounded item count.
+	ErrSyncBatchTooLarge = errors.New("internal/message: batch message sync exceeds 200 items")
+	// ErrSyncBatchReaderRequired reports that grouped batch message reads are unavailable.
+	ErrSyncBatchReaderRequired = errors.New("internal/message: batch message reader required")
+	// ErrSyncBatchResultMismatch reports a broken item-alignment contract.
+	ErrSyncBatchResultMismatch = errors.New("internal/message: batch message result count mismatch")
 	// ErrMessageEventStoreRequired reports that message event projection storage is not configured.
 	ErrMessageEventStoreRequired = errors.New("internal/message: message event store required")
 	// ErrMessageEventChannelIDRequired reports that a message event append has no channel ID.
@@ -31,6 +51,10 @@ var (
 	ErrMessageEventTypeRequired = errors.New("event_type不能为空！")
 	// ErrSendHookDepthExceeded reports that a plugin-origin send exceeded hook recursion limits.
 	ErrSendHookDepthExceeded = errors.New("internal/message: send hook depth exceeded")
+	// ErrSendBatchEmitterRequired reports a missing per-item result emitter.
+	ErrSendBatchEmitterRequired = errors.New("internal/message: send batch result emitter required")
+	// ErrSendBatchEmissionMismatch reports an internal duplicate or missing per-item completion.
+	ErrSendBatchEmissionMismatch = errors.New("internal/message: send batch result emission mismatch")
 	// ErrRequestSubscribersRequireSyncOnce reports that request-scoped sends must be sync_once.
 	ErrRequestSubscribersRequireSyncOnce = channelappend.ErrRequestSubscribersRequireSyncOnce
 	// ErrRequestSubscribersConflictChannel reports that request-scoped sends cannot specify a channel.

@@ -8,11 +8,21 @@ import (
 
 var channelAppendItemBuckets = []float64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024}
 
+var channelAppendPostCommitResults = [...]string{
+	"ok", "mixed", "canceled", "timeout", "backpressured", "channel_busy", "route_not_ready",
+	"stale_route", "stale_completion", "not_authority", "not_leader", "channel_not_found",
+	"append_result_missing", "append_failed", "commit_failed", "invalid_subscribers", "invalid_cursor",
+	"unsupported", "auth_fail", "invalid_request", "system_error", "other",
+}
+
 // ChannelAppendMetrics exposes internal channel authority writer metrics.
 type ChannelAppendMetrics struct {
 	routerTotal              *prometheus.CounterVec
 	routerDuration           *prometheus.HistogramVec
+	routerItemDuration       *prometheus.HistogramVec
 	routerItems              *prometheus.HistogramVec
+	routerGroupInflight      *prometheus.GaugeVec
+	routerGroupCapacity      *prometheus.GaugeVec
 	localAdmissionTotal      *prometheus.CounterVec
 	localAdmissionItems      *prometheus.HistogramVec
 	writerAdmission          *prometheus.GaugeVec
@@ -31,27 +41,44 @@ type ChannelAppendMetrics struct {
 	effectTotal              *prometheus.CounterVec
 	effectDuration           *prometheus.HistogramVec
 	effectItems              *prometheus.HistogramVec
+	idempotencyRecoveryItems *prometheus.CounterVec
 }
 
 func newChannelAppendMetrics(registry prometheus.Registerer, labels prometheus.Labels) *ChannelAppendMetrics {
 	m := &ChannelAppendMetrics{
 		routerTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name:        "wukongim_channelappend_router_total",
-			Help:        "Total internal channel append router groups by path and result.",
+			Help:        "Total internal channel append router operations by path and result.",
 			ConstLabels: labels,
 		}, []string{"path", "result"}),
 		routerDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:        "wukongim_channelappend_router_duration_seconds",
-			Help:        "Internal channel append router group latency in seconds.",
+			Help:        "Internal channel append router operation latency in seconds.",
+			ConstLabels: labels,
+			Buckets:     channelRuntimeDurationBuckets,
+		}, []string{"path", "result"}),
+		routerItemDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:        "wukongim_channelappend_router_item_duration_seconds",
+			Help:        "Complete router-batch latency attributed to each input SEND item.",
 			ConstLabels: labels,
 			Buckets:     channelRuntimeDurationBuckets,
 		}, []string{"path", "result"}),
 		routerItems: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:        "wukongim_channelappend_router_items",
-			Help:        "Number of SEND items in each internal channel append router group.",
+			Help:        "Number of SEND items in each internal channel append router operation.",
 			ConstLabels: labels,
 			Buckets:     channelAppendItemBuckets,
 		}, []string{"path", "result"}),
+		routerGroupInflight: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name:        "wukongim_channelappend_router_group_inflight",
+			Help:        "Current canonical-channel router groups submitted across concurrent SEND batches.",
+			ConstLabels: labels,
+		}, nil),
+		routerGroupCapacity: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name:        "wukongim_channelappend_router_group_capacity",
+			Help:        "Configured node-local concurrent channelappend router group capacity.",
+			ConstLabels: labels,
+		}, nil),
 		localAdmissionTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name:        "wukongim_channelappend_local_admission_total",
 			Help:        "Total local channel authority writer admission attempts.",
@@ -145,6 +172,11 @@ func newChannelAppendMetrics(registry prometheus.Registerer, labels prometheus.L
 			ConstLabels: labels,
 			Buckets:     channelAppendItemBuckets,
 		}, []string{"stage", "result"}),
+		idempotencyRecoveryItems: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "wukongim_channelappend_idempotency_recovery_items_total",
+			Help:        "Total channel append items entering durable idempotency recovery by final low-cardinality outcome.",
+			ConstLabels: labels,
+		}, []string{"result"}),
 	}
 	// Materialize idle writer-state series so quiescence checks can distinguish zero backlog from a missing metric contract.
 	for _, kind := range []string{"pending_append", "append_inflight", "post_commit_backlog"} {
@@ -154,13 +186,23 @@ func newChannelAppendMetrics(registry prometheus.Registerer, labels prometheus.L
 	m.postCommitHandoffCap.WithLabelValues().Set(0)
 	m.postCommitRetryQueue.WithLabelValues().Set(0)
 	m.postCommitRetryContended.WithLabelValues().Set(0)
+	m.routerGroupInflight.WithLabelValues().Set(0)
+	m.routerGroupCapacity.WithLabelValues().Set(0)
 	// Materialize the append/ok histogram without recording a synthetic observation.
 	_ = m.effectItems.WithLabelValues("append", "ok")
+	// Materialize the closed post-commit terminal partition so a zero failure
+	// delta is directly observable at both native baseline boundaries.
+	for _, result := range channelAppendPostCommitResults {
+		m.effectTotal.WithLabelValues("post_commit", result).Add(0)
+	}
 
 	registry.MustRegister(
 		m.routerTotal,
 		m.routerDuration,
+		m.routerItemDuration,
 		m.routerItems,
+		m.routerGroupInflight,
+		m.routerGroupCapacity,
 		m.localAdmissionTotal,
 		m.localAdmissionItems,
 		m.writerAdmission,
@@ -179,9 +221,28 @@ func newChannelAppendMetrics(registry prometheus.Registerer, labels prometheus.L
 		m.effectTotal,
 		m.effectDuration,
 		m.effectItems,
+		m.idempotencyRecoveryItems,
 	)
 
 	return m
+}
+
+// ObserveIdempotencyRecovery records final item outcomes after durable
+// idempotency recovery. Zero-valued outcomes do not materialize synthetic
+// counter samples.
+func (m *ChannelAppendMetrics) ObserveIdempotencyRecovery(recoveredItems int, unresolvedItems int, lookupErrorItems int) {
+	if m == nil {
+		return
+	}
+	if recoveredItems > 0 {
+		m.idempotencyRecoveryItems.WithLabelValues("recovered").Add(float64(recoveredItems))
+	}
+	if unresolvedItems > 0 {
+		m.idempotencyRecoveryItems.WithLabelValues("unresolved").Add(float64(unresolvedItems))
+	}
+	if lookupErrorItems > 0 {
+		m.idempotencyRecoveryItems.WithLabelValues("lookup_error").Add(float64(lookupErrorItems))
+	}
 }
 
 // ObserveRouter records one foreground router group.
@@ -194,7 +255,29 @@ func (m *ChannelAppendMetrics) ObserveRouter(path, result string, items int, dur
 	}
 	m.routerTotal.WithLabelValues(path, result).Inc()
 	m.routerDuration.WithLabelValues(path, result).Observe(dur.Seconds())
+	if path == "batch" && items > 0 {
+		histogram := m.routerItemDuration.WithLabelValues(path, result)
+		seconds := dur.Seconds()
+		for range items {
+			histogram.Observe(seconds)
+		}
+	}
 	m.routerItems.WithLabelValues(path, result).Observe(float64(items))
+}
+
+// SetRouterGroupPressure sets shared router group submission pressure.
+func (m *ChannelAppendMetrics) SetRouterGroupPressure(inflight int, capacity int) {
+	if m == nil {
+		return
+	}
+	if inflight < 0 {
+		inflight = 0
+	}
+	if capacity < 0 {
+		capacity = 0
+	}
+	m.routerGroupInflight.WithLabelValues().Set(float64(inflight))
+	m.routerGroupCapacity.WithLabelValues().Set(float64(capacity))
 }
 
 // ObserveLocalAdmission records one local writer admission attempt.
@@ -268,7 +351,22 @@ func (m *ChannelAppendMetrics) ObserveEffect(stage, result string, items int, du
 	if items < 0 {
 		items = 0
 	}
+	if stage == "post_commit" {
+		result = normalizeChannelAppendPostCommitResult(result)
+	}
 	m.effectTotal.WithLabelValues(stage, result).Inc()
 	m.effectDuration.WithLabelValues(stage, result).Observe(dur.Seconds())
 	m.effectItems.WithLabelValues(stage, result).Observe(float64(items))
+}
+
+func normalizeChannelAppendPostCommitResult(result string) string {
+	switch result {
+	case "ok", "mixed", "canceled", "timeout", "backpressured", "channel_busy", "route_not_ready",
+		"stale_route", "stale_completion", "not_authority", "not_leader", "channel_not_found",
+		"append_result_missing", "append_failed", "commit_failed", "invalid_subscribers", "invalid_cursor",
+		"unsupported", "auth_fail", "invalid_request", "system_error", "other":
+		return result
+	default:
+		return "other"
+	}
 }

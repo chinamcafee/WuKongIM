@@ -2,11 +2,15 @@ package reactor
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
+	"hash"
 	"time"
 
 	ch "github.com/WuKongIM/WuKongIM/pkg/channel"
 	"github.com/WuKongIM/WuKongIM/pkg/channel/machine"
+	"github.com/WuKongIM/WuKongIM/pkg/channel/replication"
 )
 
 func (r *Reactor) nextBatchOpID() ch.OpID {
@@ -28,14 +32,42 @@ func (r *Reactor) tryFlushAppend(rc *runtimeChannel, now time.Time) {
 	if rc.appendStoreBlocked && now.Before(rc.appendRetryAt) {
 		return
 	}
-	if !rc.appendQ.shouldFlush(now) {
+	if !r.appendQueueReadyToFlush(rc, now) {
 		return
 	}
-	batch := rc.appendQ.popBatch(r.nextBatchOpID(), rc.state)
+	batchOpID := r.nextBatchOpID()
+	batch := rc.appendQ.popBatch(batchOpID, rc.state)
+	if r.cfg.QuorumLog != nil {
+		// Durable proposal identity belongs to one caller request; physical
+		// batching is owned below this seam by local and peer durability owners.
+		rc.appendQ.restoreFront(batch)
+		batch = rc.appendQ.popProposal(batchOpID, rc.state, now)
+	}
 	r.observeAppendQueuePressure(rc)
 	if len(batch.requests) == 0 {
 		rc.appendQ.storeBlocked = false
 		return
+	}
+	for _, req := range batch.requests {
+		if err := r.validateAppendRouteFence(rc, req.req); err != nil {
+			rc.appendQ.storeBlocked = false
+			r.failAppendBatch(rc, batch, err)
+			return
+		}
+	}
+	if q := batch.requests[0].mqttAnchor; q != nil {
+		if err := r.validateMQTTAnchorAdmission(batch.requests[0].ctx, rc, *q); err != nil {
+			rc.appendQ.storeBlocked = false
+			r.failAppendBatch(rc, batch, err)
+			return
+		}
+	}
+	if q := batch.requests[0].mqttRetirement; q != nil {
+		if err := r.validateMQTTRetirementAdmission(batch.requests[0].ctx, rc, *q); err != nil {
+			rc.appendQ.storeBlocked = false
+			r.failAppendBatch(rc, batch, err)
+			return
+		}
 	}
 	decision := rc.state.ProposeAppendBatch(machine.AppendBatchCommand{
 		BatchOpID: batch.batchOpID,
@@ -53,10 +85,34 @@ func (r *Reactor) tryFlushAppend(rc *runtimeChannel, now time.Time) {
 	task := decision.Tasks[0]
 	batch.fence = task.Fence
 	batch.records = task.StoreAppend.Records
+	for i := range batch.records {
+		if batch.records[i].Epoch == 0 {
+			batch.records[i].Epoch = rc.state.Epoch
+		}
+	}
 	batch.trace = selectAppendTraceBatch(batch)
-	if err := r.submitStoreAppend(context.Background(), batch.requests[0].req.ChannelID, task); err != nil {
+	var submitErr error
+	if q := batch.requests[0].mqttAnchor; q != nil {
+		batch.authority = rc.quorumAuthority.ID
+		submitErr = r.submitQuorumMQTTAnchor(batch.fence, *q)
+	} else if q := batch.requests[0].mqttRetirement; q != nil {
+		batch.authority = rc.quorumAuthority.ID
+		submitErr = r.submitQuorumMQTTRetirement(batch.fence, *q)
+	} else if r.cfg.QuorumLog != nil {
+		batch.authority = rc.quorumAuthority.ID
+		batch.commandID = appendProposalCommandID(rc.state.Key, batch.authority, batch.records)
+		submitErr = r.submitQuorumCommit(context.Background(), batch.fence, replication.Proposal{
+			Key: rc.state.Key, Expected: batch.authority, CommandID: batch.commandID, Records: batch.records,
+			PayloadsImmutable:         true,
+			ServerAllocatedMessageIDs: task.StoreAppend.ServerAllocatedMessageIDs,
+			MQTTSourceActivation:      batch.requests[0].mqttSourceActivation,
+		})
+	} else {
+		submitErr = r.submitStoreAppend(context.Background(), batch.requests[0].req.ChannelID, task)
+	}
+	if submitErr != nil {
 		rc.state.AbortAppendBatchProposal(batch.batchOpID)
-		if errors.Is(err, ch.ErrBackpressured) {
+		if errors.Is(submitErr, ch.ErrBackpressured) {
 			rc.appendQ.restoreFront(batch)
 			rc.appendStoreBlocked = true
 			rc.appendRetryAt = now.Add(r.cfg.AppendStoreRetryBackoff)
@@ -64,7 +120,7 @@ func (r *Reactor) tryFlushAppend(rc *runtimeChannel, now time.Time) {
 			return
 		}
 		rc.appendQ.storeBlocked = false
-		r.failAppendBatch(rc, batch, err)
+		r.failAppendBatch(rc, batch, submitErr)
 		return
 	}
 	r.markAppendStoreSubmitted(rc, batch, now)
@@ -74,14 +130,55 @@ func (r *Reactor) tryFlushAppend(rc *runtimeChannel, now time.Time) {
 	r.observeAppendBatch(batch, now)
 }
 
+func (r *Reactor) appendQueueReadyToFlush(rc *runtimeChannel, now time.Time) bool {
+	if r == nil || rc == nil {
+		return false
+	}
+	if r.cfg.QuorumLog != nil {
+		return !rc.appendQ.storeBlocked && len(rc.appendQ.pending) > 0
+	}
+	return rc.appendQ.shouldFlush(now)
+}
+
+const appendProposalCommandDomain = "wukongim/channel/append-proposal/v1"
+
+func appendProposalCommandID(key ch.ChannelKey, authority replication.AuthorityID, records []ch.Record) ch.CommandID {
+	digest := sha256.New()
+	writeAppendCommandBytes(digest, []byte(appendProposalCommandDomain))
+	writeAppendCommandBytes(digest, []byte(key))
+	writeAppendCommandUint64(digest, authority.ChannelEpoch)
+	writeAppendCommandUint64(digest, authority.LeaderTerm)
+	writeAppendCommandUint64(digest, authority.FenceVersion)
+	writeAppendCommandUint64(digest, uint64(len(records)))
+	for _, record := range records {
+		writeAppendCommandUint64(digest, record.ID)
+	}
+	var command ch.CommandID
+	copy(command[:], digest.Sum(nil))
+	return command
+}
+
+func writeAppendCommandBytes(dst hash.Hash, value []byte) {
+	writeAppendCommandUint64(dst, uint64(len(value)))
+	_, _ = dst.Write(value)
+}
+
+func writeAppendCommandUint64(dst hash.Hash, value uint64) {
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], value)
+	_, _ = dst.Write(encoded[:])
+}
+
 func appendBatchWaiters(requests []appendRequest) []machine.AppendBatchWaiter {
 	waiters := make([]machine.AppendBatchWaiter, 0, len(requests))
 	for _, req := range requests {
 		waiters = append(waiters, machine.AppendBatchWaiter{
-			OpID:              req.opID,
-			CommitMode:        req.commitMode,
-			OmitResultPayload: req.req.OmitResultPayload,
-			Records:           req.records,
+			OpID:                      req.opID,
+			CommitMode:                req.commitMode,
+			OmitResultPayload:         req.req.OmitResultPayload,
+			Records:                   req.records,
+			PayloadsImmutable:         true,
+			ServerAllocatedMessageIDs: req.req.ServerAllocatedMessageIDs,
 		})
 	}
 	return waiters

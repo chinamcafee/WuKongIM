@@ -13,6 +13,8 @@ import (
 const (
 	wsGUID          = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 	wsMaxHeaderSize = 8 << 10
+	// Bound untrusted path text retained in handshake diagnostics.
+	wsMaxDiagnosticPathBytes = 256
 )
 
 type wsHandshakeResult struct {
@@ -23,9 +25,17 @@ type wsHandshakeResult struct {
 type wsHandshakeFailure struct {
 	response []byte
 	err      error
+	// statusCode is included in internal diagnostics, independent of the response body.
+	statusCode int
 }
 
 func parseWSHandshake(buf []byte, expectedPath string) (*wsHandshakeResult, *wsHandshakeFailure, bool) {
+	return parseWSHandshakeProtocol(buf, expectedPath, "")
+}
+
+// parseWSHandshakeProtocol negotiates a required wire subprotocol without
+// interpreting protocol payloads or product authentication.
+func parseWSHandshakeProtocol(buf []byte, expectedPath, subprotocol string) (*wsHandshakeResult, *wsHandshakeFailure, bool) {
 	headerEnd := bytes.Index(buf, []byte("\r\n\r\n"))
 	if headerEnd < 0 {
 		if len(buf) > wsMaxHeaderSize {
@@ -50,7 +60,16 @@ func parseWSHandshake(buf []byte, expectedPath string) (*wsHandshakeResult, *wsH
 		path = "/"
 	}
 	if req.URL == nil || req.URL.Path != path {
-		return nil, failWSHandshake(http.StatusNotFound, nil, fmt.Sprintf("websocket path %q not found", path)), true
+		failure := failWSHandshake(http.StatusNotFound, nil, fmt.Sprintf("websocket path %q not found", path))
+		requestedPath := ""
+		if req.URL != nil {
+			// EscapedPath excludes query credentials and keeps control bytes escaped.
+			requestedPath = req.URL.EscapedPath()
+		}
+		// Preserve the public response while making the internal mismatch unambiguous.
+		failure.err = fmt.Errorf("gateway/transport/gnet: websocket path mismatch: requested_path=%q expected_path=%q",
+			diagnosticWSPath(requestedPath), diagnosticWSPath(path))
+		return nil, failure, true
 	}
 
 	if !headerHasToken(req.Header, "Connection", "upgrade") {
@@ -72,22 +91,47 @@ func parseWSHandshake(buf []byte, expectedPath string) (*wsHandshakeResult, *wsH
 		}, fmt.Sprintf("unsupported websocket version %q", version)), true
 	}
 
+	headers := map[string]string{
+		"Upgrade":              "websocket",
+		"Connection":           "Upgrade",
+		"Sec-WebSocket-Accept": computeWSAccept(key),
+	}
+	if subprotocol != "" {
+		offered := false
+		for _, value := range req.Header.Values("Sec-WebSocket-Protocol") {
+			for _, token := range strings.Split(value, ",") {
+				if strings.TrimSpace(token) == subprotocol {
+					offered = true
+				}
+			}
+		}
+		if !offered {
+			return nil, failWSHandshake(http.StatusBadRequest, nil, "required websocket subprotocol not offered"), true
+		}
+		headers["Sec-WebSocket-Protocol"] = subprotocol
+	}
+
 	return &wsHandshakeResult{
 		consumed: headerEnd + 4,
-		response: buildHTTPResponse(http.StatusSwitchingProtocols, map[string]string{
-			"Upgrade":              "websocket",
-			"Connection":           "Upgrade",
-			"Sec-WebSocket-Accept": computeWSAccept(key),
-		}, nil),
+		response: buildHTTPResponse(http.StatusSwitchingProtocols, headers, nil),
 	}, nil, true
 }
 
 func failWSHandshake(status int, headers map[string]string, msg string) *wsHandshakeFailure {
 	body := []byte(msg)
 	return &wsHandshakeFailure{
-		response: buildHTTPResponse(status, headers, body),
-		err:      fmt.Errorf("gateway/transport/gnet: %s", msg),
+		response:   buildHTTPResponse(status, headers, body),
+		err:        fmt.Errorf("gateway/transport/gnet: %s", msg),
+		statusCode: status,
 	}
+}
+
+// diagnosticWSPath caps retained path text; callers must exclude query strings.
+func diagnosticWSPath(path string) string {
+	if len(path) > wsMaxDiagnosticPathBytes {
+		return path[:wsMaxDiagnosticPathBytes] + "..."
+	}
+	return path
 }
 
 func buildHTTPResponse(status int, headers map[string]string, body []byte) []byte {

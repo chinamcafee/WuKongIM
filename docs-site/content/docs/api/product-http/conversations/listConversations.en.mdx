@@ -1,0 +1,209 @@
+---
+title: Synchronize a Conversation page
+full: true
+_openapi:
+  preload:
+    - wukongim-product-http-complete-beta-en
+  method: POST
+  webhook: false
+  toc:
+    - depth: 2
+      title: Request Body
+      url: '#request-body'
+    - depth: 2
+      title: Response Body
+      url: '#response-body'
+  structuredData:
+    headings:
+      - content: Synchronize a Conversation page
+        id: synchronize-a-conversation-page
+    contents:
+      - content: Reads Leader-persisted messages without runtime activation. Failed
+          SENDs may appear. Any read error fails the page; retry the original
+          cursor.
+        heading: synchronize-a-conversation-page
+      - content: >-
+          POST /conversation/list
+
+          listConversations
+
+          Synchronize a Conversation page
+
+          Reads Leader-persisted messages without runtime activation. Failed
+          SENDs may appear. Any read error fails the page; retry the original
+          cursor.
+
+          ConversationListRequest
+
+          Conversation-directory pagination parameters.
+
+          additionalProperties true
+
+          uid `string` minLength: 1 User ID whose Conversation directory is
+          read.
+
+          cursor `string` default: `""` Opaque next_cursor from the previous
+          page; omit it or send an empty string for the first page.
+
+          limit `integer` 0–200; default: `50` Maximum membership entries
+          scanned for this page; 0 uses the default 50 and the maximum is 200.
+
+          completed_coverage `integer:int64` 0–∞; default: `0` Coverage saved
+          from the client's latest pass that ended with done=true; send 0 for
+          the first synchronization.
+
+          200 Canonical Conversation page
+
+          ConversationListResponse
+
+          One canonical Conversation-directory page and its synchronization
+          control state.
+
+          additionalProperties false
+
+          conversations array<`ConversationListItem`> — Resolved Conversations
+          in this page.
+
+          deletes array<`ConversationKey`> — Conversation keys the client should
+          delete.
+
+          next_cursor `string` — Opaque cursor for the next page; return it
+          unchanged.
+
+          done `boolean` — true means the full pass is complete; only then may
+          coverage be saved.
+
+          coverage `integer:int64` 0–∞ Coverage version observed by the server
+          for this synchronization pass.
+
+          tombstones_retained_since `integer:int64` 0–∞ Earliest coverage for
+          which deletion tombstones are still retained.
+
+          reset_required `boolean` — true means client coverage predates the
+          retention window and the local Conversation directory must be rebuilt.
+
+          ConversationListItem
+
+          Canonical Conversation state for one user.
+
+          channel_id `string` — Conversation Channel ID.
+
+          channel_type `integer` 1–255 Conversation Channel type.
+
+          active_at `integer:int64` — Most recent Conversation activation time.
+
+          read_seq `integer:uint64` 0–∞ Greatest message sequence read by the
+          user.
+
+          deleted_to_seq `integer:uint64` 0–∞ Greatest message sequence deleted
+          by the user.
+
+          unread `integer:uint64` 0–∞ Unread count derived from the current last
+          message and read_seq.
+
+          last_message `ConversationLastMessage` | `null` — Latest visible
+          ordinary message persisted on the current Leader, regardless of SEND
+          success; null when absent.
+
+          ConversationLastMessage
+
+          Last-message summary in the Conversation directory.
+
+          message_id `integer:uint64` 0–∞ Server int64 message ID.
+
+          message_idstr `string` — Decimal string mirror of message_id only.
+
+          message_seq `integer:uint64` 0–∞ Sequence of this message within the
+          Channel.
+
+          from_uid `string` — Message sender UID.
+
+          client_msg_no `string` — Client message number.
+
+          server_timestamp_ms `integer:int64` — Server timestamp in
+          milliseconds.
+
+          payload `string | null` encoding: base64 Base64-encoded message
+          payload; it may be null.
+
+          version `string` pattern: `^[0-9]+$` Edited content version; absent
+          means zero in the same content epoch.
+
+          updated_at_ms `integer:int64` 0–∞ Server edit time in Unix
+          milliseconds; original ordering is unchanged.
+
+          ConversationKey
+
+          Channel key for one Conversation.
+
+          channel_id `string` minLength: 1 Logical identifier of the target
+          Channel; for a person Channel this is normally the other UID.
+
+          channel_type `integer` 1–255 Numeric Channel type; 1 is a person
+          Channel, 2 is a group Channel, and other values are extension types.
+
+          400 Input, validation, dependency, or downstream error
+
+          CompatibilityError
+
+          HTTP 400 error body shared by multiple legacy entries.
+
+          msg `string` — Human-readable error text with no stability guarantee;
+          do not branch on it.
+
+          status `integer` const: `400` Application-level status fixed at 400.
+
+          500 Channel or storage read failed; no partial page or cursor is
+          returned.
+
+          msg `string` —
+
+          status `integer` —
+
+          503 Temporary read failure or restore maintenance; retry the same
+          query with bounded backoff.
+
+          MaintenanceError
+
+          503 error body returned while cluster restore maintenance is active.
+
+          error `string` const: `"maintenance"` Stable maintenance error
+          category.
+
+          message `string` const: `"restore maintenance is active"` Current
+          restore-maintenance message.
+
+          MessageUpdateError
+
+          Edit or transient read failure; no partial results.
+
+          status `integer` — HTTP status.
+
+          code `string` — Stable rejection code; uncertain writes retain their
+          exact retry identity.
+
+          msg `string` — Optional legacy diagnostic message.
+---
+
+<Callout type="warn" title="Operation boundary">
+
+- **Caller**: Trusted backend only
+- **Scope**: limit bounds membership rows scanned, not the number of returned conversations; tombstones go to deletes. Previews use Leader-persisted data without runtime activation. Any read failure fails the whole page; retry the original request and cursor.
+- **Success**: Only done=true completes a full pass and permits saving coverage; reset_required=true requires rebuilding the local Conversation directory.
+- **Recovery**: Previews include the latest tail edit; preserve the cursor on 503 unavailable. Content edits do not change conversation order or unread.
+
+</Callout>
+
+{/* This file was generated by Fumadocs. Do not edit this file directly. Any changes should be made by running the generation command again. */}
+
+export default function Layout(props) {
+  const { APIPage, OpenAPIPage } = props.components ?? {};
+  // "APIPage" is the old name from v10, this allows both for backward compatibility
+  const Comp = OpenAPIPage ?? APIPage;
+  return (
+    <>
+      {props.children}
+      <Comp document="wukongim-product-http-complete-beta-en" operations={[{"path":"/conversation/list","method":"post"}]} showDescription />
+    </>
+  );
+}

@@ -24,11 +24,24 @@ func (l *ChannelLog) Append(ctx context.Context, records []Record, opts AppendOp
 	batch := l.db.engine.NewBatch()
 	defer batch.Close()
 
-	result, err := l.prepareAndStageAppendLocked(ctx, batch, records, opts)
+	var result AppendResult
+	var err error
+	if l.db.mqttStorage != nil {
+		var rows []messageRow
+		rows, result, err = l.prepareAppendRowsLocked(ctx, records, opts)
+		if err == nil && result.Count > 0 {
+			_, _, err = l.prepareMQTTStorage(ctx, rows, nil)
+		}
+		if err == nil {
+			err = l.stageMessageRows(ctx, batch, rows)
+		}
+	} else {
+		result, err = l.prepareAndStageAppendLocked(ctx, batch, records, opts)
+	}
 	if err != nil || result.Count == 0 {
 		return AppendResult{}, err
 	}
-	if err := l.stageCatalog(batch); err != nil {
+	if err := l.stageCatalogForAppend(batch, result.BaseSeq); err != nil {
 		return AppendResult{}, err
 	}
 	if err := batch.Commit(true); err != nil {
@@ -39,14 +52,15 @@ func (l *ChannelLog) Append(ctx context.Context, records []Record, opts AppendOp
 }
 
 func (l *ChannelLog) prepareAndStageAppendLocked(ctx context.Context, batch *engine.Batch, records []Record, opts AppendOptions) (AppendResult, error) {
-	return l.walkAppendRowsLocked(ctx, records, opts, func(row messageRow, cache appendKeyCache) error {
-		return l.stageMessageRow(batch, row, cache)
+	stager := nonBusinessStager{entry: l.channelEntry, batch: batch, ctx: ctx}
+	return l.walkAppendRowsLocked(ctx, records, opts, func(row messageRow, cache *appendKeyCache) error {
+		return stager.stage(row, cache)
 	})
 }
 
 func (l *ChannelLog) prepareAppendRowsLocked(ctx context.Context, records []Record, opts AppendOptions) ([]messageRow, AppendResult, error) {
 	var rows []messageRow
-	result, err := l.walkAppendRowsLocked(ctx, records, opts, func(row messageRow, _ appendKeyCache) error {
+	result, err := l.walkAppendRowsLocked(ctx, records, opts, func(row messageRow, _ *appendKeyCache) error {
 		if rows == nil {
 			rows = make([]messageRow, 0, len(records))
 		}
@@ -59,8 +73,8 @@ func (l *ChannelLog) prepareAppendRowsLocked(ctx context.Context, records []Reco
 	return rows, result, nil
 }
 
-func (l *ChannelLog) walkAppendRowsLocked(ctx context.Context, records []Record, opts AppendOptions, onRow func(messageRow, appendKeyCache) error) (AppendResult, error) {
-	if opts.Mode != AppendStrict && opts.Mode != AppendTrustedContiguous {
+func (l *ChannelLog) walkAppendRowsLocked(ctx context.Context, records []Record, opts AppendOptions, onRow func(messageRow, *appendKeyCache) error) (AppendResult, error) {
+	if opts.Mode != AppendStrict && opts.Mode != AppendServerAllocatedMessageID && opts.Mode != AppendTrustedContiguous {
 		return AppendResult{}, dberrors.ErrInvalidArgument
 	}
 	leo, err := l.loadLEOLocked(ctx)
@@ -112,26 +126,26 @@ func (l *ChannelLog) publishAppendLocked(result AppendResult) {
 	}
 	l.leo.Store(result.LastSeq)
 	l.loaded.Store(true)
+	l.clearDurableProposalTailLocked()
 }
 
-func (l *channelEntry) stageMessageRows(batch *engine.Batch, rows []messageRow) error {
+func (l *channelEntry) stageMessageRows(ctx context.Context, batch *engine.Batch, rows []messageRow) error {
 	cache := l.appendKeyCache
+	stager := nonBusinessStager{entry: l, batch: batch, ctx: ctx}
 	for _, row := range rows {
-		if err := l.stageMessageRow(batch, row, cache); err != nil {
+		if err := stager.stage(row, cache); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (l *channelEntry) stageMessageRow(batch *engine.Batch, row messageRow, cache appendKeyCache) error {
+func (l *channelEntry) stageMessageRow(batch *engine.Batch, row messageRow, cache *appendKeyCache) error {
+	identity, err := rowIdempotencyKey(row.FromUID, row.ClientMsgNo, row.PublicationMetadata)
+	if err != nil {
+		return err
+	}
 	if err := l.stageMessageHeaderRow(batch, row, cache); err != nil {
-		return err
-	}
-	if err := l.stageMessagePayloadRow(batch, row, cache); err != nil {
-		return err
-	}
-	if err := l.stageMessageIDIndexRow(batch, row, cache); err != nil {
 		return err
 	}
 	if err := l.stageGlobalMessageIDIndexRow(batch, row); err != nil {
@@ -142,8 +156,26 @@ func (l *channelEntry) stageMessageRow(batch *engine.Batch, row messageRow, cach
 			return err
 		}
 	}
-	if row.FromUID != "" && row.ClientMsgNo != "" {
+	if identity.ServerWillKey != "" {
+		if err := l.stageWillReceipt(batch, row, identity); err != nil {
+			return err
+		}
+		value, err := encodeIdempotencyIndexValue(row)
+		if err != nil {
+			return err
+		}
+		if err := batch.Set(encodeMessageWillIdempotencyIndexKey(l.key, row.FromUID, identity.ServerWillKey), value); err != nil {
+			return err
+		}
+	} else if row.FromUID != "" && row.ClientMsgNo != "" {
 		if err := l.stageIdempotencyIndexRow(batch, row, cache); err != nil {
+			return err
+		}
+	}
+	// SyncOnce records belong to CMD discovery and must not affect ordinary
+	// conversation badge arithmetic.
+	if row.FromUID != "" && row.FramerFlags&4 == 0 {
+		if err := l.stageSenderSeqIndexRow(batch, row, cache); err != nil {
 			return err
 		}
 	}
@@ -154,29 +186,14 @@ func (l *channelEntry) stageGlobalMessageIDIndexRow(batch *engine.Batch, row mes
 	return batch.Set(encodeGlobalMessageIDIndexKey(row.MessageID), encodeGlobalMessageIDIndexValue(l.key, row.MessageSeq))
 }
 
-func (l *channelEntry) stageMessageHeaderRow(batch *engine.Batch, row messageRow, cache appendKeyCache) error {
+func (l *channelEntry) stageMessageHeaderRow(batch *engine.Batch, row messageRow, cache *appendKeyCache) error {
 	return batch.SetDeferred(cache.messageRowKeyLen(), encodedMessageHeaderLen(row), func(key, value []byte) error {
 		cache.writeMessageRowKey(key, row.MessageSeq, messageHeaderFamilyID)
 		return encodeMessageHeaderTo(value, key, row)
 	})
 }
 
-func (l *channelEntry) stageMessagePayloadRow(batch *engine.Batch, row messageRow, cache appendKeyCache) error {
-	return batch.SetDeferred(cache.messageRowKeyLen(), encodedMessagePayloadLen(row), func(key, value []byte) error {
-		cache.writeMessageRowKey(key, row.MessageSeq, messagePayloadFamilyID)
-		return encodeMessagePayloadTo(value, key, row)
-	})
-}
-
-func (l *channelEntry) stageMessageIDIndexRow(batch *engine.Batch, row messageRow, cache appendKeyCache) error {
-	return batch.SetDeferred(cache.messageIDIndexKeyLen(), messageIDIndexValueLen, func(key, value []byte) error {
-		cache.writeMessageIDIndexKey(key, row.MessageID)
-		writeMessageIDIndexValue(value, row.MessageSeq)
-		return nil
-	})
-}
-
-func (l *channelEntry) stageClientMsgNoIndexRow(batch *engine.Batch, row messageRow, cache appendKeyCache) error {
+func (l *channelEntry) stageClientMsgNoIndexRow(batch *engine.Batch, row messageRow, cache *appendKeyCache) error {
 	return batch.SetDeferred(cache.clientMsgNoIndexKeyLen(row.ClientMsgNo), messageIDIndexValueLen, func(key, value []byte) error {
 		cache.writeClientMsgNoIndexKey(key, row.ClientMsgNo, row.MessageSeq)
 		writeMessageIDIndexValue(value, row.MessageSeq)
@@ -184,10 +201,18 @@ func (l *channelEntry) stageClientMsgNoIndexRow(batch *engine.Batch, row message
 	})
 }
 
-func (l *channelEntry) stageIdempotencyIndexRow(batch *engine.Batch, row messageRow, cache appendKeyCache) error {
+func (l *channelEntry) stageIdempotencyIndexRow(batch *engine.Batch, row messageRow, cache *appendKeyCache) error {
 	return batch.SetDeferred(cache.idempotencyIndexKeyLen(row.FromUID, row.ClientMsgNo), idempotencyIndexValueLen, func(key, value []byte) error {
 		cache.writeIdempotencyIndexKey(key, row.FromUID, row.ClientMsgNo)
 		return writeIdempotencyIndexValue(value, row)
+	})
+}
+
+func (l *channelEntry) stageSenderSeqIndexRow(batch *engine.Batch, row messageRow, cache *appendKeyCache) error {
+	return batch.SetDeferred(cache.senderSeqIndexKeyLen(row.FromUID), messageIDIndexValueLen, func(key, value []byte) error {
+		cache.writeSenderSeqIndexKey(key, row.FromUID, row.MessageSeq)
+		writeMessageIDIndexValue(value, row.MessageID)
+		return nil
 	})
 }
 
@@ -236,11 +261,11 @@ func (s *appendValidationSeen) rememberIdempotencyKey(key IdempotencyKey) bool {
 }
 
 type appendValidationScratch struct {
-	messageIDIndexKey   []byte
+	globalMessageIDKey  []byte
 	idempotencyIndexKey []byte
 }
 
-func (l *ChannelLog) validateAppendRow(ctx context.Context, row messageRow, seen *appendValidationSeen, mode AppendMode, cache appendKeyCache, scratch *appendValidationScratch) error {
+func (l *ChannelLog) validateAppendRow(ctx context.Context, row messageRow, seen *appendValidationSeen, mode AppendMode, cache *appendKeyCache, scratch *appendValidationScratch) error {
 	if err := row.validate(); err != nil {
 		return err
 	}
@@ -248,26 +273,67 @@ func (l *ChannelLog) validateAppendRow(ctx context.Context, row messageRow, seen
 		return fmt.Errorf("%w: duplicate message id %d", dberrors.ErrConflict, row.MessageID)
 	}
 	if mode == AppendStrict {
-		scratch.messageIDIndexKey = cache.messageIDIndexKeyTo(scratch.messageIDIndexKey, row.MessageID)
-		existingSeq, ok, err := l.lookupMessageIDSeqByKey(ctx, scratch.messageIDIndexKey)
+		scratch.globalMessageIDKey = cache.globalMessageIDIndexKeyTo(scratch.globalMessageIDKey, row.MessageID)
+		channelKey, existingSeq, ok, err := l.lookupGlobalMessageIDByKey(ctx, scratch.globalMessageIDKey)
 		if err != nil {
 			return err
 		}
-		if ok && existingSeq != row.MessageSeq {
+		if ok && (channelKey != l.key || existingSeq != row.MessageSeq) {
 			return fmt.Errorf("%w: message id %d already stored at seq %d", dberrors.ErrConflict, row.MessageID, existingSeq)
 		}
 	}
 	if row.FromUID == "" || row.ClientMsgNo == "" {
 		return nil
 	}
-	key := IdempotencyKey{ClientMsgNo: row.ClientMsgNo}
+	key, err := rowIdempotencyKey(row.FromUID, row.ClientMsgNo, row.PublicationMetadata)
+	if err != nil {
+		return err
+	}
 	if seen.rememberIdempotencyKey(key) {
 		return fmt.Errorf("%w: duplicate idempotency key", dberrors.ErrConflict)
 	}
-	if mode == AppendTrustedContiguous {
+	if key.ServerWillKey != "" {
+		// Wills use durable point proofs even on followers. They never enter the
+		// native negative filter, so reopening cannot mistake them for absent.
+		l.db.idempotencyPointReads.Add(1)
+		receipt, present, err := loadWillReceipt(l.db.engine, l.key, key)
+		if err != nil {
+			return err
+		}
+		if present {
+			expected, err := willReceiptFromRow(row)
+			if err != nil || receipt != expected {
+				return dberrors.ErrConflict
+			}
+		}
+		hit, ok, err := l.lookupIdempotencyByKey(ctx, key, l.idempotencyStorageKey(key))
+		if err != nil {
+			return err
+		}
+		if ok && hit.MessageSeq != row.MessageSeq {
+			return fmt.Errorf("%w: Will identity already stored at seq %d", dberrors.ErrConflict, hit.MessageSeq)
+		}
 		return nil
 	}
 	scratch.idempotencyIndexKey = cache.idempotencyIndexKeyTo(scratch.idempotencyIndexKey, key.FromUID, key.ClientMsgNo)
+	if mode == AppendTrustedContiguous {
+		// A follower may later become leader without its canonical entry being
+		// reclaimed. Keep an already-loaded filter current; adding before the
+		// physical commit is safe because false positives only cause a point read.
+		if l.idempotencyMembershipLoaded {
+			l.idempotencyMembership.add(scratch.idempotencyIndexKey)
+		}
+		return nil
+	}
+	if err := l.ensureIdempotencyMembershipLoaded(ctx); err != nil {
+		return err
+	}
+	if !l.idempotencyMembership.mayContain(scratch.idempotencyIndexKey) {
+		l.idempotencyMembership.add(scratch.idempotencyIndexKey)
+		l.db.idempotencyNegativeFilterSkips.Add(1)
+		return nil
+	}
+	l.db.idempotencyPointReads.Add(1)
 	hit, ok, err := l.lookupIdempotencyByKey(ctx, key, scratch.idempotencyIndexKey)
 	if err != nil {
 		return err
@@ -275,6 +341,7 @@ func (l *ChannelLog) validateAppendRow(ctx context.Context, row messageRow, seen
 	if ok && hit.MessageSeq != row.MessageSeq {
 		return fmt.Errorf("%w: idempotency key already stored at seq %d", dberrors.ErrConflict, hit.MessageSeq)
 	}
+	l.idempotencyMembership.add(scratch.idempotencyIndexKey)
 	return nil
 }
 
@@ -284,14 +351,15 @@ func (l *ChannelLog) recordToRow(seq uint64, record Record, defaultServerTimesta
 		serverTimestampMS = defaultServerTimestampMS
 	}
 	row := messageRow{
-		MessageSeq:        seq,
-		MessageID:         record.ID,
-		ClientMsgNo:       record.ClientMsgNo,
-		FromUID:           record.FromUID,
-		ChannelID:         l.id.ID,
-		ChannelType:       l.id.Type,
-		Payload:           record.Payload,
-		ServerTimestampMS: serverTimestampMS,
+		MessageSeq:          seq,
+		MessageID:           record.ID,
+		ClientMsgNo:         record.ClientMsgNo,
+		FromUID:             record.FromUID,
+		ChannelID:           l.id.ID,
+		ChannelType:         l.id.Type,
+		Payload:             record.Payload,
+		PublicationMetadata: record.PublicationMetadata,
+		ServerTimestampMS:   serverTimestampMS,
 	}
 	if record.SizeBytes > 0 {
 		row.PayloadSize = uint64(record.SizeBytes)

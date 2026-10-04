@@ -1,131 +1,100 @@
-# internal/usecase/conversation Flow
+---
+scope: package
+summary: Builds transient conversations from UID membership and Channel state, and owns badge, hide, and activation commands.
+---
+
+# Conversation Use Case Flow
 
 ## Responsibility
 
-`internal/usecase/conversation` owns entry-agnostic conversation list reads,
-legacy-compatible conversation sync selection, legacy-compatible read/delete
-mutations, and the lightweight UID-authority active patch contract. It does not
-depend on gateway frames, HTTP DTOs, cluster, or channel log runtimes.
-Storage is supplied through small ports for UID-owned conversation active
-pages, durable UID-owned state rows, durable UID-owned state/delete writes, and
-channel-owned message reads.
+This package constructs ordinary conversation responses from UID-owned
+membership rows and Channel-owned state. Canonical previews read persisted
+state; personal mutations read committed state. It owns explicit unread,
+delete, and activation commands but persists no conversation rows.
+It does not subscribe users, deliver messages, or implement storage and transport.
 
-## List Flow
+## Boundaries
 
-```text
-List(uid, cursor, limit)
-  -> scan UID-owned normal-kind conversation active index using (active_at, channel_id, channel_type) cursor
-  -> keep the returned page order exactly as storage emits it
-  -> build current-page ordinary last-message requests with visible_after_seq = deleted_to_seq
-  -> batch-read newest non-CMD visible messages from each channel-owned message log
-  -> keep conversation rows whose channel has no visible last message
-  -> scan the committed interval (max(read_seq, deleted_to_seq), last_message_seq]
-  -> count only ordinary red-dot messages whose sender differs from uid
-  -> clone payloads before returning
-```
+- It does not subscribe users, deliver messages, or depend on access or cluster
+  implementations.
+- Directory pagination scans membership candidates, not a requested number of
+  returned conversations, and hydration is one aligned Channel-Leader batch.
+- `read_seq` is a badge floor, not a message read receipt or pull cursor.
 
-The usecase no longer scans `user_channel_membership` or reads
-`channel_latest` for the active list path. `conversation.active_at` is the
-authoritative ordering anchor; last-message time is display data only and does
-not reorder sparse or dense rows. `SparseActive=true` rows therefore stay in
-the active page position chosen by their UID-owned row even when the channel log
-contains a newer message.
+## Main Flows
 
-Rows without a visible last message are returned with `LastMessage=nil` and
-`Unread=0`. List reads do not delete, hide, or repair conversation rows.
+1. `List` scans one bounded UID membership page, emits tombstones as deletes,
+   reads persisted previews for live candidates, and returns conversations,
+   cursor, coverage, completion, and tombstone retention metadata.
+2. List admission is shared by all callers: at most 16 active list or legacy-sync requests, no waiting
+   queue, and a five-second deadline. Any item failure fails the entire page;
+   clients retain their original cursor and retry the same request.
+3. `SyncLegacy` first collects at most 1,000 candidates from the durable
+   directory, then sorts metadata by legacy activation/string-ID/type order.
+   Encoded length-prefixed directory order is not legacy string order. It
+   hydrates only the visible prefix through the requested page.
+   It replenishes directory-invisible candidates only; unread, excluded-type
+   and empty-recents filtering occur after page selection without replenishment.
+   Unpaged requests retain the full bounded walk. It applies the v2.2
+   version and per-Channel cursor semantics, then
+   reads recent persisted messages and their stream-event summaries in aligned
+   batches of at most 200 Channels. An old empty-client-number head can be
+   reread after an advanced legacy cursor to repair a missing preview; ordinary
+   heads retain exclusive-cursor behavior and durable read/delete state is unchanged.
+4. Personal commands monotonically update `read_seq`, `deleted_to_seq`, or
+   `activated_at` after exact membership and Channel-head reads.
 
-## Sync Flow
+## Invariants and Failure Semantics
 
-```text
-Sync(uid, last_msg_seqs, msg_count, only_unread, excluded_types, limit)
-  -> scan the bounded UID-owned normal-kind active view from the beginning
-  -> merge client-known last_msg_seqs as overlay candidates
-  -> read durable UID-owned normal-kind rows for overlay candidates when present
-  -> skip excluded channel types
-  -> batch-read newest non-CMD channel messages for all candidate keys
-  -> hide rows whose newest message is at or below deleted_to_seq
-  -> scan each committed interval above max(read_seq, deleted_to_seq)
-  -> count only ordinary red-dot messages whose sender differs from uid
-  -> apply only_unread to that exact count
-  -> sort by newest message time, channel type, then channel id
-  -> trim to the final limit
-  -> load recent messages only for the final returned window when msg_count > 0
-```
+- `visibility_floor = max(join_seq - 1, deleted_to_seq, retention_through_seq)`;
+  unread counts red-dot ordinary messages from other users after that floor; SyncOnce and non-red-dot records are excluded. The current
+  user's latest send within the selected persisted or committed read boundary. SyncOnce/recovery positions are excluded by the
+  Channel leader's rank query. SetUnread uses a leader-selected ordinary-message
+  boundary; legacy pulls retain the actual effective read sequence, never infer
+  it by subtracting an unread count from a sparse log sequence.
+- Empty results do not imply completion; only `done=true` completes a pass.
+- Disbanded channels become deletes. Temporary leader or storage failure fails the entire list page.
+- The canonical `List` reads current-Leader disk LEO without runtime activation
+  or quorum confirmation. Persisted messages may appear before SEND success.
+  `SyncLegacy` uses the same persisted heads and disk-only recent-message scans.
+  Off-page heads beyond the required visible prefix are not read.
+  Any attempted read failure aborts its whole response immediately; callers retry the original request.
+  The full request shares List admission and a five-second deadline, with at most
+  10,000 requested recent records and 32 MiB of base/stream payloads. Personal
+  mutations retain committed reads.
+- A legacy client cursor overrides excluded-type and unread filtering for that
+  Channel. Without such a cursor, positive `version` and `only_unread` reads
+  start after the effective badge floor. Recent messages are returned newest
+  first in the old raw-array envelope.
+- Inactive empty membership is omitted; explicit activation returns an empty
+  conversation without a last message.
+- Unread commands are idempotent no-ops for missing/tombstoned memberships or
+  a confirmed deleted Channel; they never create membership. Failed metadata or
+  head reads remain errors, and delete-command absence semantics stay unchanged.
+- SEND, receive, delivery, and pull never mutate `read_seq` or `activated_at`.
+- The opaque cursor contains `(ActivatedAt, ChannelID, ChannelType)` only.
+- Hydrated payload bytes are cloned once into usecase-owned immutable data and
+  may then be transferred through synchronous response adapters without another copy.
 
-Sync returns canonical channel IDs; access adapters convert person-channel IDs
-back to peer IDs for legacy HTTP clients. `version` is accepted for compatibility
-but does not trigger a historical directory scan. `last_msg_seqs` discovers
-client-known conversations that are outside the active scan window; overlay
-candidates without durable user state are returned only when the channel latest
-ordinary message is newer than the client-supplied sequence. Recent messages
-are filtered by the row delete floor, exclude CMD/SyncOnce messages, and are
-cloned before returning.
+- Imported list-only hidden memberships remain accessible to history reads.
+  They appear after a newer ordinary message or explicit activation, without
+  modifying read/delete floors or native unread calculations.
 
-Unread is not a sequence gap: silent `RedDot=false` entries, SyncOnce/CMD
-entries, sender-owned messages, delete-covered rows, and sequence gaps do not
-contribute. The cluster adapter pages committed channel logs and bounds parallel
-channel scans with the same conversation-read concurrency option. This exact
-scan is the correctness baseline; a future rebuildable red-dot ordinal can
-replace it if profiling shows large unread intervals need constant-time reads.
+- Message edits change only hydrated content and its version. Both list and legacy sync use latest overlays. A caught-up legacy sync explicitly includes an edited tail in recents without changing the original sequence, timestamp, conversation version, ordering or unread state; callers may receive the same edited tail again.
 
-## Mutation Flow
+## Read First
 
-```text
-ClearUnread(uid, channel, optional message_seq)
-  -> read newest channel-owned visible message
-  -> when message_seq > 0, clamp it to the newest visible sequence
-  -> when message_seq = 0, retain legacy clear-through-latest behavior
-  -> monotonically upsert UID-owned ReadSeq to that exact target
+- [Conversation application](app.go)
+- [Unread calculation](unread.go)
+- [Conversation contracts](types.go)
+- [Membership pagination tests](membership_list_test.go)
+- [Legacy sync compatibility](legacy_sync.go)
 
-SetUnread(uid, channel, unread)
-  -> read newest channel-owned visible message
-  -> derive ReadSeq so at most unread messages remain unread
-  -> upsert UID-owned ReadSeq
+## Update Triggers
 
-DeleteConversation(uid, channel, optional message_seq)
-  -> use message_seq or read the newest channel-owned visible message
-  -> write a UID-owned normal-kind delete barrier through HideConversations
-  -> durable metadata clears active_at while preserving delete visibility floor
-```
+Update this file when membership ordering, hydration, visibility or unread
+math, whole-page failure, personal mutations, activation, or cursor shape changes.
 
-Mutation APIs keep personal-channel normalization in access adapters and accept
-only normalized `ChannelID` values here. They do not scan active lists or repair
-rows. Missing latest messages make clear/set unread no-ops, while delete
-requires a concrete delete barrier and returns an error when neither the request
-nor the message store can provide one.
+### Link-U compatibility
 
-## Authority Active Patch Contract
-
-```text
-recipient authority processor
-  -> build one ActivePatch per effective recipient
-  -> group patches by UID hash-slot authority
-  -> target authority admits patches into its bounded active cache
-  -> cache flushes ConversationActivePatch rows through cluster Slot ownership
-```
-
-`ActivePatch` carries the UID-owned row key, membership visibility floors,
-message sequence fence, active timestamp, and explicit `SparseActive` mode.
-The conversation package does not classify channel membership or decide sender
-vs. recipient fanout. Those decisions belong to the recipient-authority
-processor and dispatcher, so list reads observe only authoritative UID-owned
-rows.
-
-## Cursor Contract
-
-The cursor is based on the active index row emitted by storage:
-
-```text
-(ActiveAt, ChannelID, ChannelType)
-```
-
-This matches the UID-owned active index order:
-
-```text
-active_at desc
-channel_id asc
-channel_type asc
-```
-
-Last message sequence is intentionally absent from the cursor because message
-log tails do not participate in pagination order.
+Self-sent messages do not clear incoming unread counts. Cluster adapters compute exact badge counts and set-unread boundaries from committed messages while preserving upstream directory paging, preview hydration and message edits. Explicit clear-unread accepts a bounded message sequence. Historical conversation cursors remain readable through metadata compatibility overlays.

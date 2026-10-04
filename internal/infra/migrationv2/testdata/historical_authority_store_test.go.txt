@@ -1,0 +1,17 @@
+package clusterstore
+import ("testing";"context";"github.com/WuKongIM/WuKongIM/pkg/trace";"github.com/stretchr/testify/require";"github.com/WuKongIM/WuKongIM/pkg/wkdb";"github.com/WuKongIM/WuKongIM/pkg/cluster/replica")
+func TestMigrationHistoricalConfigApplyKeepsEncodedVersion(t *testing.T) {
+ trace.SetGlobalTrace(trace.New(context.Background(),trace.NewOptions(trace.WithServiceName("migration-history"),trace.WithServiceHostName("local"))))
+ db:=wkdb.NewWukongDB(wkdb.NewOptions(wkdb.WithDir(t.TempDir()),wkdb.WithShardNum(2)))
+ require.NoError(t,db.Open());defer db.Close()
+ s:=&Store{wdb:db}
+ cfg:=wkdb.ChannelClusterConfig{ChannelId:"synthetic-history",ChannelType:2,ReplicaMaxCount:3,Replicas:[]uint64{1001,1002,1003},LeaderId:1001,Term:1,MigrateFrom:1001,MigrateTo:1001,ConfVersion:1732364897806218890}
+ data,err:=cfg.Marshal();require.NoError(t,err)
+ payload,err:=EncodeCMDChannelClusterConfigSave(cfg.ChannelId,cfg.ChannelType,data);require.NoError(t,err)
+ command,err:=NewCMD(CMDChannelClusterConfigSave,payload).Marshal();require.NoError(t,err)
+ require.NoError(t,s.onMetaApply([]replica.Log{{Index:305,Term:1,Data:command}}))
+ stored,err:=db.GetChannelClusterConfig(cfg.ChannelId,cfg.ChannelType);require.NoError(t,err)
+ require.Equal(t,cfg.ConfVersion,stored.ConfVersion)
+ require.Equal(t,cfg.MigrateFrom,stored.MigrateFrom);require.Equal(t,cfg.MigrateTo,stored.MigrateTo)
+ require.Equal(t,cfg.Replicas,stored.Replicas);require.Empty(t,stored.Learners)
+}

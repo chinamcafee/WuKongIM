@@ -1,0 +1,44 @@
+// Run as an external Go file from the unmodified original v2 module.
+// Writes only temporary databases and the output JSON specified by the caller.
+package main
+
+import (
+ "encoding/json"
+ "os"
+ "path/filepath"
+ "github.com/WuKongIM/WuKongIM/pkg/wkdb"
+ "github.com/cockroachdb/pebble"
+)
+func must(err error) { if err != nil { panic(err) } }
+type pair struct { Key, Value []byte }
+func main() {
+ root, err := os.MkdirTemp("", "original-v2-plugin-fixtures-"); must(err)
+ defer os.RemoveAll(root)
+ cases := map[string]wkdb.Plugin{
+  "descriptor": {No: "legacy-plugin", Name: "Legacy descriptor", ConfigTemplate: []byte(`{"type":"object"}`)},
+  "global_send": {No: "legacy-plugin", Methods: []string{"Send"}},
+  "global_persist": {No: "legacy-plugin", Methods: []string{"PersistAfter"}},
+  "disabled_send": {No: "legacy-plugin", Methods: []string{"Send"}, Status: wkdb.PluginStatusDisabled},
+  "config_only": {No: "legacy-plugin", Config: map[string]interface{}{"fixture_secret": "synthetic-do-not-log"}},
+ }
+ result := map[string][]pair{}
+ for name, plugin := range cases {
+  dir := filepath.Join(root, name)
+  db := wkdb.NewWukongDB(wkdb.NewOptions(wkdb.WithDir(dir), wkdb.WithNodeId(1), wkdb.WithShardNum(2)))
+  must(db.Open()); must(db.AddOrUpdatePlugin(plugin))
+  got, err := db.GetPlugin(plugin.No); must(err)
+  if got.No != plugin.No || len(got.Methods) != len(plugin.Methods) || len(got.Config) != len(plugin.Config) { panic("original public read differs") }
+  must(db.Close())
+  raw, err := pebble.Open(filepath.Join(dir, "wukongimdb", "shard000"), &pebble.Options{ReadOnly: true}); must(err)
+  iter := raw.NewIter(nil)
+  for iter.First(); iter.Valid(); iter.Next() {
+   if len(iter.Key()) >= 2 && iter.Key()[0] == 0x15 && iter.Key()[1] == 0x01 {
+    result[name] = append(result[name], pair{append([]byte(nil), iter.Key()...), append([]byte(nil), iter.Value()...)})
+   }
+  }
+  must(iter.Error()); must(iter.Close()); must(raw.Close())
+  if len(result[name]) != 8 { panic("unexpected original plugin column count") }
+ }
+ data, err := json.MarshalIndent(result, "", "  "); must(err)
+ must(os.WriteFile(os.Args[1], append(data, '\n'), 0600))
+}

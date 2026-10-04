@@ -22,5 +22,7 @@ demo
 resources
 logs
 tmp
+internal/app/prometheus_embedded/prometheus-*
 docs
+docs-site
 wukongim.conf

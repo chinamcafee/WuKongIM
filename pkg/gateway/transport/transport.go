@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"errors"
 	"time"
 )
@@ -27,6 +28,34 @@ type Conn interface {
 	Close() error
 	LocalAddr() string
 	RemoteAddr() string
+}
+
+// CloseWaiter provides physical isolation independently of handler cleanup.
+// CloseAndWait fences future writes and returns nil only after physical close
+// completes. Cancellation (including an already canceled context) stops only
+// this wait; the close is still requested and repeated calls join one receipt.
+// A successful Conn.Close or OnClose notification is not a substitute.
+type CloseWaiter interface {
+	CloseAndWait(context.Context) error
+}
+
+var (
+	ErrConnectionClosing = errors.New("gateway/transport: connection closing")
+	ErrCloseUnproved     = errors.New("gateway/transport: physical close unproved")
+)
+
+// PeerAddress preserves the physical TCP peer when RemoteAddr is supplied by a
+// trusted proxy. It is optional so existing transport implementations remain valid.
+type PeerAddress interface {
+	PeerAddr() string
+}
+
+// ObservedWriter exposes the physical asynchronous-write completion boundary.
+// The completion callback is invoked at most once after transport ownership of
+// an accepted payload ends. A caller that does not need this evidence should
+// continue to use Conn.Write.
+type ObservedWriter interface {
+	WriteObserved(data []byte, frameType string, complete func(error)) error
 }
 
 // WebSocketMessageType identifies the websocket opcode for an outbound application message.
@@ -72,3 +101,16 @@ type ListenerSpec struct {
 	Options ListenerOptions
 	Handler ConnHandler
 }
+
+// HandshakeRejectionError identifies an expected client handshake rejection,
+// not a failure of the listener. Transports still return the HTTP rejection
+// and close the connection; observers may sample these diagnostics separately.
+type HandshakeRejectionError struct {
+	// StatusCode is the HTTP response sent to the rejected client.
+	StatusCode int
+	// Err is the non-nil, redacted transport diagnostic cause.
+	Err error
+}
+
+func (e *HandshakeRejectionError) Error() string { return e.Err.Error() }
+func (e *HandshakeRejectionError) Unwrap() error { return e.Err }

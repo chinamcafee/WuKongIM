@@ -1,0 +1,13 @@
+# Run Prometheus in the management network. Replace the three private endpoints.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+rule_files:
+  - ./alerts.yml
+scrape_configs:
+  - job_name: wukongim
+    metrics_path: /metrics
+    static_configs:
+      - targets: [10.0.0.11:5001, 10.0.0.12:5001, 10.0.0.13:5001]
+        labels:
+          cluster: im-staging

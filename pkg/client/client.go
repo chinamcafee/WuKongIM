@@ -41,16 +41,60 @@ type Client struct {
 	inflight chan struct{}
 	// pending tracks SEND requests waiting for SENDACK frames from the reader loop.
 	pending *pendingTracker
-	// recvMu protects bounded overwrite semantics for recvCh.
-	recvMu sync.Mutex
-	// recvCh buffers inbound RECV frames for future public receive APIs.
+	// recvCh backpressures inbound RECV frames for future public receive APIs.
 	recvCh chan *frame.RecvPacket
+	// recvOwnership follows recvCh across a session and keeps dequeued frames
+	// observable until the next owner explicitly releases its handoff lease.
+	recvOwnership *inboundOwnership
 	// recvNotify closes when the current receive session becomes unavailable.
 	recvNotify chan struct{}
 	// recvErr records why Recv waiters should stop waiting for the current session.
 	recvErr    error
 	readerDone chan struct{}
 	writerDone chan struct{}
+	// terminalFence is terminal for this Client generation. Once quiescing
+	// begins, SEND/PING/reconnect admission never reopens.
+	terminalFence      terminalFenceState
+	terminalFenceEpoch uint64
+	terminalFenceNonce frame.TerminalFenceNonce
+	terminalFenceDone  chan struct{}
+	terminalFenceErr   error
+}
+
+// InboundQueueSnapshot is a numeric view of the current bounded RECV queue.
+// It never exposes queued packets or mutable queue storage.
+type InboundQueueSnapshot struct {
+	// Depth is the number of queued RECV packets.
+	Depth int
+	// Capacity is the fixed RECV queue capacity.
+	Capacity int
+	// Handoffs counts RECV packets owned by a blocked publisher or a consumer
+	// after dequeue and before the next processing stage accepts ownership.
+	Handoffs int
+}
+
+// FrameLease preserves receive ownership across a queue handoff. Release is
+// idempotent and MUST be called after the next processing stage has accepted
+// the frame.
+type FrameLease interface {
+	Release()
+}
+
+type inboundOwnership struct {
+	recvCh  chan *frame.RecvPacket
+	pending atomic.Int64
+}
+
+type inboundFrameLease struct {
+	once      sync.Once
+	ownership *inboundOwnership
+}
+
+func (l *inboundFrameLease) Release() {
+	if l == nil || l.ownership == nil {
+		return
+	}
+	l.once.Do(func() { l.ownership.pending.Add(-1) })
 }
 
 // New creates a WKProto client with normalized configuration defaults.
@@ -63,15 +107,17 @@ func New(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	recvCh := make(chan *frame.RecvPacket, cfg.InboundFrameBufferSize)
 	c := &Client{
-		cfg:      cfg,
-		proto:    codec.New(),
-		crypto:   crypto,
-		writeCh:  make(chan writeRequest, cfg.SendQueueCapacity),
-		closeCh:  make(chan struct{}),
-		inflight: make(chan struct{}, cfg.MaxInflight),
-		pending:  newPendingTracker(),
-		recvCh:   make(chan *frame.RecvPacket, cfg.InboundFrameBufferSize),
+		cfg:           cfg,
+		proto:         codec.New(),
+		crypto:        crypto,
+		writeCh:       make(chan writeRequest, cfg.SendQueueCapacity),
+		closeCh:       make(chan struct{}),
+		inflight:      make(chan struct{}, cfg.MaxInflight),
+		pending:       newPendingTracker(),
+		recvCh:        recvCh,
+		recvOwnership: &inboundOwnership{recvCh: recvCh},
 	}
 	c.recvNotify = closedNotify()
 	c.recvErr = ErrNotConnected
@@ -95,6 +141,12 @@ func (c *Client) Connect(ctx context.Context, opts ConnectOptions) (*frame.Conna
 	if c.closed {
 		c.mu.Unlock()
 		err := ErrClosed
+		c.observeConnect(opts, time.Since(started), err)
+		return nil, err
+	}
+	if c.terminalFence != terminalFenceOpen {
+		c.mu.Unlock()
+		err := ErrTerminalFenceActive
 		c.observeConnect(opts, time.Since(started), err)
 		return nil, err
 	}
@@ -153,6 +205,13 @@ func (c *Client) Connect(ctx context.Context, opts ConnectOptions) (*frame.Conna
 		c.observeConnect(opts, time.Since(started), err)
 		return nil, err
 	}
+	if c.terminalFence != terminalFenceOpen {
+		c.mu.Unlock()
+		_ = conn.Close()
+		err = ErrTerminalFenceActive
+		c.observeConnect(opts, time.Since(started), err)
+		return nil, err
+	}
 	oldConn = c.conn
 	oldPending = c.pending
 	oldRecvNotify := c.recvNotify
@@ -161,6 +220,7 @@ func (c *Client) Connect(ctx context.Context, opts ConnectOptions) (*frame.Conna
 	c.session = c.crypto.currentSession()
 	c.pending = newPendingTracker()
 	c.recvCh = make(chan *frame.RecvPacket, c.cfg.InboundFrameBufferSize)
+	c.recvOwnership = &inboundOwnership{recvCh: c.recvCh}
 	c.recvNotify = make(chan struct{})
 	c.recvErr = nil
 	c.startLoops(conn, c.pending, c.session)
@@ -188,10 +248,12 @@ func (c *Client) Close() error {
 		return ErrClosed
 	}
 	c.closed = true
+	c.failActiveTerminalFenceLocked(ErrClosed)
 	conn := c.conn
 	c.conn = nil
 	c.session = nil
 	c.recvCh = make(chan *frame.RecvPacket, c.cfg.InboundFrameBufferSize)
+	c.recvOwnership = &inboundOwnership{recvCh: c.recvCh}
 	pending := c.pending
 	c.signalRecvUnavailableLocked(ErrClosed)
 	c.mu.Unlock()
@@ -291,10 +353,35 @@ func (c *Client) SendAsync(ctx context.Context, msg Message) (*SendFuture, error
 	return futures[0], nil
 }
 
-// ReadFrame waits for the next inbound data frame exposed by this client.
-func (c *Client) ReadFrame(ctx context.Context) (frame.Frame, error) {
+// TrySendAsync admits one message without waiting for the SEND admission lock,
+// writer queue, or inflight capacity. ErrSendQueueFull reports transient local
+// pressure; no pending SEND remains when admission is rejected.
+func (c *Client) TrySendAsync(msg Message) (*SendFuture, error) {
 	if c == nil {
 		return nil, ErrClosed
+	}
+	item, err := c.prepareSend(msg)
+	if err != nil {
+		return nil, err
+	}
+	return c.tryAdmitPreparedSend(item)
+}
+
+// ReadFrame waits for the next inbound data frame exposed by this client.
+func (c *Client) ReadFrame(ctx context.Context) (frame.Frame, error) {
+	f, lease, err := c.ReadFrameWithLease(ctx)
+	if lease != nil {
+		lease.Release()
+	}
+	return f, err
+}
+
+// ReadFrameWithLease waits for the next inbound data frame while retaining its
+// bounded receive ownership. The caller MUST release a non-nil lease only
+// after its next processing stage has made the frame observable.
+func (c *Client) ReadFrameWithLease(ctx context.Context) (frame.Frame, FrameLease, error) {
+	if c == nil {
+		return nil, nil, ErrClosed
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -304,7 +391,7 @@ func (c *Client) ReadFrame(ctx context.Context) (frame.Frame, error) {
 		c.mu.Lock()
 		if c.closed {
 			c.mu.Unlock()
-			return nil, ErrClosed
+			return nil, nil, ErrClosed
 		}
 		if c.conn == nil {
 			err := c.recvErr
@@ -312,54 +399,105 @@ func (c *Client) ReadFrame(ctx context.Context) (frame.Frame, error) {
 				err = ErrNotConnected
 			}
 			c.mu.Unlock()
-			return nil, err
+			return nil, nil, err
 		}
 		recvCh := c.recvCh
 		recvNotify := c.recvNotify
+		ownership := c.recvOwnershipLocked()
 		c.mu.Unlock()
 
-		f, err := c.readFrameFromSnapshot(ctx, recvCh, recvNotify)
+		f, lease, err := c.readFrameWithLeaseFromSnapshot(ctx, recvCh, recvNotify, ownership)
 		if errors.Is(err, errStaleRecvSnapshot) {
 			continue
 		}
-		return f, err
+		return f, lease, err
 	}
 }
 
+// InboundQueueSnapshot reports current inbound RECV queue occupancy.
+func (c *Client) InboundQueueSnapshot() InboundQueueSnapshot {
+	if c == nil {
+		return InboundQueueSnapshot{}
+	}
+	c.mu.Lock()
+	recvCh := c.recvCh
+	ownership := c.recvOwnershipLocked()
+	c.mu.Unlock()
+	depth := len(recvCh)
+	handoffs := int(ownership.pending.Load()) - depth
+	if handoffs < 0 {
+		handoffs = 0
+	}
+	return InboundQueueSnapshot{Depth: depth, Capacity: cap(recvCh), Handoffs: handoffs}
+}
+
 func (c *Client) readFrameFromSnapshot(ctx context.Context, recvCh <-chan *frame.RecvPacket, recvNotify <-chan struct{}) (frame.Frame, error) {
+	c.mu.Lock()
+	ownership := c.recvOwnershipLocked()
+	c.mu.Unlock()
+	f, lease, err := c.readFrameWithLeaseFromSnapshot(ctx, recvCh, recvNotify, ownership)
+	if lease != nil {
+		lease.Release()
+	}
+	return f, err
+}
+
+func (c *Client) readFrameWithLeaseFromSnapshot(ctx context.Context, recvCh <-chan *frame.RecvPacket, recvNotify <-chan struct{}, ownership *inboundOwnership) (frame.Frame, FrameLease, error) {
 	for {
 		select {
 		case pkt := <-recvCh:
 			if pkt == nil {
-				return nil, ErrClosed
+				return nil, nil, ErrClosed
 			}
+			lease := newInboundFrameLease(ownership)
 			if !c.isCurrentRecvSnapshot(recvCh) {
-				return nil, c.staleRecvSnapshotError()
+				if lease != nil {
+					lease.Release()
+				}
+				return nil, nil, c.staleRecvSnapshotError()
 			}
-			return pkt, nil
+			return pkt, lease, nil
 		default:
 		}
 
 		select {
 		case pkt := <-recvCh:
 			if pkt == nil {
-				return nil, ErrClosed
+				return nil, nil, ErrClosed
 			}
+			lease := newInboundFrameLease(ownership)
 			if !c.isCurrentRecvSnapshot(recvCh) {
-				return nil, c.staleRecvSnapshotError()
+				if lease != nil {
+					lease.Release()
+				}
+				return nil, nil, c.staleRecvSnapshotError()
 			}
-			return pkt, nil
+			return pkt, lease, nil
 		case <-recvNotify:
 			if !c.isCurrentRecvSnapshot(recvCh) {
-				return nil, c.staleRecvSnapshotError()
+				return nil, nil, c.staleRecvSnapshotError()
 			}
-			return nil, c.recvUnavailableError()
+			return nil, nil, c.recvUnavailableError()
 		case <-c.closeCh:
-			return nil, ErrClosed
+			return nil, nil, ErrClosed
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		}
 	}
+}
+
+func newInboundFrameLease(ownership *inboundOwnership) FrameLease {
+	if ownership == nil || ownership.pending.Load() <= 0 {
+		return nil
+	}
+	return &inboundFrameLease{ownership: ownership}
+}
+
+func (c *Client) recvOwnershipLocked() *inboundOwnership {
+	if c.recvOwnership == nil || c.recvOwnership.recvCh != c.recvCh {
+		c.recvOwnership = &inboundOwnership{recvCh: c.recvCh}
+	}
+	return c.recvOwnership
 }
 
 func (c *Client) isCurrentRecvSnapshot(recvCh <-chan *frame.RecvPacket) bool {
@@ -414,6 +552,17 @@ func (c *Client) RecvAck(ctx context.Context, messageID int64, messageSeq uint64
 
 // Ping sends a PING control frame.
 func (c *Client) Ping(ctx context.Context) error {
+	if c == nil {
+		return ErrClosed
+	}
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	c.mu.Lock()
+	active := c.terminalFence != terminalFenceOpen
+	c.mu.Unlock()
+	if active {
+		return ErrTerminalFenceActive
+	}
 	return c.writeControl(ctx, &frame.PingPacket{})
 }
 
@@ -554,6 +703,10 @@ func (c *Client) admitPreparedSends(ctx context.Context, prepared []preparedSend
 		c.mu.Unlock()
 		return nil, ErrClosed
 	}
+	if c.terminalFence != terminalFenceOpen {
+		c.mu.Unlock()
+		return nil, ErrTerminalFenceActive
+	}
 	conn := c.conn
 	pending := c.pending
 	session := c.session
@@ -628,6 +781,76 @@ func (c *Client) admitPreparedSends(ctx context.Context, prepared []preparedSend
 	return futures, nil
 }
 
+func (c *Client) tryAdmitPreparedSend(item preparedSend) (*SendFuture, error) {
+	if !c.sendMu.TryLock() {
+		c.mu.Lock()
+		active := c.terminalFence != terminalFenceOpen
+		c.mu.Unlock()
+		if active {
+			return nil, ErrTerminalFenceActive
+		}
+		c.observeSendQueue("full")
+		return nil, ErrSendQueueFull
+	}
+	defer c.sendMu.Unlock()
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, ErrClosed
+	}
+	if c.terminalFence != terminalFenceOpen {
+		c.mu.Unlock()
+		return nil, ErrTerminalFenceActive
+	}
+	conn := c.conn
+	pending := c.pending
+	session := c.session
+	if conn == nil || pending == nil {
+		c.mu.Unlock()
+		return nil, ErrNotConnected
+	}
+	c.mu.Unlock()
+
+	if len(c.writeCh) >= cap(c.writeCh) {
+		c.observeSendQueue("full")
+		return nil, ErrSendQueueFull
+	}
+	select {
+	case c.inflight <- struct{}{}:
+	default:
+		c.observeSendQueue("full")
+		return nil, ErrSendQueueFull
+	}
+
+	entry, err := pending.addWithFinish(item.key, c.cfg.AckTimeout, c.releaseInflight)
+	if err != nil {
+		c.releaseInflight()
+		return nil, err
+	}
+	req := writeRequest{
+		kind:    writeKindSend,
+		msg:     item.msg,
+		pkt:     item.pkt,
+		entry:   entry,
+		conn:    conn,
+		pending: pending,
+		session: session,
+	}
+	select {
+	case c.writeCh <- req:
+		c.observeSendQueue("accepted")
+		return &SendFuture{done: entry.done}, nil
+	case <-c.closeCh:
+		pending.fail(entry, ErrClosed)
+		return nil, ErrClosed
+	default:
+		pending.fail(entry, ErrSendQueueFull)
+		c.observeSendQueue("full")
+		return nil, ErrSendQueueFull
+	}
+}
+
 func (c *Client) admitPreparedBatch(ctx context.Context, prepared []preparedSend, waiter *sendBatchWaiter) error {
 	if len(prepared) == 0 {
 		return nil
@@ -643,6 +866,10 @@ func (c *Client) admitPreparedBatch(ctx context.Context, prepared []preparedSend
 	if c.closed {
 		c.mu.Unlock()
 		return ErrClosed
+	}
+	if c.terminalFence != terminalFenceOpen {
+		c.mu.Unlock()
+		return ErrTerminalFenceActive
 	}
 	conn := c.conn
 	pending := c.pending
@@ -837,21 +1064,20 @@ func (c *Client) withDeadline(ctx context.Context, setDeadline func(time.Time) e
 		return err
 	}
 
-	done := make(chan struct{})
-	var deadlineWG sync.WaitGroup
-	deadlineWG.Add(1)
-	go func() {
-		defer deadlineWG.Done()
-		select {
-		case <-ctx.Done():
+	var canceled chan struct{}
+	var stopCancellation func() bool
+	if ctx.Done() != nil {
+		canceled = make(chan struct{})
+		stopCancellation = context.AfterFunc(ctx, func() {
 			_ = setDeadline(time.Now())
-		case <-done:
-		}
-	}()
+			close(canceled)
+		})
+	}
 
 	err := op()
-	close(done)
-	deadlineWG.Wait()
+	if stopCancellation != nil && !stopCancellation() {
+		<-canceled
+	}
 	_ = setDeadline(time.Time{})
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {

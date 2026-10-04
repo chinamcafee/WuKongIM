@@ -83,6 +83,8 @@ func writeNodeConfigError(c *gin.Context, err error) {
 		jsonError(c, http.StatusBadRequest, "bad_request", "invalid node config request")
 	case errors.Is(err, metadb.ErrNotFound):
 		jsonError(c, http.StatusNotFound, "not_found", "node not found")
+	case errors.Is(err, managementusecase.ErrNodeConfigDocumentUnsupported):
+		jsonError(c, http.StatusNotImplemented, "node_config_toml_unsupported", "node does not support TOML config snapshots")
 	case errors.Is(err, managementusecase.ErrNodeConfigUnavailable):
 		jsonError(c, http.StatusServiceUnavailable, "service_unavailable", "node config unavailable")
 	default:

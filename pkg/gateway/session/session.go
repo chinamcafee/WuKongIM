@@ -8,7 +8,16 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
 )
 
-var ErrSessionClosed = errors.New("gateway/session: session is closed")
+var (
+	ErrSessionClosed = errors.New("gateway/session: session is closed")
+	// ErrOutboundSealed reports a write attempted after the terminal frame was
+	// admitted. A sealed session never reopens, including when that admission
+	// returned an error.
+	ErrOutboundSealed = errors.New("gateway/session: outbound is sealed")
+	// ErrOutboundSealUnsupported reports a Session implementation that does not
+	// provide the optional atomic terminal-write capability.
+	ErrOutboundSealUnsupported = errors.New("gateway/session: outbound seal unsupported")
+)
 
 type Session interface {
 	ID() uint64
@@ -21,6 +30,23 @@ type Session interface {
 
 	SetValue(key string, value any)
 	Value(key string) any
+}
+
+// OutboundSealer atomically closes ordinary outbound admission and admits one
+// final frame through the same ordering lock used by WriteFrame.
+type OutboundSealer interface {
+	SealOutboundAndWrite(f frame.Frame, opts ...WriteOption) error
+}
+
+// OutboundSealState exposes only the terminal business-admission gate.
+type OutboundSealState interface {
+	OutboundSealed() bool
+}
+
+// OutboundFencer permanently fences new writes without joining an entered
+// encoder. Physical transport closure and admitted effect drain are separate.
+type OutboundFencer interface {
+	FenceOutbound()
 }
 
 type WriteOption interface {
@@ -44,21 +70,24 @@ func WithReplyToken(token string) WriteOption {
 }
 
 type Config struct {
-	ID           uint64
-	Listener     string
-	RemoteAddr   string
-	LocalAddr    string
-	WriteFrameFn WriteFrameFn
+	ID            uint64
+	Listener      string
+	RemoteAddr    string
+	LocalAddr     string
+	WriteFrameFn  WriteFrameFn
+	WritePacketFn WritePacketFn
 }
 
 func New(cfg Config) Session {
-	return newSession(
+	sess := newSession(
 		cfg.ID,
 		cfg.Listener,
 		cfg.RemoteAddr,
 		cfg.LocalAddr,
 		cfg.WriteFrameFn,
 	)
+	sess.writePacketFn = cfg.WritePacketFn
+	return sess
 }
 
 type session struct {
@@ -70,10 +99,12 @@ type session struct {
 	hotValues atomic.Pointer[sessionHotValues]
 	values    sync.Map
 
-	writeMu      sync.Mutex
-	closing      atomic.Bool
-	closed       atomic.Bool
-	writeFrameFn WriteFrameFn
+	writeMu        sync.Mutex
+	outboundSealed atomic.Bool
+	closing        atomic.Bool
+	closed         atomic.Bool
+	writeFrameFn   WriteFrameFn
+	writePacketFn  WritePacketFn
 }
 
 // These keys mirror gateway/types session value keys without importing that package.
@@ -159,10 +190,16 @@ func (s *session) WriteFrame(f frame.Frame, opts ...WriteOption) error {
 	if s.closing.Load() || s.closed.Load() {
 		return ErrSessionClosed
 	}
+	if s.outboundSealed.Load() {
+		return ErrOutboundSealed
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.closing.Load() || s.closed.Load() {
 		return ErrSessionClosed
+	}
+	if s.outboundSealed.Load() {
+		return ErrOutboundSealed
 	}
 
 	meta := OutboundMeta{}
@@ -177,11 +214,53 @@ func (s *session) WriteFrame(f frame.Frame, opts ...WriteOption) error {
 	return s.writeFrameFn(f, meta)
 }
 
+// SealOutboundAndWrite is the final ordered session write. It marks the
+// session sealed before invoking the transport enqueue callback, so callback
+// failure cannot accidentally reopen ordinary outbound admission.
+func (s *session) SealOutboundAndWrite(f frame.Frame, opts ...WriteOption) error {
+	if s == nil {
+		return ErrSessionClosed
+	}
+	if s.closing.Load() || s.closed.Load() {
+		return ErrSessionClosed
+	}
+	if s.outboundSealed.Load() {
+		return ErrOutboundSealed
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.closing.Load() || s.closed.Load() {
+		return ErrSessionClosed
+	}
+	if s.outboundSealed.Load() {
+		return ErrOutboundSealed
+	}
+	s.outboundSealed.Store(true)
+
+	meta := OutboundMeta{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt.apply(&meta)
+		}
+	}
+	if s.writeFrameFn == nil {
+		return nil
+	}
+	return s.writeFrameFn(f, meta)
+}
+
+// OutboundSealed reports the terminal admission state. Entry adapters use it
+// to reject every later ordinary inbound frame before invoking any use case;
+// relying on a later response write failure would allow post-fence work.
+func (s *session) OutboundSealed() bool {
+	return s != nil && s.outboundSealed.Load()
+}
+
 func (s *session) Close() error {
 	if s == nil {
 		return nil
 	}
-	s.closing.Store(true)
+	s.FenceOutbound()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.closed.Load() {
@@ -189,6 +268,12 @@ func (s *session) Close() error {
 	}
 	s.closed.Store(true)
 	return nil
+}
+
+func (s *session) FenceOutbound() {
+	if s != nil {
+		s.closing.Store(true)
+	}
 }
 
 func (s *session) SetValue(key string, value any) {
@@ -218,11 +303,21 @@ func (s *session) LoadOrStoreValue(key string, value any) (actual any, loaded bo
 		return nil, false
 	}
 	if isHotValueKey(key) {
-		if actual, ok := s.hotValue(key); ok && actual != nil {
-			return actual, true
+		for {
+			current := s.hotValues.Load()
+			if actual, loaded := current.load(key); loaded {
+				return actual, true
+			}
+
+			next := sessionHotValues{}
+			if current != nil {
+				next = *current
+			}
+			next.set(key, value)
+			if s.hotValues.CompareAndSwap(current, &next) {
+				return value, false
+			}
 		}
-		s.setHotValue(key, value)
-		return value, false
 	}
 	return s.values.LoadOrStore(key, value)
 }
@@ -253,7 +348,8 @@ func (s *session) hotValue(key string) (any, bool) {
 	if values == nil {
 		return nil, true
 	}
-	return values.value(key), true
+	value, _ := values.load(key)
+	return value, true
 }
 
 func isHotValueKey(key string) bool {
@@ -299,51 +395,51 @@ func (v *sessionHotValues) set(key string, value any) {
 	}
 }
 
-func (v *sessionHotValues) value(key string) any {
+func (v *sessionHotValues) load(key string) (any, bool) {
 	if v == nil {
-		return nil
+		return nil, false
 	}
 	switch key {
 	case hotSessionValueUID:
 		if v.uidSet {
-			return v.uid
+			return v.uid, true
 		}
 	case hotSessionValueDeviceID:
 		if v.deviceIDSet {
-			return v.deviceID
+			return v.deviceID, true
 		}
 	case hotSessionValueDeviceFlag:
 		if v.deviceFlagSet {
-			return v.deviceFlag
+			return v.deviceFlag, true
 		}
 	case hotSessionValueDeviceLevel:
 		if v.deviceLevelSet {
-			return v.deviceLevel
+			return v.deviceLevel, true
 		}
 	case hotSessionValueProtocolVersion:
 		if v.protocolVersionSet {
-			return v.protocolVersion
+			return v.protocolVersion, true
 		}
 	case hotSessionValueProtocolName:
 		if v.protocolNameSet {
-			return v.protocolName
+			return v.protocolName, true
 		}
 	case hotSessionValueEncryptionEnabled:
 		if v.encryptionEnabledSet {
-			return v.encryptionEnabled
+			return v.encryptionEnabled, true
 		}
 	case hotSessionValueAESKey:
 		if v.aesKeySet {
-			return v.aesKey
+			return v.aesKey, true
 		}
 	case hotSessionValueAESIV:
 		if v.aesIVSet {
-			return v.aesIV
+			return v.aesIV, true
 		}
 	case hotSessionValueCrypto:
 		if v.cryptoSet {
-			return v.crypto
+			return v.crypto, true
 		}
 	}
-	return nil
+	return nil, false
 }

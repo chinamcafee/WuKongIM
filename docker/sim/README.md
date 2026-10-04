@@ -1,6 +1,6 @@
 # Docker Compose Dev Simulator
 
-`wk-sim` is an optional local development simulator. It runs `wkbench dev-sim`,
+`wk-sim` is an optional local development simulator. It runs `wkcli bench dev-sim`,
 keeps a deterministic user set online, and sends person/group messages through
 the public bench API and WKProto gateways.
 

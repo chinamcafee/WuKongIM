@@ -30,7 +30,7 @@ type RecentConversationsResponseDTO struct {
 	OnlyUnread bool `json:"only_unread"`
 	// Truncated reports whether more matching conversations were detected.
 	Truncated bool `json:"truncated"`
-	// Items contains recent conversation rows.
+	// Items contains transient recent conversation views.
 	Items []RecentConversationDTO `json:"items"`
 }
 
@@ -38,7 +38,7 @@ type RecentConversationsResponseDTO struct {
 type RecentConversationDTO struct {
 	// UID is the owner user for this conversation row.
 	UID string `json:"uid"`
-	// ChannelID is the display channel id returned by conversation sync.
+	// ChannelID is the display channel id returned by transient construction.
 	ChannelID string `json:"channel_id"`
 	// ChannelType is the WuKong channel type.
 	ChannelType int64 `json:"channel_type"`
@@ -46,12 +46,12 @@ type RecentConversationDTO struct {
 	Unread int `json:"unread"`
 	// Timestamp is the latest message timestamp in Unix seconds.
 	Timestamp int64 `json:"timestamp"`
-	// LastMsgSeq is the latest message sequence known to conversation sync.
+	// LastMsgSeq is the latest committed message sequence in the constructed view.
 	LastMsgSeq uint64 `json:"last_msg_seq"`
 	// LastClientMsgNo is the latest client message number when present.
 	LastClientMsgNo string `json:"last_client_msg_no"`
 	// ReadToMsgSeq is UID's read cursor for this conversation.
-	ReadToMsgSeq uint64 `json:"read_to_msg_seq"`
+	ReadToMsgSeq uint32 `json:"read_to_msg_seq"`
 	// Version is the sync compatibility version timestamp.
 	Version int64 `json:"version"`
 	// RecentMessages contains newest message previews for this conversation.

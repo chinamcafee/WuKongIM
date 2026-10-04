@@ -17,6 +17,10 @@ const defaultWKProtoTimeout = 5 * time.Second
 
 // WKProtoClient is a black-box test client for the public WKProto transport.
 type WKProtoClient struct {
+	// operationTimeout bounds handshake, SENDACK, RECV, and control operations.
+	operationTimeout time.Duration
+	// dialer optionally observes public socket traffic without changing protocol handling.
+	dialer wkclient.Dialer
 	// mu protects the active pkg/client session and bridge channels.
 	mu sync.Mutex
 	// inner owns the WKProto TCP session, crypto state, writer, and reader.
@@ -31,7 +35,25 @@ type WKProtoClient struct {
 
 // NewWKProtoClient creates a client with fresh WKProto session keys.
 func NewWKProtoClient() (*WKProtoClient, error) {
-	return &WKProtoClient{}, nil
+	return NewWKProtoClientWithTimeout(defaultWKProtoTimeout)
+}
+
+// NewWKProtoClientWithTimeout creates a client with one explicit bounded operation timeout.
+func NewWKProtoClientWithTimeout(timeout time.Duration) (*WKProtoClient, error) {
+	if timeout <= 0 {
+		return nil, fmt.Errorf("wkproto client: operation timeout must be positive")
+	}
+	return &WKProtoClient{operationTimeout: timeout}, nil
+}
+
+// NewWKProtoClientWithDialer uses an explicit socket adapter for black-box wire evidence.
+func NewWKProtoClientWithDialer(timeout time.Duration, dialer wkclient.Dialer) (*WKProtoClient, error) {
+	c, err := NewWKProtoClientWithTimeout(timeout)
+	if err != nil {
+		return nil, err
+	}
+	c.dialer = dialer
+	return c, nil
 }
 
 // Connect opens the TCP connection and completes the WKProto handshake.
@@ -42,21 +64,17 @@ func (c *WKProtoClient) Connect(addr, uid, deviceID string) error {
 
 // ConnectContext opens the TCP connection and returns the successful Connack.
 func (c *WKProtoClient) ConnectContext(ctx context.Context, addr, uid, deviceID string) (*frame.ConnackPacket, error) {
-	return c.ConnectWithTokenContext(ctx, addr, uid, deviceID, "", frame.APP)
+	return c.ConnectAuthenticatedContext(ctx, addr, uid, deviceID, "", frame.APP)
 }
 
-// ConnectWithToken opens the TCP connection with explicit token and device identity.
-func (c *WKProtoClient) ConnectWithToken(addr, uid, deviceID, token string, deviceFlag frame.DeviceFlag) error {
-	_, err := c.ConnectWithTokenContext(context.Background(), addr, uid, deviceID, token, deviceFlag)
-	return err
+// ConnectWithTokenContext uses the same authenticated handshake with the default device flag.
+func (c *WKProtoClient) ConnectWithTokenContext(ctx context.Context, addr, uid, deviceID, token string) (*frame.ConnackPacket, error) {
+	return c.ConnectAuthenticatedContext(ctx, addr, uid, deviceID, token, frame.APP)
 }
 
-// ConnectWithTokenContext completes a token-authenticated WKProto handshake.
-func (c *WKProtoClient) ConnectWithTokenContext(
-	ctx context.Context,
-	addr, uid, deviceID, token string,
-	deviceFlag frame.DeviceFlag,
-) (*frame.ConnackPacket, error) {
+// ConnectAuthenticatedContext uses a provisioned device token without disabling
+// product authentication. The harness never logs or persists token input.
+func (c *WKProtoClient) ConnectAuthenticatedContext(ctx context.Context, addr, uid, deviceID, token string, flag frame.DeviceFlag) (*frame.ConnackPacket, error) {
 	if c == nil {
 		return nil, fmt.Errorf("wkproto client: nil client")
 	}
@@ -67,8 +85,9 @@ func (c *WKProtoClient) ConnectWithTokenContext(
 
 	inner, err := wkclient.New(wkclient.Config{
 		Addr:                   addr,
-		OperationTimeout:       defaultWKProtoTimeout,
-		AckTimeout:             defaultWKProtoTimeout,
+		Dialer:                 c.dialer,
+		OperationTimeout:       c.operationTimeout,
+		AckTimeout:             c.operationTimeout,
 		InboundFrameBufferSize: 1024,
 	})
 	if err != nil {
@@ -77,7 +96,7 @@ func (c *WKProtoClient) ConnectWithTokenContext(
 	connack, err := inner.Connect(ctx, wkclient.ConnectOptions{
 		UID:        uid,
 		DeviceID:   deviceID,
-		DeviceFlag: deviceFlag,
+		DeviceFlag: flag,
 		Token:      token,
 	})
 	if err != nil {
@@ -117,11 +136,11 @@ func (c *WKProtoClient) SendFrame(f frame.Frame) error {
 		go publishSendAck(future, ackCh, closeCh)
 		return nil
 	case *frame.PingPacket:
-		ctx, cancel := context.WithTimeout(context.Background(), defaultWKProtoTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), c.operationTimeout)
 		defer cancel()
 		return inner.Ping(ctx)
 	case *frame.RecvackPacket:
-		ctx, cancel := context.WithTimeout(context.Background(), defaultWKProtoTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), c.operationTimeout)
 		defer cancel()
 		return inner.RecvAck(ctx, pkt.MessageID, pkt.MessageSeq)
 	default:
@@ -135,7 +154,7 @@ func (c *WKProtoClient) ReadFrame() (frame.Frame, error) {
 	if err != nil {
 		return nil, err
 	}
-	timer := time.NewTimer(defaultWKProtoTimeout)
+	timer := time.NewTimer(c.operationTimeout)
 	defer timer.Stop()
 
 	select {
@@ -164,26 +183,34 @@ func (c *WKProtoClient) ReadFrame() (frame.Frame, error) {
 
 // ReadSendAck reads one send-ack packet.
 func (c *WKProtoClient) ReadSendAck() (*frame.SendackPacket, error) {
+	ack, _, err := c.ReadSendAckWithTiming()
+	return ack, err
+}
+
+// ReadSendAckWithTiming retains the shared client's process-local pending,
+// socket-write-start and decoded-ACK observations for the same matched SEND.
+// The returned packet is still the synthetic future bridge, not wire-order proof.
+func (c *WKProtoClient) ReadSendAckWithTiming() (*frame.SendackPacket, wkclient.SendResult, error) {
 	_, ackCh, _, closeCh, err := c.session()
 	if err != nil {
-		return nil, err
+		return nil, wkclient.SendResult{}, err
 	}
-	timer := time.NewTimer(defaultWKProtoTimeout)
+	timer := time.NewTimer(c.operationTimeout)
 	defer timer.Stop()
 
 	select {
 	case result := <-ackCh:
 		if result.err != nil {
-			return nil, result.err
+			return nil, result.observation, result.err
 		}
 		if result.ack == nil {
-			return nil, fmt.Errorf("wkproto client: sendack result is empty")
+			return nil, result.observation, fmt.Errorf("wkproto client: sendack result is empty")
 		}
-		return result.ack, nil
+		return result.ack, result.observation, nil
 	case <-closeCh:
-		return nil, fmt.Errorf("wkproto client: not connected")
+		return nil, wkclient.SendResult{}, fmt.Errorf("wkproto client: not connected")
 	case <-timer.C:
-		return nil, context.DeadlineExceeded
+		return nil, wkclient.SendResult{}, context.DeadlineExceeded
 	}
 }
 
@@ -193,7 +220,7 @@ func (c *WKProtoClient) ReadRecv() (*frame.RecvPacket, error) {
 	if err != nil {
 		return nil, err
 	}
-	timer := time.NewTimer(defaultWKProtoTimeout)
+	timer := time.NewTimer(c.operationTimeout)
 	defer timer.Stop()
 
 	select {
@@ -280,7 +307,7 @@ func publishSendAck(future *wkclient.SendFuture, ackCh chan<- sendAckResult, clo
 		err = nil
 	}
 	select {
-	case ackCh <- sendAckResult{ack: ack, err: err}:
+	case ackCh <- sendAckResult{ack: ack, observation: result, err: err}:
 	case <-closeCh:
 	}
 }
@@ -315,8 +342,9 @@ func sendResultToPacket(result wkclient.SendResult) *frame.SendackPacket {
 }
 
 type sendAckResult struct {
-	ack *frame.SendackPacket
-	err error
+	ack         *frame.SendackPacket
+	observation wkclient.SendResult
+	err         error
 }
 
 type recvResult struct {

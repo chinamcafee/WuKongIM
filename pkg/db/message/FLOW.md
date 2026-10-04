@@ -1,128 +1,149 @@
-# pkg/db/message Flow
+---
+scope: package
+summary: Stores Channel message logs, indexes, checkpoints, retention state, snapshots, and compatibility leases on the shared DB engine.
+---
 
-`pkg/db/message` owns channel-scoped message log storage on top of the shared
-`pkg/db/internal` primitives.
+# Message Database Flow
 
-Current flow:
+## Responsibility
+`pkg/db/message` persists node-local Channel logs with canonical leases, atomic append/follower apply,
+indexes, checkpoints, history, retention, inspection and portable backup/restore on `pkg/db/internal`.
 
-1. `MessageDB` wraps the message Pebble engine and owns one channel registry.
-   Database operation guards reject new work during close; close drains admitted
-   operations and background commit pins before detaching entries and closing
-   the physical engine exactly once. Compatibility storage metrics use the same
-   global operation guard so snapshots cannot overlap physical close.
-2. `Channel` returns a distinct, idempotently closable `ChannelLog` lease. All
-   leases for the same active key and identity share one canonical
-   `channelEntry`, including its immutable append-key cache, append mutex,
-   checkpoint mutex, and LEO state. Lease close waits for its admitted
-   operations; the last lease or pin compare-deletes and reclaims the entry.
-   `MessageDB.ChannelEntryMetricsSnapshot` and the compatibility `Engine`
-   surface expose aggregate active-entry, lease, background-pin, acquisition,
-   release, and reclamation counts. These metrics are database-wide and never
-   carry channel keys or identities as labels.
-3. `ChannelLog.Append` acquires one operation guard, serializes appends on the
-   canonical entry, assigns contiguous
-   sequences, validates strict duplicate constraints, and writes header/payload
-   row families plus secondary indexes atomically.
-   The unique idempotency index is scoped to `(channel key, client_msg_no)`;
-   sender UID remains message content and is not part of that key. Duplicate
-   keys inside one append or across concurrent appends fail before a second row
-   can be committed.
-4. `ChannelLog.LEO` lazily recovers the last durable sequence by scanning the
-   primary row keyspace after reopen or after a canonical entry is reclaimed
-   and reacquired.
-5. `ChannelLog.Read` and `ReadReverse` scan primary rows by sequence and
-   materialize messages from header/payload families.
-   `ChannelLog.GetLastVisibleMessage` uses reverse iteration over the channel
-   row keyspace to fetch the newest message above a visibility boundary without
-   scanning the full channel or recovering LEO.
-6. `GetByMessageID`, `ListByClientMsgNo`, and `LookupIdempotency` use typed
-   secondary indexes and verify indexed rows before returning. The shared
-   message engine also maintains a global `message_id` index so node-local
-   newest-message pages are bounded by page size instead of channel count;
-   truncation and retention remove that index entry atomically with the row.
-   A version marker gates reads while a resumable, idempotent background
-   backfill adds index entries for databases created before the index existed.
-   The backfill persists its channel/message cursor with each bounded batch and
-   pauses between batches; callers receive an explicit building error instead
-   of a partial page. Reads also bound raw index scans and delete dangling
-   projection keys left by concurrent truncate/backfill races.
-7. Checkpoint, epoch history, and snapshot payload APIs store channel system
-   state under the message system keyspace; snapshot install persists payload,
-   checkpoint, and epoch point in one batch.
-8. `ApplyFetch` applies fetched records plus optional checkpoint/history in one
-   batch with an explicit base sequence conflict check.
-9. Truncate and retention deletes remove primary rows and secondary indexes
-   together; bounded retention trims can advance physical deletion in multiple
-   batches while retention state preserves LEO across reopen after prefix trim.
-10. Catalog entries are updated by durable append/system mutations and can be
-   listed through `MessageDB.ListChannels`, paged with
-   `MessageDB.ListChannelsPage`, or paged through the compatibility
-   `Engine.ListChannelsPage` surface for Node-owned cleanup loops.
-11. Read-only inspect APIs page catalog channels directly by catalog key and
-    scan channel messages through raw `(MessageDB, ChannelKey)` readers. They
-    own a database operation guard but never acquire or populate a channel
-    registry entry.
-12. The compatibility `Engine` / `ChannelStore` surface adapts legacy
-    `pkg/channel` record, checkpoint, history, retention, committed-cursor, and
-    query callers onto the typed `ChannelLog` core while keeping seq/offset
-    conversion at the channel boundary. Sequence message scans preserve the
-    caller context through forward and reverse row iteration, so canceled HTTP
-    or RPC reads do not continue as background storage work. Every `ForChannel`
-    call returns a distinct lease; closing one store cannot close another lease
-    or the shared engine, and closed stores return `channelcompat.ErrClosed`.
-13. Compatibility append/apply commits transfer canonical append locks,
-    every checkpoint lock acquired for the request, and one background pin per
-    entry to a terminal commit owner. The checkpoint lock transfer is preserved
-    even when a requested HW update is already a durable no-op; row-only writes
-    must not orphan that lock. Caller cancellation stops waiting but cannot
-    release those resources before build, physical commit, publish, or
-    coordinator shutdown reaches a terminal state. Finalization unlocks
-    checkpoint then append locks before releasing pins.
-14. The commit coordinator observer emits
-    low-cardinality queue depth/capacity, batch, and logical request wait
-    measurements, splitting leader append and follower apply lanes, without
-    changing durable commit semantics. The coordinator can optionally route
-    requests across partition-hashed shards; the default is one shard, and
-    each shard still uses synchronous physical commits. Batch helpers reject
-    duplicate canonical entries before writes, group work by `Engine` in
-    request order, and never hold channel locks from different physical engines
-    simultaneously. If caller cancellation leaves an admitted group running to
-    terminal completion, all remaining Engine groups fail before taking locks.
-    Multi-entry lock acquisition releases the partial set and retries when any
-    later entry is busy, so one batch never waits while holding an earlier
-    channel lock. Checkpoint-only batches take checkpoint locks without append
-    locks and retain their entries through the same terminal commit ownership.
-    Each Engine group publishes all channel frontiers only after its shared
-    physical commit succeeds.
-15. Canonical checkpoint locking serializes all checkpoint stores and
-    apply/snapshot staging. `StoreCheckpointHWMonotonic` performs a locked
-    read-modify-write that initializes a missing checkpoint (including an
-    explicit first HW of zero), never regresses HW, and preserves epoch and
-    log-start fields.
-16. Durable payloads use FNV-64a payload hashes so
-    handler idempotency checks compare the same value that was encoded into the
-    `channel.Record` payload.
-17. Message rows persist `ServerTimestampMS`, `FromUID`, `ClientMsgNo`, setting,
-    topic, expiry, framing flags, and `Payload` so conversation display and
-    upper-layer semantic idempotency checks can read durable fields from the
-    message log instead of transient committed events. `ServerTimestampMS` is a
-    separate durable header column from the legacy `Timestamp` field; old rows
-    without the new column decode `ServerTimestampMS` as zero, and new leader
-    appends default it at the DB boundary when callers omit it.
-18. Full-backup readers pin one engine view and stream a portable, checksummed
-    hash-slot payload containing every committed message through the selected
-    HW, plus checkpoint, epoch history, retention state, and idempotency fields.
-    The count pass derives the exact message-row count and maximum message ID
-    from the same pinned view; restore parsing independently recomputes both.
-19. Restore imports one complete snapshot into a fresh isolated database in
-    bounded batches. An exact retry is idempotent, any different pre-existing
-    Channel checkpoint is a conflict, and final verification checks live
-    checkpoint/LEO state plus deterministic snapshot content before a replica
-    acknowledges staging.
-20. Restore failure cleanup removes every Channel row, global/local secondary
-    index, checkpoint/history/retention record, and catalog entry before retry.
-    Message and index deletion is paged in batches of at most 1024 rows and
-    approximately 8 MiB of payload.
-21. Schema and key helpers define the durable message table layout.
+Compatibility maps Channel records/offsets and pinned retained Will receipts without transferring engine ownership or cluster authority.
 
-Storage code in this package must not import Pebble directly.
+## Boundaries
+- Pebble-specific code stays under `pkg/db/internal`; direct Pebble imports are forbidden.
+- `MessageDB` owns one registry and physical engine. Each `Channel` or
+  `ForChannel` call returns an independently closable lease over a shared
+  canonical entry.
+- Channel quorum and visibility policy remain in `pkg/channel`; this package
+  persists caller-supplied records, progress, and retention state atomically.
+- Schema changes follow the parent storage compatibility contract.
+
+## Main Flows
+
+1. Acquiring a Channel reuses one canonical entry; append and follower apply
+   transfer its locks/pins to terminal commit ownership, validate sequences and
+   duplicates, synchronously commit compatible batches, then publish all rows,
+   indexes, checkpoints, history, and frontiers atomically.
+   Exact quorum proposals persist versioned authority, command, range,
+   predecessor, entry identities, and paired command/range indexes in that same
+   synchronous commit; replica HW may advance atomically with its proposal.
+2. Reads scan complete primary rows or verified typed indexes, recover LEO
+   lazily after reopen/reclamation, and use bounded durable verification for
+   idempotency and newest-message lookup. Newest-first primary reads iterate
+   natively in reverse and stop while scanning at `Limit` or `MaxBytes`. A
+   single-row bounded read first uses the exact durable sequence when supplied;
+   a missing row retains predecessor scanning, while corruption and I/O errors
+   fail immediately. Unresolved or maximum sequence bounds keep the range scan. Reads
+   must never materialize the complete Channel history before truncation.
+   Catalog pages follow encoded key order; skip only the exact cursor key.
+   Remote client-number lookups additionally cap inspected index entries and
+   payload bytes, failing explicitly rather than returning partial matches.
+3. Snapshot, backup, restore, truncation, retention, and close stream or mutate
+   bounded batches while keeping rows, indexes, catalog, system state, leases,
+   and physical engine ownership consistent.
+
+## Invariants and Failure Semantics
+- Offline helpers preserve optional publication column 21 and verify proposal
+  formats 1–6. Format 2 binds Expire; format 3 also binds publication metadata;
+  format 4 exclusively binds one canonical internal source activation record.
+  Metadata uses compatibility record codec 2; native codec-1 bytes stay unchanged.
+  Matched runtimes, tooling and full-generation rollback are required. Import adds no empty-key exception, uniqueness relaxation,
+  or recovery path and rejects values the native runtime cannot represent.
+  Inspection includes independently owned publication bytes only when present.
+- A sparse SyncOnce ordinal index (ID 7, complete marker system ID 11) excludes
+  internal records from badge rank queries. Existing primary rows are rebuilt in
+  bounded batches before the marker is published; channel append ownership
+  serializes writers and rank reads. A range count shares one bounded iterator
+  across both ranks and proves an empty index once, preserving the retained
+  ordinal baseline without caching unread results. Once the complete index is
+  proven empty, a constant-size canonical/warm proof avoids repeated storage
+  reads while preserving cancellation and engine lifecycle checks. SyncOnce
+  staging invalidates it before commit; restore discard and backup-import
+  generations fence active and retired entries. All append, replacement, truncate
+  and retention paths maintain the index. Portable backups omit the marker and
+  rebuild derived entries during import; raw snapshots preserve both together.
+  Matched runtimes are required after publication; older writers cannot maintain
+  this derived keyspace.
+- Sequences are contiguous and monotonic. A durable append updates its primary
+  row, global message-ID index, idempotency/client index, sender index, and
+  catalog as one atomic unit where applicable.
+- A 32,768-entry bounded warm cache retains LEO, idempotency membership, and the
+  last committed exact proposal/entry identity across Channel lease reclamation.
+  It also shares immutable encoded keys across matching identity generations;
+  retained key backing arrays have a separate 16 MiB LRU bound. Reacquisition
+  always creates a fresh mutable entry and independently closable lease.
+  Fresh exact extensions with node-scoped message-ID allocation proof may
+  validate that immutable tail in memory; restart, eviction, replay, recovery,
+  suffix mutation, or an invalidated LEO falls back to durable validation.
+- Server-allocation proof may skip only existing message-ID reads. In-batch
+  duplicate IDs and durable sender/client idempotency remain mandatory.
+- Exact retries return only durable, already-durable, definitely-not-written,
+  conflict, or outcome-unknown. Durable indexes remain authoritative across
+  cache eviction, prefix retention, and reopen; incomplete manifests, chains,
+  overlaps, or checkpoints above LEO are corruption.
+- Idempotency filter negatives may avoid a read; possible hits always verify
+  durable index and message data. Saturation can increase reads, never admit a
+  duplicate.
+- Native index 4 retains channel/client uniqueness; sequence index 3 preserves all imported/history matches and is maintained by append/trim/truncate. Runtime batching coalesces identical retries while serializing conflicting bodies/senders.
+- Keyed Wills derive unique index 8 from publication metadata and UID; client
+  index 3 preserves history lookup while native index 4 stays separate. Will
+  uniqueness uses durable point proofs without the native negative filter. System 16 atomically retains compact Will receipts across prefix trim; still-present legacy originals can materialize them during trim, while suffix rollback removes matching receipts.
+- Caller cancellation stops waiting but cannot release commit-owned locks or
+  pins before build, physical commit, publish, or terminal shutdown.
+- Retention and truncation remove primary and secondary rows together. Logical
+  retention preserves canonical lookup state until physical deletion.
+  MQTT System 12 clamps physical trim at copied-through independently of logical visibility.
+  Bounded original reads fence incarnation/HW and reject gaps; local CAS proves no distributed authority.
+  Format 4's System 13 protects pending prefixes; HW atomically creates System 12.
+  Duplicates preserve the first boundary; only uncommitted suffixes can replace it.
+  Backups skip pending controls and validate committed source/manifest pairs.
+  Source/checkpoint reads pin activation/source/HW; admission requires a covered control.
+  Replay table 2 atomically stores canonical content/counters; index 2 meters ranges.
+  Preparation returns covered pages before extending, preserving short-page retries.
+  Transfer requires committed log proofs plus an independent full-content digest;
+  native hashes omit fields. Local copy/import never advances System 12 or proves quorum.
+  Format-5 anchors journal controls in System 14; pinned source/latest reads optionally
+  include exact command lookup; planning also proves at most 64 maintenance-tail positions. Trims retain journals; suffix replacement
+  removes pending entries. Backups require matching journals and format versions.
+  Anchor repair verifies local journals under append/checkpoint ownership; repair exports reach the endpoint. Consumer reads verify that endpoint and native identities, returning typed short pages and explicit control classification.
+  Repair planning verifies coverage/cursors, scans at most 64 journals and returns one bounded interval or explicit continuation.
+  Readiness binds captured HW/latest anchor to local coverage; repair/planning/readiness never release sources or advance HW.
+  Explicit anchor release verifies committed/local prefix proofs under append/checkpoint ownership, then advances only System 12.
+  Format-6 retirement journals in System 15 retain whole-anchor decisions and monotonic prefixes.
+  Pinned latest retirement reads use HW-bounded reverse seek and independent source/proposal proofs; suffix replacement and backup preserve journals.
+  Retirement selection pins a captured anchor and scans at most 64 older journals per call, with verified backward continuations.
+  Explicit retirement verifies its committed decision, atomically storing table-2 System-2 baseline/deletion progress and bounded row/meter removal.
+  Suffix hashing, repair and readiness retain cumulative counters; historical cuts cannot borrow later retirement authority.
+  Suffix cuts never split proposals; recovery replacement is fenced by the
+  inspected frontier and atomically replaces complete verified proposal pages.
+- Queue-depth publication is monotonic through grouped collection and terminal
+  zero. Backup includes committed proposal/entry identities and excludes the
+  uncommitted suffix above the selected HW.
+- Monotonic checkpoint updates preserve epoch/log-start fields. Protected sources
+  require an intact explicit checkpoint on every load; missing or inconsistent
+  evidence cannot be recreated by a writer. Raw setters also reject protected HW
+  regression. Suffix cuts hold append then checkpoint locks through commit.
+- Retention reads reuse immutable state in the bounded canonical/warm registry.
+  A database-wide generation disables hits/fills during overlapping retention
+  mutations, truncation, recovery replacement, discard and either backup import
+  path, and invalidates before and after every attempted mutation. Ordinary
+  append does not invalidate unchanged retention state; cancellation, close and
+  durable decoding errors remain visible.
+- Close drains admitted operations/pins and closes the engine once; one lease cannot close another. Offline `HasMQTTState` skips ordinary keyspaces and detects replay/source/funding/Will evidence even without a catalog or Session.
+- Backup count and content come from one pinned view; restore is exact-retry
+  idempotent, conflicts with different state, and cleans partial rows in bounded
+  batches before retry.
+  Native/full/pruned/Will-receipt backups use versions 1/2/3/4. Byte and streaming imports share preflight for chains, originals/trim proof and immutable target receipts; allocation high-water statistics include receipts.
+  Restore rebuilds meters without global IDs, publishing baseline/frontier together after the suffix; legacy header frontiers wait until then.
+
+Message System 17 stores derived source-shared original plus future replay charges; System 18 stores one exact prepared/consumed/canceled funding ticket per Channel. Preparation/cancellation and charge rows commit atomically. One node-owned unknown physical proof survives handle reclamation; only exact charge witnesses or canceled/deleted proof settles it. Periodic exact cancellation skips busy locks, shares normal original-presence checks and transfers locks/pins to the existing managed commit owner; caller expiry retains charged proof. Suffix replacement excludes an unresolved refund on the same Channel. Restart/restore scans canonical sources in bounded pages, rebuilds charges and retains unknown debt. Only independently verified native control formats 4–7 are uncharged; ordinary SyncOnce content is charged.
+
+## Read First
+- [Database lifecycle](db.go), [Channel lease](channel_log.go), [Atomic append](append.go), [Indexes](indexes.go), [Snapshots](snapshot.go)
+
+## Update Triggers
+
+Update when durable rows/indexes, lease ownership, commit locking, checkpoints or retention change,
+backup/restore coverage changes, or the Channel compatibility contract changes.

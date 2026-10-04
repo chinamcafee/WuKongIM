@@ -1,0 +1,273 @@
+---
+title: C++ 快速接入
+description: 按准备、安装、连接、收发和清理顺序完成首次接入。
+---
+
+使用 C++17、CMake 和 WuKongEasySDK **WK_EASYSDK_CPP_VERSION** 完成在线收发。主流程采用 WuKongIM 维护的 vcpkg registry；其他安装方式见文末。
+
+## 1. 准备接入
+
+按[认证与 Token](/zh/guide/integration/authentication)让受信业务后端分别提供两人的 `uid`、`token` 和 `websocketUrl`。客户端只连接 Gateway，不调用 WuKongIM HTTP API 管理接口。设备线路值为 APP `0`、WEB `1`、PC/Desktop `2`；C++ 默认 Desktop，后端保存 Token 时必须使用相同设备类别。
+
+开发机默认示例地址为 `ws://127.0.0.1:5200`，路径是 `/`。如果 listener 或代理配置了 `/ws`，才使用 `ws://127.0.0.1:5200/ws`。跨机器时用客户端实际可达地址，生产使用 `wss://`。通用环境步骤见[运行官方示例](/zh/sdk/easy/examples)。
+
+服务端、测试账号与地址的公共准备步骤见[运行官方示例](/zh/sdk/easy/examples)。准备完成后，继续下面的安装步骤。
+
+## 2. 安装 SDK
+
+先安装 [vcpkg](https://learn.microsoft.com/zh-cn/vcpkg/get_started/get-started)，
+将 `VCPKG_ROOT` 指向安装目录。准备 Git、CMake 3.20+ 和 C++17 编译器：
+Windows 使用 Visual Studio 2022，macOS 使用 Xcode 命令行工具，Linux 使用 GCC/Clang。
+本文固定 vcpkg 工具版本为 `WK_EASYSDK_CPP_VCPKG_BASELINE`。
+
+在你的应用目录创建 `vcpkg.json`：
+
+```json
+{"dependencies": ["wukong-easy-sdk"]}
+```
+
+`vcpkg-configuration.json`:
+
+```json
+{
+  "default-registry": {
+    "kind": "git",
+    "repository": "https://github.com/microsoft/vcpkg",
+    "baseline": "WK_EASYSDK_CPP_VCPKG_BASELINE"
+  },
+  "registries": [
+    {
+      "kind": "git",
+      "repository": "https://github.com/WuKongIM/WuKongEasySDK-CPP.git",
+      "baseline": "WK_EASYSDK_CPP_REGISTRY_BASELINE",
+      "packages": [
+        "wukong-easy-sdk"
+      ]
+    }
+  ]
+}
+```
+
+在自己的 `main.cpp` 旁添加 `CMakeLists.txt`：
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(my_app LANGUAGES CXX)
+find_package(WuKongEasySDK WK_EASYSDK_CPP_CMAKE_VERSION CONFIG REQUIRED)
+add_executable(my_app main.cpp)
+target_link_libraries(my_app PRIVATE WuKongEasySDK::WuKongEasySDK)
+```
+
+
+
+
+vcpkg 会自动安装 SDK、Boost、OpenSSL 和 JSON，无需手动逐个安装。
+首次构建可能需要编译依赖并耗时数分钟，这不是预编译压缩包。
+SDK port 为静态库；Windows 使用 `x64-windows` 时，分发应用需要携带构建时复制到程序旁的依赖 DLL。
+
+这是 WuKongIM 在本仓库维护的公开 Git registry，不是微软默认目录中的包，
+因此必须同时提供 registry 配置和依赖声明。SDK 源码固定为
+`WK_EASYSDK_CPP_SOURCE_REF`，与 registry baseline 分别固定。
+将两个 JSON 文件提交到应用仓库；已有 manifest 的项目应合并字段，不要覆盖原有依赖。
+
+[独立消费端示例](https://github.com/WuKongIM/WuKongEasySDK-CPP/tree/main/examples/vcpkg-consumer) · [Registry 维护说明](https://github.com/WuKongIM/WuKongEasySDK-CPP/blob/main/docs/VCPKG.md)
+
+## 3. 连接与监听
+
+将下方完整程序保存为 `main.cpp`。从环境读取自己的 `WKIM_URL`、`WKIM_UID`、`WKIM_TOKEN`，第一个命令行参数是对方 UID。
+
+```cpp
+#include <wukong/wkim.hpp>
+#include <cstdlib>
+#include <iostream>
+
+int main(int argc, char** argv) {
+    const char* token = std::getenv("WKIM_TOKEN");
+    const char* url = std::getenv("WKIM_URL");
+    const char* uid = std::getenv("WKIM_UID");
+    if (!token || !url || !uid || argc != 2) return 2;
+    try {
+        wukong::Options options;
+        options.connectionTimeout = std::chrono::seconds(10);
+        options.requestTimeout = std::chrono::seconds(15);
+        wukong::WKIM im(url, {uid, token}, options);
+
+        auto messageListener = im.on(wukong::WKIMEvent::Message,
+            [](const wukong::Json& message) {
+                // Copy message.at("payload") into your application's UI/event queue.
+                // This callback runs on the SDK I/O thread.
+                (void)message;
+                std::cout << "Message received\n";
+            });
+        auto errorListener = im.on(wukong::WKIMEvent::Error,
+            [](const wukong::Json&) {
+                // Dispatch a sanitized failure state to the application.
+            });
+
+        im.connect().get();
+        std::cout << "Connected. Start the peer, then press Enter to send.\n";
+        std::cin.get();
+        wukong::SendOptions sendOptions;
+        // Supply a stable clientMsgNo when the application needs reconciliation.
+        auto ack = im.send(argv[1], wukong::WKIMChannelType::Person,
+                          {{"type", 1}, {"content", "Hello from C++!"}},
+                          sendOptions).get();
+        if (ack.reasonCode == 1) std::cout << "SEND completed\n";
+        std::cin.get();
+
+        im.off(messageListener);
+        im.off(errorListener);
+        im.disconnect().get();
+        im.destroy().get();
+    } catch (const wukong::Error&) {
+        std::cerr << "EasySDK operation failed\n";
+        return 1;
+    }
+}
+```
+
+`connect()` 只在鉴权完成后成功。群聊使用 `WKIMChannelType::Group`，由业务后端预先建立 Channel 和成员关系。Payload 接受 JSON 对象或数组，按 UTF-8 JSON 编码为 Base64；接收兼容对象、JSON 文本和 Base64 JSON。消息 ID 保持字符串，避免 64 位整数精度损失。
+
+发送结果包括 `messageId`、`messageSeq` 和 `reasonCode`。接收事件还包含 `header`、秒级 `timestamp`、`channelId`、`channelType`、`fromUid` 和 `payload`。自动 RECVACK 携带 `messageId` 与 `messageSeq`；这是传输确认，不能代替业务已读。发送成功、对端接收和业务处理的区别见[消息收发](/zh/guide/integration/messaging)。
+
+## 4. 收发第一条消息
+
+```sh
+# Linux / macOS
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release --parallel 2
+```
+
+```powershell
+# Windows / Visual Studio 2022
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows
+cmake --build build --config Release --parallel 2
+```
+
+构建后，在两个分别设置好连接材料的终端运行：
+
+```sh
+# Alice
+./build/my_app bob
+# Bob
+./build/my_app alice
+```
+
+Windows 使用 `build/Release/my_app.exe`。双方显示 `Connected` 后各按一次 Enter 发送，观察 `SEND completed` 和对端的 `Message received`，确认双向结果后再按 Enter 退出。
+
+两端都连接成功后，Alice 向 `bob` 发送，Bob 在消息回调中核对发送者和正文；再由 Bob 向 `alice` 回发。发送结果表示服务端接受请求，不能代替对端接收或已读。
+
+## 5. 清理连接
+
+每个实例拥有一个身份和一条 I/O 线程，没有全局单例。公共操作支持应用线程并发调用；事件在 I/O 线程串行分发。回调可以发起异步操作，但**不能在回调中等待 SDK future**。将 UI 更新和耗时工作交给应用自己的执行器。
+
+| 操作 | 语义 |
+| --- | --- |
+| `on(...)` / `off(listenerId)` | 保存并移除监听 ID；已经开始分发的回调仍可能结束执行 |
+| `connect()` | 并发连接调用共享同一次鉴权；已连接时返回当前结果 |
+| `disconnect()` | 取消待处理请求、socket、心跳与重连；随后可重新连接 |
+| `destroy()` | 终结实例，后续操作拒绝，可重复调用 |
+| 析构 | 发起清理并等待线程；回调内析构会在回调结束后完成线程退出 |
+| 更换账号、Token 或地址 | 关闭旧实例，再创建新实例 |
+
+回调捕获的数据应活到客户端关闭之后。捕获 SDK 自身时使用 `weak_ptr` 防止引用环。移除监听后仍需完成关闭，才能释放被捕获的应用状态。SDK 直接取消 socket，清理不等待对端的 close 握手。
+
+## 6. 常见问题
+
+默认连接总超时 10 秒，请求超时 15 秒，心跳间隔 25 秒，Pong 超时 10 秒。同 ID 的 `result: null` 满足心跳确认。曾成功鉴权的连接意外断开后最多重试 5 次，指数退避从 1 秒增长到最多 30 秒并加入抖动。首次连接失败交还调用方；鉴权失败、服务端主动断开、畸形协议和手动退出停止自动重试。
+
+默认最多 1,024 个待处理请求，命令队列和 WebSocket 写队列分别限制为 4 MiB，单条线路消息限制为 1 MiB。容量不足返回 `ErrorCode::QueueFull`；本地错误使用负数，服务端原因码保留在 `Error::code()`。超时和断线可能导致发送结果未知，应按 `clientMsgNo` 对账。SDK 不离线排队或自动重发。
+
+WSS 默认启用证书链和主机名验证，最低 TLS 1.2。私有 CA 可通过 `Options::caFile` 指定 PEM 文件；控制台读取 `WKIM_CA_FILE`。没有跳过证书校验的配置。SDK 默认静默，不记录 Token、Payload、URL、原始帧、服务端响应文本或底层异常对象。
+
+通过 `WKIMEvent::CustomEvent` 接收 `id`、`type`、毫秒级 `timestamp` 和 `data`；JSON 字符串 data 会被解析。事件接收能力仍取决于服务端是否产生对应通知。
+
+## 其他安装方式：预编译包
+
+希望跳过依赖编译时，从 [C++ SDK WK_EASYSDK_CPP_TAG Release](https://github.com/WuKongIM/WuKongEasySDK-CPP/releases/tag/WK_EASYSDK_CPP_TAG) 下载匹配的 ZIP 和 `SHA256SUMS`，验证 SHA-256 后解压。只需准备 CMake 3.20+ 和匹配的 C++ 开发环境，无需另装 vcpkg。
+
+| 压缩包后缀 | 对应环境 |
+| --- | --- |
+| `linux-x64-gcc13.zip` | Ubuntu 24.04 x64、GCC 13、libstdc++ C++11 ABI、glibc 2.39+ |
+| `macos-arm64-appleclang.zip` | macOS 14+ arm64、Apple Clang、libc++ |
+| `windows-x64-msvc143-md.zip` | Windows x64、Visual Studio 2022 v143；Release `/MD`、Debug `/MDd` |
+
+包名统一以 `WuKongEasySDK-CPP-WK_EASYSDK_CPP_VERSION-` 开头。包内包含 Debug/Release 静态 SDK、Boost/JSON 头文件、OpenSSL 库、许可文件和最小示例。在解压目录执行：
+
+```sh
+# Linux / macOS
+cmake -S example -B build -DCMAKE_TOOLCHAIN_FILE="$PWD/wukong-sdk.cmake" -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release --parallel 2
+ctest --test-dir build -C Release --output-on-failure
+```
+
+```powershell
+# Windows / Visual Studio 2022
+cmake -S example -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$PWD/wukong-sdk.cmake"
+cmake --build build --config Release --parallel 2
+ctest --test-dir build -C Release --output-on-failure
+```
+
+`wukong_example` 验证初始化和销毁；`wukong_chat` 可使用下节的 Alice/Bob 凭据交互收发。接入自己的应用时，保持上面的 `find_package` 和 `target_link_libraries`，将 CMake 的 toolchain 指向解压目录中的 `wukong-sdk.cmake`。
+
+Unix 的 OpenSSL 为静态库；Windows 使用包内 DLL，发布应用时携带 CMake 复制到可执行文件旁的 DLL，并安装匹配的 Visual C++ Redistributable。Debug 运行库只用于开发。**预编译包使用 WSS 时，通过 `Options::caFile`（交互示例为 `WKIM_CA_FILE`）显式提供受维护的 CA 证书包**，不要依赖 OpenSSL 构建机的默认证书路径。
+
+`BUILD_INFO.json` 记录 SDK 源码、registry 和打包提交；`FILES.sha256.json` 校验解压内容。升级时下载到新目录、校验哈希、使用新的 build 目录重新构建和验收，将应用与依赖一起更新，保留旧版本以便回滚。其他编译器、架构、CRT 或依赖组合使用 vcpkg/源码方式，不能任意混用二进制依赖。
+
+## 其他安装方式：源码构建
+
+要求 CMake 3.20+、C++17 编译器、Boost 1.74+、OpenSSL 1.1.1+、nlohmann/json 3.11+。实际产品应选择仍受维护并包含安全修复的版本。
+
+```sh
+git clone https://github.com/WuKongIM/WuKongEasySDK-CPP.git
+cd WuKongEasySDK-CPP
+git checkout WK_EASYSDK_CPP_SOURCE_REF
+
+# macOS
+brew install cmake boost openssl@3 nlohmann-json
+# Ubuntu / Debian
+sudo apt-get install g++ cmake libboost-dev libssl-dev nlohmann-json3-dev
+
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release --parallel 2
+ctest --test-dir build -C Release --output-on-failure
+```
+
+只执行与你的平台匹配的依赖安装命令。缺少 JSON 系统包时 CMake 获取固定的上游 3.11.3 commit；离线构建请预装依赖并设置 `WUKONG_FETCH_JSON=OFF`。
+
+Windows 使用 Visual Studio 2022 和 vcpkg，仓库 `vcpkg.json` 固定 baseline：
+
+```powershell
+git -C "$env:VCPKG_ROOT" fetch origin WK_EASYSDK_CPP_VCPKG_BASELINE
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows
+cmake --build build --config Release --parallel 2
+ctest --test-dir build -C Release --output-on-failure
+```
+
+在应用 CMake 中接入源码：
+
+```cmake
+add_subdirectory(external/WuKongEasySDK-CPP)
+target_link_libraries(my_app PRIVATE WuKongEasySDK::WuKongEasySDK)
+```
+
+也可执行 `cmake --install build --config Release --prefix /path/to/sdk-prefix`，在下游用 `find_package(WuKongEasySDK WK_EASYSDK_CPP_CMAKE_VERSION CONFIG REQUIRED)`，并将 `CMAKE_PREFIX_PATH` 指向安装目录。静态库导出保留第三方依赖；Windows 分发需要携带所用的动态依赖。
+
+## 运行预编译包或源码中的交互示例
+
+两个终端分别通过环境变量 `WKIM_TOKEN` 提供各自后端签发的 Token，然后运行：
+
+```sh
+# Alice 的终端
+./build/wukong_chat ws://127.0.0.1:5200 alice bob
+# Bob 的终端
+./build/wukong_chat ws://127.0.0.1:5200 bob alice
+```
+
+两端都显示 `Connected` 后输入文本，观察对端的 `Message`，再反向发送。`SEND completed` 代表 SENDACK 成功。输入 `/quit` 断开并释放资源。Windows 可执行文件位于 `build/Release/wukong_chat.exe`。
+
+示例主动展示业务消息内容；SDK 自身不输出日志。不要把示例终端内容直接接入生产日志采集。
+
+## 下一步
+
+继续阅读[消息收发](/zh/guide/integration/messaging)与[上线检查](/zh/guide/integration/acceptance)。需要离线恢复、会话、未读或推送时，先查看 [SDK 选择](/zh/sdk)。[版本与验证记录](https://github.com/WuKongIM/WuKongIM/blob/main/docs/superpowers/reports/2026-09-08-easysdk-validation-history.md#cpp)保留各次验证的完整环境和范围。

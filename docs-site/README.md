@@ -1,69 +1,154 @@
-# WuKongIM v3 Documentation Site
+# WuKongIM v3 documentation site
 
-This directory contains the standalone [Fumadocs](https://fumadocs.dev/)
-application for the public WuKongIM v3 documentation. Phase 1 established the
-bilingual shell and complete menu plan. Phase 2 publishes the first complete
-onboarding path: product orientation, core concepts, source-based single-node
-cluster startup, two-way message verification, and basic configuration. Phase 3
-publishes the business-integration path: responsibility boundaries,
-authentication constraints, messaging, and webhooks. Phase 4 publishes the
-server-deployment path: deployment selection, source-built Docker and Linux
-artifacts, static multi-node planning, readiness, and production checks. Phase 5
-publishes the server-configuration path: cluster identity, network contracts,
-storage and workload controls, security boundaries, observability, and an
-exhaustive bilingual TOML-to-environment reference. Phase 6 publishes the
-server-operations path: Manager safety, health and monitoring, explicit node
-onboarding and fail-closed scale-in, verified backup and restore, and
-compatibility-gated upgrades and migrations. Phase 7 publishes symptom-led
-troubleshooting plus the official wkcli, wkdb, wkbench, and bounded-diagnostics
-guides. Phase 8 publishes the server-architecture path: Controller intent and
-materialization, 256 physical hash-slot routing into logical Slot Raft Groups,
-Channel quorum commit, bounded transport, the end-to-end send flow, and
-target-fenced online routing. Phase 9 completes the guide foundation with
-workload-qualified capabilities and use cases, precise cluster/message/Channel/
-user/conversation concepts, and the current node-local plugin boundary. Phase
-10 publishes the first scenario tutorials: direct chat plus group chat through
-bounded 100,000-member membership and fanout workflows.
+This directory contains the bilingual Fumadocs site published under `/zh` and
+`/en`. It covers application integration, server deployment and operations,
+WuKongIMSDK and WuKongEasySDK, and the public API and protocol references.
+
+Use **WuKongIM HTTP API** for WuKongIM's backend-facing HTTP interface. Use
+**application API** for endpoints owned by an application backend.
 
 ## Develop
 
-Requires Bun.
+The site uses Bun `1.3.11`. The complete verification gate also needs Go
+1.22+ for the dependency-free business Webhook example.
 
 ```bash
 bun install
 bun run dev
 ```
 
-Open `http://localhost:3000`. The canonical local entry points are `/zh` and
-`/en`.
+Open `http://localhost:3000/zh` or `http://localhost:3000/en`.
+
+The JavaScript/Web SDK example is an independent Node.js `>=20.11` project:
+
+```bash
+cd examples/javascript-web-quickstart
+npm ci
+npm run dev
+```
+
+Its browser code talks to WuKongIM Gateway only. The loopback development BFF
+owns WuKongIM HTTP API calls and must be replaced by an authenticated application
+backend in production.
+
+The Go before-send Webhook example is a separate standard-library-only module:
+
+```bash
+cd examples/go-webhook
+go run .
+```
+
+See its `README.md` for direct callback requests, server configuration, business
+rules, and WuKongIM HTTP API send/history checks. `bun run sample:go-webhook:check`
+runs its fast unit tests from the documentation-site root and is part of `verify`.
+
+The MQTT development-preview example is a separate Node.js >=20.11 project
+in `examples/mqtt-quickstart`, pinned to MQTT.js. See its `README.md` for
+candidate startup and backend credential preparation. `bun run sample:mqtt:check`
+checks installation and syntax; the real-process `test/e2e/mqtt/docs_quickstart`
+scenario verifies both directions in single-node and three-node clusters. It
+does not establish persistent-session, Will or performance acceptance.
+
+## Content workflow
+
+- `lib/navigation.ts` is the bilingual publication registry. Add both `.mdx`
+  and `.en.mdx` variants for every published page.
+- `SDK_DOCUMENTATION_SPEC.md` defines the maintained full-SDK versions,
+  learning order, and writing contract.
+- `EASY_SDK_DOCUMENTATION_SPEC.md` defines the eight EasySDK quickstarts,
+  example-first learning path, and separate engineering validation history.
+- [Tutorial screenshots](TUTORIAL_SCREENSHOTS.md) records capture versions and
+  the process for refreshing real screenshots and bilingual numbered captions.
+- `lib/easy-sdk-releases.json` is the sole current EasySDK version manifest.
+  After validating a compatible released package against its tutorial, update
+  that platform's `version`. Source checkouts default to `v<version>`; optional
+  `sourceRevision` pins, and C++ `registryBaseline`, `vcpkgBaseline`, and
+  `cmakeVersion`, must be reviewed independently. A version edit is not evidence
+  of a successful SDK package or live messaging test.
+  MDX uses `WK_EASYSDK_<PLATFORM>_VERSION`, `_TAG`, and `_SOURCE_REF` (Web uses
+  `JAVASCRIPT`). C++ also has `_REGISTRY_BASELINE`, `_VCPKG_BASELINE`, and
+  `_CMAKE_VERSION`. The remark plugin resolves prose, code, Markdown links and
+  literal MDX attributes before HTML, search and Markdown generation. Keep
+  frontmatter version-neutral and use literal attributes rather than JavaScript
+  expressions for these tokens. Navigation reads the same manifest.
+  Run `bun run navigation:write` and `bun run verify` after updating it; generated
+  navigation is not edited by hand. Unknown tokens and unresolved output fail
+  verification. API, lifecycle, platform or installation changes still require
+  corresponding tutorial changes. Historical reports, fix-introduction versions
+  and server commits remain literal evidence. The Web SDK pilot discovers npm
+  releases, verifies the tutorial and proposes a PR through
+  [`easy-sdk-web-docs-sync.yml`](../.github/workflows/easy-sdk-web-docs-sync.yml);
+  see the [maintenance runbook](scripts/easy-sdk-sync/README.md). Other platforms
+  still require manual package validation and selection.
+- `redirects.json` records public route migrations. Removed pages must not be
+  retained as duplicate MDX content.
+- `NAVIGATION.md` is generated. Refresh it with `bun run navigation:write`.
+- WuKongIM HTTP API, Operations HTTP, and Webhook reference pages are generated from
+  the contracts under `contracts/`. After changing one, run
+  `bun run openapi:write` and review the generated MDX.
+
+Downloadable operator examples live under `public/examples/monitoring/` and
+`public/examples/wkbench/`. Keep both language guides aligned with these files.
+Validate monitoring files with `promtool check config` and `promtool check rules`.
+Validate benchmark inputs with the current `wkcli bench validate` command before
+publishing; validation does not start traffic. Report illustrations must remain
+explicitly separate from measured capacity results.
+
+The static API reference deliberately disables its request playground because
+the documented administrative endpoints require trusted network boundaries.
+WKProto, JSON-RPC, and other non-HTTP protocols remain regular protocol pages,
+not synthetic OpenAPI routes.
 
 ## Validate
+
+Run the complete documentation gate before committing:
 
 ```bash
 bun run verify
 ```
 
-The verification suite checks the navigation contract, redirect seed, generated
-menu plan, lint and TypeScript, static export, language-isolated search indexes,
-the inclusion of every published route, and the exclusion of planned routes
-from sitemap and LLM outputs.
+It checks focused content contracts, bilingual navigation and links, generated
+files, lint, TypeScript, the static build, search indexes, sitemap, and
+machine-readable outputs. The JavaScript example also has its own checks:
 
-## Content lifecycle
+```bash
+cd examples/javascript-web-quickstart
+npm test
+npm run build
+```
 
-- Edit the full bilingual plan in `lib/navigation.ts`.
-- Run `bun run navigation:write` to update `NAVIGATION.md`.
-- Add both `page.mdx` and `page.en.mdx` content variants before changing a menu
-  entry from `planned` to `published`.
-- Keep planned routes visible, but never include them in public indexes.
-- Treat `redirects.json` as a non-exhaustive migration seed, not a deployment
-  configuration.
+See `FLOW.md` for repository navigation and ownership boundaries.
 
-See `FLOW.md` for the publishing flow, `PHASE_1_SPEC.md` for the shell scope,
-`PHASE_2_SPEC.md` for the onboarding scope, and `PHASE_3_SPEC.md` for the
-business-integration scope. `PHASE_4_SPEC.md` defines the server-deployment
-scope, `PHASE_5_SPEC.md` defines the server-configuration scope, and
-`PHASE_6_SPEC.md` defines the server-operations scope. `PHASE_7_SPEC.md`
-defines troubleshooting and official-tool boundaries. `PHASE_8_SPEC.md`
-defines the current server-architecture boundaries. `PHASE_9_SPEC.md` defines
-the guide-foundation and plugin boundaries. `PHASE_10_SPEC.md` defines the
-direct-chat and group-tutorial boundaries.
+## Publish
+
+Merges to `main` that change `docs-site/**` automatically run
+`Safety Automation - Publish Documentation to GitHub Pages`. The Workflow pins
+Bun `1.3.11`, runs the complete `bun run verify` gate, uploads only `out/`, and
+deploys that verified artifact to the `github-pages` Environment. It can also
+be started manually after an interrupted publication.
+
+The production public URL is `https://docs.githubim.com`. The static export
+carries `public/.nojekyll` but deliberately carries no `CNAME`. With the
+Actions Pages source, repository Pages Settings/API is the sole authority for
+the custom domain.
+
+The planned production hosting path is:
+
+```text
+https://docs.githubim.com
+  -> Alibaba Cloud CDN
+  -> https://origin-docs.githubim.com
+  -> GitHub Pages
+```
+
+`docs.githubim.com` remains the public URL used by canonical metadata, the
+sitemap, and reader-facing links. GitHub Pages remains the only content origin
+and owns the TLS certificate for `origin-docs.githubim.com`; Alibaba Cloud CDN
+uses a separately renewed Let's Encrypt certificate for the public domain.
+
+The CDN refresh and certificate Workflows are disabled by default through
+`DOCS_CDN_ENABLED`. Publishing to GitHub Pages continues normally until an
+administrator provisions the external DNS, CDN, RAM/OIDC, and ACME resources,
+tests the origin, and explicitly enables the integration. See the
+[Alibaba Cloud CDN runbook](../docs/superpowers/runbooks/docs-alibaba-cdn.md)
+for configuration, cutover, validation, and rollback.

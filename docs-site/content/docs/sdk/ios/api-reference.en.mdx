@@ -1,0 +1,84 @@
+---
+title: iOS API Reference
+description: Find common WuKongIMSDK entry points, callbacks, models, and states by manager.
+---
+
+This is a lookup page for common entry points, not a replacement for the task guides. Access every manager from `[WKSDK shared]`.
+
+## SDK and configuration
+
+| API | Purpose |
+| --- | --- |
+| `[WKSDK shared]` | SDK singleton |
+| `options` | Endpoint, identity, debug, and synchronization settings |
+| `registerMessageContent:` | Register custom message content |
+| `sdkVersion` | Version running in the app |
+
+## `WKConnectionManager`
+
+| API | Purpose |
+| --- | --- |
+| `connect` | Start a connection attempt |
+| `disconnect:` | Disconnect; pass `YES` to stop automatic reconnection |
+| `logout` | Sign out and clear login information |
+| `addDelegate:` / `removeDelegate:` | Manage connection observers |
+| `getConnectAddr` | Supply a dynamic `host:port` |
+| `connectStatus` | Current `WKConnectStatus` |
+
+Callbacks: `onConnectStatus:reasonCode:` and `onKick:reason:`.
+
+## `WKChatManager`
+
+| API | Purpose |
+| --- | --- |
+| `sendMessage:channel:` | Send and store a message |
+| `resendMessage:` | Retry a failed message |
+| `pullLastMessages:limit:complete:` | Read the latest messages |
+| `pullDown:startOrderSeq:limit:complete:` | Read older messages |
+| `pullUp:startOrderSeq:limit:complete:` | Read newer messages |
+| `clearMessages:` | Clear local messages in one channel |
+| `syncChannelMessageProvider` | Connect remote channel history |
+
+Callbacks: `onRecvMessages:left:` and `onMessageUpdate:left:`.
+
+## `WKConversationManager`
+
+| API | Purpose |
+| --- | --- |
+| `getConversationList` | Read recent conversations |
+| `getConversation:` | Read the conversation for one channel |
+| `clearConversationUnreadCount:` | Clear unread count |
+| `getAllConversationUnreadCount` | Total all unread counts |
+| `deleteConversation:` | Delete a conversation row |
+| `setSyncConversationProviderAndAck:ack:` | Connect multi-device conversation sync |
+
+Callbacks: `onConversationUpdate:` and `onConversationUnreadCountUpdate:unreadCount:`.
+
+## `WKChannelManager`
+
+| API | Purpose |
+| --- | --- |
+| `getChannelInfo:` | Read a local channel profile |
+| `fetchChannelInfo:completion:` | Request a profile refresh |
+| `addOrUpdateChannelInfo:` | Store a channel profile |
+| `getMembersWithChannel:limit:` | Read local group members |
+| `addOrUpdateMembers:` | Store group members |
+| `updateChannelSetting:setting:` | Change mute, pin, and related settings |
+
+Callback: `channelInfoUpdate:oldChannelInfo:`. The remote profile entry point is `[WKSDK shared].channelInfoUpdate`.
+
+## Common models and states
+
+| Type | Meaning |
+| --- | --- |
+| `WKConnectInfo` | UID, token, name, and avatar |
+| `WKChannel` | `channelId` plus `channelType` |
+| `WKMessage` | Identity, sender, content, sequence, and state |
+| `WKMessageContent` | Base class for message content |
+| `WKConversation` | Chat-list row and unread count |
+| `WKChannelInfo` | Name, avatar, and channel settings |
+| `WKChannelMember` | Group member profile |
+
+Connection states: `WKNoConnect`, `WKConnecting`, `WKPullingOffline`, `WKConnected`, and `WKDisconnected`.
+
+Message states: `WK_MESSAGE_WAITSEND`, `WK_MESSAGE_UPLOADING`, `WK_MESSAGE_SUCCESS`, and `WK_MESSAGE_FAIL`.

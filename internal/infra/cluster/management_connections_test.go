@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	accessnode "github.com/WuKongIM/WuKongIM/internal/access/node"
@@ -10,7 +11,9 @@ import (
 
 func TestManagementConnectionReaderRoutesRemoteList(t *testing.T) {
 	service := &fakeManagerConnectionService{
-		connections: []managementusecase.Connection{{NodeID: 2, SessionID: 101, UID: "u1"}},
+		page: managementusecase.ListConnectionsResponse{
+			Total: 1, Items: []managementusecase.Connection{{NodeID: 2, SessionID: 101, UID: "u1"}},
+		},
 	}
 	adapter := accessnode.New(accessnode.Options{ManagerConnections: service})
 	node := &fakeManagementConnectionNode{
@@ -19,13 +22,14 @@ func TestManagementConnectionReaderRoutesRemoteList(t *testing.T) {
 	}
 	reader := NewManagementConnectionReader(node)
 
-	got, err := reader.NodeConnections(context.Background(), 2, 100)
+	req := managementusecase.ListConnectionsRequest{NodeID: 2, Limit: 100}
+	got, err := reader.NodeConnections(context.Background(), req)
 	if err != nil {
 		t.Fatalf("NodeConnections() error = %v", err)
 	}
 
-	if !sameManagementConnections(got, service.connections) {
-		t.Fatalf("connections = %#v, want %#v", got, service.connections)
+	if got.Total != 1 || !sameManagementConnections(got.Items, service.page.Items) {
+		t.Fatalf("page = %#v, want %#v", got, service.page)
 	}
 	if service.listReq != (managementusecase.ListConnectionsRequest{NodeID: 2, Limit: 100}) {
 		t.Fatalf("list request = %#v, want node 2 limit 100", service.listReq)
@@ -35,10 +39,52 @@ func TestManagementConnectionReaderRoutesRemoteList(t *testing.T) {
 	}
 }
 
+func TestManagementConnectionReaderRoutesExactRemoteDetail(t *testing.T) {
+	t.Parallel()
+
+	service := &fakeManagerConnectionService{detail: managementusecase.ConnectionDetail{NodeID: 2, SessionID: 101, UID: "u1"}}
+	adapter := accessnode.New(accessnode.Options{ManagerConnections: service})
+	node := &fakeManagementConnectionNode{nodeID: 1, handler: adapter.HandleManagerConnectionRPC}
+	reader := NewManagementConnectionReader(node)
+
+	detail, err := reader.NodeConnection(context.Background(), 2, 101)
+	if err != nil {
+		t.Fatalf("NodeConnection() error = %v", err)
+	}
+	if detail.NodeID != 2 || detail.SessionID != 101 || detail.UID != "u1" {
+		t.Fatalf("detail = %#v", detail)
+	}
+	if service.detailReq != (managementusecase.GetConnectionRequest{NodeID: 2, SessionID: 101}) {
+		t.Fatalf("detail request = %#v", service.detailReq)
+	}
+	if node.calledNodeID != 2 || node.calledServiceID != accessnode.ManagerConnectionRPCServiceID {
+		t.Fatalf("rpc target = node:%d service:%d", node.calledNodeID, node.calledServiceID)
+	}
+}
+
+func TestManagementConnectionReaderFailsClosedWhenUnwired(t *testing.T) {
+	t.Parallel()
+
+	var reader *ManagementConnectionReader
+	if _, err := reader.NodeConnections(context.Background(), managementusecase.ListConnectionsRequest{NodeID: 2}); !errors.Is(err, managementusecase.ErrConnectionReaderUnavailable) {
+		t.Fatalf("NodeConnections() error = %v", err)
+	}
+	if _, err := reader.NodeConnection(context.Background(), 2, 101); !errors.Is(err, managementusecase.ErrConnectionReaderUnavailable) {
+		t.Fatalf("NodeConnection() error = %v", err)
+	}
+	if _, err := reader.NodeRuntimeSummary(context.Background(), 2); !errors.Is(err, managementusecase.ErrConnectionReaderUnavailable) {
+		t.Fatalf("NodeRuntimeSummary() error = %v", err)
+	}
+	if _, err := reader.SetNodeDrainMode(context.Background(), 2, true); !errors.Is(err, managementusecase.ErrNodeScaleInUnavailable) {
+		t.Fatalf("SetNodeDrainMode() error = %v", err)
+	}
+}
+
 func TestManagementConnectionReaderRoutesRuntimeSummary(t *testing.T) {
 	service := &fakeManagerConnectionService{
 		runtime: managementusecase.NodeRuntimeSummary{
 			NodeID:               2,
+			Version:              "v3.0.0-beta.7",
 			ActiveOnline:         3,
 			GatewaySessions:      4,
 			PendingActivations:   1,
@@ -61,7 +107,7 @@ func TestManagementConnectionReaderRoutesRuntimeSummary(t *testing.T) {
 		t.Fatalf("NodeRuntimeSummary() error = %v", err)
 	}
 
-	if got.NodeID != 2 || got.ActiveOnline != 3 || got.GatewaySessions != 4 ||
+	if got.NodeID != 2 || got.Version != "v3.0.0-beta.7" || got.ActiveOnline != 3 || got.GatewaySessions != 4 ||
 		got.PendingActivations != 1 || got.SessionsByListener["tcp"] != 4 || !got.AcceptingNewSessions || got.Unknown ||
 		got.ChannelRuntime != service.runtime.ChannelRuntime {
 		t.Fatalf("runtime summary = %#v, want concrete summary", got)
@@ -114,19 +160,23 @@ func (f *fakeManagementConnectionNode) CallRPC(ctx context.Context, nodeID uint6
 }
 
 type fakeManagerConnectionService struct {
-	connections []managementusecase.Connection
-	listReq     managementusecase.ListConnectionsRequest
-	drainReq    managementusecase.SetNodeDrainModeRequest
-	detail      managementusecase.ConnectionDetail
-	runtime     managementusecase.NodeRuntimeSummary
+	page      managementusecase.ListConnectionsResponse
+	listReq   managementusecase.ListConnectionsRequest
+	drainReq  managementusecase.SetNodeDrainModeRequest
+	detail    managementusecase.ConnectionDetail
+	detailReq managementusecase.GetConnectionRequest
+	runtime   managementusecase.NodeRuntimeSummary
 }
 
-func (f *fakeManagerConnectionService) ListConnections(_ context.Context, req managementusecase.ListConnectionsRequest) ([]managementusecase.Connection, error) {
+func (f *fakeManagerConnectionService) ListConnections(_ context.Context, req managementusecase.ListConnectionsRequest) (managementusecase.ListConnectionsResponse, error) {
 	f.listReq = req
-	return append([]managementusecase.Connection(nil), f.connections...), nil
+	resp := f.page
+	resp.Items = append([]managementusecase.Connection(nil), f.page.Items...)
+	return resp, nil
 }
 
-func (f *fakeManagerConnectionService) GetConnection(context.Context, managementusecase.GetConnectionRequest) (managementusecase.ConnectionDetail, error) {
+func (f *fakeManagerConnectionService) GetConnection(_ context.Context, req managementusecase.GetConnectionRequest) (managementusecase.ConnectionDetail, error) {
+	f.detailReq = req
 	return f.detail, nil
 }
 

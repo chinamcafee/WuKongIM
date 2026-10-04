@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -236,6 +237,39 @@ func TestRunScheduledMessagesStopsSchedulingWhenWindowExpires(t *testing.T) {
 	require.Equal(t, 0, <-started)
 }
 
+func TestRunScheduledMessagesUsesCallerOwnedAdmissionDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	deadline := time.Now().Add(30 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+	started := make(chan int, 3)
+	err := runScheduledMessagesByKeyUntilWithStats(ctx, 3, 20*time.Millisecond, 1, deadline, nil, func(ctx context.Context, offset int) error {
+		started <- offset
+		select {
+		case <-time.After(20 * time.Millisecond):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}, nil)
+
+	require.NoError(t, err)
+	close(started)
+	require.Equal(t, []int{0}, drainStartedOffsets(started))
+}
+
+func TestRunSequentialMessagesDoesNotAdmitAtExpiredCallerDeadline(t *testing.T) {
+	started := 0
+	err := runSequentialMessagesUntil(context.Background(), time.Now().Add(-time.Millisecond), 1, 0, nil, func(context.Context, int) error {
+		started++
+		return nil
+	})
+
+	require.NoError(t, err)
+	require.Zero(t, started)
+}
+
 func TestRunScheduledMessagesCatchesUpAfterBlockedDispatch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -268,48 +302,52 @@ func TestRunScheduledMessagesCatchesUpAfterBlockedDispatch(t *testing.T) {
 }
 
 func TestRunScheduledMessagesByKeyDispatchesReadyKeysBehindLargeBusyPrefix(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	const (
-		busyPrefix = 100000
-		readyCount = 1000
-	)
-	releaseBusy := make(chan struct{})
-	readyStarted := make(chan int, readyCount)
-	done := make(chan error, 1)
+		const (
+			busyPrefix = 100000
+			readyCount = 1000
+		)
+		releaseBusy := make(chan struct{})
+		readyStarted := make(chan int, readyCount)
+		done := make(chan error, 1)
 
-	go func() {
-		done <- runScheduledMessagesByKey(ctx, busyPrefix+readyCount, 0, readyCount+1, func(offset int) string {
-			if offset < busyPrefix {
-				return "busy-sender"
-			}
-			return fmt.Sprintf("ready-sender-%d", offset)
-		}, func(ctx context.Context, offset int) error {
-			if offset < busyPrefix {
-				select {
-				case <-releaseBusy:
-					return nil
-				case <-ctx.Done():
-					return ctx.Err()
+		go func() {
+			done <- runScheduledMessagesByKey(ctx, busyPrefix+readyCount, 0, readyCount+1, func(offset int) string {
+				if offset < busyPrefix {
+					return "busy-sender"
 				}
-			}
-			readyStarted <- offset
-			return nil
-		})
-	}()
+				return fmt.Sprintf("ready-sender-%d", offset)
+			}, func(ctx context.Context, offset int) error {
+				if offset < busyPrefix {
+					select {
+					case <-releaseBusy:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
+				readyStarted <- offset
+				return nil
+			})
+		}()
 
-	require.Eventually(t, func() bool {
-		return len(readyStarted) == readyCount
-	}, 75*time.Millisecond, time.Millisecond)
-	close(releaseBusy)
-	cancel()
-	select {
-	case err := <-done:
-		require.True(t, err == nil || errors.Is(err, context.Canceled), "unexpected scheduler error: %v", err)
-	case <-time.After(time.Second):
-		t.Fatal("scheduler did not stop after cancellation")
-	}
+		// Wait until the scheduler and blocked sender are durably blocked. This
+		// tests ready-key progress without imposing a machine-speed deadline on
+		// 100,000 enqueues and 1,000 goroutines under the race detector.
+		synctest.Wait()
+		require.Len(t, readyStarted, readyCount)
+		close(releaseBusy)
+		cancel()
+		select {
+		case err := <-done:
+			require.True(t, err == nil || errors.Is(err, context.Canceled), "unexpected scheduler error: %v", err)
+		case <-time.After(time.Second):
+			t.Fatal("scheduler did not stop after cancellation")
+		}
+	})
 }
 
 func drainStartedOffsets(started <-chan int) []int {

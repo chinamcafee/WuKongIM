@@ -1,46 +1,63 @@
-# internal/usecase/user Flow
+---
+scope: package
+summary: Orchestrates legacy-compatible user tokens, device quit, online status, system UIDs, and restore cache reload.
+---
+
+# User Use Case Flow
 
 ## Responsibility
 
-`internal/usecase/user` coordinates legacy-compatible user token, device quit,
-online-status, and system UID operations without depending on HTTP, gateway
-frames, or concrete cluster types.
+This package owns entry-independent user token persistence and verification,
+device quit, online-status, system UID, and restore-time cache reload policy.
+It does not own HTTP, gateway frames, concrete storage, or cluster transport.
 
-## Flow
+## Boundaries
 
-```text
-/user/token
-  -> validate UID/token/device fields
-  -> create UID metadata when missing
-  -> upsert per-device token metadata
-  -> for master-device updates, schedule owner-local same-device session close
+- Durable metadata and authority presence are injected ports supplied by app;
+  HTTP, gateway frames, and concrete cluster types remain outside the package.
+- A single node is still a single-node cluster and uses the same ports.
+- The restore-only system UID read port is used only by full cache reload;
+  foreground operations remain behind ordinary store fences.
 
-/user/device_quit
-  -> read selected device metadata
-  -> clear stored token
-  -> schedule owner-local matching-device session close
+## Main Flows
 
-/user/onlinestatus
-  -> prefer authoritative presence route lookup when configured
-  -> return one legacy online item for each active route
+1. Token update validates identity and device fields, creates missing UID
+   metadata, upserts per-device token state, and schedules owner-local
+   same-device close for master-device replacement. CONNECT verification reads
+   the same UID/device row, compares the opaque token, and returns its durable
+   device level only after a match.
+2. Device quit clears the selected stored token and schedules owner-local
+   matching-device close; online status prefers authority routes when configured.
+3. System UID commands persist the reserved set and maintain the process-local
+   fast-check cache; restore resume replaces that cache from the restore port
+   before foreground admission.
 
-/user/systemuids*
-  -> persist reserved system UIDs through the configured system UID store
-  -> maintain the process-local cache used by callers that need fast checks
+## Invariants and Failure Semantics
 
-restore resume
-  -> use the optional restore-only system UID read port
-  -> replace the complete process-local cache before foreground admission
-```
+- Session close actions are owner-local effects triggered after the relevant
+  durable token mutation.
+- Missing, cleared, or mismatched device tokens fail CONNECT verification
+  closed without exposing the stored credential.
+- Online results contain one legacy item per active authority route.
+- Cache reload replaces the complete set rather than incrementally merging
+  restored and pre-restore state.
+- The configured primary system UID is always recognized in addition to the
+  durable system-UID registry; every cluster node must use the same value.
+- Ordinary operations never bypass foreground storage fencing.
 
-The usecase treats a single node as a single-node cluster. Durable metadata
-access happens through injected ports supplied by `internal/app`. The
-restore-only read is selected only by `ReloadSystemUIDCache`; ordinary user
-operations continue through the foreground-fenced store methods.
+- UID-owned send-ban reads and atomic versioned mutations expose policy only,
+  without credential data. Restricting sends does not reject login, receiving or
+  protocol acknowledgments; credential initialization preserves the restriction.
+  Mutation audit observers receive apply-time old/new policies and explicit
+  unknown outcomes, without credentials or message data.
 
-Internal device credential apply/revoke is item-wise and version fenced. The
-usecase fixes APP/PC to MASTER, allow-lists operation/cause pairs, derives an
-operation digest without logging plaintext tokens, persists ACTIVE or REVOKED
-tombstones through Slot CAS, and always advances/reconciles Presence for both
-APPLIED and IDEMPOTENT results. Durable credential outcome and route outcome
-are independent response axes.
+## Read First
+
+- [User application](app.go)
+- [User contracts](types.go)
+- [Behavior tests](user_test.go)
+
+## Update Triggers
+
+Update this file when token or device semantics, close scheduling, online
+status, system UID persistence, cache ownership, or restore reload changes.

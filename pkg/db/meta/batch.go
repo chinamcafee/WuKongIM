@@ -1,9 +1,11 @@
 package meta
 
 import (
+	"bytes"
 	"context"
 	"errors"
 
+	"github.com/WuKongIM/WuKongIM/pkg/db/internal/commit"
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/dberrors"
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/engine"
 )
@@ -41,6 +43,8 @@ type Batch struct {
 	messageEventApplied map[string]MessageEventApplied
 	closed              bool
 	lastLocked          []HashSlot
+	// recoveryScoped means the FSM explicitly classified this request's owner.
+	recoveryScoped bool
 }
 
 type metaBatchOp struct {
@@ -49,14 +53,19 @@ type metaBatchOp struct {
 }
 
 type batchCommitState struct {
-	db               *MetaDB
-	tableRows        map[string]tableRowOverlay
-	tableCreates     map[string]struct{}
-	runtimeMeta      map[string]runtimeMetaOverlay
-	migrationTasks   map[string]migrationTaskOverlay
-	subscriberRows   map[string]bool
-	channelPublishes map[string]Channel
-	channelDeletes   map[string]struct{}
+	db        *MetaDB
+	tableRows map[string]tableRowOverlay
+	// tableDeletes masks disk rows after bounded range deletion in this apply batch.
+	tableDeletes   []engine.Span
+	tableCreates   map[string]struct{}
+	runtimeMeta    map[string]runtimeMetaOverlay
+	migrationTasks map[string]migrationTaskOverlay
+	subscriberRows map[string]bool
+	// subscriberDeletes bounds range tombstones to channels touched by this batch.
+	subscriberDeletes   [][]byte
+	subscriberSequences map[HashSlot]uint64
+	channelPublishes    map[string]Channel
+	channelDeletes      map[string]struct{}
 }
 
 type tableRowOverlay struct {
@@ -103,7 +112,30 @@ func (b *Batch) CreateUser(hashSlot HashSlot, user User) error {
 
 // UpsertUser stages a user upsert.
 func (b *Batch) UpsertUser(hashSlot HashSlot, user User) error {
-	return userTable.StageUpsert(b, hashSlot, user)
+	if err := b.ensureOpen(); err != nil {
+		return err
+	}
+	if err := validateKeyString(user.UID); err != nil {
+		return err
+	}
+	key := encodeUserRowKey(hashSlot, user.UID, userPrimaryFamilyID)
+	b.addOp(hashSlot, func(ctx context.Context, state *batchCommitState, batch *engine.Batch) error {
+		next := user
+		old, exists, err := state.loadUser(key, user.UID)
+		if err != nil {
+			return err
+		}
+		if exists {
+			next.SendBan, next.SendBanVersion = old.SendBan, old.SendBanVersion
+		}
+		value := encodeUserValue(next)
+		if err := batch.Set(key, value); err != nil {
+			return err
+		}
+		state.tableRows[string(key)] = tableRowOverlay{value: value, exists: true}
+		return nil
+	})
+	return nil
 }
 
 // UpsertChannel stages a channel upsert and publishes the channel cache after commit.
@@ -126,7 +158,18 @@ func (b *Batch) UpsertChannel(hashSlot HashSlot, channel Channel) error {
 			return err
 		}
 		if err == nil && exists {
+			next.SendBan, next.SendBanVersion = existing.SendBan, existing.SendBanVersion
+			if existing.Disband != 0 {
+				next.Disband = 1
+			}
+			next.SubscriberMutationVersion = max(next.SubscriberMutationVersion, existing.SubscriberMutationVersion)
 			next.SubscriberCount = existing.SubscriberCount
+			if existing.DirectoryProjectionState > next.DirectoryProjectionState {
+				next.DirectoryProjectionState = existing.DirectoryProjectionState
+			}
+			if existing.DirectoryProjectionGeneration > next.DirectoryProjectionGeneration {
+				next.DirectoryProjectionGeneration = existing.DirectoryProjectionGeneration
+			}
 		}
 		shard := &Shard{db: state.db, hashSlot: hashSlot}
 		if err := shard.stageChannel(batch, primaryKey, next); err != nil {
@@ -193,6 +236,11 @@ func (b *Batch) UpsertChannelRuntimeMeta(hashSlot HashSlot, meta ChannelRuntimeM
 		if err != nil {
 			return err
 		}
+		if !exists {
+			if err := rejectRetiredRuntimeUpsert(state, hashSlot, meta); err != nil {
+				return err
+			}
+		}
 		next, result := resolveMonotonicChannelRuntimeMeta(existing, exists, meta)
 		switch result {
 		case MonotonicIgnoredStale:
@@ -211,6 +259,44 @@ func (b *Batch) UpsertChannelRuntimeMeta(hashSlot HashSlot, meta ChannelRuntimeM
 		return nil
 	})
 	return MonotonicApplied, nil
+}
+
+// CreateChannelRuntimeMeta stages an insert that succeeds without replacing an existing row.
+// Staging owns a canonical copy, so later caller mutations cannot affect Commit.
+func (b *Batch) CreateChannelRuntimeMeta(hashSlot HashSlot, meta ChannelRuntimeMeta) (*ChannelRuntimeMetaCreateResult, error) {
+	if err := b.ensureOpen(); err != nil {
+		return nil, err
+	}
+	staged := normalizeChannelRuntimeMeta(meta)
+	if err := validateChannelRuntimeMeta(staged); err != nil {
+		return nil, err
+	}
+	key := encodeChannelRuntimeMetaRowKey(hashSlot, staged.ChannelID, staged.ChannelType, channelRuntimeMetaPrimaryFamilyID)
+	result := &ChannelRuntimeMetaCreateResult{}
+	b.addOp(hashSlot, func(ctx context.Context, state *batchCommitState, batch *engine.Batch) error {
+		_, exists, err := state.loadRuntimeMeta(ctx, hashSlot, key, staged.ChannelID, staged.ChannelType)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return nil
+		}
+		next, err := newRuntimeIncarnation(state, hashSlot, staged)
+		if err != nil {
+			return err
+		}
+		value, err := channelRuntimeMetaTable.encodeValue(key, next)
+		if err != nil {
+			return err
+		}
+		if err := batch.Set(key, value); err != nil {
+			return err
+		}
+		state.runtimeMeta[string(key)] = runtimeMetaOverlay{meta: next, exists: true}
+		result.Created = true
+		return nil
+	})
+	return result, nil
 }
 
 // CreateChannelMigrationTask stages a migration task create with active uniqueness.
@@ -285,44 +371,58 @@ func (b *Batch) Commit(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if b.db == nil || b.db.engine == nil {
+	if b.db == nil || b.db.engine == nil || b.db.committer == nil {
 		return dberrors.ErrClosed
 	}
 	unlock := b.db.lockHashSlots(b.hashSlots)
-	b.lastLocked = b.db.testLockedOrder()
-	defer unlock()
-
-	engineBatch := b.db.engine.NewBatch()
-	defer engineBatch.Close()
-	state := &batchCommitState{
-		db:               b.db,
-		tableRows:        make(map[string]tableRowOverlay),
-		tableCreates:     make(map[string]struct{}),
-		runtimeMeta:      make(map[string]runtimeMetaOverlay),
-		migrationTasks:   make(map[string]migrationTaskOverlay),
-		subscriberRows:   make(map[string]bool),
-		channelPublishes: make(map[string]Channel),
-		channelDeletes:   make(map[string]struct{}),
-	}
-	for _, op := range b.ops {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := op.apply(ctx, state, engineBatch); err != nil {
-			return err
-		}
-	}
-	if err := engineBatch.Commit(true); err != nil {
+	if err := ctx.Err(); err != nil {
+		unlock()
 		return err
 	}
-	for cacheKey, channel := range state.channelPublishes {
-		b.db.rememberChannel([]byte(cacheKey), channel)
-	}
-	for cacheKey := range state.channelDeletes {
-		b.db.forgetChannel([]byte(cacheKey))
-	}
-	b.closed = true
-	return nil
+	b.lastLocked = b.db.testLockedOrder()
+	// Once the mutation owns its hash-slot locks, it must retain its staged
+	// operations until the coordinator reports one durable terminal outcome.
+	// Callers commonly defer Batch.Close, so returning an ambiguous cancellation
+	// here would otherwise allow Close to clear operations still queued for Build.
+	commitCtx := context.WithoutCancel(ctx)
+	var state *batchCommitState
+	return b.db.committer.Submit(commitCtx, commit.Request{
+		Lane:                commit.Lane{Name: "meta"},
+		RebuildOnGroupAbort: true,
+		Records:             len(b.ops),
+		Build: func(engineBatch *engine.Batch) error {
+			if !b.recoveryScoped {
+				engineBatch.InvalidateRecoveryCertificates()
+			}
+			state = &batchCommitState{
+				db:               b.db,
+				tableRows:        make(map[string]tableRowOverlay),
+				tableCreates:     make(map[string]struct{}),
+				runtimeMeta:      make(map[string]runtimeMetaOverlay),
+				migrationTasks:   make(map[string]migrationTaskOverlay),
+				subscriberRows:   make(map[string]bool),
+				channelPublishes: make(map[string]Channel),
+				channelDeletes:   make(map[string]struct{}),
+			}
+			for _, op := range b.ops {
+				if err := op.apply(commitCtx, state, engineBatch); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		Publish: func() error {
+			for cacheKey, channel := range state.channelPublishes {
+				b.db.rememberChannel([]byte(cacheKey), channel)
+			}
+			for cacheKey := range state.channelDeletes {
+				b.db.forgetChannel([]byte(cacheKey))
+			}
+			b.closed = true
+			return nil
+		},
+		Finalize: unlock,
+	})
 }
 
 func (b *Batch) ensureOpen() error {
@@ -381,6 +481,11 @@ func (state *batchCommitState) loadChannel(ctx context.Context, key []byte, chan
 func (state *batchCommitState) loadSubscriberExists(key []byte) (bool, error) {
 	if exists, ok := state.subscriberRows[string(key)]; ok {
 		return exists, nil
+	}
+	for _, prefix := range state.subscriberDeletes {
+		if bytes.HasPrefix(key, prefix) {
+			return false, nil
+		}
 	}
 	_, exists, err := state.db.get(key)
 	return exists, err

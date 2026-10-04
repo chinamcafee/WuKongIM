@@ -6,6 +6,7 @@ import { beforeEach, expect, test, vi } from "vitest"
 import { createAnonymousAuthState, useAuthStore } from "@/auth/auth-store"
 import { I18nProvider } from "@/i18n/provider"
 import { resetLocale } from "@/i18n/locale-store"
+import { ManagerApiError } from "@/lib/manager-api"
 import { MessagesPage } from "@/pages/messages/page"
 
 const getMessagesMock = vi.fn()
@@ -181,6 +182,21 @@ test("shows the latest messages across the cluster by default", async () => {
   expect(screen.getByText("Scope: latest across cluster")).toBeInTheDocument()
   expect(screen.getByText("room-latest")).toBeInTheDocument()
   expect(getMessagesMock).toHaveBeenCalledWith({ limit: 50, clientMsgNo: "" })
+})
+
+test("explains latest-message backpressure without presenting it as a generic outage", async () => {
+  localStorage.setItem("wukongim_manager_locale", "zh-CN")
+  getMessagesMock.mockRejectedValueOnce(new ManagerApiError(
+    503,
+    "latest_messages_backpressured",
+    "latest message scan is temporarily backpressured; retry later",
+  ))
+
+  renderMessagesPage()
+
+  expect(await screen.findByText("最新消息索引正在追赶，暂时无法确认完整结果。请稍后重试；按频道查询仍可使用。")).toBeInTheDocument()
+  expect(screen.queryByText("管理服务当前不可用。")).not.toBeInTheDocument()
+  expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument()
 })
 
 test("does not let a slow default latest request replace a newer channel query", async () => {
@@ -487,9 +503,11 @@ test("deletes message history through a selected sequence after confirmation", a
   renderMessagesPage("/messages?channel_id=room-1&channel_type=2")
 
   expect(await screen.findByText("c-101")).toBeInTheDocument()
-  await user.click(screen.getByRole("button", { name: "Delete history through seq 9" }))
+  await user.click(screen.getByRole("button", { name: "Delete this & earlier messages: channel room-1 (type 2), through seq 9 (inclusive)" }))
   const dialog = await screen.findByRole("dialog")
-  await user.click(within(dialog).getByRole("button", { name: "Confirm" }))
+  expect(dialog).toHaveAccessibleDescription("This will delete message seq 9 and all earlier messages in channel room-1 (type 2), including history not shown in this list. These messages will no longer be readable. This action cannot be undone.")
+  expect(advanceMessageRetentionMock).not.toHaveBeenCalled()
+  await user.click(within(dialog).getByRole("button", { name: "Confirm bulk deletion" }))
 
   await waitFor(() => {
     expect(advanceMessageRetentionMock).toHaveBeenCalledWith({ channelId: "room-1", channelType: 2, throughSeq: 9 })
@@ -526,9 +544,9 @@ test("keeps delete dialog open when message retention is blocked", async () => {
   renderMessagesPage("/messages?channel_id=room-1&channel_type=2")
 
   expect(await screen.findByText("c-101")).toBeInTheDocument()
-  await user.click(screen.getByRole("button", { name: "Delete history through seq 9" }))
+  await user.click(screen.getByRole("button", { name: "Delete this & earlier messages: channel room-1 (type 2), through seq 9 (inclusive)" }))
   const dialog = await screen.findByRole("dialog")
-  await user.click(within(dialog).getByRole("button", { name: "Confirm" }))
+  await user.click(within(dialog).getByRole("button", { name: "Confirm bulk deletion" }))
 
   expect(await within(dialog).findByText("History retention is blocked: replay_cursor")).toBeInTheDocument()
   expect(getMessagesMock).toHaveBeenCalledTimes(1)

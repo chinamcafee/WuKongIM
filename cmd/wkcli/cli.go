@@ -7,11 +7,16 @@ import (
 	"os"
 
 	benchcmd "github.com/WuKongIM/WuKongIM/cmd/wkcli/internal/bench"
+	fullbenchcmd "github.com/WuKongIM/WuKongIM/cmd/wkcli/internal/benchmark"
 	"github.com/WuKongIM/WuKongIM/cmd/wkcli/internal/command"
 	contextcmd "github.com/WuKongIM/WuKongIM/cmd/wkcli/internal/context"
+	dbcmd "github.com/WuKongIM/WuKongIM/cmd/wkcli/internal/database"
+	"github.com/WuKongIM/WuKongIM/cmd/wkcli/internal/diagnostics"
+	migratecmd "github.com/WuKongIM/WuKongIM/cmd/wkcli/internal/migrate"
 	nodeopscmd "github.com/WuKongIM/WuKongIM/cmd/wkcli/internal/nodeops"
 	simcmd "github.com/WuKongIM/WuKongIM/cmd/wkcli/internal/sim"
 	topcmd "github.com/WuKongIM/WuKongIM/cmd/wkcli/internal/top"
+	"github.com/WuKongIM/WuKongIM/pkg/dataformat"
 	"github.com/spf13/cobra"
 )
 
@@ -28,8 +33,13 @@ func run(args []string) int {
 
 func runWithIO(args []string, stdout, stderr io.Writer) int {
 	contextDir := contextcmd.DefaultStoreDir()
-	deps := command.Deps{Stdout: stdout, Stderr: stderr, ContextDir: &contextDir}
+	deps := command.Deps{Build: dataformat.Build{Program: "wkcli", Version: buildVersion, Commit: buildCommit, BuildSource: buildSource}, Stdin: os.Stdin, Stdout: stdout, Stderr: stderr, ContextDir: &contextDir}
 	cmd := newRootCommand(deps, defaultCommandFactories())
+	// Only raw parser families need root flags consumed before their argument
+	// vector is forwarded. Cobra families retain leaf flags before subcommands.
+	if selected, _, err := cmd.Find(args); err == nil && selected.DisableFlagParsing {
+		cmd.TraverseChildren = true
+	}
 	cmd.SetArgs(args)
 	return executeCommand(cmd, stderr)
 }
@@ -42,6 +52,13 @@ func executeCommand(cmd *cobra.Command, stderr io.Writer) int {
 				fmt.Fprintln(stderr, exit.Message)
 			}
 			return exit.Code
+		}
+		var classified interface{ ExitCode() int }
+		if errors.As(err, &classified) {
+			if err.Error() != "" {
+				fmt.Fprintln(stderr, err)
+			}
+			return classified.ExitCode()
 		}
 		fmt.Fprintln(stderr, err)
 		return exitConfig
@@ -75,10 +92,26 @@ func newRootCommand(deps command.Deps, factories []command.Factory) *cobra.Comma
 
 func defaultCommandFactories() []command.Factory {
 	return []command.Factory{
+		newVersionCommand,
 		contextcmd.NewCommand,
 		topcmd.NewCommand,
-		benchcmd.NewCommand,
+		newBenchCommand,
+		dbcmd.NewCommand,
+		migratecmd.NewCommand,
 		simcmd.NewCommand,
 		nodeopscmd.NewCommand,
 	}
+}
+
+// newBenchCommand combines lightweight SEND testing and distributed scenarios.
+func newBenchCommand(deps command.Deps) *cobra.Command {
+	cmd := benchcmd.NewCommand(deps)
+	full := fullbenchcmd.NewCommand(deps.Stderr)
+	for _, child := range full.Commands() {
+		if child.Name() == "report" {
+			child.AddCommand(diagnostics.NewRedactionCommand())
+		}
+		cmd.AddCommand(child)
+	}
+	return cmd
 }

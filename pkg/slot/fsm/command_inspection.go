@@ -1,12 +1,17 @@
 package fsm
 
 import (
+	"errors"
 	"fmt"
 
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 )
 
 const redactedSecret = "***"
+
+// ErrCommandInspectionUnsupported means the command version, type, or decoded
+// command has no inspection view. It does not establish whether the data is corrupt.
+var ErrCommandInspectionUnsupported = errors.New("unsupported command inspection")
 
 // CommandInspection is a redacted, JSON-friendly view of one Slot FSM command.
 type CommandInspection struct {
@@ -18,6 +23,16 @@ type CommandInspection struct {
 
 // DecodeCommandInspection decodes one Slot FSM command into a redacted summary.
 func DecodeCommandInspection(data []byte) (CommandInspection, error) {
+	// Classify unfamiliar wire formats only for inspection; the FSM decoder
+	// continues to reject them under its existing application contract.
+	if len(data) >= headerSize {
+		if data[0] != commandVersion {
+			return CommandInspection{}, fmt.Errorf("%w: command version %d", ErrCommandInspectionUnsupported, data[0])
+		}
+		if _, ok := commandDecoders[data[1]]; !ok {
+			return CommandInspection{}, fmt.Errorf("%w: command type %d", ErrCommandInspectionUnsupported, data[1])
+		}
+	}
 	cmd, err := decodeCommand(data)
 	if err != nil {
 		return CommandInspection{}, err
@@ -27,6 +42,105 @@ func DecodeCommandInspection(data []byte) (CommandInspection, error) {
 
 func inspectCommand(cmd command) (CommandInspection, error) {
 	switch typed := cmd.(type) {
+	case *mqttStorageCmd:
+		q := typed.query
+		return simpleInspection("mqtt_storage", map[string]any{"node_id": q.NodeID, "expected_revision": q.ExpectedRevision, "expected_bytes": q.ExpectedBytes, "target_bytes": q.TargetBytes, "cluster_limit": q.ClusterLimit}), nil
+	case *mqttSourceBindingRetireCmd:
+		p := typed.payload
+		return simpleInspection("mqtt_source_binding_retire", map[string]any{
+			"owner_kind": uint8(p.Key.Owner.Kind), "owner_id": p.Key.Owner.ID, "owner_generation": p.Key.Owner.Generation,
+			"broker_namespace": p.Key.Namespace, "client_id": p.Key.ClientID, "session_generation": p.Key.SessionGeneration,
+			"subscription_generation": p.Key.SubscriptionGeneration, "expected_revision": p.ExpectedRevision, "closed_through": p.ClosedThrough,
+			"live_subscription_through": p.LiveSubscriptionThrough,
+		}), nil
+	case *mqttReplayMarkerClearCmd:
+		o := typed.payload.Owner
+		return simpleInspection("mqtt_replay_marker_clear", map[string]any{"owner_kind": uint8(o.Kind), "owner_id": o.ID, "owner_generation": o.Generation}), nil
+	case *mqttReclamationIndexCmd:
+		return simpleInspection("mqtt_reclamation_index", map[string]any{"page_limit": 64}), nil
+	case *mqttReclamationCmd:
+		m := typed.payload.Mutation
+		return simpleInspection("mqtt_session_reclamation", map[string]any{
+			"broker_namespace": m.Namespace, "client_id": m.ClientID, "expected_revision": m.ExpectedRevision,
+			"through_generation": m.ThroughGeneration, "updated_at_ms": m.UpdatedAtMS,
+		}), nil
+	case *mqttLifecycleCmd:
+		m := typed.payload.Mutation
+		r := m.Session
+		return simpleInspection("mqtt_lifecycle", map[string]any{
+			"broker_namespace": r.Namespace, "client_id": r.ClientID, "expected_revision": m.ExpectedRevision,
+			"expected_generation": m.ExpectedGeneration, "owner_generation": m.OwnerGeneration, "owner_node_id": m.OwnerNodeID,
+			"event": uint8(m.Event), "clean_start": m.CleanStart, "revision": r.Revision, "generation": r.Generation,
+			"next_owner_generation": r.OwnerGeneration, "next_owner_node_id": r.OwnerNodeID, "state": uint8(r.State), "has_new_will": m.Will != nil,
+		}), nil
+	case *mqttWillCASCmd:
+		r := typed.payload.Will
+		return simpleInspection("mqtt_will", map[string]any{
+			"broker_namespace": r.Key.Namespace, "client_id": r.Key.ClientID, "session_generation": r.Key.SessionGeneration, "will_generation": r.Key.WillGeneration,
+			"expected_revision": typed.payload.ExpectedRevision, "revision": r.Revision, "decision_revision": r.DecisionRevision, "stage": uint8(r.Stage),
+			"execution_generation": r.ExecutionGeneration, "executor_node_id": r.ExecutorNodeID, "due_at_ms": r.DueAtMS, "lease_until_ms": r.LeaseUntilMS,
+			"message_id": r.MessageID, "message_seq": r.MessageSeq, "payload_bytes": len(r.Payload), "publication_metadata_bytes": len(r.PublicationMetadata),
+			"dispatch_stage": uint8(r.DispatchStage), "dispatch_payload_bytes": len(r.DispatchPayload),
+		}), nil
+	case *mqttInboxAdmissionCASCmd:
+		r := typed.payload.Admission
+		return simpleInspection("mqtt_inbox_admission", map[string]any{
+			"channel_id": r.ChannelID, "directory_generation": r.DirectoryGeneration, "expected_revision": typed.payload.ExpectedRevision,
+			"revision": r.Revision, "participant": r.Participant, "broker_namespace": r.After.Namespace, "client_id": r.After.ClientID,
+		}), nil
+	case *mqttSourceBindingCASCmd:
+		r := typed.payload.Binding
+		k := r.Key
+		return simpleInspection("mqtt_source_binding", map[string]any{
+			"owner_kind": uint8(k.Owner.Kind), "owner_id": k.Owner.ID, "owner_generation": k.Owner.Generation,
+			"broker_namespace": k.Namespace, "client_id": k.ClientID, "session_generation": k.SessionGeneration,
+			"subscription_generation": k.SubscriptionGeneration, "expected_revision": typed.payload.ExpectedRevision,
+			"revision": r.Revision, "intent_revision": r.IntentRevision, "progress_revision": r.ProgressRevision,
+			"protection_revision": r.ProtectionRevision, "stage": uint8(r.Stage), "release_reason": uint8(r.ReleaseReason),
+		}), nil
+	case *mqttWindowCmd:
+		m := typed.payload.Mutation
+		k := m.Key
+		return simpleInspection("mqtt_window", map[string]any{
+			"broker_namespace": k.Namespace, "client_id": k.ClientID, "session_generation": k.SessionGeneration,
+			"subscription_generation": k.SubscriptionGeneration, "source_kind": uint8(k.SourceKind), "source_id": k.SourceID,
+			"source_generation": k.SourceGeneration, "expected_revision": m.ExpectedRevision, "op": uint8(m.Op),
+			"packet_id": m.PacketID, "delivery_order": m.DeliveryOrder, "message_id": m.Publication.MessageID,
+			"content_version": m.Publication.ContentVersion, "through": m.Through,
+		}), nil
+	case *mqttDeliveryCursorCmd:
+		m := typed.payload.Mutation
+		k := m.Key
+		return simpleInspection("mqtt_delivery_cursor", map[string]any{
+			"broker_namespace": k.Namespace, "client_id": k.ClientID, "session_generation": k.SessionGeneration,
+			"subscription_generation": k.SubscriptionGeneration, "source_kind": uint8(k.SourceKind), "source_id": k.SourceID,
+			"source_generation": k.SourceGeneration, "expected_revision": m.ExpectedRevision, "op": uint8(m.Op),
+			"through": m.Through, "added_messages": m.AddedMessages, "added_bytes": m.AddedBytes,
+		}), nil
+	case *mqttSubscriptionCmd:
+		m := typed.payload.Mutation
+		r := m.Subscription
+		return simpleInspection("mqtt_subscription_mutation", map[string]any{
+			"broker_namespace": r.Namespace, "client_id": r.ClientID, "session_generation": r.SessionGeneration,
+			"expected_revision": m.ExpectedRevision, "owner_generation": m.OwnerGeneration, "owner_node_id": m.OwnerNodeID,
+			"topic": r.Topic, "generation": r.Generation, "target_kind": uint8(r.TargetKind), "target_id": r.TargetID,
+			"stage": uint8(r.Stage), "operation_id": r.OperationID,
+		}), nil
+	case *mqttSessionCASCmd:
+		r := typed.payload.Session
+		return simpleInspection("mqtt_session_cas", map[string]any{
+			"broker_namespace": r.Namespace, "client_id": r.ClientID, "uid": r.UID,
+			"expected_revision": typed.payload.ExpectedRevision, "revision": r.Revision,
+			"generation": r.Generation, "owner_generation": r.OwnerGeneration,
+			"owner_node_id": r.OwnerNodeID, "state": uint8(r.State),
+		}), nil
+	case *channelInfoCmd:
+		return simpleInspection("update_channel_info", map[string]any{"channel_id": typed.mutation.ChannelID, "channel_type": typed.mutation.ChannelType, "send_ban": typed.mutation.SendBan}), nil
+	case *sendBanCmd:
+		return simpleInspection("set_send_ban", map[string]any{"uid": typed.mutation.UID, "channel_id": typed.mutation.ChannelID, "channel_type": typed.mutation.ChannelType, "send_ban": typed.mutation.SendBan, "expected_version": typed.mutation.ExpectedVersion}), nil
+	case *messageUpdateCmd:
+		q := typed.mutation
+		return simpleInspection("message_update", map[string]any{"operation": q.Op, "channel_id": q.ChannelID, "channel_type": q.ChannelType, "message_id": q.MessageID, "message_seq": q.MessageSeq, "expected_version": q.ExpectedVersion, "payload_bytes": len(q.Payload)}), nil
 	case *noopCmd:
 		return simpleInspection("noop", map[string]any{"command": "noop"}), nil
 	case *upsertUserCmd:
@@ -39,6 +153,13 @@ func inspectCommand(cmd command) (CommandInspection, error) {
 		return deviceCredentialInspection(typed.device), nil
 	case *upsertChannelCmd:
 		return channelInspection("upsert_channel", typed.channel), nil
+	case *createChannelCmd:
+		return channelInspection("create_channel", typed.channel), nil
+	case *patchChannelBusinessFlagsCmd:
+		return simpleInspection("patch_channel_business_flags", map[string]any{
+			"channel_id": typed.channelID, "channel_type": typed.channelType,
+			"ban": typed.flags.Ban, "disband": typed.flags.Disband, "send_ban": typed.flags.SendBan,
+		}), nil
 	case *deleteChannelCmd:
 		return simpleInspection("delete_channel", map[string]any{
 			"channel_id":   typed.channelID,
@@ -46,6 +167,51 @@ func inspectCommand(cmd command) (CommandInspection, error) {
 		}), nil
 	case *upsertChannelRuntimeMetaCmd:
 		return runtimeMetaInspection("upsert_channel_runtime_meta", typed.meta), nil
+	case *createChannelRuntimeMetaBatchCmd:
+		items := make([]map[string]any, len(typed.items))
+		for i, item := range typed.items {
+			items[i] = runtimeMetaInspection("create_channel_runtime_meta", item.Meta).Payload
+			items[i]["hash_slot"] = item.HashSlot
+		}
+		return simpleInspection("create_channel_runtime_meta_batch", map[string]any{"items": items}), nil
+	case *admitPersonDirectoryTaskBatchCmd:
+		items := make([]map[string]any, len(typed.items))
+		for i, item := range typed.items {
+			items[i] = map[string]any{
+				"hash_slot":      item.HashSlot,
+				"channel_id":     item.Task.ChannelID,
+				"channel_type":   item.Task.ChannelType,
+				"committed_tail": item.Task.CommittedTail,
+				"created_at":     item.Task.CreatedAt,
+				"runtime_meta":   runtimeMetaInspection("create_channel_runtime_meta", item.RuntimeMeta).Payload,
+			}
+		}
+		return simpleInspection("admit_person_directory_task_batch", map[string]any{"items": items}), nil
+	case *upsertUserChannelMembershipBatchCmd:
+		items := make([]map[string]any, len(typed.items))
+		for i, item := range typed.items {
+			items[i] = userChannelMembershipPayload(item.Membership)
+			items[i]["hash_slot"] = item.HashSlot
+		}
+		return simpleInspection("upsert_user_channel_membership_batch", map[string]any{"items": items}), nil
+	case *ensureUserChannelMembershipBatchCmd:
+		items := make([]map[string]any, len(typed.items))
+		for i, item := range typed.items {
+			items[i] = userChannelMembershipPayload(item.Membership)
+			items[i]["hash_slot"] = item.HashSlot
+		}
+		return simpleInspection("ensure_user_channel_membership_batch", map[string]any{"items": items}), nil
+	case *completePersonDirectoryTaskBatchCmd:
+		items := make([]map[string]any, len(typed.items))
+		for i, item := range typed.items {
+			items[i] = map[string]any{
+				"hash_slot":    item.HashSlot,
+				"channel_id":   item.ChannelID,
+				"channel_type": item.ChannelType,
+				"generation":   item.Generation,
+			}
+		}
+		return simpleInspection("complete_person_directory_task_batch", map[string]any{"items": items}), nil
 	case *deleteChannelRuntimeMetaCmd:
 		return simpleInspection("delete_channel_runtime_meta", map[string]any{
 			"channel_id":   typed.channelID,
@@ -80,7 +246,7 @@ func inspectCommand(cmd command) (CommandInspection, error) {
 		return simpleInspection("clear_conversation_active_at", map[string]any{
 			"kind": uint8(typed.kind),
 			"uid":  typed.uid,
-			"keys": conversationKeysPayload(typed.keys),
+			"keys": legacyConversationKeysPayload(typed.keys),
 		}), nil
 	case *reservedConversationProjectionCmd:
 		return simpleInspection("reserved_conversation_projection", map[string]any{
@@ -91,6 +257,31 @@ func inspectCommand(cmd command) (CommandInspection, error) {
 		return simpleInspection("hide_conversations", map[string]any{
 			"deletes": conversationDeletesPayload(typed.deletes()),
 		}), nil
+	case *upsertUserChannelMembershipsCmd:
+		return userChannelMembershipsInspection("upsert_user_channel_memberships", typed.memberships), nil
+	case *deleteUserChannelMembershipsCmd:
+		return userChannelMembershipsInspection("delete_user_channel_memberships", typed.memberships), nil
+	case *advanceUserChannelMembershipReadSeqCmd:
+		return userChannelMembershipsInspection("advance_user_channel_membership_read_seq", typed.memberships), nil
+	case *hideUserChannelMembershipCmd:
+		return userChannelMembershipsInspection("hide_user_channel_membership", typed.memberships), nil
+	case *activateUserChannelMembershipCmd:
+		return userChannelMembershipsInspection("activate_user_channel_membership", typed.memberships), nil
+	case *upsertUserCMDChannelMembershipsCmd:
+		return userCMDChannelMembershipsInspection("upsert_user_cmd_channel_memberships", typed.memberships), nil
+	case *advanceUserCMDChannelMembershipAcksCmd:
+		return userCMDChannelMembershipsInspection("advance_user_cmd_channel_membership_acks", typed.memberships), nil
+	case *tombstoneUserCMDChannelMembershipsCmd:
+		return userCMDChannelMembershipsInspection("tombstone_user_cmd_channel_memberships", typed.memberships), nil
+	case *upsertChannelLatestCmd:
+		return simpleInspection("upsert_channel_latest", channelLatestPayload(typed.latest)), nil
+	case *upsertChannelLatestBatchCmd:
+		items := make([]map[string]any, len(typed.items))
+		for i, item := range typed.items {
+			items[i] = channelLatestPayload(item.Latest)
+			items[i]["hash_slot"] = item.HashSlot
+		}
+		return simpleInspection("upsert_channel_latest_batch", map[string]any{"items": items}), nil
 	case *appendMessageEventCmd:
 		return simpleInspection("append_message_event", messageEventAppendPayload(typed.event)), nil
 	case *appendMessageEventsBatchCmd:
@@ -147,8 +338,12 @@ func inspectCommand(cmd command) (CommandInspection, error) {
 		return channelMigrationGuardInspection("clear_channel_write_fence", typed.req.Guard), nil
 	case *abortChannelMigrationCmd:
 		return channelMigrationGuardInspection("abort_channel_migration", typed.req.Guard), nil
+	case *garbageCollectMigrationTasksCmd:
+		return simpleInspection("garbage_collect_terminal_channel_migration_tasks", map[string]any{
+			"before_ms": typed.req.BeforeMS, "limit": typed.req.Limit,
+		}), nil
 	default:
-		return CommandInspection{}, fmt.Errorf("%w: unsupported command inspection %T", metadb.ErrInvalidArgument, cmd)
+		return CommandInspection{}, fmt.Errorf("%w %T", ErrCommandInspectionUnsupported, cmd)
 	}
 }
 
@@ -296,6 +491,40 @@ func applyDeltaInspection(cmd *applyDeltaCmd) (CommandInspection, error) {
 	}), nil
 }
 
+func messageEventAppendBatchPayload(events []metadb.MessageEventAppend) []map[string]any {
+	out := make([]map[string]any, 0, len(events))
+	for _, event := range events {
+		out = append(out, messageEventAppendPayload(event))
+	}
+	return out
+}
+
+func messageEventAppendPayload(event metadb.MessageEventAppend) map[string]any {
+	return map[string]any{
+		"channel_id":    event.ChannelID,
+		"channel_type":  event.ChannelType,
+		"client_msg_no": event.ClientMsgNo,
+		"event_id":      event.EventID,
+		"event_key":     event.EventKey,
+		"event_type":    event.EventType,
+		"visibility":    event.Visibility,
+		"occurred_at":   event.OccurredAt,
+		"updated_at":    event.UpdatedAt,
+		"payload_bytes": len(event.Payload),
+	}
+}
+
+func conversationKeysPayload(keys []metadb.ChannelKey) []map[string]any {
+	out := make([]map[string]any, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, map[string]any{
+			"channel_id":   key.ChannelID,
+			"channel_type": key.ChannelType,
+		})
+	}
+	return out
+}
+
 func conversationStatesPayload(states []metadb.ConversationState) []map[string]any {
 	out := make([]map[string]any, 0, len(states))
 	for _, state := range states {
@@ -349,30 +578,7 @@ func conversationDeletesPayload(deletes []metadb.ConversationDelete) []map[strin
 	return out
 }
 
-func messageEventAppendBatchPayload(events []metadb.MessageEventAppend) []map[string]any {
-	out := make([]map[string]any, 0, len(events))
-	for _, event := range events {
-		out = append(out, messageEventAppendPayload(event))
-	}
-	return out
-}
-
-func messageEventAppendPayload(event metadb.MessageEventAppend) map[string]any {
-	return map[string]any{
-		"channel_id":    event.ChannelID,
-		"channel_type":  event.ChannelType,
-		"client_msg_no": event.ClientMsgNo,
-		"event_id":      event.EventID,
-		"event_key":     event.EventKey,
-		"event_type":    event.EventType,
-		"visibility":    event.Visibility,
-		"occurred_at":   event.OccurredAt,
-		"updated_at":    event.UpdatedAt,
-		"payload_bytes": len(event.Payload),
-	}
-}
-
-func conversationKeysPayload(keys []metadb.ConversationKey) []map[string]any {
+func legacyConversationKeysPayload(keys []metadb.ConversationKey) []map[string]any {
 	out := make([]map[string]any, 0, len(keys))
 	for _, key := range keys {
 		out = append(out, map[string]any{

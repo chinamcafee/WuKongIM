@@ -5,7 +5,6 @@ import (
 	clusterinfra "github.com/WuKongIM/WuKongIM/internal/infra/cluster"
 	deliveryinfra "github.com/WuKongIM/WuKongIM/internal/infra/delivery"
 	runtimedelivery "github.com/WuKongIM/WuKongIM/internal/runtime/delivery"
-	deliveryusecase "github.com/WuKongIM/WuKongIM/internal/usecase/delivery"
 )
 
 func (a *App) wireDelivery() {
@@ -31,9 +30,8 @@ func (a *App) wireDelivery() {
 		LocalNodeID:                    localNodeID,
 		Presence:                       deliveryinfra.NewPresenceResolver(a.presence),
 		RemoteOwnerPusher:              remote,
-		SessionWriter:                  deliveryinfra.NewLocalSessionWriter(deliveryinfra.LocalSessionWriterOptions{Online: a.online, Logger: a.logger.Named("delivery.owner")}),
+		SessionWriter:                  deliveryinfra.NewLocalSessionWriter(deliveryinfra.LocalSessionWriterOptions{CommandChannelSuffix: a.cfg.Message.CMDChannelSuffix, Online: a.online, Logger: a.logger.Named("delivery.owner")}),
 		OfflineRecipientsObserver:      offlineObserver,
-		OfflineNotificationDeviceFlags: append([]uint8(nil), a.cfg.Webhook.OfflineNotificationDeviceFlags...),
 		QueueSize:                      a.cfg.Delivery.EventQueueSize,
 		Workers:                        a.cfg.Delivery.RecipientWorkerConcurrency,
 		MaxPlanRecipients:              a.cfg.Delivery.PushBatchSize,
@@ -46,12 +44,12 @@ func (a *App) wireDelivery() {
 		AckObserver:                    observer,
 		AckBatchObserver:               observer,
 		Goroutines:                     a.goroutines,
+		OfflineNotificationDeviceFlags: append([]uint8(nil), a.cfg.Webhook.OfflineNotificationDeviceFlags...),
 		Acks: runtimedelivery.NewAckTracker(runtimedelivery.AckTrackerOptions{
 			MaxPendingPerSession: a.cfg.Delivery.PendingAckMaxPerSession,
 		}),
 	})
 	a.onlineDelivery = runtime
-	a.delivery = deliveryusecase.New(deliveryusecase.Options{Runtime: onlineDeliveryUsecaseAdapter{runtime: runtime}})
 	a.deliveryWorker = runtime
 	if presenceNode, ok := a.cluster.(clusterinfra.PresenceNode); ok {
 		adapter := accessnode.New(accessnode.Options{

@@ -89,7 +89,7 @@ func Render(root string, spec BundleSpec) error {
 	if err != nil {
 		return err
 	}
-	requiredBinaries := []string{"wukongim", "wkbench", "wkanalysis", "prometheus", "node_exporter"}
+	requiredBinaries := []string{"wukongim", "wkcli", "wkanalysis", "prometheus", "node_exporter"}
 	if spec.PublicViewEnabled {
 		requiredBinaries = append(requiredBinaries, "wkcloudview")
 	}

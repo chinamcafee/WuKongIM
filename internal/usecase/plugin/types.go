@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/usecase/message"
 	"github.com/WuKongIM/WuKongIM/pkg/plugin/pluginproto"
+	runtimechannelid "github.com/WuKongIM/WuKongIM/pkg/protocol/channelid"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 )
 
@@ -62,10 +64,17 @@ var (
 
 const (
 	// SecretHidden is the manager-visible placeholder for configured secret values.
-	SecretHidden = "******"
+	SecretHidden           = "******"
+	reservedPluginNoPrefix = "__wukongim_"
 )
 
 var pluginNoPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// IsReservedPluginNo reports whether a plugin number belongs to WuKongIM's
+// internal runtime namespace and must never be exposed as an operator plugin.
+func IsReservedPluginNo(no string) bool {
+	return strings.HasPrefix(strings.TrimSpace(no), reservedPluginNoPrefix)
+}
 
 // Method identifies a plugin hook advertised by a plugin manifest.
 type Method string
@@ -268,6 +277,12 @@ type ChannelOwnerReader interface {
 	ChannelOwnerNode(context.Context, message.ChannelID) (uint64, error)
 }
 
+// ChannelOwnerBatchReader shares authoritative reads across a conversation list.
+type ChannelOwnerBatchReader interface {
+	// ChannelOwnerNodes returns one current owner per input, preserving input order.
+	ChannelOwnerNodes(context.Context, []message.ChannelID) ([]uint64, error)
+}
+
 // ConversationReader reads authoritative UID conversation channel lists for host RPCs.
 type ConversationReader interface {
 	// ConversationChannels returns recent conversation channels for a UID in reader-defined order.
@@ -308,8 +323,10 @@ type Observer interface {
 
 // Options configures the v2 plugin usecase.
 type Options struct {
-	Runtime Runtime
-	Invoker Invoker
+	// CommandChannelSuffix selects command IDs; empty retains the legacy default.
+	CommandChannelSuffix string
+	Runtime              Runtime
+	Invoker              Invoker
 	// DesiredStore persists plugin config and enable state.
 	DesiredStore DesiredStore
 	// Messages submits plugin-origin /message/send host RPCs.
@@ -346,6 +363,8 @@ type Options struct {
 
 // App orchestrates v2 plugin lifecycle, selection, and hook invocation usecases.
 type App struct {
+	// commandChannels keeps internal command IDs consistent with this node configuration.
+	commandChannels        runtimechannelid.CommandCodec
 	runtime                Runtime
 	invoker                Invoker
 	desired                DesiredStore

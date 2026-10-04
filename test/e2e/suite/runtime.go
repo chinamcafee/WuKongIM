@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -67,10 +68,15 @@ func (f optionFunc) apply(options *suiteOptions) {
 }
 
 type suiteOptions struct {
+	// tcpPartition optionally routes static cluster traffic through owned relays.
+	tcpPartition           *ClusterTCPPartition
 	workspaceRootDir       string
 	nodeLogRootDir         string
 	managerHTTP            bool
+	webSocketGateway       bool
+	mqttWebSocketGateway   bool
 	sharedBackupRepository bool
+	configFileOnly         bool
 	dynamicJoinToken       string
 	nodeConfigOverrides    map[uint64]map[string]string
 	nodeEnv                map[uint64][]string
@@ -95,6 +101,20 @@ func WithManagerHTTP() Option {
 	return optionFunc(func(options *suiteOptions) {
 		options.managerHTTP = true
 	})
+}
+
+// WithWebSocketGateway enables one browser-addressable WKProto-over-WebSocket
+// listener while retaining the suite's default TCP WKProto listener.
+func WithWebSocketGateway() Option {
+	return optionFunc(func(options *suiteOptions) {
+		options.webSocketGateway = true
+	})
+}
+
+// WithMQTTWebSocketGateway adds an independent /mqtt listener while keeping
+// WKProto TCP readiness and any existing /ws wsmux listener. Enable MQTT explicitly.
+func WithMQTTWebSocketGateway() Option {
+	return optionFunc(func(options *suiteOptions) { options.mqttWebSocketGateway = true })
 }
 
 // WithSharedBackupRepository mounts one workspace-scoped file repository at
@@ -143,12 +163,23 @@ func WithNodeEnv(nodeID uint64, env ...string) Option {
 	})
 }
 
+// WithConfigFileOnly keeps rendered configuration in TOML without duplicating
+// it as WK_* process variables. Explicit WithNodeEnv runtime controls remain.
+func WithConfigFileOnly() Option {
+	return optionFunc(func(options *suiteOptions) {
+		options.configFileOnly = true
+	})
+}
+
 // NewWorkspace creates a temp workspace with a default node-1 tree.
 func NewWorkspace(t *testing.T, opts ...Option) Workspace {
 	t.Helper()
 
 	options := resolveSuiteOptions(opts...)
 	rootDir := allocateWorkspaceRoot(t, options.workspaceRootDir)
+	if runtime.GOOS == "darwin" {
+		require.NoError(t, os.WriteFile(filepath.Join(rootDir, ".metadata_never_index"), nil, 0o600))
+	}
 	workspace := Workspace{
 		RootDir:          rootDir,
 		pluginSocketRoot: allocatePluginSocketRoot(t),
@@ -188,7 +219,9 @@ func (s *Suite) StartSingleNodeCluster(opts ...Option) *StartedNode {
 	}
 	renderedConfig := RenderSingleNodeConfig(spec)
 	require.NoError(s.t, os.WriteFile(spec.ConfigPath, []byte(renderedConfig), 0o644))
-	spec.Env = append(envFromConfig(renderedConfig), spec.Env...)
+	if !spec.ConfigFileOnly {
+		spec.Env = append(envFromConfig(renderedConfig), spec.Env...)
+	}
 
 	process := &NodeProcess{
 		Spec:       spec,
@@ -213,13 +246,18 @@ func (s *Suite) StartSingleNodeCluster(opts ...Option) *StartedNode {
 
 // StartThreeNodeCluster starts three static wukongim child processes.
 func (s *Suite) StartThreeNodeCluster(opts ...Option) *StartedCluster {
+	return s.StartStaticCluster(3, opts...)
+}
+
+// StartStaticCluster starts nodeCount static wukongim child processes.
+func (s *Suite) StartStaticCluster(nodeCount int, opts ...Option) *StartedCluster {
 	s.t.Helper()
+	require.Greater(s.t, nodeCount, 0, "static cluster node count must be positive")
 
 	workspace, options := s.startContext(opts...)
-	ports := []PortSet{
-		ReserveLoopbackPorts(s.t),
-		ReserveLoopbackPorts(s.t),
-		ReserveLoopbackPorts(s.t),
+	ports := make([]PortSet, nodeCount)
+	for index := range ports {
+		ports[index] = ReserveLoopbackPorts(s.t)
 	}
 	specs := make([]NodeSpec, 0, len(ports))
 	for i, portSet := range ports {
@@ -235,10 +273,16 @@ func (s *Suite) StartThreeNodeCluster(opts ...Option) *StartedCluster {
 		specs = append(specs, spec)
 	}
 
+	peers := specs
+	if options.tcpPartition != nil {
+		peers = options.tcpPartition.start(s.t, specs)
+	}
 	for i := range specs {
-		renderedConfig := RenderClusterConfig(specs[i], specs)
+		renderedConfig := RenderClusterConfig(specs[i], peers)
 		require.NoError(s.t, os.WriteFile(specs[i].ConfigPath, []byte(renderedConfig), 0o644))
-		specs[i].Env = append(envFromConfig(renderedConfig), specs[i].Env...)
+		if !specs[i].ConfigFileOnly {
+			specs[i].Env = append(envFromConfig(renderedConfig), specs[i].Env...)
+		}
 	}
 
 	cluster := &StartedCluster{
@@ -252,6 +296,9 @@ func (s *Suite) StartThreeNodeCluster(opts ...Option) *StartedCluster {
 	for _, spec := range specs {
 		process := &NodeProcess{Spec: spec, BinaryPath: s.binaryPath}
 		require.NoError(s.t, process.Start())
+		if options.tcpPartition != nil {
+			options.tcpPartition.register(spec.ID, process)
+		}
 		cluster.Nodes = append(cluster.Nodes, StartedNode{Spec: spec, Process: process})
 	}
 
@@ -342,7 +389,9 @@ func (c *StartedCluster) StartSeedJoinNodeNoWait(t testing.TB, cfg SeedJoinNodeC
 	}
 	renderedConfig := RenderSeedJoinNodeConfig(spec, cfg)
 	require.NoError(t, os.WriteFile(spec.ConfigPath, []byte(renderedConfig), 0o644))
-	spec.Env = append(envFromConfig(renderedConfig), spec.Env...)
+	if !spec.ConfigFileOnly {
+		spec.Env = append(envFromConfig(renderedConfig), spec.Env...)
+	}
 
 	process := &NodeProcess{Spec: spec, BinaryPath: c.binaryPath}
 	require.NoError(t, process.Start())
@@ -523,7 +572,10 @@ func (c *StartedCluster) ReconfigureStoppedNodes(overrides map[uint64]map[string
 			return fmt.Errorf("write node %d config: %w", specs[index].ID, err)
 		}
 		externalEnv := nonConfigEnvironment(specs[index].Env, schema)
-		specs[index].Env = append(envFromConfig(rendered), externalEnv...)
+		specs[index].Env = externalEnv
+		if !specs[index].ConfigFileOnly {
+			specs[index].Env = append(envFromConfig(rendered), externalEnv...)
+		}
 		c.Nodes[index].Spec = specs[index]
 	}
 	c.lastReadyz = make(map[uint64]HTTPObservation, len(c.Nodes))
@@ -557,6 +609,19 @@ func (n StartedNode) ManagerAddr() string {
 // GatewayAddr returns the public WKProto listen address for the started node.
 func (n StartedNode) GatewayAddr() string {
 	return n.Spec.GatewayAddr
+}
+
+// WebSocketURL returns the browser-addressable WKProto WebSocket route.
+func (n StartedNode) WebSocketURL() string {
+	return browserWebSocketURL(n.Spec.WebSocketAddr)
+}
+
+// MQTTWebSocketURL returns the independently allocated MQTT /mqtt endpoint.
+func (n StartedNode) MQTTWebSocketURL() string {
+	if n.Spec.MQTTWebSocketAddr == "" {
+		return ""
+	}
+	return "ws://" + n.Spec.MQTTWebSocketAddr + "/mqtt"
 }
 
 // DumpDiagnostics returns diagnostics for the started node process.
@@ -652,21 +717,32 @@ func buildNodeSpec(nodeID uint64, ports PortSet, workspace Workspace, options su
 		}
 		configOverrides[pluginSocketConfigKey] = workspace.pluginSocketPath(nodeID)
 	}
+	webSocketAddr := ""
+	if options.webSocketGateway {
+		webSocketAddr = ports.WebSocketAddr
+	}
+	mqttWebSocketAddr := ""
+	if options.mqttWebSocketGateway {
+		mqttWebSocketAddr = ports.MQTTWebSocketAddr
+	}
 	return NodeSpec{
-		ID:              nodeID,
-		Name:            "node-" + strconv.FormatUint(nodeID, 10),
-		RootDir:         workspace.NodeRootDir(nodeID),
-		DataDir:         workspace.NodeDataDir(nodeID),
-		ConfigPath:      workspace.NodeConfigPath(nodeID),
-		StdoutPath:      workspace.NodeStdoutPath(nodeID),
-		StderrPath:      workspace.NodeStderrPath(nodeID),
-		ClusterAddr:     ports.ClusterAddr,
-		GatewayAddr:     ports.GatewayAddr,
-		APIAddr:         ports.APIAddr,
-		ManagerAddr:     managerAddr,
-		LogDir:          workspace.NodeLogDir(nodeID),
-		ConfigOverrides: configOverrides,
-		Env:             cloneEnv(options.nodeEnv[nodeID]),
+		ID:                nodeID,
+		Name:              "node-" + strconv.FormatUint(nodeID, 10),
+		RootDir:           workspace.NodeRootDir(nodeID),
+		DataDir:           workspace.NodeDataDir(nodeID),
+		ConfigPath:        workspace.NodeConfigPath(nodeID),
+		StdoutPath:        workspace.NodeStdoutPath(nodeID),
+		StderrPath:        workspace.NodeStderrPath(nodeID),
+		ClusterAddr:       ports.ClusterAddr,
+		GatewayAddr:       ports.GatewayAddr,
+		WebSocketAddr:     webSocketAddr,
+		MQTTWebSocketAddr: mqttWebSocketAddr,
+		APIAddr:           ports.APIAddr,
+		ManagerAddr:       managerAddr,
+		LogDir:            workspace.NodeLogDir(nodeID),
+		ConfigOverrides:   configOverrides,
+		ConfigFileOnly:    options.configFileOnly,
+		Env:               cloneEnv(options.nodeEnv[nodeID]),
 	}
 }
 

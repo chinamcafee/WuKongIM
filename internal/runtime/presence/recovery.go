@@ -1,0 +1,99 @@
+package presence
+
+import "time"
+
+// RecoveryBatchSize bounds one owner query and atomic reconstruction page.
+const RecoveryBatchSize = 512
+
+// A bounded FIFO proof cache avoids unbounded memory for offline recipient UIDs.
+// Eviction requires another owner query; it never turns unknown into offline.
+const recoveryCacheSize = 1024
+
+func (s *authoritySlot) recoveryReady(uids []string) bool {
+	for _, uid := range uids {
+		if uid != "" {
+			if _, ok := s.recovered[uid]; !ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// RecoveryUIDs returns only UIDs lacking an exact current-authority owner proof.
+func (d *Directory) RecoveryUIDs(target RouteTarget, uids []string) ([]string, error) {
+	shard := d.shard(target.HashSlot)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+	slot, err := d.validateTargetLocked(shard, target)
+	if err != nil {
+		return nil, err
+	}
+	if len(uids) > RecoveryBatchSize {
+		return nil, ErrRouteNotReady
+	}
+	var missing []string
+	seen := make(map[string]struct{}, len(uids))
+	for _, uid := range uids {
+		if uid == "" {
+			continue
+		}
+		if _, ok := slot.recovered[uid]; ok {
+			continue
+		}
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		missing = append(missing, uid)
+	}
+	return missing, nil
+}
+
+// InstallRecoveredRoutes publishes one complete owner-query page under the
+// original authority fence. Concurrent unregister tombstones and newer owner
+// sequences still win; missing proof is never published by partial owner reads.
+func (d *Directory) InstallRecoveredRoutes(target RouteTarget, uids []string, routes []Route) error {
+	shard := d.shard(target.HashSlot)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	slot, err := d.validateTargetLocked(shard, target)
+	if err != nil {
+		return err
+	}
+	if len(uids) > RecoveryBatchSize || len(routes) > 4096 {
+		return ErrRouteNotReady
+	}
+	allowed := make(map[string]struct{}, len(uids))
+	for _, uid := range uids {
+		allowed[uid] = struct{}{}
+	}
+	for _, route := range routes {
+		if _, ok := allowed[route.UID]; !ok || route.OwnerNodeID == 0 || route.OwnerBootID == 0 || route.SessionID == 0 {
+			return ErrStaleRoute
+		}
+	}
+	for _, route := range routes {
+		slot.touchLocked(route, time.Now().UnixMilli())
+	}
+	if slot.recovered == nil {
+		slot.recovered = make(map[string]struct{})
+	}
+	for _, uid := range uids {
+		if uid == "" {
+			continue
+		}
+		if _, ok := slot.recovered[uid]; ok {
+			continue
+		}
+		if len(slot.recoveryOrder) < recoveryCacheSize {
+			slot.recoveryOrder = append(slot.recoveryOrder, uid)
+		} else {
+			delete(slot.recovered, slot.recoveryOrder[slot.recoveryNext])
+			slot.recoveryOrder[slot.recoveryNext] = uid
+			slot.recoveryNext = (slot.recoveryNext + 1) % recoveryCacheSize
+		}
+		slot.recovered[uid] = struct{}{}
+	}
+	return nil
+}

@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "source_commit": "a888f89533d0e7d1b2030e06504ca97f1ad891d4",
+  "sources": [
+    {"node_id": 1001, "data_dir": "/source/node1/data", "shard_count": 8}
+  ],
+  "target": {
+    "cluster_id": "replace-with-new-rehearsal-cluster-id",
+    "created_at": "2026-09-09T00:00:00Z",
+    "slot_count": 12,
+    "hash_slot_count": 256,
+    "replicas": 1,
+    "channel_replicas": 1,
+    "nodes": [
+      {"node_id": 1, "addr": "127.0.0.1:37101", "data_dir": "/targets/1"}
+    ]
+  }
+}

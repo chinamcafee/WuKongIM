@@ -1,0 +1,243 @@
+name: Safety Automation - Publish Documentation to GitHub Pages
+run-name: >-
+  Documentation Pages ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }} attempt ${{ github.run_attempt }}
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/docs-pages.yml"
+      - "CHANGELOG.md"
+      - "docs-site/**"
+      - "scripts/docs-cdn/install-aliyun-cli.sh"
+      - "scripts/docs-cdn/refresh.sh"
+      - "scripts/docs-cdn/verify-pages-origin.sh"
+  workflow_run:
+    workflows:
+      - Safety Automation - Publish WuKongIM Binaries
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      expected_pages_domain:
+        description: "Optional exact Pages domain; build first, then wait for this domain before deploying"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Verify and package the static documentation site
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        startsWith(github.event.workflow_run.head_branch, 'v') &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout the exact source revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate the immutable release documentation source
+        if: github.event_name == 'workflow_run'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RELEASE_EVENT: ${{ github.event.workflow_run.event }}
+          RELEASE_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          RELEASE_SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_CONCLUSION" == success ]]
+          [[ "$RELEASE_EVENT" == push ]]
+          [[ "$RELEASE_REPOSITORY" == "$GITHUB_REPOSITORY" ]]
+          [[ "$RELEASE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_TAG" =~ ^v[0-9] ]]
+          [[ "$(git rev-parse HEAD)" == "$RELEASE_SOURCE_SHA" ]]
+
+          git fetch --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/main"
+          git merge-base --is-ancestor "$RELEASE_SOURCE_SHA" refs/remotes/origin/main
+
+          git fetch --no-tags origin \
+            "refs/tags/$RELEASE_TAG:refs/remotes/origin/release-docs-tag"
+          [[ "$(git rev-parse 'refs/remotes/origin/release-docs-tag^{commit}')" == "$RELEASE_SOURCE_SHA" ]]
+
+          readonly release_id="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" | \
+            jq -er 'select(.tag_name == env.RELEASE_TAG and .immutable == true and .draft == false) | .id')"
+          [[ "$release_id" =~ ^[0-9]+$ ]]
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.11"
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - name: Install, verify, and export the site
+        working-directory: docs-site
+        env:
+          DOCS_RELEASE_TAG: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || '' }}
+          DOCS_SITE_URL: https://docs.githubim.com
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(bun --version)" = "1.3.11"
+          bun install --frozen-lockfile
+          bun run verify
+      - name: Verify the GitHub Pages static markers
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e docs-site/out/CNAME
+          test -f docs-site/out/.nojekyll
+      - name: Upload the exact static export
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: docs-site/out
+          include-hidden-files: true
+          retention-days: 1
+
+  deploy:
+    name: Deploy the verified artifact
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Wait for the expected GitHub Pages custom domain
+        if: github.event_name == 'workflow_dispatch' && inputs.expected_pages_domain != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_PAGES_DOMAIN: ${{ inputs.expected_pages_domain }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/main ]]
+          [[ "$EXPECTED_PAGES_DOMAIN" == docs.githubim.com || "$EXPECTED_PAGES_DOMAIN" == origin-docs.githubim.com ]]
+          readonly pages_api="https://api.github.com/repos/${GITHUB_REPOSITORY}/pages"
+          domain_ready=false
+          for attempt in $(seq 1 120); do
+            current_domain="$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "$pages_api" --jq '.cname // ""' 2>/dev/null || true)"
+            if [[ "$current_domain" == "$EXPECTED_PAGES_DOMAIN" ]]; then
+              domain_ready=true
+              break
+            fi
+            printf 'Waiting for Pages domain %s (current: %s, attempt: %s/120)\n' \
+              "$EXPECTED_PAGES_DOMAIN" "${current_domain:-missing}" "$attempt"
+            sleep 5
+          done
+          [[ "$domain_ready" == true ]]
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+
+  verify_pages_origin:
+    name: Verify the direct GitHub Pages origin
+    needs: deploy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: read
+    steps:
+      - name: Checkout the exact source revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Require the Pages API and direct origin data plane to agree
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOCS_PAGES_REPOSITORY: ${{ github.repository }}
+          DOCS_PAGES_DOMAIN: ${{ inputs.expected_pages_domain }}
+          DOCS_PAGES_CACHE_BUST: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: ./scripts/docs-cdn/verify-pages-origin.sh
+
+  refresh_cdn:
+    name: Refresh bounded Alibaba CDN URLs
+    needs: verify_pages_origin
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      vars.DOCS_CDN_ENABLED == 'true' &&
+      (github.event_name != 'workflow_dispatch' || inputs.expected_pages_domain == '')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: docs-cdn
+    steps:
+      - name: Checkout the exact source revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate the exact CDN refresh binding without credentials
+        shell: bash
+        env:
+          DOCS_CDN_DOMAIN: ${{ vars.DOCS_CDN_DOMAIN }}
+          DOCS_CDN_REFRESH_ROLE_ARN: ${{ vars.DOCS_CDN_REFRESH_ROLE_ARN }}
+          DOCS_CDN_CERTIFICATE_ROLE_ARN: ${{ vars.DOCS_CDN_CERTIFICATE_ROLE_ARN }}
+          DOCS_CDN_OIDC_PROVIDER_ARN: ${{ vars.DOCS_CDN_OIDC_PROVIDER_ARN }}
+          DOCS_CDN_OIDC_AUDIENCE: ${{ vars.DOCS_CDN_OIDC_AUDIENCE }}
+        run: |
+          set -euo pipefail
+          [[ "$DOCS_CDN_DOMAIN" == docs.githubim.com ]]
+          [[ "$DOCS_CDN_REFRESH_ROLE_ARN" =~ ^acs:ram::([0-9]+):role/[A-Za-z0-9_-]+$ ]]
+          readonly role_account="${BASH_REMATCH[1]}"
+          [[ "$DOCS_CDN_CERTIFICATE_ROLE_ARN" =~ ^acs:ram::([0-9]+):role/[A-Za-z0-9_-]+$ ]]
+          readonly certificate_role_account="${BASH_REMATCH[1]}"
+          [[ "$DOCS_CDN_OIDC_PROVIDER_ARN" =~ ^acs:ram::([0-9]+):oidc-provider/[A-Za-z0-9._-]+$ ]]
+          readonly provider_account="${BASH_REMATCH[1]}"
+          [[ "$role_account" == "$certificate_role_account" && "$role_account" == "$provider_account" ]]
+          [[ "$DOCS_CDN_REFRESH_ROLE_ARN" != "$DOCS_CDN_CERTIFICATE_ROLE_ARN" ]]
+          [[ "$DOCS_CDN_OIDC_AUDIENCE" =~ ^[A-Za-z0-9._:-]{1,128}$ ]]
+      - name: Install the pinned Alibaba Cloud CLI
+        shell: bash
+        run: ./scripts/docs-cdn/install-aliyun-cli.sh "$RUNNER_TEMP/docs-cdn-cli"
+      - name: Exchange the exact CDN refresh OIDC identity
+        uses: aliyun/configure-aliyun-credentials-action@1e5248c8d5d93a8781ac344a68e19a43341e79e6 # v1.1.0
+        with:
+          role-to-assume: ${{ vars.DOCS_CDN_REFRESH_ROLE_ARN }}
+          oidc-provider-arn: ${{ vars.DOCS_CDN_OIDC_PROVIDER_ARN }}
+          audience: ${{ vars.DOCS_CDN_OIDC_AUDIENCE }}
+          role-session-name: wukongim-docs-cdn-refresh-${{ github.run_id }}
+          role-session-expiration: 900
+      - name: Refresh only the bounded stable public URLs
+        shell: bash
+        env:
+          DOCS_CDN_ENABLED: ${{ vars.DOCS_CDN_ENABLED }}
+          DOCS_CDN_DOMAIN: ${{ vars.DOCS_CDN_DOMAIN }}
+        run: |
+          set -euo pipefail
+          export PATH="$RUNNER_TEMP/docs-cdn-cli:$PATH"
+          ./scripts/docs-cdn/refresh.sh

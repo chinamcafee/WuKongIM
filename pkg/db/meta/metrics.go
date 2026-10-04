@@ -4,6 +4,18 @@ import "github.com/WuKongIM/WuKongIM/pkg/db/internal/engine"
 
 // EngineMetricsSnapshot is a stable view of the metadata engine's local storage state.
 type EngineMetricsSnapshot struct {
+	// RuntimeCacheEntries includes resident runtime rows awaiting lazy invalidation.
+	RuntimeCacheEntries int
+	// RuntimeCacheCapacity is the runtime row cache's fixed entry limit.
+	RuntimeCacheCapacity int
+	// RuntimeCacheBytes conservatively accounts retained row and entry bytes.
+	RuntimeCacheBytes int
+	// RuntimeCacheByteLimit bounds runtime row and entry retention.
+	RuntimeCacheByteLimit int
+	// ChannelCacheEntries is the number of business-channel rows retained by the read cache.
+	ChannelCacheEntries int
+	// ChannelCacheCapacity is the hard upper bound for business-channel cache entries.
+	ChannelCacheCapacity int
 	// DiskSpaceUsageBytes is the engine's local disk usage, including live and obsolete files.
 	DiskSpaceUsageBytes uint64
 	// ReadAmplification is the current LSM read amplification estimate.
@@ -22,6 +34,14 @@ type EngineMetricsSnapshot struct {
 	WALBytesIn uint64
 	// WALBytesWritten is the physical bytes written to the WAL.
 	WALBytesWritten uint64
+	// SSTableSizeBytes is the current physical size of live SSTables across all levels.
+	SSTableSizeBytes uint64
+	// FlushBytesWritten is the cumulative bytes written to SSTables by flushes.
+	FlushBytesWritten uint64
+	// CompactionBytesRead is the cumulative SSTable bytes read by compactions.
+	CompactionBytesRead uint64
+	// CompactionBytesWritten is the cumulative SSTable bytes written by compactions.
+	CompactionBytesWritten uint64
 	// FlushCount is the number of completed flushes since this engine opened.
 	FlushCount int64
 	// FlushesInProgress is the current number of flushes in progress.
@@ -34,6 +54,36 @@ type EngineMetricsSnapshot struct {
 	CompactionInProgressBytes int64
 	// CompactionsInProgress is the current number of compactions in progress.
 	CompactionsInProgress int64
+	// WriteStallMemTableCount counts Pebble write stalls caused by the memtable stop-writes threshold.
+	WriteStallMemTableCount int64
+	// WriteStallL0Count counts Pebble write stalls caused by the L0 stop-writes threshold.
+	WriteStallL0Count int64
+	// WriteStallOtherCount counts Pebble write stalls with any other reason.
+	WriteStallOtherCount int64
+	// WriteStallTotalNanos is the cumulative write-stall duration, including an open stall.
+	WriteStallTotalNanos int64
+	// WriteStallMaxNanos is the longest single write stall, including an open stall.
+	WriteStallMaxNanos int64
+	// WriteStallActive reports whether writes are stalled at snapshot time.
+	WriteStallActive bool
+	// WALFsyncCount is the number of WAL fsyncs observed since the store opened.
+	WALFsyncCount uint64
+	// WALFsyncSumNanos is the cumulative WAL fsync duration.
+	WALFsyncSumNanos int64
+	// WALFsyncOver100ms counts WAL fsyncs slower than 100ms at histogram bucket resolution.
+	WALFsyncOver100ms uint64
+	// WALFsyncOver1s counts WAL fsyncs slower than 1s at histogram bucket resolution.
+	WALFsyncOver1s uint64
+	// WALFsyncOver5s counts WAL fsyncs slower than 5s at histogram bucket resolution.
+	WALFsyncOver5s uint64
+	// DiskSlowWALEvents counts slow-disk reports on WAL files.
+	DiskSlowWALEvents int64
+	// DiskSlowWALMaxNanos is the longest reported WAL disk operation.
+	DiskSlowWALMaxNanos int64
+	// DiskSlowOtherEvents counts slow-disk reports on SST, manifest and other files.
+	DiskSlowOtherEvents int64
+	// DiskSlowOtherMaxNanos is the longest reported non-WAL disk operation.
+	DiskSlowOtherMaxNanos int64
 }
 
 // MetricsSnapshot returns the metadata engine's current storage metrics.
@@ -41,7 +91,15 @@ func (db *DB) MetricsSnapshot() EngineMetricsSnapshot {
 	if db == nil || db.engine == nil {
 		return EngineMetricsSnapshot{}
 	}
-	return metaMetricsFromSnapshot(db.engine.MetricsSnapshot())
+	snapshot := metaMetricsFromSnapshot(db.engine.MetricsSnapshot())
+	if db.meta != nil {
+		snapshot.RuntimeCacheEntries, snapshot.RuntimeCacheBytes = db.meta.runtimeCache.usage()
+		snapshot.RuntimeCacheCapacity = runtimeReadCacheEntries
+		snapshot.RuntimeCacheByteLimit = runtimeReadCacheBytes
+		snapshot.ChannelCacheEntries = db.meta.channelCacheSize()
+		snapshot.ChannelCacheCapacity = channelCacheCapacity
+	}
+	return snapshot
 }
 
 func metaMetricsFromSnapshot(snapshot engine.MetricsSnapshot) EngineMetricsSnapshot {
@@ -55,11 +113,30 @@ func metaMetricsFromSnapshot(snapshot engine.MetricsSnapshot) EngineMetricsSnaps
 		WALPhysicalSizeBytes:         snapshot.WALPhysicalSizeBytes,
 		WALBytesIn:                   snapshot.WALBytesIn,
 		WALBytesWritten:              snapshot.WALBytesWritten,
+		SSTableSizeBytes:             snapshot.SSTableSizeBytes,
+		FlushBytesWritten:            snapshot.FlushBytesWritten,
+		CompactionBytesRead:          snapshot.CompactionBytesRead,
+		CompactionBytesWritten:       snapshot.CompactionBytesWritten,
 		FlushCount:                   snapshot.FlushCount,
 		FlushesInProgress:            snapshot.FlushesInProgress,
 		CompactionCount:              snapshot.CompactionCount,
 		CompactionEstimatedDebtBytes: snapshot.CompactionEstimatedDebtBytes,
 		CompactionInProgressBytes:    snapshot.CompactionInProgressBytes,
 		CompactionsInProgress:        snapshot.CompactionsInProgress,
+		WriteStallMemTableCount:      snapshot.WriteStalls.MemTableStalls,
+		WriteStallL0Count:            snapshot.WriteStalls.L0Stalls,
+		WriteStallOtherCount:         snapshot.WriteStalls.OtherStalls,
+		WriteStallTotalNanos:         snapshot.WriteStalls.TotalNanos,
+		WriteStallMaxNanos:           snapshot.WriteStalls.MaxNanos,
+		WriteStallActive:             snapshot.WriteStalls.Active,
+		WALFsyncCount:                snapshot.WALFsync.Count,
+		WALFsyncSumNanos:             snapshot.WALFsync.SumNanos,
+		WALFsyncOver100ms:            snapshot.WALFsync.Over100ms,
+		WALFsyncOver1s:               snapshot.WALFsync.Over1s,
+		WALFsyncOver5s:               snapshot.WALFsync.Over5s,
+		DiskSlowWALEvents:            snapshot.DiskSlow.WALEvents,
+		DiskSlowWALMaxNanos:          snapshot.DiskSlow.WALMaxNanos,
+		DiskSlowOtherEvents:          snapshot.DiskSlow.OtherEvents,
+		DiskSlowOtherMaxNanos:        snapshot.DiskSlow.OtherMaxNanos,
 	}
 }

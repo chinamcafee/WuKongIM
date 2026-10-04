@@ -43,12 +43,16 @@ func (s *Store) RegisterRPCHandlers(register RegisterRPCHandlerFunc) {
 func storeRPCHandlers(store *Store) []storeRPCRegistration {
 	return []storeRPCRegistration{
 		{serviceID: runtimeMetaRPCServiceID, handler: store.handleRuntimeMetaRPC},
+		{serviceID: cmdDeviceRPCServiceID, handler: store.handleCMDDeviceReadRPC},
 		{serviceID: identityRPCServiceID, handler: store.handleIdentityRPC},
 		{serviceID: subscriberRPCServiceID, handler: store.handleSubscriberRPC},
 		{serviceID: channelRPCServiceID, handler: store.handleChannelRPC},
-		{serviceID: userConversationStateRPCServiceID, handler: store.handleUserConversationStateRPC},
+		{serviceID: permissionBatchRPCServiceID, handler: store.handlePermissionBatchRPC},
+		{serviceID: sendPermissionRPCServiceID, handler: store.handleSendPermissionRPC},
 		{serviceID: channelMigrationRPCServiceID, handler: store.handleChannelMigrationRPC},
-		{serviceID: cmdConversationStateRPCServiceID, handler: store.handleCMDConversationStateRPC},
 		{serviceID: pluginBindingRPCServiceID, handler: store.handlePluginBindingRPC},
+		{serviceID: membershipRPCServiceID, handler: store.handleMembershipRPC},
+		{serviceID: messageUpdateRPCServiceID, handler: store.handleMessageUpdateReadRPC},
+		{serviceID: mqttReadRPCServiceID, handler: store.handleMQTTReadRPC},
 	}
 }

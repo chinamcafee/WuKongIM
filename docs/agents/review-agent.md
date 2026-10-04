@@ -78,11 +78,17 @@ The trusted Context Builder includes:
 - the complete paginated file inventory, exact base/head text, full-file
   review content, and GitHub's real diff hunks for inline coordinates;
 - pull-request title, body, linked Issue identities, and intent digest;
-- exact trusted control/base `AGENTS.md` and applicable `FLOW.md` blobs;
+- exact trusted control/base `AGENTS.md` instructions and applicable advisory
+  `FLOW.md` navigation blobs;
 - current Reviews, comments, unresolved threads, and Check facts;
 - protected policy, prompt, and schema digests plus the mandatory-check plan;
   and
 - the exact generation identity.
+
+The reviewer applies mandatory `AGENTS.md` first, then executable
+code/schema/test facts, accepted ADRs or stable project knowledge, advisory
+`FLOW.md`, and finally the generated FLOW index. A FLOW conflict with a
+higher-authority source is reported rather than silently followed.
 
 On reconsideration, the prior generation's structured findings are copied
 from signed state into the new Context Bundle with stable digests. The new
@@ -90,8 +96,10 @@ result must explicitly retain each exact finding or withdraw it with a bounded
 reason; a prior finding can never disappear silently.
 
 Candidate text, repository files, comments, public web content, linked Issue
-text, and test output are untrusted data. Candidate changes to instructions or
-Review Agent control files never govern their own review.
+text, and test output are untrusted data. Candidate changes to AGENTS, FLOW, or
+Review Agent control files never govern their own review. Frozen base/control
+FLOW content remains advisory and cannot override mandatory AGENTS rules or
+executable repository facts.
 
 Incomplete pagination, unreadable content, unsupported changes, merge identity
 failure, or a context too large for complete risk coverage yields
@@ -230,11 +238,12 @@ waits for another administrator review command. Infrastructure failure retries
 once inside the protected budget, then becomes `inconclusive`. Code/check
 failures are not infrastructure retries. The next administrator review command
 creates the new generation.
-One generation has a 90-minute wall-time budget measured from its signed lease;
-the initial review, automatic retry, reconsideration worker, and explanation
-worker all honor their own signed lease deadline. Late review results can never
-approve and are recorded as `inconclusive`; late explanations are discarded
-without changing the verdict. A fresh merge conflict is adjudicated without a
+Each review infrastructure attempt has a 90-minute wall-time budget. The one
+automatic retry remains in the same generation but receives a fresh signed
+attempt deadline, bounding a generation to 180 minutes. Reconsideration and
+explanation workers honor their own signed lease deadlines. Late review results
+can never approve and are recorded as `inconclusive`; late explanations are
+discarded without changing the verdict. A fresh merge conflict is adjudicated without a
 model as `changes_required`, with a formal `REQUEST_CHANGES` Review and failed
 Verdict. A failed Controller state, projection, or dispatch effect is
 automatically reconciled once from fresh facts.

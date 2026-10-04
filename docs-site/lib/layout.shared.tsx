@@ -1,5 +1,7 @@
 import Image from 'next/image';
+import { zhCN } from '@fumadocs/language/zh-cn';
 import type { BaseLayoutProps } from 'fumadocs-ui/layouts/shared';
+import { openapiTranslations } from 'fumadocs-openapi/i18n';
 import { uiTranslations } from 'fumadocs-ui/i18n';
 import { domains, type Locale } from './navigation';
 import { i18n } from './i18n';
@@ -8,6 +10,8 @@ import { appName, gitConfig } from './shared';
 export const translations = i18n
   .translations()
   .extend(uiTranslations())
+  .extend(openapiTranslations())
+  .preset('zh', zhCN())
   .add({
     zh: {
       displayName: '中文',
@@ -61,7 +65,6 @@ export function baseOptions(locale: Locale): BaseLayoutProps {
       url: `/${locale}`,
       transparentMode: 'top',
     },
-    githubUrl: `https://github.com/${gitConfig.user}/${gitConfig.repo}`,
     links: [
       ...domains.map((domain) => ({
         text: domain.label[locale],
@@ -73,18 +76,18 @@ export function baseOptions(locale: Locale): BaseLayoutProps {
         text: locale === 'zh' ? '资源' : 'Resources',
         items: [
           {
-            text: locale === 'zh' ? '官网' : 'Website',
-            url: 'https://githubim.com',
+            text: 'GitHub',
+            url: `https://github.com/${gitConfig.user}/${gitConfig.repo}`,
             external: true,
           },
           {
             text: locale === 'zh' ? '聊天演示' : 'Chat Demo',
-            url: 'https://imdemo.githubim.com',
+            url: 'https://demo.githubim.com/',
             external: true,
           },
           {
             text: locale === 'zh' ? 'Manager 演示' : 'Manager Demo',
-            url: 'https://monitor.githubim.com/web/',
+            url: 'https://manager.githubim.com/',
             external: true,
           },
           {

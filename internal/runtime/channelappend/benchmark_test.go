@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/contracts/onlinedelivery"
-	"github.com/WuKongIM/WuKongIM/internal/runtime/conversationactive"
 	runtimechannelid "github.com/WuKongIM/WuKongIM/pkg/protocol/channelid"
 )
 
@@ -488,24 +487,15 @@ func (o *benchmarkWriterPressureObserver) SetChannelAppendWriterPressure(event W
 	o.pressure.Store(int64(event.PendingAppendItems + event.AppendInflightItems + event.PostCommitBacklog))
 }
 
-// benchmarkNoopActiveAdmitter enables the post-commit path (hasPostCommitWork
-// == true) so advance() - not advanceAppendOnly() - is exercised, without
-// adding real delivery cost. This is the path where commitEffect duffcopy
-// dominates under load.
-type benchmarkNoopActiveAdmitter struct{}
-
-func (benchmarkNoopActiveAdmitter) AdmitActiveBatch(context.Context, conversationactive.ActiveBatch) error {
-	return nil
-}
-
 func BenchmarkSubmitLocalHotChannelPostCommit(b *testing.B) {
+	persistAfter := &benchmarkPersistAfterEnqueuer{}
 	group := newBenchmarkChannelAppendGroup(b, Options{
-		LocalNodeID:                1,
-		AuthorityShardCount:        1,
-		EffectPoolSize:             4,
-		AdmissionCapacityPerShard:  4096,
-		InboxCoalesceWindow:        -time.Nanosecond,
-		ConversationActiveAdmitter: benchmarkNoopActiveAdmitter{},
+		LocalNodeID:               1,
+		AuthorityShardCount:       1,
+		EffectPoolSize:            4,
+		AdmissionCapacityPerShard: 4096,
+		InboxCoalesceWindow:       -time.Nanosecond,
+		PersistAfterEnqueuer:      persistAfter,
 	})
 	target := benchmarkAuthorityTarget("bench-postcommit")
 	item := benchmarkSendItem("bench-postcommit")
@@ -529,20 +519,64 @@ func BenchmarkSubmitLocalHotChannelPostCommit(b *testing.B) {
 func BenchmarkChannelAppendPostCommitPlugin(b *testing.B) {
 	event := CommittedEnvelope{MessageID: 1, MessageSeq: 1, ChannelID: "room", ChannelType: 2, Payload: []byte("payload")}
 	b.Run("disabled", func(b *testing.B) {
-		effect := commitEffect{events: []CommittedEnvelope{event}}
+		effect := commitEffect{events: []committedPostCommit{{envelope: event}}}
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			_ = effect.run(context.Background(), commitPorts{})
 		}
 	})
 	b.Run("enabled_enqueue", func(b *testing.B) {
-		effect := commitEffect{events: []CommittedEnvelope{event}}
+		effect := commitEffect{events: []committedPostCommit{{envelope: event}}}
 		enqueuer := &benchmarkPersistAfterEnqueuer{}
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			_ = effect.run(context.Background(), commitPorts{persistAfter: enqueuer})
 		}
 	})
+}
+
+// BenchmarkVeryLargeGroupRecipientDispatch measures the complete bounded
+// subscriber-page -> authority-grouping -> delivery-plan admission path used by
+// the formal 100,000-member group canary. The delivery runtime itself has a
+// separate 100K benchmark; keeping this benchmark here makes page-size CPU and
+// allocation costs visible instead of starting from already-grouped plans.
+func BenchmarkVeryLargeGroupRecipientDispatch(b *testing.B) {
+	const recipientCount = 100_000
+	recipients := make([]Recipient, recipientCount)
+	for i := range recipients {
+		recipients[i].UID = "u-" + strconv.Itoa(i)
+	}
+
+	for _, pageSize := range []int{512, 2048, 4096, 8192} {
+		b.Run(strconv.Itoa(pageSize), func(b *testing.B) {
+			source := benchmarkPagedSubscriberSource{recipients: recipients}
+			resolver := benchmarkRecipientAuthorityResolver{}
+			enqueuer := &benchmarkCountingDeliveryEnqueuer{}
+			ports := commitPorts{
+				subscribers:                source,
+				recipientAuthorityResolver: resolver,
+				deliveryEnqueuer:           enqueuer,
+				recipientBatchSize:         512,
+				subscriberPageSize:         pageSize,
+			}
+			event := CommittedEnvelope{MessageID: 1, MessageSeq: 1, ChannelID: "bench-very-large", ChannelType: 2, FromUID: "sender", Payload: benchmarkPayload}
+			target := benchmarkAuthorityTarget(event.ChannelID)
+			target.Large = true
+
+			b.ReportAllocs()
+			b.ReportMetric(recipientCount, "recipients/op")
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := dispatchCommittedRecipientsForTarget(context.Background(), target, event, subscriberCache{}, ports); err != nil {
+					b.Fatalf("dispatchCommittedRecipientsForTarget() error = %v", err)
+				}
+			}
+			b.StopTimer()
+			if got, want := enqueuer.recipients.Load(), uint64(b.N*recipientCount); got != want {
+				b.Fatalf("enqueued recipients = %d, want %d", got, want)
+			}
+		})
+	}
 }
 
 func maxBenchmarkInt(a, b int) int {
@@ -566,5 +600,57 @@ type benchmarkRealtimeDeliveryEnqueuer struct {
 
 func (e *benchmarkRealtimeDeliveryEnqueuer) EnqueueRecipientDeliveryPlan(context.Context, onlinedelivery.RecipientDeliveryPlan) error {
 	e.count.Add(1)
+	return nil
+}
+
+type benchmarkPagedSubscriberSource struct {
+	recipients []Recipient
+}
+
+func (s benchmarkPagedSubscriberSource) NextSubscriberPage(_ context.Context, req SubscriberPageRequest) (SubscriberPage, error) {
+	start := 0
+	if req.Cursor != "" {
+		var err error
+		start, err = strconv.Atoi(req.Cursor)
+		if err != nil {
+			return SubscriberPage{}, err
+		}
+	}
+	end := min(start+req.Limit, len(s.recipients))
+	page := SubscriberPage{Recipients: s.recipients[start:end:end], Done: end == len(s.recipients)}
+	if !page.Done {
+		page.Cursor = strconv.Itoa(end)
+	}
+	return page, nil
+}
+
+type benchmarkRecipientAuthorityResolver struct{}
+
+func (benchmarkRecipientAuthorityResolver) ResolveRecipientAuthority(_ context.Context, uid string) (RecipientAuthorityTarget, error) {
+	return benchmarkRecipientAuthorityTarget(uid), nil
+}
+
+func (benchmarkRecipientAuthorityResolver) ResolveRecipientAuthorities(_ context.Context, uids []string) ([]RecipientAuthorityResult, error) {
+	results := make([]RecipientAuthorityResult, len(uids))
+	for i, uid := range uids {
+		results[i].Target = benchmarkRecipientAuthorityTarget(uid)
+	}
+	return results, nil
+}
+
+func benchmarkRecipientAuthorityTarget(uid string) RecipientAuthorityTarget {
+	hashSlot := uint16(hashString64(uid) % 256)
+	return RecipientAuthorityTarget{
+		HashSlot: hashSlot, SlotID: uint32(hashSlot%12 + 1), LeaderNodeID: uint64(hashSlot%3 + 1),
+		LeaderTerm: 1, ConfigEpoch: 1, RouteRevision: 1, AuthorityEpoch: 1,
+	}
+}
+
+type benchmarkCountingDeliveryEnqueuer struct {
+	recipients atomic.Uint64
+}
+
+func (e *benchmarkCountingDeliveryEnqueuer) EnqueueRecipientDeliveryPlan(_ context.Context, plan onlinedelivery.RecipientDeliveryPlan) error {
+	e.recipients.Add(uint64(plan.RecipientCount()))
 	return nil
 }

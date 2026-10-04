@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Copy, RefreshCw, Search } from "lucide-react"
+import { RefreshCw, Search } from "lucide-react"
 import { useIntl, type IntlShape } from "react-intl"
 import { useSearchParams } from "react-router-dom"
 
@@ -9,20 +9,22 @@ import { PageContainer } from "@/components/shell/page-container"
 import { PageHeader } from "@/components/shell/page-header"
 import { SectionCard } from "@/components/shell/section-card"
 import { Button } from "@/components/ui/button"
-import { getNodeConfig, getNodes, ManagerApiError } from "@/lib/manager-api"
+import { getNodeConfigDocument, getNodes, ManagerApiError } from "@/lib/manager-api"
 import type {
   ManagerNode,
-  ManagerNodeConfigGroup,
-  ManagerNodeConfigResponse,
+  ManagerNodeConfigDocument,
   ManagerNodesResponse,
 } from "@/lib/manager-api.types"
+import {
+  nodeConfigSourceLabel,
+} from "@/lib/node-config-i18n"
 import { cn } from "@/lib/utils"
 
-const allGroupsId = "all"
+import { NodeConfigDocumentView } from "./document-view"
 
 type NodeConfigState = {
   nodes: ManagerNodesResponse | null
-  config: ManagerNodeConfigResponse | null
+  config: ManagerNodeConfigDocument | null
   loadingNodes: boolean
   loadingConfig: boolean
   nodeError: Error | null
@@ -34,9 +36,6 @@ export function NodeConfigPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const [selectedNodeId, setSelectedNodeId] = useState<number | null>(null)
   const [nodeQuery, setNodeQuery] = useState("")
-  const [configQuery, setConfigQuery] = useState("")
-  const [activeGroup, setActiveGroup] = useState(allGroupsId)
-  const [copied, setCopied] = useState(false)
   const [state, setState] = useState<NodeConfigState>({
     nodes: null,
     config: null,
@@ -58,9 +57,12 @@ export function NodeConfigPage() {
       configError: null,
     }))
     try {
-      const config = await getNodeConfig(nodeId)
+      const config = await getNodeConfigDocument(nodeId)
       if (configRequestIdRef.current !== requestId) {
         return
+      }
+      if (config.node_id !== nodeId || typeof config.toml !== "string") {
+        throw new Error("invalid node config document")
       }
       setState((current) => ({
         ...current,
@@ -91,13 +93,18 @@ export function NodeConfigPage() {
         loadingNodes: false,
         nodeError: null,
       }))
+      return nodes
     } catch (error) {
+      configRequestIdRef.current += 1
       setState((current) => ({
         ...current,
+        config: null,
+        loadingConfig: false,
         nodes: null,
         loadingNodes: false,
         nodeError: error instanceof Error ? error : new Error("nodes request failed"),
       }))
+      return null
     }
   }, [])
 
@@ -123,6 +130,7 @@ export function NodeConfigPage() {
       return
     }
     void loadConfig(selectedNodeId)
+    return () => { configRequestIdRef.current += 1 }
   }, [loadConfig, selectedNodeId])
 
   useEffect(() => {
@@ -136,13 +144,6 @@ export function NodeConfigPage() {
     }
   }, [searchParams, selectedNodeId, setSearchParams])
 
-  useEffect(() => {
-    if (activeGroup === allGroupsId || state.config?.groups.some((group) => group.id === activeGroup)) {
-      return
-    }
-    setActiveGroup(allGroupsId)
-  }, [activeGroup, state.config])
-
   const selectedNode = useMemo(
     () => state.nodes?.items.find((node) => node.node_id === selectedNodeId) ?? null,
     [selectedNodeId, state.nodes],
@@ -151,40 +152,11 @@ export function NodeConfigPage() {
     () => filterNodes(state.nodes?.items ?? [], nodeQuery),
     [nodeQuery, state.nodes],
   )
-  const visibleGroups = useMemo(
-    () => filterConfigGroups(state.config, activeGroup, configQuery),
-    [activeGroup, configQuery, state.config],
-  )
-  const visibleItemCount = useMemo(
-    () => visibleGroups.reduce((sum, group) => sum + group.items.length, 0),
-    [visibleGroups],
-  )
-  const totalItemCount = useMemo(
-    () => (state.config?.groups ?? []).reduce((sum, group) => sum + group.items.length, 0),
-    [state.config],
-  )
-  const groupTabs = state.config?.groups ?? []
-
   async function refresh() {
-    await loadNodes()
-    if (selectedNodeId) {
+    const nodes = await loadNodes()
+    if (nodes && selectedNodeId && chooseSelectedNodeId(nodes, requestedNodeId, selectedNodeId) === selectedNodeId) {
       await loadConfig(selectedNodeId)
     }
-  }
-
-  async function copyFilteredResult() {
-    if (!state.config) {
-      return
-    }
-    const payload = {
-      generated_at: state.config.generated_at,
-      node_id: state.config.node_id,
-      source: state.config.source,
-      requires_restart: state.config.requires_restart,
-      groups: visibleGroups,
-    }
-    await navigator.clipboard?.writeText(JSON.stringify(payload, null, 2))
-    setCopied(true)
   }
 
   function selectNode(nodeId: number) {
@@ -203,27 +175,13 @@ export function NodeConfigPage() {
               <RefreshCw className="mr-2 size-4" />
               {intl.formatMessage({ id: "common.refresh" })}
             </Button>
-            <Button
-              disabled={!state.config || visibleItemCount === 0}
-              onClick={() => void copyFilteredResult()}
-              size="sm"
-              variant="outline"
-            >
-              <Copy className="mr-2 size-4" />
-              {intl.formatMessage({ id: "nodeConfig.copyFiltered" })}
-            </Button>
-            {copied ? (
-              <span className="text-xs font-medium text-muted-foreground">
-                {intl.formatMessage({ id: "nodeConfig.copied" })}
-              </span>
-            ) : null}
           </>
         )}
         description={intl.formatMessage({ id: "nodeConfig.description" })}
         title={intl.formatMessage({ id: "nodeConfig.title" })}
       />
 
-      <div className="grid gap-4 xl:grid-cols-[300px_minmax(0,1fr)]">
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-[300px_minmax(0,1fr)]">
         <SectionCard
           action={state.nodes ? (
             <span className="font-mono text-xs text-muted-foreground">
@@ -296,50 +254,18 @@ export function NodeConfigPage() {
           </div>
         </SectionCard>
 
-        <div className="space-y-4">
+        <div className="min-w-0 space-y-4">
           <ConfigSummary config={state.config} intl={intl} node={selectedNode} />
 
-          <SectionCard
-            action={state.config ? (
-              <span className="font-mono text-xs text-muted-foreground">
-                {intl.formatMessage({ id: "nodeConfig.config.count" }, { visible: visibleItemCount, total: totalItemCount })}
-              </span>
-            ) : null}
-            title={intl.formatMessage({ id: "nodeConfig.config.title" })}
-          >
+          <SectionCard title={intl.formatMessage({ id: "nodeConfig.config.title" })}>
             <div className="space-y-4">
-              <label className="relative block">
-                <span className="sr-only">{intl.formatMessage({ id: "nodeConfig.config.search" })}</span>
-                <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-                <input
-                  aria-label={intl.formatMessage({ id: "nodeConfig.config.search" })}
-                  className="h-8 w-full rounded-md border border-input bg-background px-3 pl-8 font-mono text-xs outline-none transition-colors placeholder:text-muted-foreground focus:border-ring focus:ring-2 focus:ring-ring/30"
-                  onChange={(event) => setConfigQuery(event.target.value)}
-                  value={configQuery}
-                />
-              </label>
-
-              {state.config ? (
-                <div aria-label={intl.formatMessage({ id: "nodeConfig.groups" })} className="flex flex-wrap gap-2 border-b border-border" role="tablist">
-                  <GroupTab active={activeGroup === allGroupsId} id={allGroupsId} label={intl.formatMessage({ id: "nodeConfig.group.all" })} onSelect={setActiveGroup} />
-                  {groupTabs.map((group) => (
-                    <GroupTab
-                      active={activeGroup === group.id}
-                      id={group.id}
-                      key={group.id}
-                      label={group.title}
-                      onSelect={setActiveGroup}
-                    />
-                  ))}
-                </div>
-              ) : null}
-
               {state.loadingConfig ? (
                 <ResourceState kind="loading" title={intl.formatMessage({ id: "nodeConfig.config.status" })} />
               ) : null}
               {!state.loadingConfig && state.configError ? (
                 <ResourceState
                   kind={mapErrorKind(state.configError)}
+                  description={state.configError instanceof ManagerApiError && state.configError.error === "node_config_toml_unsupported" ? intl.formatMessage({ id: "nodeConfig.toml.unsupported" }) : undefined}
                   onRetry={() => {
                     if (selectedNodeId) {
                       void loadConfig(selectedNodeId)
@@ -351,14 +277,8 @@ export function NodeConfigPage() {
               {!state.loadingConfig && !state.configError && !selectedNodeId ? (
                 <ResourceState kind="empty" title={intl.formatMessage({ id: "nodeConfig.config.noNode" })} />
               ) : null}
-              {!state.loadingConfig && !state.configError && state.config && totalItemCount === 0 ? (
-                <ResourceState kind="empty" title={intl.formatMessage({ id: "nodeConfig.config.empty" })} />
-              ) : null}
-              {!state.loadingConfig && !state.configError && state.config && totalItemCount > 0 && visibleItemCount === 0 ? (
-                <ResourceState kind="empty" title={intl.formatMessage({ id: "nodeConfig.config.emptyFilter" })} />
-              ) : null}
-              {!state.loadingConfig && !state.configError && visibleItemCount > 0 ? (
-                <ConfigGroups groups={visibleGroups} />
+              {!state.loadingConfig && !state.configError && state.config ? (
+                <NodeConfigDocumentView document={state.config} />
               ) : null}
             </div>
           </SectionCard>
@@ -373,7 +293,7 @@ function ConfigSummary({
   intl,
   node,
 }: {
-  config: ManagerNodeConfigResponse | null
+  config: ManagerNodeConfigDocument | null
   intl: IntlShape
   node: ManagerNode | null
 }) {
@@ -384,7 +304,7 @@ function ConfigSummary({
     },
     {
       label: intl.formatMessage({ id: "nodeConfig.summary.source" }),
-      value: config?.source ?? "-",
+      value: config ? nodeConfigSourceLabel(intl, config.source) : "-",
     },
     {
       label: intl.formatMessage({ id: "nodeConfig.summary.restart" }),
@@ -406,93 +326,6 @@ function ConfigSummary({
           <div className="text-xs font-medium text-muted-foreground">{cell.label}</div>
           <div className="mt-2 break-words text-sm font-semibold text-foreground">{cell.value}</div>
         </div>
-      ))}
-    </div>
-  )
-}
-
-function GroupTab({
-  active,
-  id,
-  label,
-  onSelect,
-}: {
-  active: boolean
-  id: string
-  label: string
-  onSelect: (group: string) => void
-}) {
-  return (
-    <button
-      aria-selected={active}
-      className={cn(
-        "border-b-2 px-3 py-2 text-sm font-medium text-muted-foreground transition-colors",
-        active ? "border-[var(--status-healthy)] text-foreground" : "border-transparent hover:text-foreground",
-      )}
-      onClick={() => onSelect(id)}
-      role="tab"
-      type="button"
-    >
-      {label}
-    </button>
-  )
-}
-
-function ConfigGroups({ groups }: { groups: ManagerNodeConfigGroup[] }) {
-  const intl = useIntl()
-
-  return (
-    <div className="space-y-4">
-      {groups.map((group) => (
-        <section className="space-y-2" key={group.id}>
-          <h3 className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">
-            {group.title}
-          </h3>
-          <div className="max-h-[520px] overflow-auto rounded-md border border-border bg-background">
-            <table aria-label={group.title} className="w-full min-w-[680px] border-collapse text-left text-sm">
-              <thead className="sticky top-0 z-10 bg-muted/60 text-xs uppercase tracking-[0.12em] text-muted-foreground">
-                <tr>
-                  <th className="px-3 py-3">{intl.formatMessage({ id: "nodes.config.table.key" })}</th>
-                  <th className="px-3 py-3">{intl.formatMessage({ id: "nodes.config.table.label" })}</th>
-                  <th className="px-3 py-3">{intl.formatMessage({ id: "nodes.config.table.value" })}</th>
-                  <th className="px-3 py-3">{intl.formatMessage({ id: "nodes.config.table.flags" })}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {group.items.map((item) => {
-                  const flags = [
-                    item.sensitive ? intl.formatMessage({ id: "nodes.config.sensitive" }) : null,
-                    item.redacted ? intl.formatMessage({ id: "nodes.config.redacted" }) : null,
-                  ].filter((flag): flag is string => Boolean(flag))
-                  return (
-                    <tr className="border-t border-border align-top hover:bg-muted/30" key={item.key}>
-                      <td className="max-w-[280px] break-words px-3 py-3 font-mono text-xs text-muted-foreground">
-                        {item.key}
-                      </td>
-                      <td className="px-3 py-3 text-foreground">{item.label}</td>
-                      <td className="max-w-[360px] break-words px-3 py-3 font-mono text-xs text-foreground">
-                        {item.value || "-"}
-                      </td>
-                      <td className="px-3 py-3">
-                        {flags.length > 0 ? (
-                          <div className="flex flex-wrap gap-1">
-                            {flags.map((flag) => (
-                              <span className="rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground" key={flag}>
-                                {flag}
-                              </span>
-                            ))}
-                          </div>
-                        ) : (
-                          <span className="text-muted-foreground">-</span>
-                        )}
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
-        </section>
       ))}
     </div>
   )
@@ -532,22 +365,6 @@ function filterNodes(nodes: ManagerNode[], query: string) {
     node.membership?.join_state ?? "",
     node.controller.role,
   ].some((value) => value.toLowerCase().includes(normalized)))
-}
-
-function filterConfigGroups(config: ManagerNodeConfigResponse | null, groupId: string, query: string) {
-  const normalized = query.trim().toLowerCase()
-  return (config?.groups ?? [])
-    .filter((group) => groupId === allGroupsId || group.id === groupId)
-    .map((group) => ({
-      ...group,
-      items: group.items.filter((item) => (
-        !normalized ||
-        item.key.toLowerCase().includes(normalized) ||
-        item.label.toLowerCase().includes(normalized) ||
-        item.value.toLowerCase().includes(normalized)
-      )),
-    }))
-    .filter((group) => group.items.length > 0)
 }
 
 function mapErrorKind(error: Error | null) {

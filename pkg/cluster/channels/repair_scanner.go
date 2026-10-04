@@ -3,6 +3,8 @@ package channels
 import (
 	"context"
 	"fmt"
+	"slices"
+	"sort"
 	"time"
 
 	ch "github.com/WuKongIM/WuKongIM/pkg/channel"
@@ -74,7 +76,9 @@ type RepairScannerResult struct {
 	PagesScanned    int
 	ChannelsScanned int
 	TasksCreated    int
-	Blocked         []RepairScannerBlocked
+	// TasksAborted counts guarded pre-promotion replacements released for failover.
+	TasksAborted int
+	Blocked      []RepairScannerBlocked
 }
 
 // RepairScanner scans Slot-owned channel metadata and creates bounded repair work.
@@ -84,6 +88,14 @@ type RepairScanner struct {
 	store   RepairScannerStore
 	planner FailoverPlanner
 	repair  ReplicaRepairPlanner
+	// Per-owned-Slot cursors retain bounded progress; dropped leadership removes
+	// its cursor. RunOnce is called serially by the node-owned worker.
+	cursors map[uint32]metadb.ChannelRuntimeMetaCursor
+	// lastSlot rotates page admission so a large or failing Slot cannot starve peers.
+	lastSlot     uint32
+	haveLastSlot bool
+	// healthyNodes invalidates old cursor positions when a leader becomes ineligible.
+	healthyNodes map[uint64]bool
 }
 
 // NewRepairScanner creates a bounded Channel repair scanner.
@@ -116,33 +128,72 @@ func (s *RepairScanner) RunOnce(ctx context.Context) (RepairScannerResult, error
 	if err != nil {
 		return result, err
 	}
+	healthy := failoverHealthyNodeSet(snapshot.Nodes)
+	for nodeID := range s.healthyNodes {
+		if !healthy[nodeID] {
+			clear(s.cursors)
+			s.lastSlot = 0
+			s.haveLastSlot = false
+			break
+		}
+	}
+	s.healthyNodes = healthy
 	slotIDs, err := s.source.LocalLeaderSlotIDs(ctx)
 	if err != nil {
 		return result, err
 	}
-	for _, slotID := range slotIDs {
-		cursor := metadb.ChannelRuntimeMetaCursor{}
-		for result.PagesScanned < s.cfg.MaxPagesPerTick {
-			page, next, done, err := s.source.ListRepairScannerRuntimeMetaPage(ctx, slotID, cursor, s.cfg.PageLimit)
-			if err != nil {
-				return result, err
-			}
-			result.PagesScanned++
-			for _, item := range page {
-				if result.TasksCreated >= s.cfg.MaxTasksPerTick {
-					return s.observeRepairScan(result), nil
-				}
-				if err := s.scanMeta(ctx, snapshot, item, &result); err != nil {
-					return result, err
-				}
-			}
-			if done {
+	slices.Sort(slotIDs)
+	slotIDs = slices.Compact(slotIDs)
+	if s.cursors == nil {
+		s.cursors = make(map[uint32]metadb.ChannelRuntimeMetaCursor)
+	}
+	for slotID := range s.cursors {
+		if _, owned := slices.BinarySearch(slotIDs, slotID); !owned {
+			delete(s.cursors, slotID)
+		}
+	}
+	if len(slotIDs) == 0 {
+		return s.observeRepairScan(result), nil
+	}
+	index := 0
+	if s.haveLastSlot {
+		index = sort.Search(len(slotIDs), func(i int) bool { return slotIDs[i] > s.lastSlot }) % len(slotIDs)
+	}
+	finished := make(map[uint32]bool, len(slotIDs))
+	for result.PagesScanned < s.cfg.MaxPagesPerTick && result.TasksCreated+result.TasksAborted < s.cfg.MaxTasksPerTick && len(finished) < len(slotIDs) {
+		slotID := slotIDs[index]
+		index = (index + 1) % len(slotIDs)
+		if finished[slotID] {
+			continue
+		}
+		s.lastSlot, s.haveLastSlot = slotID, true
+		page, next, done, err := s.source.ListRepairScannerRuntimeMetaPage(ctx, slotID, s.cursors[slotID], s.cfg.PageLimit)
+		if err != nil {
+			return s.observeRepairScan(result), err
+		}
+		result.PagesScanned++
+		processed := 0
+		for _, item := range page {
+			if result.TasksCreated+result.TasksAborted >= s.cfg.MaxTasksPerTick {
 				break
 			}
-			cursor = next
+			if err := s.scanMeta(ctx, snapshot, item, &result); err != nil {
+				return s.observeRepairScan(result), err
+			}
+			// A task limit can stop inside a page. Resume after only the last
+			// inspected row, never after unseen rows from the returned page.
+			s.cursors[slotID] = metadb.ChannelRuntimeMetaCursor{
+				ChannelID: item.Meta.ChannelID, ChannelType: item.Meta.ChannelType,
+			}
+			processed++
 		}
-		if result.PagesScanned >= s.cfg.MaxPagesPerTick || result.TasksCreated >= s.cfg.MaxTasksPerTick {
-			break
+		if processed == len(page) {
+			if done {
+				s.cursors[slotID] = metadb.ChannelRuntimeMetaCursor{}
+				finished[slotID] = true
+			} else {
+				s.cursors[slotID] = next
+			}
 		}
 	}
 	return s.observeRepairScan(result), nil
@@ -161,6 +212,19 @@ func (s *RepairScanner) scanMeta(ctx context.Context, snapshot control.Snapshot,
 			return err
 		}
 		if active {
+			if preemptor, ok := s.store.(interface {
+				AbortReplicaReplacementForFailover(context.Context, ch.ChannelID, uint64, uint64) (bool, error)
+			}); ok {
+				aborted, err := preemptor.AbortReplicaReplacementForFailover(ctx, id, meta.Leader, meta.LeaderEpoch)
+				if err != nil {
+					return err
+				}
+				if aborted {
+					result.TasksAborted++
+				}
+			}
+			// The abort can advance the Channel epoch and remove a learner.
+			// Elect only from a new authoritative snapshot on a later tick.
 			return nil
 		}
 		return s.scanLeaderFailover(ctx, snapshot, meta, id, result)

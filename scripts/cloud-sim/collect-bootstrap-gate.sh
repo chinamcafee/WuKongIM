@@ -134,9 +134,9 @@ if [[ "$WK_CLOUD_PUBLIC_OBSERVATION" == "true" ]]; then
   ssh_sim "curl --fail --silent --show-error --max-time 10 'http://127.0.0.1:19443/cloud-view/status' >/dev/null"
   cloud_view_self_check=true
 fi
-ssh_sim "sudo -u wukongim bash -c 'set -a; source /etc/wukongim/sim.env; set +a; /opt/wukongim/bin/wkbench validate --target /etc/wukongim/target.yaml --workers /etc/wukongim/workers.yaml --scenario /etc/wukongim/scenario.yaml'"
+ssh_sim "sudo -u wukongim bash -c 'set -a; source /etc/wukongim/sim.env; set +a; /opt/wukongim/bin/wkcli bench validate --target /etc/wukongim/target.yaml --workers /etc/wukongim/workers.yaml --scenario /etc/wukongim/scenario.yaml'"
 wkbench_validate=true
-ssh_sim "sudo -u wukongim bash -c 'set -a; source /etc/wukongim/sim.env; set +a; /opt/wukongim/bin/wkbench doctor --target /etc/wukongim/target.yaml --workers /etc/wukongim/workers.yaml --scenario /etc/wukongim/scenario.yaml'"
+ssh_sim "sudo -u wukongim bash -c 'set -a; source /etc/wukongim/sim.env; set +a; /opt/wukongim/bin/wkcli bench doctor --target /etc/wukongim/target.yaml --workers /etc/wukongim/workers.yaml --scenario /etc/wukongim/scenario.yaml'"
 wkbench_doctor=true
 
 jq -n \

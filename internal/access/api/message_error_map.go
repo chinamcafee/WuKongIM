@@ -34,6 +34,10 @@ func mapSendError(err error) (int, string, bool) {
 }
 
 func mapMessageReason(reason messageusecase.Reason) frame.ReasonCode {
+	// Business rejection codes occupy the same reserved range on every entry.
+	if messageusecase.IsBusinessReasonCode(uint32(reason)) {
+		return frame.ReasonCode(reason)
+	}
 	switch reason {
 	case messageusecase.ReasonSuccess:
 		return frame.ReasonSuccess
@@ -57,6 +61,8 @@ func mapMessageReason(reason messageusecase.Reason) frame.ReasonCode {
 		return frame.ReasonDisband
 	case messageusecase.ReasonSendBan:
 		return frame.ReasonSendBan
+	case messageusecase.ReasonSystemBusy:
+		return frame.ReasonSystemBusy
 	case messageusecase.ReasonInvalidRequest, messageusecase.ReasonUnsupported:
 		return frame.ReasonPayloadDecodeError
 	default:

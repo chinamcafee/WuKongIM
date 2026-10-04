@@ -1,0 +1,42 @@
+{
+  "config_directory_lists_empty": true,
+  "empty": {
+    "channel_type": 0,
+    "empty": true,
+    "found": false,
+    "leader": 0,
+    "term": 0,
+    "version": 0
+  },
+  "empty_channel_info": {
+    "empty": true,
+    "exists": false,
+    "physical_id_nonzero": true,
+    "search_lists_empty": true
+  },
+  "raft_downgrade": {
+    "retained_version": 5,
+    "step_returns_error": false
+  },
+  "raft_zero_version": {
+    "leader": true,
+    "term": 1,
+    "version": 0
+  },
+  "type_zero": {
+    "channel_type": 0,
+    "empty": false,
+    "found": true,
+    "leader": 1,
+    "term": 1,
+    "version": 0
+  },
+  "zero_version": {
+    "channel_type": 1,
+    "empty": false,
+    "found": true,
+    "leader": 1,
+    "term": 1,
+    "version": 0
+  }
+}

@@ -1,0 +1,91 @@
+{
+  "allowlist": [
+    {
+      "id": 12450027564364998467,
+      "uid": "allowed",
+      "created_at": "2023-11-15T06:13:21.123456789+08:00",
+      "updated_at": "2023-11-15T06:13:21.123456789+08:00"
+    }
+  ],
+  "channel": {
+    "id": 17930037264876462710,
+    "channel_id": "群:一-2",
+    "channel_type": 2,
+    "large": true,
+    "send_ban": true,
+    "created_at": "2023-11-14T22:13:21.123456789Z",
+    "updated_at": "2023-11-14T22:13:21.123456789Z"
+  },
+  "conversations": [
+    {
+      "id": 887766,
+      "uid": "用户:一",
+      "channel_id": "群:一-2",
+      "channel_type": 2,
+      "readed_to_msg_seq": 257,
+      "created_at": "2023-11-15T06:13:21.123456789+08:00",
+      "updated_at": "2023-11-15T06:13:21.123456789+08:00"
+    }
+  ],
+  "denylist": [
+    {
+      "id": 12553276322104181718,
+      "uid": "denied",
+      "created_at": "2023-11-15T06:13:21.123456789+08:00",
+      "updated_at": "2023-11-15T06:13:21.123456789+08:00"
+    }
+  ],
+  "device": {
+    "id": 123456789,
+    "uid": "用户:一",
+    "token": "fixture-only-凭据",
+    "device_flag": 1,
+    "device_level": 1,
+    "created_at": "2023-11-14T22:13:21.123456789Z",
+    "updated_at": "2023-11-14T22:13:21.123456789Z"
+  },
+  "messages": [
+    {
+      "FrameType": 0,
+      "RemainingLength": 0,
+      "NoPersist": false,
+      "RedDot": false,
+      "SyncOnce": false,
+      "DUP": false,
+      "HasServerVersion": false,
+      "End": false,
+      "FrameSize": 0,
+      "Setting": 0,
+      "MsgKey": "",
+      "Expire": 3600,
+      "MessageID": 9007199254740999,
+      "MessageSeq": 257,
+      "ClientMsgNo": "client-一",
+      "StreamNo": "stream-一",
+      "StreamId": 0,
+      "StreamFlag": 0,
+      "Timestamp": 1700000001,
+      "ChannelID": "群:一-2",
+      "ChannelType": 2,
+      "Topic": "topic-一",
+      "FromUID": "用户:一",
+      "Payload": "AAH/AA==",
+      "ClientSeq": 0,
+      "Term": 3
+    }
+  ],
+  "subscribers": [
+    {
+      "id": 7976039811237385143,
+      "uid": "用户:一",
+      "created_at": "2023-11-15T06:13:21.123456789+08:00",
+      "updated_at": "2023-11-15T06:13:21.123456789+08:00"
+    }
+  ],
+  "user": {
+    "id": 7976039811237385143,
+    "uid": "用户:一",
+    "created_at": "2023-11-15T06:13:21.123456789+08:00",
+    "updated_at": "2023-11-15T06:13:21.123456789+08:00"
+  }
+}

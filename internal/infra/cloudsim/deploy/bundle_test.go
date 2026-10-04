@@ -24,7 +24,7 @@ func TestRenderSealVerifyAndTamperDetection(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"wukongim", "wkbench", "wkanalysis", "wkcloudview", "prometheus", "node_exporter"} {
+	for _, name := range []string{"wukongim", "wkcli", "wkanalysis", "wkcloudview", "prometheus", "node_exporter"} {
 		if err := os.WriteFile(filepath.Join(root, "bin", name), []byte("static-"+name), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -69,7 +69,7 @@ func TestRenderSealVerifyAndTamperDetection(t *testing.T) {
 	if !strings.Contains(string(renderedScenario), "id: run-1") || !strings.Contains(string(renderedScenario), "duration: 30m0s") || !strings.Contains(string(renderedScenario), "report_dir: /var/lib/wukongim-cloud/reports/run-1") {
 		t.Fatalf("scenario does not bind requested duration and run report directory:\n%s", renderedScenario)
 	}
-	if err := os.WriteFile(filepath.Join(root, "bin", "wkbench"), []byte("tampered"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "bin", "wkcli"), []byte("tampered"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Verify(root); !errors.Is(err, ErrInvalidBundle) {
@@ -82,7 +82,7 @@ func TestRenderOmitsCloudViewWhenPublicObservationDisabled(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"wukongim", "wkbench", "wkanalysis", "prometheus", "node_exporter"} {
+	for _, name := range []string{"wukongim", "wkcli", "wkanalysis", "prometheus", "node_exporter"} {
 		if err := os.WriteFile(filepath.Join(root, "bin", name), []byte(name), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -155,21 +155,18 @@ func TestRenderedContractsUseSystemdAndThreeNode256Slots(t *testing.T) {
 	if !strings.Contains(config, "hash_slot_count = 256") || !strings.Contains(config, "initial_slot_count = 10") || !strings.Contains(config, "channel_replica_n = 3") || strings.Count(config, "[[cluster.nodes]]") != 3 {
 		t.Fatalf("node config does not preserve the three-node 256 hash-slot and 10 Slot Group contract:\n%s", config)
 	}
-	if !strings.Contains(config, "[conversation]") || !strings.Contains(config, "authority_cache_max_rows = 750000") {
-		t.Fatalf("cloud node config does not retain the bounded Medium conversation working set:\n%s", config)
-	}
 	if !strings.Contains(config, "[delivery]") || !strings.Contains(config, fmt.Sprintf("recipient_worker_concurrency = %d", cloudMediumRecipientWorkerConcurrency)) {
 		t.Fatalf("cloud Medium node config does not retain the measured recipient worker capacity:\n%s", config)
 	}
 	for _, required := range []string{
 		"channel_reactor_count = 4",
-		"channel_store_append_workers = 8",
+		"channel_store_append_workers = 128",
 		"channel_store_apply_workers = 8",
 		"channel_rpc_workers = 96",
 		"channel_rpc_batch_max_items = 8",
 		"gnet_multicore = true",
 		"gnet_num_event_loop = 4",
-		"runtime_async_send_workers = 128",
+		"runtime_async_send_workers = 1000",
 		"runtime_async_send_queue_capacity = 131072",
 	} {
 		if !strings.Contains(config, required) {
@@ -200,12 +197,11 @@ func TestRenderedContractsUseSystemdAndThreeNode256Slots(t *testing.T) {
 func TestNodeRuntimeProfileUsesReviewedCloudScale(t *testing.T) {
 	tests := []struct {
 		scale                string
-		wantCacheRows        int
 		wantRecipientWorkers int
 	}{
-		{scale: "small", wantCacheRows: cloudSmallAuthorityCacheMaxRows, wantRecipientWorkers: cloudDefaultRecipientWorkers},
-		{scale: "medium", wantCacheRows: cloudMediumAuthorityCacheMaxRows, wantRecipientWorkers: cloudMediumRecipientWorkerConcurrency},
-		{scale: "large", wantCacheRows: cloudLargeAuthorityCacheMaxRows, wantRecipientWorkers: cloudDefaultRecipientWorkers},
+		{scale: "small", wantRecipientWorkers: cloudDefaultRecipientWorkers},
+		{scale: "medium", wantRecipientWorkers: cloudMediumRecipientWorkerConcurrency},
+		{scale: "large", wantRecipientWorkers: cloudDefaultRecipientWorkers},
 	}
 	for _, test := range tests {
 		t.Run(test.scale, func(t *testing.T) {
@@ -218,16 +214,10 @@ func TestNodeRuntimeProfileUsesReviewedCloudScale(t *testing.T) {
 			if err != nil {
 				t.Fatalf("nodeRuntimeProfileForScenario() error = %v", err)
 			}
-			if profile.ConversationAuthorityCacheMaxRows != test.wantCacheRows {
-				t.Fatalf("authority cache max rows = %d, want %d", profile.ConversationAuthorityCacheMaxRows, test.wantCacheRows)
-			}
 			if profile.RecipientWorkerConcurrency != test.wantRecipientWorkers {
 				t.Fatalf("recipient worker concurrency = %d, want %d", profile.RecipientWorkerConcurrency, test.wantRecipientWorkers)
 			}
 			config := nodeConfig(1, testBundleSpec("unused").PrivateIPv4, profile)
-			if !strings.Contains(config, fmt.Sprintf("authority_cache_max_rows = %d", test.wantCacheRows)) {
-				t.Fatalf("node config does not use %s ceiling %d:\n%s", test.scale, test.wantCacheRows, config)
-			}
 			workerConfigLine := fmt.Sprintf("recipient_worker_concurrency = %d", test.wantRecipientWorkers)
 			if !strings.Contains(config, workerConfigLine) {
 				t.Fatalf("node config does not use %s recipient worker capacity %d:\n%s", test.scale, test.wantRecipientWorkers, config)
@@ -239,13 +229,14 @@ func TestNodeRuntimeProfileUsesReviewedCloudScale(t *testing.T) {
 func TestRenderedCloudScaleNodeConfigLoadsReviewedRuntimeProfile(t *testing.T) {
 	tests := []struct {
 		scale                string
-		wantCacheRows        int
 		wantRecipientWorkers int
 		wantRPCWorkers       int
+		wantAppendWorkers    int
+		wantGatewayWorkers   int
 	}{
-		{scale: "small", wantCacheRows: cloudSmallAuthorityCacheMaxRows, wantRecipientWorkers: 100, wantRPCWorkers: cloudDefaultChannelRPCWorkers},
-		{scale: "medium", wantCacheRows: cloudMediumAuthorityCacheMaxRows, wantRecipientWorkers: cloudMediumRecipientWorkerConcurrency, wantRPCWorkers: cloudMediumChannelRPCWorkers},
-		{scale: "large", wantCacheRows: cloudLargeAuthorityCacheMaxRows, wantRecipientWorkers: 100, wantRPCWorkers: cloudDefaultChannelRPCWorkers},
+		{scale: "small", wantRecipientWorkers: 100, wantRPCWorkers: cloudDefaultChannelRPCWorkers, wantAppendWorkers: cloudDefaultChannelStoreAppendWorkers, wantGatewayWorkers: cloudDefaultGatewayAsyncSendWorkers},
+		{scale: "medium", wantRecipientWorkers: cloudMediumRecipientWorkerConcurrency, wantRPCWorkers: cloudMediumChannelRPCWorkers, wantAppendWorkers: cloudMediumChannelStoreAppendWorkers, wantGatewayWorkers: cloudMediumGatewayAsyncSendWorkers},
+		{scale: "large", wantRecipientWorkers: 100, wantRPCWorkers: cloudDefaultChannelRPCWorkers, wantAppendWorkers: cloudDefaultChannelStoreAppendWorkers, wantGatewayWorkers: cloudDefaultGatewayAsyncSendWorkers},
 	}
 	for _, test := range tests {
 		t.Run(test.scale, func(t *testing.T) {
@@ -253,7 +244,7 @@ func TestRenderedCloudScaleNodeConfigLoadsReviewedRuntimeProfile(t *testing.T) {
 			if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
 				t.Fatal(err)
 			}
-			for _, name := range []string{"wukongim", "wkbench", "wkanalysis", "wkcloudview", "prometheus", "node_exporter"} {
+			for _, name := range []string{"wukongim", "wkcli", "wkanalysis", "wkcloudview", "prometheus", "node_exporter"} {
 				if err := os.WriteFile(filepath.Join(root, "bin", name), []byte(name), 0o755); err != nil {
 					t.Fatal(err)
 				}
@@ -281,22 +272,19 @@ func TestRenderedCloudScaleNodeConfigLoadsReviewedRuntimeProfile(t *testing.T) {
 			if loaded.Delivery.RecipientWorkerConcurrency != test.wantRecipientWorkers {
 				t.Fatalf("recipient worker concurrency = %d, want %d", loaded.Delivery.RecipientWorkerConcurrency, test.wantRecipientWorkers)
 			}
-			if loaded.Conversation.AuthorityCacheMaxRows != test.wantCacheRows {
-				t.Fatalf("authority cache max rows = %d, want %d", loaded.Conversation.AuthorityCacheMaxRows, test.wantCacheRows)
-			}
 			if loaded.Cluster.Slots.HashSlotCount != 256 || loaded.Cluster.Slots.InitialSlotCount != 10 {
 				t.Fatalf("cluster slots = hash %d / initial %d, want 256 / 10", loaded.Cluster.Slots.HashSlotCount, loaded.Cluster.Slots.InitialSlotCount)
 			}
 			if loaded.Cluster.Slots.ReplicaCount != 3 || loaded.Cluster.Channel.ReplicaCount != 3 {
 				t.Fatalf("cluster replicas = Slot %d / Channel %d, want 3 / 3", loaded.Cluster.Slots.ReplicaCount, loaded.Cluster.Channel.ReplicaCount)
 			}
-			if loaded.Cluster.Channel.ReactorCount != 4 || loaded.Cluster.Channel.StoreAppendWorkers != 8 ||
+			if loaded.Cluster.Channel.ReactorCount != 4 || loaded.Cluster.Channel.StoreAppendWorkers != test.wantAppendWorkers ||
 				loaded.Cluster.Channel.StoreApplyWorkers != 8 || loaded.Cluster.Channel.RPCWorkers != test.wantRPCWorkers ||
 				loaded.Cluster.Channel.RPCBatchMaxItems != 8 {
-				t.Fatalf("channel runtime = %#v, want reactor/append/apply/RPC/batch 4/8/8/%d/8", loaded.Cluster.Channel, test.wantRPCWorkers)
+				t.Fatalf("channel runtime = %#v, want reactor/append/apply/RPC/batch 4/%d/8/%d/8", loaded.Cluster.Channel, test.wantAppendWorkers, test.wantRPCWorkers)
 			}
-			if !loaded.Gateway.Transport.Gnet.Multicore || loaded.Gateway.Transport.Gnet.NumEventLoop != 4 || loaded.Gateway.Runtime.AsyncSendWorkers != 128 || loaded.Gateway.Runtime.AsyncSendQueueCapacity != 131072 {
-				t.Fatalf("gateway runtime = transport %#v runtime %#v, want multicore/loops/workers/queue true/4/128/131072", loaded.Gateway.Transport.Gnet, loaded.Gateway.Runtime)
+			if !loaded.Gateway.Transport.Gnet.Multicore || loaded.Gateway.Transport.Gnet.NumEventLoop != 4 || loaded.Gateway.Runtime.AsyncSendWorkers != test.wantGatewayWorkers || loaded.Gateway.Runtime.AsyncSendQueueCapacity != 131072 {
+				t.Fatalf("gateway runtime = transport %#v runtime %#v, want multicore/loops/workers/queue true/4/%d/131072", loaded.Gateway.Transport.Gnet, loaded.Gateway.Runtime, test.wantGatewayWorkers)
 			}
 			sources := startupConfigSources(loaded.StartupConfigSnapshot)
 			for _, key := range effectiveRuntimeContractKeys {

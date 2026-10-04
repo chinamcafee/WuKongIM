@@ -37,6 +37,10 @@ func (r *Runtime) RequestSlotReplicaMove(ctx context.Context, req SlotReplicaMov
 	if err := ctxErr(ctx); err != nil {
 		return SlotReplicaMoveResult{}, err
 	}
+	service := r.raftService()
+	if service == nil {
+		return SlotReplicaMoveResult{}, ErrNotStarted
+	}
 	st, err := r.LocalState(ctx)
 	if err != nil {
 		return SlotReplicaMoveResult{}, err

@@ -1,0 +1,16 @@
+{
+  "source_commit": "a888f89533d0e7d1b2030e06504ca97f1ad891d4",
+  "binary_sha256": "6c2984f0e9fd7e1e84fa3e30bc01f329d6bb5a9fdf5c1e02a4cc2c5ab40a07ae",
+  "fixture_sha256": "730a5a26e9789302716a8d3c782f72b9b3a7ccc69232ab04afa590704a12336e",
+  "source_nodes": 1,
+  "source_slots": 4,
+  "business_shards": 2,
+  "message_rows": 3,
+  "normal_shutdown": true,
+  "synthetic_only": true,
+  "source_archive_sha256": "23ca071434408328a0f0b4c81dadcb3330471d916436910b35eea1d65fe1afdc",
+  "source_files_checked": 976,
+  "source_files_unchanged_after_build": true,
+  "source_code_modified": false,
+  "data_written_through_original_http": true
+}

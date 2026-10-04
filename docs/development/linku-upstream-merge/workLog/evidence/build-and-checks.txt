@@ -1,0 +1,33 @@
+Execution: macOS arm64, 2026-10-04/05
+
+GOTOOLCHAIN=go1.25.11 GOWORK=off go build -p 4 ./cmd/... ./internal/... ./pkg/...
+EXIT 0; go version go1.25.11 darwin/arm64
+
+GOWORK=off go test -p 4 -count=1 -timeout=20m ./cmd/... ./internal/... ./pkg/... ./scripts/... ./docker/...
+EXIT 0; runtime go1.26.5; 220 tested packages passed; 15 packages without tests
+
+GOWORK=off go vet -p 2 ./cmd/... ./internal/... ./pkg/... ./scripts/... ./docker/...
+EXIT 0; no diagnostics
+
+go mod tidy -diff
+EXIT 0; generated, ignored docs-site/out was temporarily moved out of package discovery and restored
+
+gofmt -l changed Go files
+EXIT 0; no output
+
+Conflict markers: 0. Sensitive key/token pattern candidates: 0.
+New whitespace diagnostics relative to either parent: 0.
+Inherited whitespace diagnostics relative to HEAD: 63, retained historical evidence/assets.
+
+Node v24.19.0; Bun 1.3.14
+Web: 580/580 tests in 52 files; tsc/Vite build passed.
+Web bundle: 55 JS chunks, 1598360 bytes total, <=500000 bytes each.
+Web ESLint: baseline matches 41 findings.
+Chat Demo: 26/26 tests; production build passed.
+Docs: 212/212 tests; lint, navigation and 110 bilingual OpenAPI page checks passed.
+Docs build: 903 static pages; 446 bounded RSC URLs; static output contract passed.
+Docs JS example: 29/29 tests, build and typecheck passed.
+Docs MQTT example: npm ci and node --check passed.
+Docs Go Webhook example: go test . -count=1 -timeout=30s passed.
+FLOW: 89 compliant, 0 invalid, 19 advisory length warnings; generated index check passed.
+Skills: 3 valid, 3 registered focused tests passed.

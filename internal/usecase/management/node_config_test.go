@@ -127,6 +127,9 @@ func TestNodeConfigSnapshotUnavailableWithoutClusterBeforeReader(t *testing.T) {
 func TestNodeConfigDTOsHaveNoEntryTags(t *testing.T) {
 	for _, typ := range []reflect.Type{
 		reflect.TypeOf(NodeConfigSnapshot{}),
+		reflect.TypeOf(NodeConfigDocument{}),
+		reflect.TypeOf(NodeConfigDocumentField{}),
+		reflect.TypeOf(NodeConfigDocumentSection{}),
 		reflect.TypeOf(NodeConfigGroup{}),
 		reflect.TypeOf(NodeConfigItem{}),
 	} {
@@ -164,4 +167,36 @@ func (r *nodeConfigReaderStub) NodeConfigSnapshot(_ context.Context, nodeID uint
 		return NodeConfigSnapshot{}, r.err
 	}
 	return r.snapshot, nil
+}
+
+type configDocumentReaderStub struct {
+	nodeConfigReaderStub
+	document NodeConfigDocument
+}
+
+func (r *configDocumentReaderStub) NodeConfigDocument(_ context.Context, id uint64) (NodeConfigDocument, error) {
+	r.calls++
+	r.nodeID = id
+	return r.document, r.err
+}
+
+func TestNodeConfigDocumentChecksMembershipAndReturnedIdentity(t *testing.T) {
+	reader := &configDocumentReaderStub{document: NodeConfigDocument{NodeID: 2, Source: NodeConfigSnapshotSourceEffectiveStartup,
+		TOML: "[node]\nid = 2\n", Fields: []NodeConfigDocumentField{{Path: "node.id", Line: 2}},
+	}}
+	instance := New(Options{Cluster: &nodeConfigControlReader{snapshot: control.Snapshot{Nodes: []control.Node{{NodeID: 2}}}}, NodeConfig: reader})
+	if _, err := instance.NodeConfigDocument(context.Background(), 3); !errors.Is(err, metadb.ErrNotFound) || reader.calls != 0 {
+		t.Fatalf("membership fence: %v", err)
+	}
+	if _, err := instance.NodeConfigDocument(context.Background(), 0); !errors.Is(err, metadb.ErrInvalidArgument) {
+		t.Fatalf("invalid target: %v", err)
+	}
+	got, err := instance.NodeConfigDocument(context.Background(), 2)
+	if err != nil || got.NodeID != 2 || reader.nodeID != 2 {
+		t.Fatalf("selected document: %+v %v", got, err)
+	}
+	reader.document.NodeID = 1
+	if _, err := instance.NodeConfigDocument(context.Background(), 2); !errors.Is(err, ErrNodeConfigUnavailable) {
+		t.Fatalf("accepted wrong node: %v", err)
+	}
 }

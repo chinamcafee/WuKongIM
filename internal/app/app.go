@@ -20,19 +20,22 @@ import (
 	obsdiagnostics "github.com/WuKongIM/WuKongIM/internal/observability/diagnostics"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/channelappend"
 	runtimedelivery "github.com/WuKongIM/WuKongIM/internal/runtime/delivery"
+	"github.com/WuKongIM/WuKongIM/internal/runtime/messageupdates"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/online"
 	runtimeops "github.com/WuKongIM/WuKongIM/internal/runtime/opsmcp"
+	"github.com/WuKongIM/WuKongIM/internal/runtime/persondirectory"
 	authoritypresence "github.com/WuKongIM/WuKongIM/internal/runtime/presence"
 	backupusecase "github.com/WuKongIM/WuKongIM/internal/usecase/backup"
+	"github.com/WuKongIM/WuKongIM/internal/usecase/benchterminal"
 	channelusecase "github.com/WuKongIM/WuKongIM/internal/usecase/channel"
 	cmdsyncusecase "github.com/WuKongIM/WuKongIM/internal/usecase/cmdsync"
 	conversationusecase "github.com/WuKongIM/WuKongIM/internal/usecase/conversation"
-	deliveryusecase "github.com/WuKongIM/WuKongIM/internal/usecase/delivery"
 	"github.com/WuKongIM/WuKongIM/internal/usecase/message"
 	pluginusecase "github.com/WuKongIM/WuKongIM/internal/usecase/plugin"
 	"github.com/WuKongIM/WuKongIM/internal/usecase/presence"
 	userusecase "github.com/WuKongIM/WuKongIM/internal/usecase/user"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster"
+	"github.com/WuKongIM/WuKongIM/pkg/dataformat"
 	"github.com/WuKongIM/WuKongIM/pkg/gateway"
 	goruntimeregistry "github.com/WuKongIM/WuKongIM/pkg/goroutine"
 	obsmetrics "github.com/WuKongIM/WuKongIM/pkg/metrics"
@@ -80,21 +83,37 @@ type Option func(*App)
 
 // App is the internal composition root for cluster, message, and gateway runtimes.
 type App struct {
-	cfg     Config
-	cluster ClusterRuntime
-	api     APIRuntime
-	manager ManagerRuntime
+	cfg Config
+	// buildVersion is the release version reported by this process to cluster management views.
+	buildVersion string
+	// buildIdentity is immutable creator provenance passed to fresh node directories.
+	buildIdentity dataformat.Build
+	cluster       ClusterRuntime
+	api           APIRuntime
+	manager       ManagerRuntime
 	// opsMCPEndpoint serves stateless MCP on every configured Manager listener.
 	opsMCPEndpoint *accessops.Endpoint
 	// opsMCPCalls owns node-local rate budgets and rotated audit output.
-	opsMCPCalls           *runtimeops.CallControl
-	gateway               GatewayRuntime
-	handler               *accessgateway.Handler
-	messages              *message.App
-	apiMessages           accessapi.MessageUsecase
-	channelAppends        *channelappend.Group
-	channelAppendRouter   *channelappend.Router
-	channelAppendMetadata *clusterinfra.ChannelAppendMetadataCache
+	opsMCPCalls         *runtimeops.CallControl
+	gateway             GatewayRuntime
+	handler             *accessgateway.Handler
+	messages            *message.App
+	apiMessages         accessapi.MessageUsecase
+	channelAppends      *channelappend.Group
+	channelAppendRouter *channelappend.Router
+	// channelSubmissions owns bounded gateway routing until ordered completion.
+	channelSubmissions *channelappend.OrderedSubmitter
+	// deferredGatewayMessages is set only for the default, fully wired usecase.
+	deferredGatewayMessages accessgateway.DeferredMessageUsecase
+	channelAppendMetadata   *clusterinfra.ChannelAppendMetadataCache
+	// mqtt owns the optional entry and its joined runtime lifecycle.
+	mqtt *mqttProduct
+	// mqttInboxWrites enables full-cluster preparation for future person sources.
+	// Product MQTT and focused module integrations share the same appender gate.
+	mqttInboxWrites bool
+	// benchTerminal owns the one-shot terminal drain and opaque grant for one
+	// benchmark product-process generation.
+	benchTerminal *benchterminal.Controller
 	// messageIDs owns the node-scoped allocator so activated restore fences can
 	// be installed before ordinary traffic starts.
 	messageIDs *nodeMessageIDs
@@ -110,6 +129,8 @@ type App struct {
 	webhook WorkerRuntime
 	// webhookOutbox exposes durable critical-webhook state and controlled dead-letter replay.
 	webhookOutbox webhookOutboxRuntime
+	// beforeSendWebhook owns synchronous admission independently of notification workers.
+	beforeSendWebhook *message.BeforeSendWebhook
 	// webhookNotify adapts durable committed envelopes into msg.notify webhook events.
 	webhookNotify channelappend.PersistAfterEnqueuer
 	// webhookOffline adapts offline recipient batches into msg.offline webhook events.
@@ -125,17 +146,21 @@ type App struct {
 	// gatewayTokenMetadata is the routed authoritative device-token reader used
 	// by WKProto CONNECT authentication.
 	gatewayTokenMetadata gatewayTokenMetadataReader
-	delivery             *deliveryusecase.App
 	// onlineDelivery owns canonical recipient-plan processing and owner-local ACK state.
 	onlineDelivery *runtimedelivery.Runtime
 	// deliveryWorker owns the canonical delivery runtime lifecycle.
 	deliveryWorker WorkerRuntime
+	// personDirectoryProjector materializes UID-owned directory rows from
+	// durable source-Slot tasks using one scanner and fixed workers.
+	personDirectoryProjector *persondirectory.Projector
+	// messageUpdateWorker repairs durable body-free edit notifications.
+	messageUpdateWorker     *messageupdates.Worker
+	messageUpdateHintsReady bool
+	// messageChannelStore owns the request-side durable directory admission
+	// batcher and must be sealed before the cluster runtime stops.
+	messageChannelStore *clusterinfra.ChannelMetadataStore
 	// seedJoinLoop retries pre-membership JoinNode RPCs and gates entry startup until admission is observed.
-	seedJoinLoop                seedJoinRuntime
-	conversationRouteLifecycle  WorkerRuntime
-	conversationActiveWorker    WorkerRuntime
-	conversationAuthority       *conversationAuthority
-	conversationAuthorityClient *clusterinfra.ConversationAuthorityClient
+	seedJoinLoop seedJoinRuntime
 	// deliverySubscribers scans durable non-person channel subscribers when provided.
 	deliverySubscribers     channelappend.SubscriberSource
 	deliveryMeta            *deliveryMetaStore
@@ -175,32 +200,38 @@ type App struct {
 	backupRuntime WorkerRuntime
 	// restoreMaintenance mirrors the Controller fence for entry quiescence.
 	restoreMaintenance atomic.Bool
+	// restoreReadFence packs a transition sequence with the active bit so HTTP
+	// content reads can reject restore overlap without a second Controller read.
+	restoreReadFence atomic.Uint64
 	// restoreSideEffectsMu serializes drain/suspend/resume around one restore.
 	restoreSideEffectsMu        sync.Mutex
 	restoreSideEffectsSuspended bool
-	logger                      wklog.Logger
+	// restoreAdmissionMu orders maintenance reopen against terminal shutdown.
+	// Once stopped, an observer can never admit a new Gateway connection.
+	restoreAdmissionMu      sync.Mutex
+	restoreAdmissionStopped bool
+	logger                  wklog.Logger
 	// startupConsole renders the human-facing startup lifecycle when console output is enabled.
 	startupConsole *startupConsole
 
-	lifecycleMu               sync.Mutex
-	started                   bool
-	stopped                   bool
-	clusterStarted            bool
-	seedJoinStarted           bool
-	presenceStarted           bool
-	conversationRouteStarted  bool
-	conversationActiveStarted bool
-	channelAppendStarted      bool
-	deliveryStarted           bool
-	pluginRuntimeStarted      bool
-	pluginHookStarted         bool
-	webhookStarted            bool
-	backupRuntimeStarted      bool
-	apiStarted                bool
-	managerStarted            bool
-	prometheusStarted         bool
-	gatewayStarted            bool
-	deliveryErrors            atomic.Uint64
+	lifecycleMu            sync.Mutex
+	started                bool
+	stopped                bool
+	clusterStarted         bool
+	seedJoinStarted        bool
+	presenceStarted        bool
+	channelAppendStarted   bool
+	deliveryStarted        bool
+	personDirectoryStarted bool
+	pluginRuntimeStarted   bool
+	pluginHookStarted      bool
+	webhookStarted         bool
+	backupRuntimeStarted   bool
+	apiStarted             bool
+	managerStarted         bool
+	prometheusStarted      bool
+	gatewayStarted         bool
+	deliveryErrors         atomic.Uint64
 }
 
 // New creates an internal App.
@@ -219,12 +250,24 @@ func New(cfg Config, opts ...Option) (*App, error) {
 		return nil, err
 	}
 	app.applyOptions(opts)
+	app.mqttInboxWrites = app.mqttInboxWrites || app.cfg.MQTT.Enabled
+	clusterCfg := defaultClusterConfig(app.cfg)
+	clusterCfg.Storage.MQTTNodeBytes = app.cfg.MQTT.StorageNodeBytes
+	clusterCfg.Storage.MQTTClusterBytes = app.cfg.MQTT.StorageClusterBytes
+	clusterCfg.CreatedBy = app.buildIdentity
+	clusterCfg.CreatedBy.Version = app.buildVersion
+	// Inspect freshness before a nested log directory can make the root nonempty.
+	// An injected cluster owns its own data-directory lifecycle.
+	if app.cluster == nil {
+		if err := dataformat.EnsureFresh(clusterCfg.DataDir, clusterCfg.CreatedBy, clusterCfg.Control.StateDir); err != nil {
+			return nil, err
+		}
+	}
 	app.ensureStartupConsole()
 	if err := app.ensureLogger(); err != nil {
 		return nil, err
 	}
 
-	clusterCfg := defaultClusterConfig(app.cfg)
 	clusterCfg.Logger = app.logger.Named("cluster")
 	clusterCfg.MaintenanceObserver = appMaintenanceObserver{
 		app: app, next: clusterCfg.MaintenanceObserver,
@@ -240,6 +283,13 @@ func New(cfg Config, opts ...Option) (*App, error) {
 		return nil, fmt.Errorf("internal/app: create message id generator: %w", err)
 	}
 	app.messageIDs = messageIDs
+	if imported, found, err := cluster.ReadOfflineImportSeal(clusterCfg.DataDir); err != nil {
+		return nil, err
+	} else if found {
+		if err := messageIDs.SetFloor(imported.MaxMessageID); err != nil {
+			return nil, err
+		}
+	}
 
 	app.ensureOnlineRegistry()
 	if err := app.wireWebhook(); err != nil {
@@ -247,9 +297,10 @@ func New(cfg Config, opts ...Option) (*App, error) {
 	}
 	app.wireDeliveryMetadata()
 	app.wireChannels()
+	if err := app.wirePersonDirectoryProjector(); err != nil {
+		return nil, err
+	}
 	conversationReadStore := app.newConversationReadStore()
-	app.wireConversationAuthority()
-	app.wireConversations(conversationReadStore)
 	app.wirePresence()
 	if err := app.wireBackup(clusterCfg); err != nil {
 		return nil, err
@@ -279,15 +330,20 @@ func New(cfg Config, opts ...Option) (*App, error) {
 		return nil, err
 	}
 	app.wireMessages()
+	app.wireConversations(conversationReadStore)
 	app.wireCMDSync()
 	app.wireAPIMessageFacade()
 	app.wireGatewayHandler(clusterCfg.NodeID)
-	app.wireAPI()
-	app.wireManager()
-	app.wirePrometheus()
+	if err := app.wireMQTT(clusterCfg.NodeID); err != nil {
+		return nil, err
+	}
 	if err := app.wireGateway(clusterCfg.NodeID); err != nil {
 		return nil, err
 	}
+	app.wireBenchTerminal()
+	app.wireAPI()
+	app.wireManager()
+	app.wirePrometheus()
 
 	constructionOK = true
 	return app, nil
@@ -360,6 +416,19 @@ func WithLogger(logger wklog.Logger) Option {
 	return func(a *App) { a.logger = logger }
 }
 
+// WithBuildVersion sets the program version reported by this process.
+func WithBuildVersion(version string) Option {
+	return func(a *App) { a.buildVersion = strings.TrimSpace(version) }
+}
+
+// WithBuildIdentity records the initializing binary without changing stored data versions.
+func WithBuildIdentity(build dataformat.Build) Option {
+	return func(a *App) {
+		a.buildIdentity = build
+		a.buildVersion = strings.TrimSpace(build.Version)
+	}
+}
+
 // Handler returns the gateway access handler.
 func (a *App) Handler() *accessgateway.Handler {
 	if a == nil {
@@ -384,14 +453,6 @@ func (a *App) Conversations() *conversationusecase.App {
 	return a.conversations
 }
 
-// Delivery returns the delivery usecase app.
-func (a *App) Delivery() *deliveryusecase.App {
-	if a == nil {
-		return nil
-	}
-	return a.delivery
-}
-
 func (a *App) metricsHandler() http.Handler {
 	if a == nil || a.metrics == nil {
 		return nil
@@ -404,20 +465,6 @@ func (a *App) conversationListObserver() accessapi.ConversationListObserver {
 		return nil
 	}
 	return conversationListMetricsObserver{metrics: a.metrics}
-}
-
-func (a *App) conversationSyncObserver() accessapi.ConversationSyncObserver {
-	if a == nil || a.metrics == nil {
-		return nil
-	}
-	return conversationSyncMetricsObserver{metrics: a.metrics}
-}
-
-func (a *App) conversationAuthorityObserver() conversationAuthorityObserver {
-	if a == nil || a.metrics == nil {
-		return nil
-	}
-	return conversationAuthorityMetricsObserver{metrics: a.metrics}
 }
 
 func (a *App) gatewayObserver() gateway.Observer {
@@ -512,26 +559,6 @@ func (a *App) currentPresenceAuthorities() []cluster.RouteAuthority {
 		})
 	}
 	return authorities
-}
-
-func (a *App) currentConversationAuthorityRouteTarget(hashSlot uint16) (conversationusecase.RouteTarget, bool) {
-	routes, ok := a.cluster.(clusterWriteReadyRuntime)
-	if !ok {
-		return conversationusecase.RouteTarget{}, false
-	}
-	route, err := routes.RouteHashSlot(hashSlot)
-	if err != nil {
-		return conversationusecase.RouteTarget{}, false
-	}
-	return conversationusecase.RouteTarget{
-		HashSlot:       route.HashSlot,
-		SlotID:         route.SlotID,
-		LeaderNodeID:   route.Leader,
-		LeaderTerm:     route.LeaderTerm,
-		ConfigEpoch:    route.ConfigEpoch,
-		RouteRevision:  route.Revision,
-		AuthorityEpoch: route.AuthorityEpoch,
-	}, true
 }
 
 func defaultClusterConfig(cfg Config) cluster.Config {

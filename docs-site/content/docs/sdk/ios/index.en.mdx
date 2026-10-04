@@ -1,0 +1,34 @@
+---
+title: iOS
+description: Use Objective-C to connect WuKongIMSDK and manage connections, messages, conversations, and channel profiles.
+---
+
+`WuKongIMSDK` is the full WuKongIM SDK for iOS. It manages the persistent connection, message delivery, local message database, conversation list, and channel profiles. Use it when your app owns the chat UI.
+
+These guides target `WuKongIMSDK 1.1.1` and use Objective-C throughout.
+
+## Before you start
+
+Prepare:
+
+- a reachable WuKongIM service;
+- two test users, such as `alice` and `bob`;
+- a `uid`, `token`, connection `host`, and `port` returned by your application server;
+- an iOS project that uses CocoaPods.
+
+<Callout type="info" title="Where does the token come from?">
+  Your application server should create the token and return it to an authenticated user. Never put a WuKongIM admin secret in the app or let the app call an admin API to create tokens.
+</Callout>
+
+## Recommended order
+
+<Cards>
+  <Card title="Quickstart" description="Install the SDK, connect a user, and send the first online text message." href="/en/sdk/ios/quickstart" />
+  <Card title="Connection" description="Understand connection states, dynamic endpoints, disconnect, and logout." href="/en/sdk/ios/connection" />
+  <Card title="Messages" description="Send, receive, retry, and read local messages." href="/en/sdk/ios/messages" />
+  <Card title="Conversations" description="Build the chat list and maintain unread counts." href="/en/sdk/ios/conversations" />
+  <Card title="Channels" description="Load names, avatars, and members for direct or group chats." href="/en/sdk/ios/channels" />
+  <Card title="Advanced" description="Add custom content, media upload, and remote history." href="/en/sdk/ios/advanced" />
+</Cards>
+
+Read [Core Concepts](/en/sdk/wukongim/concepts) first if “channel” or “conversation” is unfamiliar. Open the [API Reference](/en/sdk/ios/api-reference) when you only need a method name.

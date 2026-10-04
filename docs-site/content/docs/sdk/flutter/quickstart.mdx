@@ -1,0 +1,143 @@
+---
+title: Flutter 快速开始
+description: 安装 wukongimfluttersdk 1.7.9，连接用户并完成第一条在线文本消息。
+---
+
+这一页只做一件事：让两个在线 Flutter 客户端互相发送一条文本消息。
+
+## 前置条件
+
+- 业务服务端已为 `alice` 和 `bob` 返回各自的 `uid`、`token` 和 `host:port`；
+- 两个独立的 App 进程或设备。`WKIM.shared` 是进程单例；
+- Flutter 工程已能在目标设备运行。
+
+## 1. 安装
+
+在 `pubspec.yaml` 中固定版本：
+
+```yaml
+dependencies:
+  wukongimfluttersdk: 1.7.9
+```
+
+然后执行：
+
+```bash
+flutter pub get
+```
+
+## 2. 初始化
+
+```dart
+import 'package:flutter/widgets.dart';
+import 'package:wukongimfluttersdk/common/options.dart';
+import 'package:wukongimfluttersdk/entity/channel.dart';
+import 'package:wukongimfluttersdk/entity/conversation.dart';
+import 'package:wukongimfluttersdk/entity/msg.dart';
+import 'package:wukongimfluttersdk/model/wk_text_content.dart';
+import 'package:wukongimfluttersdk/type/const.dart';
+import 'package:wukongimfluttersdk/wkim.dart';
+
+WidgetsFlutterBinding.ensureInitialized();
+
+final im = WKIM.shared;
+final options = Options.newDefault(
+  bootstrap.uid,
+  bootstrap.token,
+  addr: bootstrap.address, // 例如 im.example.com:5100
+)
+  ..debug = false
+  ..deviceFlag = 0;
+
+final initialized = await im.setup(options);
+if (!initialized) {
+  throw StateError('WuKongIM local database initialization failed');
+}
+```
+
+地址不能带 `tcp://`、`http://` 或 `https://`。
+
+## 3. 提供会话同步并监听状态
+
+连接成功后 SDK 会先同步最近会话。即使只测试全新账号，也要结束这个同步步骤：
+
+```dart
+im.conversationManager.addOnSyncConversationListener(
+  (lastMsgSeqs, msgCount, version, complete) async {
+    // 正式应用应在这里调用业务服务端并返回完整 WKSyncConversation。
+    final empty = WKSyncConversation()
+      ..uid = bootstrap.uid
+      ..conversations = [];
+    complete(empty);
+  },
+);
+
+const listenerKey = 'chat-home';
+im.connectionManager.addOnConnectionStatus(
+  listenerKey,
+  (status, reasonCode, info) {
+    if (status == WKConnectStatus.syncCompleted) {
+      print('WuKongIM ready');
+    } else if (status == WKConnectStatus.fail && reasonCode != null) {
+      print('connect failed: $reasonCode');
+    } else if (status == WKConnectStatus.kicked) {
+      print('this account was signed in elsewhere');
+    }
+  },
+);
+```
+
+`WKConnectStatus.success` 表示连接协议成功，随后还会出现 `syncMsg` 和 `syncCompleted`。最简单的发送门槛是等待 `syncCompleted`。
+
+## 4. 监听消息并连接
+
+```dart
+im.messageManager.addOnNewMsgListener(listenerKey, (messages) {
+  for (final message in messages) {
+    final content = message.messageContent;
+    if (content is WKTextContent) {
+      print('${message.fromUID}: ${content.content}');
+    }
+  }
+});
+
+im.messageManager.addOnRefreshMsgListener(listenerKey, (message) {
+  if (message.status == WKSendMsgResult.sendSuccess) {
+    print('message sent: ${message.clientMsgNO}');
+  } else if (message.status == WKSendMsgResult.sendFail) {
+    print('message failed: ${message.clientMsgNO}');
+  }
+});
+
+im.connectionManager.connect();
+```
+
+## 5. 发送文本
+
+收到 `syncCompleted` 后，让 Alice 向 Bob 发送：
+
+```dart
+await im.messageManager.sendWithOption(
+  WKTextContent('你好，Bob'),
+  WKChannel('bob', WKChannelType.personal),
+  WKSendOptions(),
+);
+```
+
+使用 `sendWithOption` 并等待它完成，可以确保本地保存步骤完成；服务器结果仍来自消息刷新监听器。
+
+## 预期结果
+
+1. Alice 和 Bob 都到达 `syncCompleted`；
+2. Alice 的消息状态变成 `sendSuccess`；
+3. Bob 的新消息监听器打印“你好，Bob”。
+
+页面结束时清理：
+
+```dart
+im.connectionManager.removeOnConnectionStatus(listenerKey);
+im.messageManager.removeNewMsgListener(listenerKey);
+im.messageManager.removeOnRefreshMsgListener(listenerKey);
+```
+
+下一步阅读[连接管理](/zh/sdk/flutter/connection)和[消息管理](/zh/sdk/flutter/messages)。

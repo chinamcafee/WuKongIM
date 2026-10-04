@@ -241,3 +241,32 @@ func pluginBindingUIDs(bindings []metadb.PluginUserBinding) []string {
 	}
 	return uids
 }
+
+func TestClusterDeviceCredentialsReadCurrentSlotLeader(t *testing.T) {
+	nodes := newDefaultThreeNodeCluster(t)
+	startNodes(t, nodes...)
+	t.Cleanup(func() { stopNodes(t, nodes...) })
+	waitClusterReady(t, nodes...)
+	const uid = "device-authority-regression"
+	route := waitRouteKeyLeaderConverged(t, nodes, uid)
+	follower := firstNonLeaderNode(t, nodes, route.Leader)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	want := metadb.Device{UID: uid, DeviceFlag: 0, Token: "current-device-token", DeviceLevel: 0}
+	if err := nodes[0].UpsertDeviceMetadata(ctx, want); err != nil {
+		t.Fatalf("write device: %v", err)
+	}
+	// A stale ingress replica must never become credential authority.
+	stale := want
+	stale.Token = "stale-device-token"
+	if err := follower.defaultSlotMetaDB.ForHashSlot(route.HashSlot).UpsertDevice(ctx, stale); err != nil {
+		t.Fatal(err)
+	}
+	got, err := follower.GetDeviceMetadata(ctx, uid, 0)
+	if err != nil {
+		t.Fatalf("read leader through node %d: %v", follower.NodeID(), err)
+	}
+	if got.Token != want.Token {
+		t.Fatal("device read used stale ingress credential")
+	}
+}

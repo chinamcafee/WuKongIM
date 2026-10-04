@@ -1,0 +1,40 @@
+---
+title: HarmonyOS SDK
+description: 使用 @wukong/wkim 1.1.7 在 HarmonyOS NEXT 应用中接入完整 WuKongIMSDK。
+---
+
+`@wukong/wkim` 是 HarmonyOS NEXT 的完整 SDK。它负责长连接、消息收发、本地消息、会话和频道资料；你的应用负责登录、Token、连接地址以及业务 HTTP API。
+
+如果 `Channel`、`Conversation` 或 Provider 还是陌生概念，先读[核心概念](/zh/sdk/wukongim/concepts)。
+
+<Cards>
+  <Card title="快速开始" description="安装 SDK，连接两个用户，发送第一条文本消息。" href="/zh/sdk/harmonyos/quickstart" />
+  <Card title="连接管理" description="配置身份和地址，理解连接与同步状态。" href="/zh/sdk/harmonyos/connection" />
+  <Card title="消息管理" description="发送、接收、查询消息并显示发送结果。" href="/zh/sdk/harmonyos/messages" />
+  <Card title="会话管理" description="构建聊天列表、未读数和多设备同步。" href="/zh/sdk/harmonyos/conversations" />
+  <Card title="频道资料" description="读取和刷新单聊用户、群组资料。" href="/zh/sdk/harmonyos/channels" />
+  <Card title="高级功能" description="接入自定义正文、媒体上传和远端历史。" href="/zh/sdk/harmonyos/advanced" />
+</Cards>
+
+## SDK 和应用各自负责什么
+
+| 能力 | SDK | 你的应用 |
+| --- | --- | --- |
+| 登录身份 | 使用 UID 和 Token 建立连接 | 通过业务服务端登录并取得 UID、Token |
+| 长连接 | 连接、心跳、重连和协议处理 | 提供可访问的 `host:port` |
+| 消息 | 本地保存、发送、接收和状态更新 | 聊天 UI、业务正文和失败提示 |
+| 会话 | 保存聊天列表和未读数 | 提供多设备会话同步接口 |
+| 频道 | 缓存用户与群资料 | 提供用户、群组和成员接口 |
+| 媒体 | 管理媒体消息发送流程 | 上传文件并返回下载 URL |
+
+## 关于导入路径
+
+包根目前只导出 `WKIM`：
+
+```typescript
+import { WKIM } from '@wukong/wkim'
+```
+
+`WKChannel`、状态常量和消息正文需要从 `@wukong/wkim/src/main/ets/...` 导入。下面的示例会给出完整路径。升级 SDK 时应重新编译这些导入，确认包结构没有变化。
+
+建议按“快速开始 → 连接 → 消息 → 会话 → 频道 → 高级功能”的顺序阅读。需要查方法名时再打开 [API 参考](/zh/sdk/harmonyos/api-reference)。

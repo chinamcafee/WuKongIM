@@ -60,3 +60,21 @@ func (r *ManagementNodeConfigReader) NodeConfigSnapshot(ctx context.Context, nod
 func (r *ManagementNodeConfigReader) isLocal(nodeID uint64) bool {
 	return r.node == nil || nodeID == r.node.NodeID()
 }
+
+// NodeConfigDocument routes the independent TOML capability to the selected node.
+func (r *ManagementNodeConfigReader) NodeConfigDocument(ctx context.Context, nodeID uint64) (managementusecase.NodeConfigDocument, error) {
+	if r == nil {
+		return managementusecase.NodeConfigDocument{}, managementusecase.ErrNodeConfigUnavailable
+	}
+	if r.isLocal(nodeID) {
+		reader, ok := r.local.(managementusecase.NodeConfigDocumentReader)
+		if !ok {
+			return managementusecase.NodeConfigDocument{}, managementusecase.ErrNodeConfigDocumentUnsupported
+		}
+		return reader.NodeConfigDocument(ctx, nodeID)
+	}
+	if r.remote == nil {
+		return managementusecase.NodeConfigDocument{}, managementusecase.ErrNodeConfigUnavailable
+	}
+	return r.remote.GetManagerNodeConfigDocument(ctx, nodeID)
+}

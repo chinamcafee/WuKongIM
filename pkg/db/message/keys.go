@@ -11,32 +11,38 @@ func channelPartitionID(key ChannelKey) []byte {
 	return keycodec.AppendString(nil, string(key))
 }
 
+// newMessageKey reserves the complete key once while preserving the shared
+// domain/partition encoding. The returned bytes belong exclusively to the caller.
+func newMessageKey(channelKey ChannelKey, suffixBytes int) []byte {
+	if len(channelKey) > int(^uint16(0)) {
+		// Preserve the shared codec's rejection before allocating key storage.
+		return keycodec.AppendString(nil, string(channelKey))
+	}
+	key := make([]byte, 0, 4+len(channelKey)+suffixBytes)
+	key = append(key, byte(keycodec.DomainMessage), byte(keycodec.PartitionChannel))
+	return keycodec.AppendString(key, string(channelKey))
+}
+
+// messageTableKey reserves the selected table suffix without temporary builder
+// buffers or partition copies. Callers append only the reserved key parts.
+func messageTableKey(channelKey ChannelKey, space keycodec.Space, suffixBytes int) []byte {
+	key := newMessageKey(channelKey, 5+suffixBytes)
+	key = append(key, byte(space))
+	return keycodec.AppendUint32(key, TableIDMessage)
+}
+
 func encodeMessageChannelPartitionPrefix(channelKey ChannelKey) []byte {
-	var builder keycodec.Builder
-	return builder.Reset().
-		Domain(keycodec.DomainMessage).
-		Partition(keycodec.PartitionChannel, channelPartitionID(channelKey)).
-		Key()
+	return newMessageKey(channelKey, 0)
 }
 
 func encodeMessageRowPrefix(channelKey ChannelKey) []byte {
-	var builder keycodec.Builder
-	return builder.Reset().
-		Domain(keycodec.DomainMessage).
-		Partition(keycodec.PartitionChannel, channelPartitionID(channelKey)).
-		Row(TableIDMessage).
-		Key()
+	return messageTableKey(channelKey, keycodec.SpaceRow, 0)
 }
 
 func encodeMessageRowKey(channelKey ChannelKey, seq uint64, familyID uint16) []byte {
-	var builder keycodec.Builder
-	return builder.Reset().
-		Domain(keycodec.DomainMessage).
-		Partition(keycodec.PartitionChannel, channelPartitionID(channelKey)).
-		Row(TableIDMessage).
-		Uint64(seq).
-		Family(familyID).
-		Key()
+	key := messageTableKey(channelKey, keycodec.SpaceRow, 10)
+	key = keycodec.AppendUint64(key, seq)
+	return keycodec.AppendUint16(key, familyID)
 }
 
 func decodeMessageRowKey(channelKey ChannelKey, key []byte) (seq uint64, familyID uint16, ok bool) {
@@ -52,12 +58,8 @@ func decodeMessageRowKey(channelKey ChannelKey, key []byte) (seq uint64, familyI
 }
 
 func encodeMessageIndexPrefix(channelKey ChannelKey, indexID uint16) []byte {
-	var builder keycodec.Builder
-	return builder.Reset().
-		Domain(keycodec.DomainMessage).
-		Partition(keycodec.PartitionChannel, channelPartitionID(channelKey)).
-		Index(TableIDMessage, indexID).
-		Key()
+	key := messageTableKey(channelKey, keycodec.SpaceIndex, 2)
+	return keycodec.AppendUint16(key, indexID)
 }
 
 func encodeMessageIDIndexKey(channelKey ChannelKey, messageID uint64) []byte {
@@ -91,6 +93,34 @@ func encodeMessageIdempotencyIndexKey(channelKey ChannelKey, fromUID string, cli
 	_ = fromUID
 	key := encodeMessageIndexPrefix(channelKey, messageIndexIDFromUIDClientMsgNo)
 	return keycodec.AppendString(key, clientMsgNo)
+}
+
+func encodeMessageWillIdempotencyIndexKey(channelKey ChannelKey, fromUID, serverKey string) []byte {
+	key := encodeMessageIndexPrefix(channelKey, messageIndexIDServerWill)
+	key = keycodec.AppendString(key, serverKey)
+	return keycodec.AppendString(key, fromUID)
+}
+
+func encodeMessageClientLookupIndexPrefix(channelKey ChannelKey, clientMsgNo string) []byte {
+	key := encodeMessageIndexPrefix(channelKey, messageIndexIDFromUIDClientMsgNo)
+	return keycodec.AppendString(key, clientMsgNo)
+}
+
+func encodeMessageSenderSeqIndexPrefix(channelKey ChannelKey, fromUID string) []byte {
+	key := encodeMessageIndexPrefix(channelKey, messageIndexIDFromUIDMessageSeq)
+	return keycodec.AppendString(key, fromUID)
+}
+
+func encodeMessageSenderSeqIndexKey(channelKey ChannelKey, fromUID string, seq uint64) []byte {
+	return keycodec.AppendUint64(encodeMessageSenderSeqIndexPrefix(channelKey, fromUID), seq)
+}
+
+func decodeMessageSenderSeqIndexSeq(channelKey ChannelKey, fromUID string, key []byte) (uint64, bool) {
+	prefix := encodeMessageSenderSeqIndexPrefix(channelKey, fromUID)
+	if !bytes.HasPrefix(key, prefix) || len(key) != len(prefix)+8 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(key[len(prefix):]), true
 }
 
 func encodeGlobalMessageIDIndexPrefix() []byte {
@@ -141,12 +171,8 @@ func encodeGlobalLatestIndexProgressKey() []byte {
 }
 
 func encodeMessageSystemPrefix(channelKey ChannelKey, systemID uint16) []byte {
-	var builder keycodec.Builder
-	return builder.Reset().
-		Domain(keycodec.DomainMessage).
-		Partition(keycodec.PartitionChannel, channelPartitionID(channelKey)).
-		System(TableIDMessage, systemID).
-		Key()
+	key := messageTableKey(channelKey, keycodec.SpaceSystem, 2)
+	return keycodec.AppendUint16(key, systemID)
 }
 
 func encodeRetentionStateKey(channelKey ChannelKey) []byte {
@@ -178,6 +204,56 @@ func encodeHistoryPointKey(channelKey ChannelKey, point EpochPoint) []byte {
 
 func encodeSnapshotKey(channelKey ChannelKey) []byte {
 	return encodeMessageSystemPrefix(channelKey, messageSystemIDSnapshot)
+}
+
+func encodeProposalByLastKey(channelKey ChannelKey, lastOffset uint64) []byte {
+	return keycodec.AppendUint64(encodeProposalByLastPrefix(channelKey), lastOffset)
+}
+
+func encodeProposalByLastPrefix(channelKey ChannelKey) []byte {
+	return encodeMessageSystemPrefix(channelKey, messageSystemIDProposalByLast)
+}
+
+func decodeProposalByLastKey(channelKey ChannelKey, key []byte) (uint64, bool) {
+	prefix := encodeProposalByLastPrefix(channelKey)
+	if !bytes.HasPrefix(key, prefix) || len(key) != len(prefix)+8 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(key[len(prefix):]), true
+}
+
+func encodeProposalByCommandKey(channelKey ChannelKey, commandID [32]byte) []byte {
+	return append(encodeProposalByCommandPrefix(channelKey), commandID[:]...)
+}
+
+func encodeProposalByCommandPrefix(channelKey ChannelKey) []byte {
+	return encodeMessageSystemPrefix(channelKey, messageSystemIDProposalByCommand)
+}
+
+func decodeProposalByCommandKey(channelKey ChannelKey, key []byte) ([32]byte, bool) {
+	prefix := encodeProposalByCommandPrefix(channelKey)
+	if !bytes.HasPrefix(key, prefix) || len(key) != len(prefix)+32 {
+		return [32]byte{}, false
+	}
+	var commandID [32]byte
+	copy(commandID[:], key[len(prefix):])
+	return commandID, true
+}
+
+func encodeEntryIdentityPrefix(channelKey ChannelKey) []byte {
+	return encodeMessageSystemPrefix(channelKey, messageSystemIDEntryIdentity)
+}
+
+func encodeEntryIdentityKey(channelKey ChannelKey, index uint64) []byte {
+	return keycodec.AppendUint64(encodeEntryIdentityPrefix(channelKey), index)
+}
+
+func decodeEntryIdentityKey(channelKey ChannelKey, key []byte) (uint64, bool) {
+	prefix := encodeEntryIdentityPrefix(channelKey)
+	if !bytes.HasPrefix(key, prefix) || len(key) != len(prefix)+8 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(key[len(prefix):]), true
 }
 
 func encodeCatalogPrefix() []byte {

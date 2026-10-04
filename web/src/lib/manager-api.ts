@@ -64,6 +64,7 @@ import type {
   ManagerNodeOnboardingStartResponse,
   ManagerNodeOnboardingStatusResponse,
   ManagerNodeConfigResponse,
+  ManagerNodeConfigDocument,
   ManagerNodeDetailResponse,
   ManagerNodeScaleInActionInput,
   ManagerNodeScaleInAdvanceResponse,
@@ -89,15 +90,11 @@ import type {
   ManagerPluginMutationResponse,
   ManagerUserDetailResponse,
   ManagerUsersResponse,
-  ManagerSlotDetailResponse,
   ManagerSlotLeaderTransferBatchExecuteResponse,
   ManagerSlotLeaderTransferBatchPlanResponse,
   ManagerSlotLeaderTransferResponse,
   ManagerSlotLogsResponse,
   ManagerSlotRaftCompactResponse,
-  ManagerSlotRemoveResponse,
-  ManagerSlotRecoverResponse,
-  ManagerSlotRebalanceResponse,
   ManagerSystemUsersResponse,
   ManagerSlotsResponse,
   ManagerTaskDetailResponse,
@@ -112,7 +109,6 @@ import type {
   PluginBindingListParams,
   SlotListParams,
   SlotLogListParams,
-  RecoverSlotInput,
   ResetUserTokenInput,
   ResetUserTokenResponse,
   RealtimeMonitorCategory,
@@ -296,6 +292,9 @@ function buildConnectionListPath(params?: ConnectionListParams) {
   }
   if (typeof params?.limit === "number") {
     search.set("limit", String(params.limit))
+  }
+  if (params?.cursor) {
+    search.set("cursor", params.cursor)
   }
 
   const query = search.toString()
@@ -548,6 +547,14 @@ export async function managerFetch(path: string, init?: RequestInit) {
   return response
 }
 
+export type ManagerLoginInfo = {
+  guest?: ManagerLoginCredentials
+}
+
+export function getManagerLoginInfo(init?: RequestInit): Promise<ManagerLoginInfo> {
+  return jsonManagerFetch<ManagerLoginInfo>("/manager/login", { ...init, cache: "no-store" })
+}
+
 export async function loginManager(credentials: ManagerLoginCredentials): Promise<ManagerSession> {
   const payload = await jsonManagerFetch<ManagerLoginResponse>("/manager/login", {
     method: "POST",
@@ -563,8 +570,122 @@ export async function loginManager(credentials: ManagerLoginCredentials): Promis
   }
 }
 
-export function getOverview() {
-  return jsonManagerFetch<ManagerOverviewResponse>("/manager/overview")
+function buildOverviewSlotAnomaly(slot: ManagerSlotsResponse["items"][number]) {
+  return {
+    slot_id: slot.slot_id,
+    quorum: slot.state.quorum,
+    sync: slot.state.sync,
+    leader_id: slot.runtime.leader_id ?? 0,
+    desired_peers: slot.assignment.desired_peers,
+    current_peers: slot.runtime.current_peers,
+    last_report_at: slot.runtime.last_report_at,
+  }
+}
+
+function buildOverviewTaskAnomaly(task: ManagerControllerTask) {
+  return {
+    slot_id: task.slot_id,
+    kind: task.kind,
+    step: task.step,
+    status: task.status,
+    source_node: task.source_node,
+    target_node: task.target_node,
+    attempt: task.attempt,
+    next_run_at: null,
+    last_error: task.last_error,
+  }
+}
+
+function buildManagerOverview(
+  nodes: ManagerNodesResponse,
+  slots: ManagerSlotsResponse,
+  pendingTasks: ManagerControllerTasksResponse,
+  runningTasks: ManagerControllerTasksResponse,
+  failedTasks: ManagerControllerTasksResponse,
+): ManagerOverviewResponse {
+  const quorumLostSlots = slots.items.filter((slot) => slot.state.quorum === "lost")
+  const unreportedSlots = slots.items.filter((slot) => slot.state.sync === "unreported")
+  const leaderMissingSlots = slots.items.filter(
+    (slot) => slot.state.sync !== "unreported" && (slot.runtime.leader_id ?? 0) <= 0,
+  )
+  const syncMismatchSlots = slots.items.filter((slot) => slot.state.sync === "mismatch")
+  const epochLagSlots = slots.items.filter(
+    (slot) => slot.runtime.observed_config_epoch > 0 &&
+      slot.runtime.observed_config_epoch < slot.assignment.config_epoch,
+  )
+  const epochLagSlotIds = new Set(epochLagSlots.map((slot) => slot.slot_id))
+  const readySlots = slots.items.filter(
+    (slot) => slot.state.quorum === "ready" &&
+      slot.state.sync === "matched" &&
+      (slot.runtime.leader_id ?? 0) > 0 &&
+      !epochLagSlotIds.has(slot.slot_id),
+  )
+  const nodeCount = (status: string) => nodes.items.filter((node) => node.status === status).length
+  const drainingNodes = nodes.items.filter(
+    (node) => node.runtime?.draining === true || node.membership?.join_state === "leaving",
+  )
+
+  return {
+    generated_at: new Date().toISOString(),
+    cluster: { controller_leader_id: nodes.controller_leader_id },
+    nodes: {
+      total: nodes.total,
+      alive: nodeCount("alive"),
+      suspect: nodeCount("suspect"),
+      dead: nodeCount("dead"),
+      draining: drainingNodes.length,
+    },
+    slots: {
+      total: slots.total,
+      ready: readySlots.length,
+      quorum_lost: quorumLostSlots.length,
+      leader_missing: leaderMissingSlots.length,
+      unreported: unreportedSlots.length,
+      peer_mismatch: syncMismatchSlots.length,
+      epoch_lag: epochLagSlots.length,
+    },
+    tasks: {
+      total: pendingTasks.total + runningTasks.total + failedTasks.total,
+      pending: pendingTasks.total,
+      running: runningTasks.total,
+      failed: failedTasks.total,
+    },
+    anomalies: {
+      slots: {
+        quorum_lost: {
+          count: quorumLostSlots.length,
+          items: quorumLostSlots.map(buildOverviewSlotAnomaly),
+        },
+        leader_missing: {
+          count: leaderMissingSlots.length,
+          items: leaderMissingSlots.map(buildOverviewSlotAnomaly),
+        },
+        sync_mismatch: {
+          count: syncMismatchSlots.length,
+          items: syncMismatchSlots.map(buildOverviewSlotAnomaly),
+        },
+      },
+      tasks: {
+        failed: {
+          count: failedTasks.total,
+          items: failedTasks.items.map(buildOverviewTaskAnomaly),
+        },
+      },
+    },
+  }
+}
+
+/** Builds the dashboard overview from the bounded manager resources exposed by the server. */
+export async function getOverview(init?: RequestInit) {
+  const [nodes, slots, pendingTasks, runningTasks, failedTasks] = await Promise.all([
+    jsonManagerFetch<ManagerNodesResponse>("/manager/nodes", init),
+    jsonManagerFetch<ManagerSlotsResponse>("/manager/slots", init),
+    jsonManagerFetch<ManagerControllerTasksResponse>(buildControllerTasksPath({ status: "pending", limit: 500 }), init),
+    jsonManagerFetch<ManagerControllerTasksResponse>(buildControllerTasksPath({ status: "running", limit: 500 }), init),
+    jsonManagerFetch<ManagerControllerTasksResponse>(buildControllerTasksPath({ status: "failed", limit: 500 }), init),
+  ])
+
+  return buildManagerOverview(nodes, slots, pendingTasks, runningTasks, failedTasks)
 }
 
 export function getPermissions() {
@@ -670,8 +791,8 @@ export function getRealtimeMonitor(params?: { window?: string; step?: string; no
   return jsonManagerFetch<RealtimeMonitorResponse>(`/manager/realtime-monitor${query ? `?${query}` : ""}`)
 }
 
-export function getNodes() {
-  return jsonManagerFetch<ManagerNodesResponse>("/manager/nodes")
+export function getNodes(init?: RequestInit) {
+  return jsonManagerFetch<ManagerNodesResponse>("/manager/nodes", init)
 }
 
 export function getNode(nodeId: number) {
@@ -853,10 +974,6 @@ export function getSlots(params: SlotListParams = {}) {
   return jsonManagerFetch<ManagerSlotsResponse>(`/manager/slots${query ? `?${query}` : ""}`)
 }
 
-export function getSlot(slotId: number) {
-  return jsonManagerFetch<ManagerSlotDetailResponse>(`/manager/slots/${slotId}`)
-}
-
 function buildLogListSearch(params: { nodeId: number; limit?: number; cursor?: number }) {
   const search = new URLSearchParams()
   search.set("node_id", String(params.nodeId))
@@ -938,18 +1055,6 @@ export function compactControllerRaftLogOnNode(nodeId: number) {
   })
 }
 
-export function addSlot() {
-  return jsonManagerFetch<ManagerSlotDetailResponse>("/manager/slots", {
-    method: "POST",
-  })
-}
-
-export function removeSlot(slotId: number) {
-  return jsonManagerFetch<ManagerSlotRemoveResponse>(`/manager/slots/${slotId}`, {
-    method: "DELETE",
-  })
-}
-
 function slotLeaderTransferBatchBody(input: SlotLeaderTransferBatchInput) {
   return {
     source_node_id: input.sourceNodeId,
@@ -982,19 +1087,6 @@ export function executeSlotLeaderTransferBatch(input: ExecuteSlotLeaderTransferB
       state_revision: input.stateRevision,
       plan_id: input.planId,
     }),
-  })
-}
-
-export function recoverSlot(slotId: number, input: RecoverSlotInput) {
-  return jsonManagerFetch<ManagerSlotRecoverResponse>(`/manager/slots/${slotId}/recover`, {
-    method: "POST",
-    body: JSON.stringify({ strategy: input.strategy }),
-  })
-}
-
-export function rebalanceSlots() {
-  return jsonManagerFetch<ManagerSlotRebalanceResponse>("/manager/slots/rebalance", {
-    method: "POST",
   })
 }
 
@@ -1455,4 +1547,10 @@ export async function cancelBackupRestore(jobID: string) {
     method: "POST",
     body: JSON.stringify({}),
   })
+}
+
+export function getNodeConfigDocument(nodeId: number) {
+  return jsonManagerFetch<ManagerNodeConfigDocument>(
+    `/manager/nodes/${encodeURIComponent(String(nodeId))}/config/toml`,
+  )
 }

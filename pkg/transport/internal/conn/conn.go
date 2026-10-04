@@ -19,7 +19,7 @@ import (
 
 var (
 	writeFramesInto   = wire.WriteFramesInto
-	waitForWriteBatch = time.Sleep
+	waitForWriteBatch = waitForBatch
 )
 
 // Config configures a single connection actor.
@@ -52,6 +52,8 @@ type Outbound struct {
 
 // Inbound is one received frame transferred to Dispatch ownership.
 type Inbound struct {
+	// BudgetMillis is the remaining receiver budget of a negotiated request.
+	BudgetMillis uint32
 	// Kind identifies the inbound frame behavior.
 	Kind core.FrameKind
 	// Priority is the sender's priority lane.
@@ -90,6 +92,16 @@ type Conn struct {
 	dispatch  Dispatch
 	scheduler *sched.Scheduler
 	pending   *rpc.PendingTable
+	// capability serializes one version-1 negotiation per connection generation.
+	capability      atomic.Uint32
+	capabilityMu    sync.Mutex
+	capabilityReady chan struct{}
+	// inboundMu owns cancellation handles until each admitted request finishes.
+	inboundMu       sync.Mutex
+	inboundRequests map[uint64]context.CancelFunc
+	// pendingObservationMu orders absolute pending-RPC snapshots after concurrent
+	// pending-table mutations so downstream revision-aware gauges cannot regress.
+	pendingObservationMu sync.Mutex
 
 	nextRequestID atomic.Uint64
 
@@ -156,12 +168,12 @@ func (c *Conn) Send(ctx context.Context, outbound Outbound) error {
 		return core.ErrMsgTooLarge
 	}
 
-	// Queue cost is body bytes only. Header bytes are fixed wire overhead; adding them here
-	// would make a MaxFrameBodyBytes-sized frame exceed a valid MaxBatchBytes setting.
+	// Admission charges backing storage while batch limits continue to count wire body bytes.
 	err := c.scheduler.Enqueue(ctx, sched.Item{
-		Priority: outbound.Priority,
-		Bytes:    outbound.Payload.Len(),
-		Value:    outbound,
+		Priority:      outbound.Priority,
+		Bytes:         outbound.Payload.Len(),
+		RetainedBytes: outbound.Payload.RetainedBytes(),
+		Value:         outbound,
 	})
 	if err != nil {
 		outbound.Payload.Release()
@@ -174,6 +186,9 @@ func (c *Conn) Send(ctx context.Context, outbound Outbound) error {
 func (c *Conn) Call(ctx context.Context, outbound Outbound) ([]byte, error) {
 	requestID := c.nextRequestID.Add(1)
 	outbound.Kind = core.FrameKindRPCRequest
+	if c.capability.Load() == 2 && outbound.ServiceID != wire.CapabilityServiceID {
+		outbound.Kind = core.FrameKindRPCBudgetRequest
+	}
 	outbound.RequestID = requestID
 	outbound.writeCtx = ctx
 
@@ -193,6 +208,11 @@ func (c *Conn) Call(ctx context.Context, outbound Outbound) ([]byte, error) {
 	case resp := <-respCh:
 		return resp.Payload, resp.Err
 	case <-ctx.Done():
+		if outbound.Kind == core.FrameKindRPCBudgetRequest {
+			// Best effort: a full/failed connection cannot reliably deliver cancellation;
+			// the propagated budget still bounds queued work on the receiver.
+			_ = c.Send(c.ctx, Outbound{Kind: core.FrameKindRPCCancel, Priority: core.PriorityControl, ServiceID: outbound.ServiceID, RequestID: requestID})
+		}
 		c.pending.Delete(requestID)
 		c.observePendingRPC("ok")
 		if errors.Is(ctx.Err(), context.Canceled) {
@@ -226,7 +246,7 @@ func (c *Conn) readLoop() {
 			c.shutdown(err)
 			return
 		}
-		c.observeBytes("received_bytes", frame.Header.Kind, frame.Body.Len())
+		c.observeBytes("received_bytes", frame.Header.Kind, frame.Header.Priority, frame.Body.Len())
 		if frame.Header.Kind == core.FrameKindRPCResponse {
 			c.handleRPCResponse(frame)
 			continue
@@ -236,12 +256,13 @@ func (c *Conn) readLoop() {
 			continue
 		}
 		c.dispatch.Dispatch(c.ctx, Inbound{
-			Kind:      frame.Header.Kind,
-			Priority:  frame.Header.Priority,
-			ServiceID: frame.Header.ServiceID,
-			RequestID: frame.Header.RequestID,
-			Payload:   frame.Body,
-			Conn:      c,
+			BudgetMillis: frame.Header.BudgetMillis,
+			Kind:         frame.Header.Kind,
+			Priority:     frame.Header.Priority,
+			ServiceID:    frame.Header.ServiceID,
+			RequestID:    frame.Header.RequestID,
+			Payload:      frame.Body,
+			Conn:         c,
 		})
 	}
 }
@@ -284,9 +305,20 @@ func (c *Conn) collectAvailableWriteItems(batch, scratch []sched.Item) ([]sched.
 	if !c.shouldWaitForWriteBatch(batch) {
 		return batch, scratch
 	}
-	waitForWriteBatch(c.cfg.Limits.WriteBatchMaxWait)
+	waitForWriteBatch(c.ctx, c.scheduler.UrgentReady(), c.cfg.Limits.WriteBatchMaxWait)
 	scratch = c.scheduler.NextBatchInto(scratch)
 	return append(batch, scratch...), scratch
+}
+
+// waitForBatch never delays urgent traffic or connection shutdown for coalescing.
+func waitForBatch(ctx context.Context, urgent <-chan struct{}, delay time.Duration) {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-urgent:
+	case <-timer.C:
+	}
 }
 
 func (c *Conn) shouldWaitForWriteBatch(batch []sched.Item) bool {
@@ -310,7 +342,7 @@ func (c *Conn) writeOutbound(outbound Outbound) error {
 	if err := wire.WriteFrame(c.raw, outbound.toFrame(), c.cfg.Limits.MaxFrameBodyBytes); err != nil {
 		return err
 	}
-	c.observeBytes("sent_bytes", outbound.Kind, outbound.Payload.Len())
+	c.observeBytes("sent_bytes", outbound.Kind, outbound.Priority, outbound.Payload.Len())
 	return nil
 }
 
@@ -333,14 +365,16 @@ func (c *Conn) writeOutboundBatch(items []sched.Item, outbounds []Outbound, fram
 			releaseOutbounds(outbounds)
 			return err
 		}
-		var sentBytesByKind [core.FrameKindControl + 1]int
+		var sentBytesByKind [core.FrameKindRPCCancel + 1][core.PriorityBulk + 1]int
 		for _, outbound := range outbounds {
-			sentBytesByKind[outbound.Kind] += outbound.Payload.Len()
+			sentBytesByKind[outbound.Kind][outbound.Priority] += outbound.Payload.Len()
 			outbound.Payload.Release()
 		}
 		c.observeWriteBatch(len(outbounds), batchBytes)
-		for kind := core.FrameKindData; kind <= core.FrameKindControl; kind++ {
-			c.observeBytes("sent_bytes", kind, sentBytesByKind[kind])
+		for kind := core.FrameKindData; kind <= core.FrameKindRPCCancel; kind++ {
+			for priority := core.Priority(0); priority <= core.PriorityBulk; priority++ {
+				c.observeBytes("sent_bytes", kind, priority, sentBytesByKind[kind][priority])
+			}
 		}
 		outbounds = outbounds[:0]
 		frames = frames[:0]
@@ -390,6 +424,7 @@ func (c *Conn) shutdown(err error) {
 	}
 	c.closeOnce.Do(func() {
 		c.cancel()
+		c.cancelInboundRequests()
 		_ = c.raw.Close()
 		drained := c.scheduler.Stop(err)
 		releaseSchedItems(drained)
@@ -401,34 +436,46 @@ func (c *Conn) shutdown(err error) {
 func (c *Conn) handleRPCResponse(frame wire.Frame) {
 	defer frame.Body.Release()
 
+	responseChannel, pending := c.pending.Take(frame.Header.RequestID)
+	if !pending {
+		return
+	}
+	defer c.observePendingRPC("ok")
 	body := frame.Body.Bytes()
-	if len(body) == 0 {
-		c.pending.Complete(frame.Header.RequestID, rpc.Response{})
-		c.observePendingRPC("ok")
-		return
-	}
-
-	status := body[0]
-	payload := append([]byte(nil), body[1:]...)
-	if status != wire.ResponseOK {
-		code := core.RemoteErrorCodeGeneric
-		if status == wire.ResponseServiceNotFound {
-			code = core.RemoteErrorCodeServiceNotFound
+	response := rpc.Response{}
+	if len(body) > 0 {
+		status := body[0]
+		if status != wire.ResponseOK {
+			code := core.RemoteErrorCodeGeneric
+			switch status {
+			case wire.ResponseServiceNotFound:
+				code = core.RemoteErrorCodeServiceNotFound
+			case wire.ResponseTimeout:
+				code = core.RemoteErrorCodeTimeout
+			case wire.ResponseCanceled:
+				code = core.RemoteErrorCodeCanceled
+			case wire.ResponseBusy:
+				code = core.RemoteErrorCodeBusy
+			case wire.ResponseStopped:
+				code = core.RemoteErrorCodeStopped
+			}
+			response.Err = core.RemoteError{Code: code, Message: string(body[1:])}
+		} else {
+			response.Payload = append([]byte(nil), body[1:]...)
 		}
-		c.pending.Complete(frame.Header.RequestID, rpc.Response{
-			Err: core.RemoteError{Code: code, Message: string(payload)},
-		})
-		c.observePendingRPC("ok")
-		return
 	}
-	c.pending.Complete(frame.Header.RequestID, rpc.Response{Payload: payload})
-	c.observePendingRPC("ok")
+	select {
+	case responseChannel <- response:
+	default:
+	}
 }
 
 func (c *Conn) observePendingRPC(result string) {
 	if c.cfg.Observer == nil {
 		return
 	}
+	c.pendingObservationMu.Lock()
+	defer c.pendingObservationMu.Unlock()
 	if result == "" {
 		result = "ok"
 	}
@@ -437,11 +484,12 @@ func (c *Conn) observePendingRPC(result string) {
 		NodeID:   c.cfg.NodeID,
 		SourceID: c.cfg.SourceID,
 		Result:   result,
+		Revision: core.NextStateRevision(),
 		Inflight: c.pending.Len(),
 	})
 }
 
-func (c *Conn) observeBytes(name string, kind core.FrameKind, bytes int) {
+func (c *Conn) observeBytes(name string, kind core.FrameKind, priority core.Priority, bytes int) {
 	if c.cfg.Observer == nil || bytes <= 0 {
 		return
 	}
@@ -450,6 +498,7 @@ func (c *Conn) observeBytes(name string, kind core.FrameKind, bytes int) {
 		NodeID:   c.cfg.NodeID,
 		SourceID: c.cfg.SourceID,
 		Kind:     kind,
+		Priority: priority,
 		Bytes:    bytes,
 	})
 }
@@ -471,12 +520,21 @@ func (c *Conn) observeWriteBatch(frames, bytes int) {
 }
 
 func (o Outbound) toFrame() wire.Frame {
+	var budget uint32
+	if o.Kind == core.FrameKindRPCBudgetRequest && o.writeCtx != nil {
+		if deadline, ok := o.writeCtx.Deadline(); ok {
+			remaining := time.Until(deadline)
+			millis := max(int64(1), (int64(remaining)+int64(time.Millisecond)-1)/int64(time.Millisecond))
+			budget = uint32(min(millis, int64(^uint32(0))))
+		}
+	}
 	return wire.Frame{
 		Header: wire.Header{
-			Kind:      o.Kind,
-			Priority:  o.Priority,
-			ServiceID: o.ServiceID,
-			RequestID: o.RequestID,
+			BudgetMillis: budget,
+			Kind:         o.Kind,
+			Priority:     o.Priority,
+			ServiceID:    o.ServiceID,
+			RequestID:    o.RequestID,
 		},
 		Body: o.Payload,
 	}

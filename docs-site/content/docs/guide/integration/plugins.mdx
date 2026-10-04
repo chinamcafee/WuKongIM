@@ -21,12 +21,14 @@ WuKongIM v3 Beta 支持以本地 `.wkp` 进程扩展消息路径和 Host RPC。�
 
 ## 生命周期
 
-```text
-local plugin directory
-  -> plugin process starts and calls /plugin/start
-  -> server validates observed manifest
-  -> merge node-local desired enable/config state
-  -> running + enabled + advertised method = hook candidate
+```mermaid
+flowchart TD
+  Directory["本地插件目录"] --> Start["插件进程启动并调用 /plugin/start"]
+  Start --> Validate["服务端校验观测到的 manifest"]
+  Validate --> Merge["合并节点本地启用与配置期望状态"]
+  Merge --> Candidate{"进程运行、已启用且声明该方法？"}
+  Candidate -->|是| Hook["成为 Hook 候选"]
+  Candidate -->|否| Inactive["不参与 Hook 调用"]
 ```
 
 Manager 更新配置时会保留被 `SecretHidden` 占位的已有 secret，返回详情时对 secret 脱敏。运行中且声明 `ConfigUpdate` 的插件会收到同步配置更新调用。Uninstall 先写 disabled desired state，再停止并移除本地进程。
@@ -36,7 +38,7 @@ Manager 更新配置时会保留被 `SecretHidden` 占位的已有 secret，返�
 | Hook | 时机 | 失败语义 |
 | --- | --- | --- |
 | Send | 权限成功后、Channel append admission 前 | 同步；默认 fail-closed，可显式配置 fail-open；可修改 Payload 或拒绝 |
-| Receive | durable commit 后，针对离线 UID batch | 独立接收者失败不改变 SENDACK、在线投递或会话投影 |
+| Receive | durable commit 后，针对离线 UID batch | 独立接收者失败不改变 SENDACK、在线投递或 membership 状态 |
 | PersistAfter | durable commit 后 | 失败只进入 worker 日志/指标，不回滚消息 |
 
 候选插件按 priority 降序、plugin number 升序稳定选择。Send 响应只能替换 Payload，不能篡改发送者、Channel、Session 或路由字段。插件来源的发送仍进入消息用例、权限检查、递归 guard 和 Channel authority。
@@ -58,6 +60,14 @@ UID 到 plugin number 的绑定是 Slot-authoritative 元数据，以 UID 作为
 - 在本地或指定节点转发有界 HTTP 请求到插件 route。
 
 Host RPC 仍遵守 body、header、query、timeout 和目标验证。`toNodeId=-1` 的 fanout 当前明确未实现，不会偷偷执行部分节点广播。
+
+## 业务 HTTP 路由
+
+业务后端可在 WuKongIM HTTP API 监听器调用 `ANY /plugins/:plugin_no/*path`，例如 `POST /plugins/wk.plugin.search/search`。服务端将 HTTP 方法、路径、请求体及每项首个 header/query 值传给该节点上已连接的插件 `Route` 方法，并返回插件的状态码、响应体和端到端响应头。具体请求与响应结构由插件定义，不属于核心 WuKongIM HTTP API JSON 操作清单。
+
+入口继承 WuKongIM HTTP API 的网络隔离和维护模式限制，不新增身份认证。请求体和响应体均限 10 MiB，执行超时使用 `plugin.timeout`（默认 5 秒）；超大请求返回 413，插件不可用或非法响应返回 502，未接入插件运行时返回 503。跳对跳响应头及插件提供的 `Content-Length` 不会透传。
+
+此兼容入口是 `v3.0.0-beta.13` 之后的修复；该已发布版本对此路径返回 404。旧业务依赖它时，需要包含修复的服务端，并验证真实插件调用。
 
 ## 安全与容量检查
 

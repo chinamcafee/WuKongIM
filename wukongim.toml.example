@@ -3,38 +3,69 @@ id = 1
 data_dir = "./data/wukongim-single-node-data"
 
 [cluster]
+# Internal RPC batches ready frames without an idle delay. Queue wait is bounded
+# to 5s and ordinary handler execution to 30s. Operations MCP allows 1m for
+# bounded profiling; repository probes allow 5m, and complete backup/restore
+# operations allow 48h to preserve the supported job-duration envelope.
+# Negotiated caller budgets may expire queued work earlier; caller cancellation
+# never acknowledges rollback of an already-started mutation.
+# Controller Raft uses 100ms heartbeats and a 1s minimum election timeout.
+# Its timing is independent of the configurable Slot Raft timing below.
 listen_addr = "127.0.0.1:7001"
+# Maximum wait for startup readiness, including committed Slot write probes.
+# Omitted or 0 uses 90s. Increase only after measuring cold recovery duration;
+# routing, quorum, and placement checks still have to pass before serving traffic.
+# This does not change request timeouts after startup.
+start_timeout = "90s"
 id = "wukongim-single"
 nodes = [{ id = 1, addr = "127.0.0.1:7001" }]
 join_token = "change-me"
 # Logical Slot Raft Group count created by the initial Controller snapshot.
-initial_slot_count = 10
+# Applied only during first initialization; existing clusters retain their persisted Slot count.
+initial_slot_count = 12
 # Stable physical hash-slot fence count used to route keys to logical Slot Raft Groups.
 hash_slot_count = 256
 slot_replica_n = 1
+# Slot Raft ticks every 50ms. Heartbeats are sent every two ticks (100ms),
+# while elections start after at least 40 ticks (2s, randomized by Raft).
+# This leaves headroom for bounded storage and RPC tail latency without slowing
+# ordinary proposal replication; set all three values together when tuning.
+slot_tick_interval = "50ms"
+slot_heartbeat_tick = 2
+slot_election_tick = 40
 node_health_report_interval = "5s"
 node_health_report_ttl = "30s"
+# Reactor partitions remain CPU-aware. The blocking pools below use the
+# qualified sustained 2,000 SEND/s, three-replica runtime profile.
 channel_reactor_count = 0
-channel_store_append_workers = 0
-channel_store_apply_workers = 0
-# Bounds blocking replication RPC work. The 160-worker default avoids the scheduler
-# and allocation overhead observed with oversized pools while retaining burst headroom.
-channel_rpc_workers = 160
+channel_store_append_workers = 128
+channel_store_apply_workers = 8
+# Bounds blocking replication RPC work. The 96-worker default preserves measured
+# 2,000 SEND/s headroom without oversized-pool scheduler and allocation overhead.
+channel_rpc_workers = 96
 # Maximum same-target Pull or PullHint items coalesced into one bounded
-# replication transport call. Zero uses the runtime default.
-channel_rpc_batch_max_items = 16
+# replication transport call. The qualified default is eight items.
+channel_rpc_batch_max_items = 8
 max_channels = 0
 channel_append_batch_max_records = 0
 channel_append_batch_max_wait = "0"
 channel_follower_recovery_probe_interval = "2s"
 channel_follower_recovery_probe_jitter = "1s"
-commit_coordinator_flush_window = "200us"
+# Maximum time to collect adjacent durable commit requests. The measured
+# 500us default favors low caller latency and is also the reviewed three-node
+# cluster profile value at sustained write rates.
+commit_coordinator_flush_window = "500us"
 commit_coordinator_max_requests = 0
 commit_coordinator_max_records = 0
 commit_coordinator_max_bytes = 0
-# Four partition-hashed coordinators preserve per-channel append locking and
-# synchronous durable commits while allowing unrelated channels to commit concurrently.
-commit_coordinator_shards = 4
+# One coordinator maximizes durable group-commit batches for the single physical
+# message DB and avoids concurrent fsync contention. Increase only after storage-specific validation.
+commit_coordinator_shards = 1
+# Message DB disk operations (WAL fsync, SST writes, ...) slower than this are
+# counted in wukongim_storage_pebble_disk_slow_* metrics. The 1s default sits
+# below the 5s client SENDACK timeout so slow syncs are visible before clients
+# time out. Observation only: it never changes durability or write behavior.
+storage_disk_slow_threshold = "1s"
 
 [channel]
 message_retention_physical_gc_enable = false
@@ -46,6 +77,16 @@ large_group_subscriber_threshold = 500
 
 [api]
 listen_addr = "127.0.0.1:5001"
+# Optional client-facing overrides. These loopback examples suit host-local
+# access or SSH forwarding. Omit them to derive addresses from Gateway listeners:
+# default external /route and /route/batch replace only wildcard listener hosts
+# with the request Host, retaining the Gateway port, scheme and path. Concrete
+# listener hosts, intranet routes and explicit node selectors stay unchanged.
+# Set overrides for remapped host ports, separate public domains, TLS proxies,
+# or a backend whose API request host is not reachable by its clients.
+# For the opt-in public Demo deployment, demo/deployment.mjs derives this value
+# from public_url, e.g. wss://demo.example.com/ws. Its proxy strips /ws to the
+# WSMUX listener's / path and keeps MQTT on its separate /mqtt listener.
 external_tcp_addr = "127.0.0.1:5100"
 external_ws_addr = "ws://127.0.0.1:5200"
 # Required for Link-U /internal/v3/device-credentials:* requests. Set a strong shared secret in production.
@@ -61,6 +102,7 @@ auth_on = true
 jwt_secret = "wukongim-dev-manager-secret"
 jwt_issuer = "wukongim-manager"
 jwt_expire = "24h"
+# A user named exactly "guest" has its username and password publicly displayed on the Manager login page when auth is enabled.
 users = [{ username = "admin", password = "a1234567", permissions = [{ resource = "*", actions = ["*"] }] }]
 
 [bench]
@@ -71,6 +113,8 @@ api_max_batch_size = 10000
 api_max_payload_bytes = 10485760
 
 [observability]
+# Transport counters and latest pressure state aggregate every 10ms. Duration
+# histograms sample one in 32 observations; observer overflow has its own counter.
 metrics_enable = true
 debug_api_enable = false
 
@@ -124,16 +168,41 @@ format = "console"
 [gateway]
 token_auth_enabled = true
 token_auth_timeout = "3s"
+# Require every client CONNECT token to match the durable device token stored
+# for the same UID and device_flag. Enabled by default; set false only during a
+# controlled compatibility migration because disabling it removes this identity check.
+token_auth_on = true
+# Each listener may set proxy_protocol_trusted_cidrs = ["192.0.2.10/32"].
+# Direct traffic and PROXY v1/v2 are auto-detected on the same port by default.
+# Empty/omitted CIDRs accept headers from any TCP peer, so clients can assert
+# arbitrary addresses in connection information and logs. To verify the source,
+# set controlled proxy egress CIDRs (up to 128 IPv4/IPv6 CIDRs); headers from other
+# peers are then rejected. Direct traffic remains accepted from any peer.
+# Preface detection must finish within 5s of accept; v1 is capped at 107 bytes and
+# v2 at 4096 bytes including TLVs. The proxy must prepend its own PROXY header;
+# HTTP X-Forwarded-For and TLS termination are separate capabilities.
+# Optional MQTT WebSocket access requires mqtt.enable = true. Append a separate
+# listener with network = "websocket", transport = "gnet", protocol = "mqtt",
+# address = "127.0.0.1:1884" and path = "/mqtt". Listener addresses must be unique;
+# the existing wsmux listener does not dispatch MQTT. Clients offer subprotocol
+# "mqtt" and send binary messages. TLS for wss:// terminates upstream.
 listeners = [{ name = "tcp-wkproto", network = "tcp", address = "0.0.0.0:5100", transport = "gnet", protocol = "wkproto" }, { name = "ws-gateway", network = "websocket", address = "0.0.0.0:5200", transport = "gnet", protocol = "wsmux" }]
+# Four multicore event loops and 1,000 bounded SEND preparation workers.
+# Product SEND retains the 131,072-record budget through execution and ordered
+# ACK publication. Per-shard reservations use that same outstanding-work budget.
+# Prepared append payloads are additionally bounded by workers * batch_max_bytes,
+# or one maximum inbound frame when larger; saturation returns a retryable error.
 gnet_multicore = true
-gnet_num_event_loop = 0
-runtime_async_send_workers = 128
+gnet_num_event_loop = 4
+runtime_async_send_workers = 1000
 runtime_async_send_queue_capacity = 131072
 runtime_async_auth_workers = 16
 runtime_async_auth_queue_capacity = 8192
 runtime_async_pool_release_timeout = "100ms"
 default_session_async_send_batch_max_wait = "1ms"
-default_session_async_send_batch_max_records = 512
+# Maximum SEND frames coalesced into one asynchronous gateway dispatch batch.
+# The 128-record limit is qualified for sustained high-QPS workloads.
+default_session_async_send_batch_max_records = 128
 default_session_async_send_batch_max_bytes = 524288
 send_timeout = "5s"
 
@@ -146,8 +215,22 @@ personal_send_authorization_url = ""
 personal_send_authorization_timeout = "500ms"
 # Bounds in-flight callbacks without an unbounded waiting queue.
 personal_send_authorization_max_concurrent = 64
+# Reserved suffix used for internal command-channel IDs (empty uses ____cmd).
+# Use only ASCII letters, digits, underscores, or hyphens. Do not use this suffix
+# for business channel IDs. Every cluster node must use the same value.
+# Set it before first use: changing it does not migrate stored command channels
+# or UID bindings and may leave pending commands inaccessible. Requires restart.
+# Environment override: WK_MESSAGE_CMD_CHANNEL_SUFFIX.
+cmd_channel_suffix = "____cmd"
 person_whitelist_enabled = false
+# System account UID used when a trusted message sender is omitted.
+# Omitted or empty values use the built-in ____system account.
+system_uid = "____system"
 system_device_id = "____device"
+# Cache auxiliary membership/list facts for this duration (zero disables it).
+# User and source-channel send bans and terminal disband always use fresh Slot
+# authority, independent of this TTL. Ban/unban does not require reconnecting.
+# Environment override: WK_MESSAGE_PERMISSION_CACHE_TTL.
 permission_cache_ttl = "0"
 
 [presence]
@@ -159,25 +242,6 @@ touch_batch_size = 512
 touch_max_routes_per_flush = 65536
 route_ttl = "90s"
 
-[conversation]
-max_last_message_concurrency = 32
-authority_cache_max_rows_per_uid = 4096
-authority_cache_max_rows = 100000
-authority_list_db_window_max = 1000
-authority_handoff_timeout = "3s"
-# Coalesces receiver-only active_at persistence while keeping the latest
-# activity visible in the UID authority cache. Delete barriers invalidate the
-# cached durable baseline before any later message can reuse this cooldown.
-authority_active_cooldown = "2h"
-authority_flush_interval = "1s"
-authority_flush_timeout = "5s"
-# Maximum dirty active rows persisted by one periodic, pressure-woken, or authority-handoff flush attempt.
-authority_flush_batch_rows = 512
-authority_admit_batch_rows = 512
-authority_admit_concurrency = 16
-
-
-
 [delivery]
 enable = true
 fanout_page_size = 512
@@ -188,9 +252,10 @@ pending_ack_ttl = "30s"
 pending_ack_max_per_session = 1024
 # Maximum recipient delivery plans waiting for asynchronous processing.
 event_queue_size = 1024
-# Maximum recipient-authority delivery batches processed concurrently by this node.
+# Maximum number of distinct Channels with delivery plans executing concurrently on this node.
+# Plans for one Channel stay FIFO; ready Channels share workers without hash-shard blocking.
 # This is independent from channel_append.recipient_authority_dispatch_concurrency.
-recipient_worker_concurrency = 100
+recipient_worker_concurrency = 320
 
 [channel_append]
 shard_count = 0
@@ -219,6 +284,22 @@ outbox_retry_base_delay = "1s"
 outbox_retry_max_delay = "5m"
 outbox_delivered_retention = "168h"
 
+# Synchronous admission runs after Send plugins and before message submission.
+# This group is independent of webhook.http_addr, focus_events, and plugin.enable.
+[webhook.before_send]
+# Explicit opt-in; enabling requires an absolute HTTP(S) callback URL.
+enabled = false
+# Receives one JSON message per POST with event=msg.before_send.
+http_addr = ""
+# Bounds each callback within the original send deadline; zero uses 500ms.
+timeout = "500ms"
+# Callback timeout policy: allow preserves the input payload; deny rejects.
+on_timeout = "deny"
+# Transport, HTTP status, or invalid response policy; never overrides a denial.
+on_error = "deny"
+# Maximum concurrent callbacks per node; saturation always rejects without queueing.
+max_in_flight = 256
+
 [plugin]
 enable = true
 dir = "./data/wukongim-single-node-data/plugins"
@@ -230,3 +311,36 @@ hot_reload = true
 fail_open = false
 persist_after_queue_size = 1024
 persist_after_workers = 16
+
+# Optional MQTT 5 access. Complete recovery/scale acceptance remains in progress.
+[mqtt]
+# Enable MQTT product handling and the default TCP listener; default false.
+# Additional WebSocket listeners use gateway.listeners with protocol = "mqtt".
+# MQTT product acceptance remains in progress.
+enable = false
+# TCP bind address with a nonzero port; TLS terminates upstream.
+listen_addr = "0.0.0.0:1883"
+# Stable broker ClientID namespace; use the same value on every cluster node.
+namespace = "main"
+# Maximum retained owners including pending and closing connections; 1 to 1000000.
+max_connections = 100000
+# Maximum pending, active and removing subscriptions per Session; 1 to 1024.
+max_subscriptions = 128
+# Workers in each bounded connection/delivery cohort; 1 to 128.
+workers = 16
+# Maximum inbound packet bytes; default and ceiling 1 MiB.
+max_packet_bytes = 1048576
+# Maximum requested offline Session lifetime in seconds; default 24 hours.
+session_expiry_limit_sec = 86400
+# Logical per-Session backlog count limit; candidate default 10000, not a scale guarantee.
+quota_messages = 10000
+# Logical per-Session backlog byte limit; candidate default 64 MiB.
+quota_bytes = 67108864
+# Aggregate node reservations for protected originals and future shared replay.
+# This excludes ordinary history, WAL/compaction and other physical amplification.
+storage_node_bytes = 8589934592
+# Aggregate replica reservations; every storage node must agree, even with MQTT disabled.
+# A body shared by many Sessions is charged once on each retaining replica.
+storage_cluster_bytes = 68719476736
+# Maximum durable QoS 1 exchanges; 1 to 1024, further limited by peer Receive Maximum.
+window_limit = 64

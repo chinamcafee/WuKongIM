@@ -3,6 +3,9 @@ package clusternet
 import "testing"
 
 func TestRPCServiceIDsAreUniqueAndNonZero(t *testing.T) {
+	if RPCNodeSendPermissions != 91 || RPCMessageEventDelivery != 92 {
+		t.Fatal("main permission and stream RPC identities must remain stable")
+	}
 	ids := rpcServiceIDsForTest()
 	seen := make(map[uint8]string, len(ids))
 	for name, id := range ids {
@@ -18,56 +21,81 @@ func TestRPCServiceIDsAreUniqueAndNonZero(t *testing.T) {
 
 func rpcServiceIDsForTest() map[string]uint8 {
 	return map[string]uint8{
-		"msg_slot_raft":             MsgSlotRaft,
-		"msg_slot_raft_batch":       MsgSlotRaftBatch,
-		"slot_forward_propose":      RPCSlotForwardPropose,
-		"channel_pull":              RPCChannelPull,
-		"channel_ack":               RPCChannelAck,
-		"channel_pull_hint":         RPCChannelPullHint,
-		"channel_notify":            RPCChannelNotify,
-		"control_state_sync":        RPCControlStateSync,
-		"control_report_node":       RPCControlReportNode,
-		"control_report_slots":      RPCControlReportSlots,
-		"channel_append":            RPCChannelAppend,
-		"channel_append_batch":      RPCChannelAppendBatch,
-		"control_raft":              RPCControlRaft,
-		"control_task_result":       RPCControlTaskResult,
-		"presence_authority":        RPCPresenceAuthority,
-		"presence_owner":            RPCPresenceOwner,
-		"delivery_push":             RPCDeliveryPush,
-		"delivery_fanout":           RPCDeliveryFanout,
-		"channel_pull_batch":        RPCChannelPullBatch,
-		"channel_pull_hint_batch":   RPCChannelPullHintBatch,
-		"channel_last_visible":      RPCChannelLastVisible,
-		"conversation_authority":    RPCConversationAuthority,
-		"channel_authority_send":    RPCChannelAuthoritySend,
-		"manager_connection":        RPCManagerConnection,
-		"manager_logs":              RPCManagerLogs,
-		"manager_controller_raft":   RPCManagerControllerRaft,
-		"manager_slot_raft":         RPCManagerSlotRaft,
-		"manager_channels":          RPCManagerChannels,
-		"manager_db_inspect":        RPCManagerDBInspect,
-		"manager_app_logs":          RPCManagerAppLogs,
-		"manager_diagnostics":       RPCManagerDiagnostics,
-		"manager_plugins":           RPCManagerPlugins,
-		"manager_node_config":       RPCManagerNodeConfig,
-		"manager_latest_messages":   RPCManagerLatestMessages,
-		"manager_message_retention": RPCManagerMessageRetention,
-		"node_lifecycle":            RPCNodeLifecycle,
-		"plugin_binding_scan":       RPCPluginBindingScan,
-		"slot_status":               RPCSlotStatus,
-		"control_write":             RPCControlWrite,
-		"manager_task_audit":        RPCManagerTaskAudit,
-		"manager_goroutines":        RPCManagerGoroutines,
-		"channel_migration_meta":    RPCChannelMigrationMeta,
-		"message_event_append":      RPCMessageEventAppend,
-		"scheduled_backup_messages": RPCScheduledBackupMessages,
-		"scheduled_backup_slot":     RPCScheduledBackupSlot,
-		"scheduled_backup_probe":    RPCScheduledBackupRepositoryProbe,
-		"scheduled_backup_restore":  RPCScheduledBackupRestore,
-		"operations_mcp":            RPCOpsMCP,
-		"slot_subscriber_metadata":  RPCSlotSubscriberMetadata,
-		"slot_channel_metadata":     RPCSlotChannelMetadata,
+		"slot_device_cmd_cursors":        RPCSlotCMDDeviceCursors,
+		"msg_slot_raft":                  MsgSlotRaft,
+		"msg_slot_raft_batch":            MsgSlotRaftBatch,
+		"slot_forward_propose":           RPCSlotForwardPropose,
+		"channel_pull":                   RPCChannelPull,
+		"channel_ack":                    RPCChannelAck,
+		"channel_pull_hint":              RPCChannelPullHint,
+		"channel_notify":                 RPCChannelNotify,
+		"control_state_sync":             RPCControlStateSync,
+		"control_report_node":            RPCControlReportNode,
+		"control_report_slots":           RPCControlReportSlots,
+		"channel_append":                 RPCChannelAppend,
+		"channel_append_batch":           RPCChannelAppendBatch,
+		"control_raft":                   RPCControlRaft,
+		"control_task_result":            RPCControlTaskResult,
+		"presence_authority":             RPCPresenceAuthority,
+		"presence_owner":                 RPCPresenceOwner,
+		"delivery_push":                  RPCDeliveryPush,
+		"delivery_fanout":                RPCDeliveryFanout,
+		"channel_pull_batch":             RPCChannelPullBatch,
+		"channel_pull_hint_batch":        RPCChannelPullHintBatch,
+		"channel_last_visible":           RPCChannelLastVisible,
+		"channel_conversation_heads":     RPCChannelConversationHeads,
+		"channel_committed_reads":        RPCChannelCommittedReads,
+		"reserved_conversation":          RPCReservedConversationDirectory,
+		"channel_authority_send":         RPCChannelAuthoritySend,
+		"manager_connection":             RPCManagerConnection,
+		"manager_logs":                   RPCManagerLogs,
+		"manager_controller_raft":        RPCManagerControllerRaft,
+		"manager_slot_raft":              RPCManagerSlotRaft,
+		"manager_channels":               RPCManagerChannels,
+		"manager_db_inspect":             RPCManagerDBInspect,
+		"manager_app_logs":               RPCManagerAppLogs,
+		"manager_diagnostics":            RPCManagerDiagnostics,
+		"manager_plugins":                RPCManagerPlugins,
+		"manager_node_config":            RPCManagerNodeConfig,
+		"manager_node_config_document":   RPCManagerNodeConfigDocument,
+		"manager_latest_messages":        RPCManagerLatestMessages,
+		"manager_message_retention":      RPCManagerMessageRetention,
+		"node_lifecycle":                 RPCNodeLifecycle,
+		"plugin_binding_scan":            RPCPluginBindingScan,
+		"slot_status":                    RPCSlotStatus,
+		"control_write":                  RPCControlWrite,
+		"manager_task_audit":             RPCManagerTaskAudit,
+		"manager_goroutines":             RPCManagerGoroutines,
+		"channel_migration_meta":         RPCChannelMigrationMeta,
+		"message_event_append":           RPCMessageEventAppend,
+		"slot_message_updates":           RPCSlotMessageUpdates,
+		"message_update_hint":            RPCMessageUpdateHint,
+		"slot_mqtt_metadata":             RPCSlotMQTTMetadata,
+		"mqtt_owner":                     RPCMQTTOwner,
+		"mqtt_source":                    RPCChannelMQTTSource,
+		"node_send_permissions":          RPCNodeSendPermissions,
+		"message_event_delivery":         RPCMessageEventDelivery,
+		"scheduled_backup_messages":      RPCScheduledBackupMessages,
+		"scheduled_backup_slot":          RPCScheduledBackupSlot,
+		"scheduled_backup_probe":         RPCScheduledBackupRepositoryProbe,
+		"scheduled_backup_restore":       RPCScheduledBackupRestore,
+		"operations_mcp":                 RPCOpsMCP,
+		"slot_subscriber_metadata":       RPCSlotSubscriberMetadata,
+		"slot_channel_metadata":          RPCSlotChannelMetadata,
+		"slot_user_membership":           RPCSlotUserMembership,
+		"slot_runtime_metadata":          RPCSlotRuntimeMetadata,
+		"slot_permission_metadata_batch": RPCSlotPermissionMetadataBatch,
+		"channel_quorum_exchange":        RPCChannelQuorumExchange,
+		"slot_identity_metadata":         RPCSlotIdentityMetadata,
+	}
+}
+
+func TestMQTTMetadataServiceIdentity(t *testing.T) {
+	if RPCSlotMQTTMetadata != 106 || transportServiceAlias(RPCSlotMQTTMetadata) != "slot mqtt metadata" {
+		t.Fatal("MQTT metadata service must preserve its reserved ID and alias")
+	}
+	if RPCMQTTOwner != 107 || transportServiceAlias(RPCMQTTOwner) != "mqtt owner" {
+		t.Fatal("MQTT owner service must preserve its ID and alias")
 	}
 }
 
@@ -81,10 +109,89 @@ func TestRPCManagerTaskAuditServiceAlias(t *testing.T) {
 }
 
 func TestRPCManagerNodeConfigServiceAlias(t *testing.T) {
+	if RPCManagerNodeConfig != 71 || RPCManagerNodeConfigDocument != 88 {
+		t.Fatal("node config services must preserve the legacy and document protocol IDs")
+	}
 	if got := transportServiceAlias(RPCManagerNodeConfig); got != "manager node config" {
 		t.Fatalf("node config service alias = %q, want manager node config", got)
 	}
 	if got := transportServiceFailpointAlias(RPCManagerNodeConfig); got != "manager_node_config" {
 		t.Fatalf("node config failpoint alias = %q, want manager_node_config", got)
+	}
+	if got := transportServiceAlias(RPCManagerNodeConfigDocument); got != "manager node config document" {
+		t.Fatalf("node config document service alias = %q, want manager node config document", got)
+	}
+}
+
+func TestMQTTSourceServiceIdentity(t *testing.T) {
+	if RPCChannelMQTTSource != 93 || transportServiceAlias(RPCChannelMQTTSource) != "channel mqtt source" {
+		t.Fatal("MQTT source service identity changed")
+	}
+	if !isForegroundChannelMutationService(RPCChannelMQTTSource) {
+		t.Fatal("source activation must use bounded mutation admission")
+	}
+}
+
+func TestMQTTReplayServiceIdentity(t *testing.T) {
+	if RPCChannelMQTTReplay != 94 || transportServiceAlias(RPCChannelMQTTReplay) != "channel mqtt replay" {
+		t.Fatal("MQTT replay service identity changed")
+	}
+	if !isForegroundChannelMutationService(RPCChannelMQTTReplay) {
+		t.Fatal("replay preparation must use bounded mutation admission")
+	}
+}
+
+func TestMQTTCopyServiceIdentity(t *testing.T) {
+	if RPCChannelMQTTCopy != 95 || transportServiceAlias(RPCChannelMQTTCopy) != "channel mqtt copy" {
+		t.Fatal("MQTT copy service identity changed")
+	}
+	if !isForegroundChannelMutationService(RPCChannelMQTTCopy) {
+		t.Fatal("MQTT copy must preserve maintenance admission")
+	}
+}
+
+func TestMQTTAnchorServiceIdentity(t *testing.T) {
+	if RPCChannelMQTTAnchor != 96 || transportServiceAlias(RPCChannelMQTTAnchor) != "channel mqtt anchor" {
+		t.Fatal("MQTT anchor service identity changed")
+	}
+	if !isForegroundChannelMutationService(RPCChannelMQTTAnchor) {
+		t.Fatal("MQTT anchor must preserve foreground mutation admission")
+	}
+}
+
+func TestMQTTPlanServiceIdentity(t *testing.T) {
+	if RPCChannelMQTTPlan != 97 || transportServiceAlias(RPCChannelMQTTPlan) != "channel mqtt plan" {
+		t.Fatal("MQTT planning identity changed")
+	}
+	if !isForegroundChannelMutationService(RPCChannelMQTTPlan) {
+		t.Fatal("planning checkpoint must preserve foreground mutation admission")
+	}
+}
+
+func TestMQTTRecoveryServiceIdentity(t *testing.T) {
+	if RPCChannelMQTTRecovery != 99 || transportServiceAlias(RPCChannelMQTTRecovery) != "channel mqtt recovery" {
+		t.Fatal("MQTT recovery service identity changed")
+	}
+	if !isForegroundChannelMutationService(RPCChannelMQTTRecovery) {
+		t.Fatal("MQTT recovery must preserve foreground mutation admission")
+	}
+}
+
+func TestMQTTRetirementServicesHaveStableIDsAndForegroundPolicy(t *testing.T) {
+	if RPCChannelMQTTRetirement != 100 || transportServiceAlias(RPCChannelMQTTRetirement) != "channel mqtt retirement" || !isForegroundChannelMutationService(RPCChannelMQTTRetirement) {
+		t.Fatal("retirement service lost exact ID or mutation policy")
+	}
+	if RPCChannelMQTTRetirementSelection != 101 || transportServiceAlias(RPCChannelMQTTRetirementSelection) != "channel mqtt retirement selection" || !isForegroundChannelMutationService(RPCChannelMQTTRetirementSelection) {
+		t.Fatal("selection service lost exact ID or foreground policy")
+	}
+}
+
+func TestMQTTOriginalsServiceIdentityAndCancellation(t *testing.T) {
+	if RPCChannelMQTTOriginals != 104 || transportServiceAlias(RPCChannelMQTTOriginals) != "channel mqtt originals" || !isForegroundChannelMutationService(RPCChannelMQTTOriginals) {
+		t.Fatal("compound originals lost its reserved identity or bounded foreground policy")
+	}
+	s := &TransportServer{}
+	if !s.serviceOptions(RPCChannelMQTTOriginals).CancelRunning {
+		t.Fatal("bounded original reads must follow caller cancellation")
 	}
 }

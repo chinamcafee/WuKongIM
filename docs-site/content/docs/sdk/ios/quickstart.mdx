@@ -1,0 +1,126 @@
+---
+title: iOS 快速开始
+description: 安装 WuKongIMSDK 1.1.1，连接用户并完成第一条在线文本消息。
+---
+
+这一页只做一件事：让两个在线的 iOS 客户端互相发送一条文本消息。完成后，再按需要学习会话、频道资料和离线同步。
+
+## 前置条件
+
+- 业务服务端已经为 `alice` 和 `bob` 返回各自的 `uid`、`token`、`host`、`port`；
+- 两个独立的 App 进程或设备。`WKSDK` 是单例，不能在同一进程同时登录两个用户；
+- Objective-C 工程已经可以正常使用 CocoaPods。
+
+## 1. 安装
+
+在 `Podfile` 中固定版本：
+
+```ruby
+pod 'WuKongIMSDK', '1.1.1'
+```
+
+然后执行：
+
+```bash
+pod install
+```
+
+以后从生成的 `.xcworkspace` 打开工程。
+
+## 2. 配置并连接
+
+创建一个对象统一持有连接和消息监听器：
+
+```objc
+#import <WuKongIMSDK/WuKongIMSDK.h>
+
+@interface IMClient : NSObject <WKConnectionManagerDelegate, WKChatManagerDelegate>
+- (void)startWithUID:(NSString *)uid
+               token:(NSString *)token
+                host:(NSString *)host
+                port:(uint16_t)port;
+- (void)sendText:(NSString *)text toUID:(NSString *)uid;
+@end
+
+@implementation IMClient
+
+- (void)startWithUID:(NSString *)uid
+               token:(NSString *)token
+                host:(NSString *)host
+                port:(uint16_t)port {
+    WKOptions *options = [WKOptions new];
+    options.host = host;
+    options.port = port;
+    options.isDebug = NO;
+    options.connectInfo = [WKConnectInfo initWithUID:uid
+                                               token:token
+                                                name:@""
+                                              avatar:@""];
+    [WKSDK shared].options = options;
+
+    [[WKSDK shared].connectionManager addDelegate:self];
+    [[WKSDK shared].chatManager addDelegate:self];
+    [[WKSDK shared].connectionManager connect];
+}
+
+- (void)onConnectStatus:(WKConnectStatus)status reasonCode:(WKReason)reasonCode {
+    if (status == WKConnected) {
+        NSLog(@"WuKongIM connected");
+    } else if (status == WKDisconnected) {
+        NSLog(@"WuKongIM disconnected, reason: %ld", (long)reasonCode);
+    }
+}
+```
+
+`connect` 只是发起连接。只有收到 `WKConnected` 后，连接才可以用于发送消息。
+
+## 3. 发送文本消息
+
+Alice 连接成功后，向 Bob 的 UID 发送消息：
+
+```objc
+- (void)sendText:(NSString *)text toUID:(NSString *)uid {
+    WKTextContent *content = [[WKTextContent alloc] initWithContent:text];
+    WKChannel *channel = [WKChannel personWithChannelID:uid];
+    [[WKSDK shared].chatManager sendMessage:content channel:channel];
+}
+```
+
+调用：
+
+```objc
+[client sendText:@"你好，Bob" toUID:@"bob"];
+```
+
+## 4. 接收结果
+
+同一个监听器分别处理本端消息状态和对方发来的消息：
+
+```objc
+- (void)onMessageUpdate:(WKMessage *)message left:(NSInteger)left {
+    if (message.status == WK_MESSAGE_SUCCESS) {
+        NSLog(@"message sent: %@", message.clientMsgNo);
+    } else if (message.status == WK_MESSAGE_FAIL) {
+        NSLog(@"message failed: %@", message.clientMsgNo);
+    }
+}
+
+- (void)onRecvMessages:(WKMessage *)message left:(NSInteger)left {
+    if ([message.content isKindOfClass:[WKTextContent class]]) {
+        WKTextContent *text = (WKTextContent *)message.content;
+        NSLog(@"%@ says: %@", message.fromUid, text.content);
+    }
+}
+
+@end
+```
+
+## 预期结果
+
+1. Alice 和 Bob 都收到 `WKConnected`；
+2. Alice 的 `onMessageUpdate` 收到 `WK_MESSAGE_SUCCESS`；
+3. Bob 的 `onRecvMessages` 打印“你好，Bob”。
+
+如果连接失败，先检查 `host` 不能带 `http://` 或 `https://`，并确认 `port` 是客户端长连接端口。若发送没有结果，确认接收方确实在线、UID 正确，而且发送发生在 `WKConnected` 之后。
+
+下一步阅读[连接管理](/zh/sdk/ios/connection)和[消息管理](/zh/sdk/ios/messages)。

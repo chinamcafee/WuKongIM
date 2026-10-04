@@ -1,0 +1,108 @@
+---
+title: WuKongEasySDK
+description: 选择平台，使用固定版本完成第一次在线双向收发。
+---
+
+WuKongEasySDK 提供轻量的连接、在线消息和事件 API。你负责业务后端与界面，SDK 负责通过 WebSocket JSON-RPC CONNECT 建立认证连接并收发消息。先选择平台；需要准备服务端和测试账号时，跟随[运行官方示例](/zh/sdk/easy/examples)。
+
+## 选择平台，发送第一条消息
+
+<Cards>
+  <Card title="iOS" description="WK_EASYSDK_IOS_VERSION · Swift / iOS 15+" href="/zh/sdk/easy/ios/getting-started" />
+  <Card title="Android" description="WK_EASYSDK_ANDROID_VERSION · Kotlin / API 21+" href="/zh/sdk/easy/android/getting-started" />
+  <Card title="Flutter" description="WK_EASYSDK_FLUTTER_VERSION · Dart 3+ / Flutter 3+" href="/zh/sdk/easy/flutter/getting-started" />
+  <Card title="Web" description="WK_EASYSDK_JAVASCRIPT_VERSION · TypeScript / WebSocket" href="/zh/sdk/easy/javascript/getting-started" />
+  <Card title="Rust" description="WK_EASYSDK_RUST_VERSION · Rust 1.86+ / Tokio" href="/zh/sdk/easy/rust/getting-started" />
+  <Card title="C#" description="WK_EASYSDK_CSHARP_VERSION · .NET 8+" href="/zh/sdk/easy/csharp/getting-started" />
+  <Card title="C++" description="WK_EASYSDK_CPP_VERSION · C++17 / CMake 3.20+" href="/zh/sdk/easy/cpp/getting-started" />
+  <Card title="Python" description="WK_EASYSDK_PYTHON_VERSION · Python 3.11+ / asyncio" href="/zh/sdk/easy/python/getting-started" />
+  <Card title="Agent 流式回复" description="用 EasySDK 与真实模型构建在线流式聊天，处理取消、失败和重连恢复。" href="/zh/sdk/easy/agent-streaming" />
+</Cards>
+
+## 是否适合你的应用
+
+| 选择 EasySDK，如果你只需要 | 选择完整版 WuKongIMSDK，如果你还需要 |
+| --- | --- |
+| WebSocket 连接与自动重连 | 本地消息数据库与离线恢复 |
+| 单聊或群聊 Channel 的在线消息 | 会话列表、未读数与消息同步 |
+| 发送结果和实时消息事件 | 推送、多设备与完整平台能力 |
+| 自己维护 UI、持久化和业务回执 | SDK 承担更多客户端消息状态 |
+
+EasySDK 不是聊天 UI，也不是完整产品后端。`send` 成功表示服务端返回了发送结果，不表示对方已经收到、展示或处理消息。需要完整能力时，回到 [SDK 选择](/zh/sdk)。
+
+## 先认识三个概念
+
+**Channel（频道）** 是消息的目标。单聊时，发送目标是对方 UID；群聊时，目标是后端创建的群 ID。
+
+**Payload（消息内容）** 是应用约定的 JSON，例如 `{"type":1,"content":"你好"}`。SDK 收到消息后，把内容交给你的 UI 或业务处理代码。
+
+**发送结果** 表示服务端返回的处理结果。它与“对方收到”和“对方已读”不同；首次接入要分别观察发送端结果和接收端事件。
+
+## 准备连接材料
+
+客户端不应该创建自己的身份或调用 WuKongIM HTTP API 管理接口。用户登录产品后，受信业务后端通过 HTTPS 返回最小连接材料：
+
+```json
+{
+  "uid": "alice",
+  "token": "short-lived-token",
+  "websocketUrl": "wss://im.example.com/ws"
+}
+```
+
+| 字段 | 所有者与约束 |
+| --- | --- |
+| `uid` | 业务后端确认的稳定用户标识；Alice 与 Bob 必须不同 |
+| `token` | 短期、可撤销，只用于当前身份连接；不能授予 WuKongIM HTTP API 管理权限 |
+| `websocketUrl` | 后端从部署配置或安全路由结果中选择；生产环境使用 `wss://` |
+
+先完成[认证与 Token](/zh/guide/integration/authentication)。当前默认组合会把 CONNECT Token 与 `/user/token` 保存的相同 UID、设备类别记录精确匹配；部署仍必须保护该接口、实现过期与轮换策略，并证明无效、撤销和按业务规则过期的 Token 会被拒绝。
+
+## 跑通 Alice 与 Bob
+
+各平台遵循同一条最小路径：
+
+1. 为 Alice 和 Bob 分别取得自己的 `uid`、短期 `token` 与 `websocketUrl`；
+2. 在两个独立设备、进程或浏览器上下文中按平台教程创建客户端；
+3. 两端都观察到连接成功后，Alice 向个人 Channel `bob` 发送文本 JSON Payload；
+4. Alice 保存发送结果，Bob 在实时消息事件中核对 `fromUid`、Channel 与 Payload；
+5. Bob 向 Alice 回发，验证反向链路；
+6. 退出页面或账号，移除监听器并断开连接，确认没有重复事件或后台连接。
+
+这个闭环只验证在线消息。发送确认、实时接收与业务完成是三个不同状态，具体建模见[消息收发](/zh/guide/integration/messaging)。
+
+## 退出时释放资源
+
+| 平台 | 事件订阅与取消 | 连接所有者退出 |
+| --- | --- | --- |
+| iOS | `onMessage` / `removeListener` | `disconnect()` |
+| Android | `addEventListener` / `removeEventListener` | `disconnect()` |
+| Flutter | `addEventListener` / `removeEventListener` | `disconnect()` + `dispose()` |
+| Web | `on` / `off` | `destroy()` |
+| Rust | `subscribe()` / drop receiver | `destroy().await` |
+| C# | `+=` / `-=` | `await using` / `DisposeAsync()` |
+| C++ | `on` / `off(listenerId)` | `destroy().get()` |
+| Python | `on` / `off` | `async with` / `await destroy()` |
+
+连接通常由应用级对象持有。页面只移除自己的订阅，退出账号时再释放连接。各平台的单例、线程和重连约束不同，按对应教程处理。
+
+## 版本与兼容性
+
+| 平台 | 本教程版本 | 安装来源 |
+| --- | --- | --- |
+| [iOS](https://github.com/WuKongIM/WuKongEasySDK-iOS) | `WK_EASYSDK_IOS_VERSION` | Swift Package Manager / CocoaPods |
+| [Android](https://github.com/WuKongIM/WuKongEasySDK-Android) | `WK_EASYSDK_ANDROID_VERSION` | Maven Central |
+| [Flutter](https://github.com/WuKongIM/WuKongEasySDK-Flutter) | `WK_EASYSDK_FLUTTER_VERSION` | pub.dev |
+| [Web](https://github.com/WuKongIM/WuKongEasySDK-JS) | `WK_EASYSDK_JAVASCRIPT_VERSION` | npm |
+| [Rust](https://github.com/WuKongIM/WuKongEasySDK-Rust) | `WK_EASYSDK_RUST_VERSION` | crates.io |
+| [C#](https://github.com/WuKongIM/WuKongEasySDK-CSharp) | `WK_EASYSDK_CSHARP_VERSION` | NuGet |
+| [C++](https://github.com/WuKongIM/WuKongEasySDK-CPP) | `WK_EASYSDK_CPP_VERSION` | vcpkg / ZIP |
+| [Python](https://github.com/WuKongIM/WuKongEasySDK-Python) | `WK_EASYSDK_PYTHON_VERSION` | PyPI |
+
+教程固定上表版本，方便复现与排障。Web 2.0.5 包含握手失败时的重连修复，见[发布说明](https://github.com/WuKongIM/WuKongEasySDK-JS/releases/tag/v2.0.5)。C++ 使用 WuKongIM 自定义 registry 或匹配系统的预编译包。
+
+本次入门目标是在线双向消息；自动重连不会补拉离线历史，也不等于自动切换到其他节点。集群故障恢复与成员更新还取决于服务端版本。完整历史运行环境、成功与失败范围见[工程验证记录](https://github.com/WuKongIM/WuKongIM/blob/main/docs/superpowers/reports/2026-09-08-easysdk-validation-history.md)。
+
+## 下一步
+
+[运行官方示例](/zh/sdk/easy/examples) → 选择平台教程 → 完成双向收发 → 按[上线检查](/zh/guide/integration/acceptance)验证实际设备、WSS、Token 轮换和故障恢复。

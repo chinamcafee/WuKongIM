@@ -8,6 +8,7 @@ import (
 
 var (
 	ErrInvalidArgument = errors.New("channel: invalid argument")
+	ErrBackpressured   = errors.New("channel: backpressured")
 	ErrClosed          = errors.New("channel: closed")
 	ErrCorruptState    = errors.New("channel: corrupt state")
 	ErrEmptyState      = errors.New("channel: empty state")
@@ -19,7 +20,10 @@ const (
 	// message payload contract shared by log encoding and store-side apply-fetch
 	// idempotency reconstruction.
 	DurableMessageCodecVersion byte = 1
-	DurableMessageHeaderSize        = 45
+	// PublicationMessageCodecVersion adds a mandatory append timestamp and
+	// length-prefixed publication metadata; old readers reject this version.
+	PublicationMessageCodecVersion byte = 2
+	DurableMessageHeaderSize            = 45
 )
 
 type ChannelKey string
@@ -50,6 +54,8 @@ type Message struct {
 	// ServerTimestampMS is the server append timestamp in Unix milliseconds.
 	ServerTimestampMS int64
 	Payload           []byte
+	// PublicationMetadata is immutable bounded publication content, not a frame.
+	PublicationMetadata []byte
 }
 
 type Record struct {

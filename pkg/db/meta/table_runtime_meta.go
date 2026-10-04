@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"slices"
-	"sort"
 
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/dberrors"
 	"github.com/WuKongIM/WuKongIM/pkg/db/internal/keycodec"
@@ -38,6 +37,7 @@ const (
 	runtimeMetaColumnWriteFenceReason    uint16 = 14
 	runtimeMetaColumnWriteFenceUntilMS   uint16 = 15
 	runtimeMetaColumnRouteGeneration     uint16 = 16
+	runtimeMetaColumnDirectoryGeneration uint16 = 17
 )
 
 const runtimeMetaValueVersion byte = 1
@@ -106,6 +106,17 @@ type ChannelRuntimeMeta struct {
 	WriteFenceReason uint8
 	// WriteFenceUntilMS is the fence lease deadline in milliseconds.
 	WriteFenceUntilMS int64
+	// DirectoryGeneration is the durable person-directory incarnation fence.
+	// It survives business Channel deletion so delayed projection work from an
+	// older incarnation cannot complete or overwrite the recreated directory.
+	DirectoryGeneration uint64
+}
+
+// ChannelRuntimeMetaCreateResult is populated by Batch.Commit.
+// Created is meaningful only after Commit returns nil and remains false before Commit.
+type ChannelRuntimeMetaCreateResult struct {
+	// Created reports whether Commit inserted the row instead of finding it already present.
+	Created bool
 }
 
 // MonotonicResult describes how a runtime metadata upsert resolved.
@@ -156,6 +167,11 @@ func (s *Shard) UpsertChannelRuntimeMeta(ctx context.Context, meta ChannelRuntim
 	if err != nil {
 		return 0, err
 	}
+	if !exists {
+		if err := rejectRetiredRuntimeUpsert(&batchCommitState{db: s.db}, s.hashSlot, meta); err != nil {
+			return MonotonicConflict, err
+		}
+	}
 	next, result := resolveMonotonicChannelRuntimeMeta(existing, exists, meta)
 	if result == MonotonicIgnoredStale {
 		return result, nil
@@ -186,32 +202,33 @@ func (s *Shard) GetChannelRuntimeMeta(ctx context.Context, channelID string, cha
 	if err := validateKeyString(channelID); err != nil {
 		return ChannelRuntimeMeta{}, false, err
 	}
-	return channelRuntimeMetaTable.Get(ctx, s, channelRuntimeMetaPrimaryKey(channelID, channelType))
+	if s.db.engine.IsClosed() {
+		return ChannelRuntimeMeta{}, false, dberrors.ErrClosed
+	}
+	key := runtimeReadKey{hashSlot: s.hashSlot, channelID: channelID, channelType: channelType}
+	if m, ok, generation := s.db.runtimeCache.get(key); ok {
+		return m, true, nil
+	} else {
+		m, found, err := channelRuntimeMetaTable.Get(ctx, s, channelRuntimeMetaPrimaryKey(channelID, channelType))
+		if err == nil && found {
+			s.db.runtimeCache.put(key, m, generation)
+		}
+		return m, found, err
+	}
 }
 
-// DeleteChannelRuntimeMeta removes one runtime metadata row.
+// DeleteChannelRuntimeMeta removes one runtime row while retaining its authority
+// high water atomically. Subsequent recreation requires an explicit create.
 func (s *Shard) DeleteChannelRuntimeMeta(ctx context.Context, channelID string, channelType int64) error {
 	if err := s.check(ctx); err != nil {
 		return err
 	}
-	if err := validateKeyString(channelID); err != nil {
-		return err
-	}
-	unlock := s.lock()
-	defer unlock()
-	key := encodeChannelRuntimeMetaRowKey(s.hashSlot, channelID, channelType, channelRuntimeMetaPrimaryFamilyID)
-	if _, ok, err := s.db.get(key); err != nil || !ok {
-		if err != nil {
-			return err
-		}
-		return dberrors.ErrNotFound
-	}
-	batch := s.db.engine.NewBatch()
+	batch := s.db.NewBatch()
 	defer batch.Close()
-	if err := batch.Delete(key); err != nil {
+	if err := batch.deleteChannelRuntimeMeta(s.hashSlot, channelID, channelType, true); err != nil {
 		return err
 	}
-	return batch.Commit(true)
+	return batch.Commit(ctx)
 }
 
 // ListChannelRuntimeMetaPage returns runtime metadata in channel ID/type order.
@@ -347,10 +364,21 @@ func validateChannelRuntimeMeta(meta ChannelRuntimeMeta) error {
 }
 
 func normalizeChannelRuntimeMeta(meta ChannelRuntimeMeta) ChannelRuntimeMeta {
-	meta.Replicas = normalizeUint64Set(meta.Replicas)
-	meta.ISR = normalizeUint64Set(meta.ISR)
+	meta.Replicas = append([]uint64(nil), meta.Replicas...)
+	meta.ISR = append([]uint64(nil), meta.ISR...)
+	return normalizeOwnedChannelRuntimeMeta(meta)
+}
+
+// normalizeOwnedChannelRuntimeMeta consumes freshly decoded or cloned replica
+// slices. Borrowed caller slices must go through normalizeChannelRuntimeMeta.
+func normalizeOwnedChannelRuntimeMeta(meta ChannelRuntimeMeta) ChannelRuntimeMeta {
+	meta.Replicas = normalizeOwnedUint64Set(meta.Replicas)
+	meta.ISR = normalizeOwnedUint64Set(meta.ISR)
 	if meta.RouteGeneration == 0 {
 		meta.RouteGeneration = maxUint64(meta.ChannelEpoch, meta.LeaderEpoch, meta.WriteFenceVersion, 1)
+	}
+	if meta.ChannelType == 1 && meta.DirectoryGeneration == 0 {
+		meta.DirectoryGeneration = 1
 	}
 	return meta
 }
@@ -374,12 +402,12 @@ func resolveMonotonicChannelRuntimeMeta(existing ChannelRuntimeMeta, exists bool
 		return existing, MonotonicIgnoredStale
 	case candidate.ChannelEpoch > existing.ChannelEpoch:
 		preserveRuntimeMetaState(existing, &candidate)
-		return bumpRuntimeRoute(existing, candidate, candidateHadRouteGeneration), MonotonicApplied
+		return bumpRuntimeRoute(existing, candidate, candidateHadRouteGeneration)
 	case candidate.LeaderEpoch < existing.LeaderEpoch:
 		return existing, MonotonicIgnoredStale
 	case candidate.LeaderEpoch > existing.LeaderEpoch:
 		preserveRuntimeMetaState(existing, &candidate)
-		return bumpRuntimeRoute(existing, candidate, candidateHadRouteGeneration), MonotonicApplied
+		return bumpRuntimeRoute(existing, candidate, candidateHadRouteGeneration)
 	case candidate.Leader != existing.Leader:
 		return existing, MonotonicConflict
 	}
@@ -387,10 +415,13 @@ func resolveMonotonicChannelRuntimeMeta(existing ChannelRuntimeMeta, exists bool
 		candidate.LeaseUntilMS = existing.LeaseUntilMS
 	}
 	preserveRuntimeMetaState(existing, &candidate)
-	return bumpRuntimeRoute(existing, candidate, candidateHadRouteGeneration), MonotonicApplied
+	return bumpRuntimeRoute(existing, candidate, candidateHadRouteGeneration)
 }
 
 func preserveRuntimeMetaState(existing ChannelRuntimeMeta, candidate *ChannelRuntimeMeta) {
+	if candidate.DirectoryGeneration < existing.DirectoryGeneration {
+		candidate.DirectoryGeneration = existing.DirectoryGeneration
+	}
 	if candidate.RetentionThroughSeq < existing.RetentionThroughSeq ||
 		(candidate.RetentionThroughSeq == existing.RetentionThroughSeq && candidate.RetentionUpdatedAtMS < existing.RetentionUpdatedAtMS) {
 		candidate.RetentionThroughSeq = existing.RetentionThroughSeq
@@ -404,18 +435,22 @@ func preserveRuntimeMetaState(existing ChannelRuntimeMeta, candidate *ChannelRun
 	}
 }
 
-func bumpRuntimeRoute(existing, candidate ChannelRuntimeMeta, candidateHadRouteGeneration bool) ChannelRuntimeMeta {
+func bumpRuntimeRoute(existing, candidate ChannelRuntimeMeta, candidateHadRouteGeneration bool) (ChannelRuntimeMeta, MonotonicResult) {
 	if !candidateHadRouteGeneration && candidate.RouteGeneration < existing.RouteGeneration {
 		candidate.RouteGeneration = existing.RouteGeneration
 	}
 	if runtimeRouteChanged(existing, candidate) && candidate.RouteGeneration <= existing.RouteGeneration {
+		if existing.RouteGeneration == ^uint64(0) {
+			return existing, MonotonicConflict
+		}
 		candidate.RouteGeneration = nextChannelRouteGeneration(existing.RouteGeneration)
 	}
-	return candidate
+	return candidate, MonotonicApplied
 }
 
 func runtimeRouteChanged(a, b ChannelRuntimeMeta) bool {
-	return a.ChannelEpoch != b.ChannelEpoch ||
+	return a.DirectoryGeneration != b.DirectoryGeneration ||
+		a.ChannelEpoch != b.ChannelEpoch ||
 		a.LeaderEpoch != b.LeaderEpoch ||
 		a.Leader != b.Leader ||
 		!slices.Equal(a.Replicas, b.Replicas) ||
@@ -457,11 +492,12 @@ func encodeChannelRuntimeMetaValue(key []byte, meta ChannelRuntimeMeta) []byte {
 	_ = w.Uint8(runtimeMetaColumnWriteFenceReason, meta.WriteFenceReason)
 	_ = w.Int64(runtimeMetaColumnWriteFenceUntilMS, meta.WriteFenceUntilMS)
 	_ = w.Uint64(runtimeMetaColumnRouteGeneration, meta.RouteGeneration)
+	_ = w.Uint64(runtimeMetaColumnDirectoryGeneration, meta.DirectoryGeneration)
 	return rowcodec.Wrap(key, runtimeMetaValueVersion, rowcodec.CodecColumns, rowcodec.FlagChecksum, w.Bytes())
 }
 
 func decodeChannelRuntimeMetaValue(key []byte, value []byte) (ChannelRuntimeMeta, error) {
-	env, err := rowcodec.Unwrap(key, value)
+	env, err := rowcodec.UnwrapBorrowed(key, value)
 	if err != nil {
 		return ChannelRuntimeMeta{}, err
 	}
@@ -469,7 +505,7 @@ func decodeChannelRuntimeMetaValue(key []byte, value []byte) (ChannelRuntimeMeta
 		return ChannelRuntimeMeta{}, fmt.Errorf("%w: invalid runtime meta envelope", dberrors.ErrCorruptValue)
 	}
 	var meta ChannelRuntimeMeta
-	scanner := rowcodec.NewScanner(env.Payload)
+	scanner := rowcodec.NewBorrowedScanner(env.Payload)
 	for scanner.Next() {
 		if err := decodeRuntimeMetaColumn(scanner, &meta); err != nil {
 			return ChannelRuntimeMeta{}, err
@@ -478,7 +514,7 @@ func decodeChannelRuntimeMetaValue(key []byte, value []byte) (ChannelRuntimeMeta
 	if err := scanner.Err(); err != nil {
 		return ChannelRuntimeMeta{}, err
 	}
-	return normalizeChannelRuntimeMeta(meta), nil
+	return normalizeOwnedChannelRuntimeMeta(meta), nil
 }
 
 func decodeRuntimeMetaColumn(scanner *rowcodec.Scanner, meta *ChannelRuntimeMeta) error {
@@ -492,14 +528,14 @@ func decodeRuntimeMetaColumn(scanner *rowcodec.Scanner, meta *ChannelRuntimeMeta
 		meta.LeaderEpoch = value
 		return err
 	case runtimeMetaColumnReplicas:
-		value, err := scanner.Bytes()
+		value, err := scanner.BorrowedBytes()
 		if err != nil {
 			return err
 		}
 		meta.Replicas, err = decodeUint64Slice(value)
 		return err
 	case runtimeMetaColumnISR:
-		value, err := scanner.Bytes()
+		value, err := scanner.BorrowedBytes()
 		if err != nil {
 			return err
 		}
@@ -552,6 +588,10 @@ func decodeRuntimeMetaColumn(scanner *rowcodec.Scanner, meta *ChannelRuntimeMeta
 	case runtimeMetaColumnRouteGeneration:
 		value, err := scanner.Uint64()
 		meta.RouteGeneration = value
+		return err
+	case runtimeMetaColumnDirectoryGeneration:
+		value, err := scanner.Uint64()
+		meta.DirectoryGeneration = value
 		return err
 	default:
 		return nil
@@ -608,20 +648,15 @@ func decodeUint64Slice(value []byte) ([]uint64, error) {
 }
 
 func normalizeUint64Set(values []uint64) []uint64 {
+	return normalizeOwnedUint64Set(append([]uint64(nil), values...))
+}
+
+func normalizeOwnedUint64Set(values []uint64) []uint64 {
 	if len(values) == 0 {
 		return nil
 	}
-	out := append([]uint64(nil), values...)
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	n := 1
-	for i := 1; i < len(out); i++ {
-		if out[i] == out[n-1] {
-			continue
-		}
-		out[n] = out[i]
-		n++
-	}
-	return out[:n]
+	slices.Sort(values)
+	return slices.Compact(values)
 }
 
 func containsUint64(values []uint64, target uint64) bool {

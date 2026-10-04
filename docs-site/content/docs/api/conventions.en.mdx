@@ -1,0 +1,52 @@
+---
+title: Conventions
+description: Addressing, JSON, identifiers, cursors, and retry rules for WuKongIM HTTP API.
+---
+
+The following rules apply to the currently published WuKongIM HTTP API operations.
+
+## Addressing and format
+
+| Convention | Behavior |
+| --- | --- |
+| Base URL | Local example: `http://127.0.0.1:5001`; all paths start at `/` |
+| Request | POST uses UTF-8 JSON; `/route`, `/channel/whitelist`, and `/user/systemuids` use GET query parameters |
+| Response | JSON; endpoints do not share a universal envelope |
+| UID / Channel ID | Strings owned by the product |
+| Channel | Identified by `channel_id` plus `channel_type` |
+| Message sequence | Ordered only within one Channel |
+
+Check HTTP status first, then parse the endpoint-specific schema. Do not force responses into a universal `{data,error}` type.
+
+## Identifiers and cursors
+
+- `uid` is a product identity, not a nickname, connection ID, or device ID.
+- The client view of a person Channel uses the peer UID.
+- `message_seq` is a per-Channel `uint64` cursor. JavaScript must preserve it with a lossless JSON parser, decimal string, or `BigInt`. `message_idstr` mirrors only `message_id`, cannot replace `message_seq`, and is absent from `/message/send` responses.
+- `next_cursor` is opaque. Echo it unchanged until `done=true`.
+
+For legacy-client compatibility, request objects ignore unknown JSON fields. Callers should still send only declared fields: a typo will not necessarily fail, and extra fields are not an extension mechanism.
+
+## State and execution scope
+
+| Scope | Meaning |
+| --- | --- |
+| Cluster-durable state | Other nodes can read it after success, while follow-up derived work may still be running |
+| Current-process cache | Affects only the process handling the request; do not assume it survives load-balancer node changes |
+| Owner-local action | The request node routes or delays a Session action; the HTTP response does not mean that action has finished |
+| Staged write | Removal, chunked insertion, and derived-flag refresh are not one transaction; verify desired state after failure |
+
+The “Operation boundary” callout on each generated operation page identifies the applicable scope and any success check beyond HTTP 200.
+
+## Retries
+
+| Operation | Rule |
+| --- | --- |
+| `/route` | Back off and retry network failures or temporary `5xx` |
+| `/user/token` | Retry the same identity intent; do not mint tokens in a loop |
+| `/channel/messagesync` | Retry with the same cursor and tolerate overlap with realtime delivery |
+| Channel mutation | Replay the desired state only while the product intent remains valid; `reset`, set, and remove-all may partially complete |
+| `/conversation/list` | Echo `next_cursor` unchanged and stop only at `done=true` |
+| `/conversation/list` | Any channel read failure fails the whole page; retry the original request and cursor |
+
+These operations define no universal `Idempotency-Key`. See [Authentication & Security](/en/api/authentication) for security requirements and [Error Responses](/en/api/product-http/errors) for failure classification.

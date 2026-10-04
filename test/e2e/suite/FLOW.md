@@ -1,90 +1,105 @@
+---
+scope: package
+summary: Provides reusable black-box process, workspace, configuration, protocol, HTTP, diagnostics, and convergence helpers for E2E tests.
+---
+
 # E2E Suite Flow
 
-`test/e2e/suite` owns reusable black-box process, configuration, protocol, and
-HTTP helpers for real `cmd/wukongim` tests.
+## Responsibility
 
-## Process lifecycle
+This package is reusable harness code for real `cmd/wukongim` processes. It
+contains no scenario-specific business assertions and follows `test/e2e/AGENTS.md`.
 
-1. `Suite` allocates a test workspace, loopback ports, and a short independent
-   plugin socket root. Each `go test` process holds one sentinel listener for
-   its process-lifetime port block, so concurrently running E2E packages cannot
-   return overlapping listener addresses; individual addresses are still
-   probed before use to avoid unrelated host listeners.
-2. Config renderers write node TOML and derive the product environment. The
-   shared E2E baseline explicitly disables the optional plugin runtime; plugin
-   scenarios opt in per node through a config override.
-   The harness explicitly disables Gateway token authentication for legacy
-   scenarios that do not provision `/user/token`; authentication scenarios
-   opt in per node and use TCP readiness before registering credentials.
-3. The default binary cache builds `cmd/wukongim` with the `e2e` build tag into
-   one user-cache location scoped by repository, operating system, and
-   architecture. Concurrent test processes publish complete binaries through
-   atomic replacement, so package-level runs do not accumulate one large
-   temporary directory per process. Tagged product substitutes remain dormant
-   unless their separate explicit harness environment is present.
-   `NodeProcess.Start` removes the harness-only `WK_E2E_*` namespace before
-   starting the child process. On Unix, every product process starts as the
-   leader of an independent process group so plugin and other descendants stay
-   inside the harness-owned lifecycle boundary. `NodeProcess` owns the only
-   `Wait` call for the group leader.
-4. Test cleanup stops the current process for every registered node, including
-   nodes appended after cluster startup and processes replaced by restart.
-   Static cluster nodes receive graceful termination concurrently so one node
-   does not lose Raft quorum while later nodes are still waiting to begin
-   shutdown, and so per-node stop budgets do not accumulate serially.
-   Concurrent or repeated stops join the same exit result, and readiness waits
-   fail immediately when their child exits instead of consuming the full poll
-   timeout. Leader exit also starts group cleanup: the harness sends `TERM`,
-   waits for a bounded grace interval, then sends `KILL` to the whole process
-   group when any descendant remains. `Stop` does not return until that cleanup
-   has completed, including when the leader exited before `Stop` was called.
-   Detached-node start and restart paths join this cleanup before reusing the
-   node's ports or data directory.
+## Boundaries
 
-`ReconfigureStoppedNodes` rewrites a static cluster generation only after all
-nodes are stopped. It preserves data directories and non-product external
-environment, replaces schema-known product config environment, and lets a
-restore scenario restart the same successor data in normal mode without a
-mixed restore/normal generation.
+- Helpers observe public HTTP, WKProto, MQTT 5, metrics, process state, and bounded
+  artifacts; they do not import app, use cases, or storage internals.
+- `WK_E2E_*` is harness-only and is removed from spawned nodes. Real product
+  variables must be passed explicitly through `NodeSpec.Env`.
+- Rendered TOML is also mirrored into product environment variables by default.
+  `WithConfigFileOnly` omits that generated mirror across startup, seed join and
+  stopped-node reconfiguration; explicit `WithNodeEnv` controls remain caller-owned.
+- Unix socket placement uses a short independent workspace path.
 
-## Failure diagnostics
+## Main Flows
 
-`NodeProcess.DumpDiagnostics` keeps output bounded and safe for CI logs:
+1. Allocate isolated workspace and non-overlapping loopback port block, render
+   node TOML, obtain the repository/OS/architecture-scoped cached E2E binary,
+   and start each product as an independently owned process group.
+   `WithWebSocketGateway` adds a browser-addressable `/ws` wsmux listener and
+   published route while retaining the default TCP WKProto listener.
+   `WithMQTTWebSocketGateway` independently allocates `/mqtt`; callers enable the
+   product MQTT feature and provision credentials. Raw WebSocket helpers use Paho
+   packet encoding and stream binary messages without business retries.
+2. Migration helpers observe bounded CLI success/refusal and start caller-configured product
+   nodes on already imported data, without opening storage inside the harness.
+3. Wait for readiness, stable Slot authority, or active Channel runtime metadata
+   through public evidence; restart or reconfigure only after previous
+   process-group cleanup completes.
+4. Cleanup stops static nodes concurrently, joins repeated stops, escalates
+   TERM to KILL for remaining descendants, and waits for complete group cleanup.
+5. Optional static-cluster TCP relays publish membership endpoints separately
+   from product listeners. Bounded socket/PID evidence identifies exact owned
+   senders; partition cuts both directed links, retains node-local/public TCP,
+   refuses reconnects and joins relay workers after product cleanup.
 
-- process state and artifact paths are always reported;
-- config content is parsed as TOML and validated against the public
-  `internal/config.SchemaFields` leaf and group-prefix contract before it is
-  re-encoded and limited to the diagnostic tail;
-- unknown paths, scalar values where schema groups are required, schema-leaf
-  kind mismatches, and invalid TOML fail closed to the single
-  `[invalid or unsupported TOML; content omitted]` marker; neither source
-  content nor validation/parser errors are included in diagnostics;
-- stdout, stderr, app, and error logs use the existing bounded tail path.
+## Invariants and Failure Semantics
 
-Every schema leaf marked `DiagnosticSensitive` is redacted as a whole value.
-Startup-snapshot `Sensitive` fields inherit that diagnostic behavior, while the
-additional URL-only diagnostic policy does not change startup snapshot output.
-The complete URL values for `api.external_ws_addr`, `api.external_wss_addr`,
-`webhook.http_addr`, and `prometheus.query_base_url` are diagnostic-sensitive so
-userinfo, paths, query parameters, and fragments cannot leak.
+- One `NodeProcess` owns the only leader `Wait`; readiness fails immediately on
+  child exit. Restart never reuses ports/data before prior group cleanup.
+- Binary publication is atomic. Plugin runtime is disabled by default and
+  enabled only by plugin scenarios.
+- Managed-process WKProto readiness registers a dedicated device token through
+  Product HTTP, then proves a real authenticated handshake. Registration errors
+  remain bounded and never echo credentials; readiness does not disable auth.
+- MQTT fixtures use independent Eclipse Paho clients with bounded receive queues
+  and deadlines. Queue overflow fails the observation instead of dropping a
+  message silently. Explicit WK fixture credentials preserve token-auth behavior;
+  no helper provisions credentials or makes application retry decisions. Optional
+  Will fields, manual PUBACK, Receive Maximum and joined TCP abort exercise Paho behavior.
+- BackupClient uses authenticated public Manager HTTP with bounded response reads;
+  only explicit 401 refreshes login and definite plan-revision conflicts reread.
+  Archive selection and convergence assertions belong to the scenario.
+- WKProto clients accept explicit registered device Tokens without changing
+  server authentication; tokenless fixtures remain explicit.
+- WKProto clients may inject a Dialer to observe public socket bytes. Their
+  synthetic future ACK bridge is not wire-order evidence; ordering probes must
+  capture decoded ACKs directly from the TCP read stream.
+- WebSocket gateway opt-in publishes only the allocated loopback listener;
+  TCP WKProto remains the readiness authority for the started node.
+- Diagnostics expose bounded paths and tails. TOML is re-encoded only after
+  schema validation; invalid structure is fully omitted, and sensitive leaves
+  plus nested secret-like keys are redacted.
+- Optional enabled debug API stack capture writes at most 1 MiB to a private file.
+- Linux recovery sampling separates process RSS/I/O/CPU from enclosing cgroup
+  limits/OOM counters and joins its sampler; public profiles are size/time bounded.
+- Full public metrics observations explicitly request identity encoding, reuse
+  the existing HTTP transport, and reject redirects, non-200 responses, empty
+  snapshots, and invalid sample lines. They do not cache, filter, or retry.
+- Optional metrics receipts bind status, encoding, logical-body byte count and
+  SHA-256, UTC bounds, and monotonic duration to that same request. Receipts keep
+  no body or metric labels. Failed reads retain safe partial metadata and return
+  no samples; a partial-body hash does not prove a complete snapshot.
+- Message-send recovery retries only exact public
+  `503 {"error":"retry required"}` with one stable body and idempotency key.
+- A bounded HTTP fault proxy may forward one real POST and withhold its response
+  until the caller deadline. It records only the upstream status, joins its
+  canceled handler, and leaves commit verification to subsequent public reads.
+- `WaitClusterReady` proves availability only. `WaitSlotLeadersStable` proves
+  closed cross-node inventories, voters, quorum, actual Raft leader agreement,
+  and a stable fingerprint; PreferredLeader is not authority.
+- Channel runtime convergence uses the exact public Manager lookup and requires
+  both active status and an observed Channel Leader within a bounded deadline.
 
-Known ordinary structured leaves remain useful as evidence, but their nested
-password, secret, token, credential, and private/API/access key values are
-redacted using case-insensitive, separator-independent key matching.
+## Read First
 
-## Public request helpers
+- [Suite runtime](runtime.go)
+- [Node process](process.go)
+- [Configuration rendering](config.go)
+- [Slot convergence](slot_convergence.go)
+- [Public metrics observation](metrics.go)
 
-HTTP helpers preserve typed non-2xx response details. Message-send recovery
-retries only the exact public `503 {"error":"retry required"}` signal while
-reusing one serialized request body and idempotency key.
+## Update Triggers
 
-## Cluster convergence
-
-`WaitClusterReady` proves only public HTTP and WKProto availability. Scenarios
-whose correctness depends on stable Slot authority enable read-only Manager
-HTTP and call `WaitSlotLeadersStable`. That helper polls every node's full
-control inventory plus each node-scoped voter inventory, proves the two views
-are closed over the same Slots, validates desired/current voters and quorum,
-uses the actual Raft-elected `node_log.leader_id` rather than
-`preferred_leader_id`, requires cross-node agreement, and resets its bounded
-stability timer whenever the leader/config fingerprint changes.
+Update this file when workspace isolation, binary caching, process ownership,
+environment filtering, cleanup, diagnostics, HTTP metrics observation, retry, convergence or TCP partition changes.

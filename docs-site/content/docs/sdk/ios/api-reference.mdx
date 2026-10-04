@@ -1,0 +1,84 @@
+---
+title: iOS API 参考
+description: 按管理器快速查找 WuKongIMSDK 常用入口、回调、模型和状态。
+---
+
+本页是常用入口速查，不替代各任务页面。所有管理器都从 `[WKSDK shared]` 获取。
+
+## SDK 与配置
+
+| API | 用途 |
+| --- | --- |
+| `[WKSDK shared]` | SDK 单例 |
+| `options` | `host`、`port`、身份、调试和同步配置 |
+| `registerMessageContent:` | 注册自定义消息正文 |
+| `sdkVersion` | 当前运行的 SDK 版本 |
+
+## `WKConnectionManager`
+
+| API | 用途 |
+| --- | --- |
+| `connect` | 发起连接 |
+| `disconnect:` | 断开；传 `YES` 停止自动重连 |
+| `logout` | 退出并清除登录信息 |
+| `addDelegate:` / `removeDelegate:` | 管理连接监听器 |
+| `getConnectAddr` | 动态提供 `host:port` |
+| `connectStatus` | 当前 `WKConnectStatus` |
+
+连接回调：`onConnectStatus:reasonCode:`、`onKick:reason:`。
+
+## `WKChatManager`
+
+| API | 用途 |
+| --- | --- |
+| `sendMessage:channel:` | 发送并保存消息 |
+| `resendMessage:` | 重发失败消息 |
+| `pullLastMessages:limit:complete:` | 读取最近消息 |
+| `pullDown:startOrderSeq:limit:complete:` | 读取更早消息 |
+| `pullUp:startOrderSeq:limit:complete:` | 读取更新消息 |
+| `clearMessages:` | 清除一个频道的本地消息 |
+| `syncChannelMessageProvider` | 接入远端频道历史消息 |
+
+消息回调：`onRecvMessages:left:`、`onMessageUpdate:left:`。
+
+## `WKConversationManager`
+
+| API | 用途 |
+| --- | --- |
+| `getConversationList` | 读取最近会话 |
+| `getConversation:` | 读取一个频道的会话 |
+| `clearConversationUnreadCount:` | 清除未读数 |
+| `getAllConversationUnreadCount` | 统计总未读数 |
+| `deleteConversation:` | 删除会话列表项 |
+| `setSyncConversationProviderAndAck:ack:` | 接入多设备会话同步 |
+
+会话回调：`onConversationUpdate:`、`onConversationUnreadCountUpdate:unreadCount:`。
+
+## `WKChannelManager`
+
+| API | 用途 |
+| --- | --- |
+| `getChannelInfo:` | 读取本地频道资料 |
+| `fetchChannelInfo:completion:` | 请求刷新频道资料 |
+| `addOrUpdateChannelInfo:` | 写入频道资料 |
+| `getMembersWithChannel:limit:` | 读取本地群成员 |
+| `addOrUpdateMembers:` | 写入群成员 |
+| `updateChannelSetting:setting:` | 更新免打扰、置顶等设置 |
+
+频道回调：`channelInfoUpdate:oldChannelInfo:`。远端资料入口是 `[WKSDK shared].channelInfoUpdate`。
+
+## 常用模型与状态
+
+| 类型 | 说明 |
+| --- | --- |
+| `WKConnectInfo` | `uid`、`token`、名称和头像 |
+| `WKChannel` | `channelId` 与 `channelType` |
+| `WKMessage` | 消息身份、发送者、正文、序号和状态 |
+| `WKMessageContent` | 消息正文基类 |
+| `WKConversation` | 聊天列表项与未读数 |
+| `WKChannelInfo` | 名称、头像和频道设置 |
+| `WKChannelMember` | 群成员资料 |
+
+连接状态：`WKNoConnect`、`WKConnecting`、`WKPullingOffline`、`WKConnected`、`WKDisconnected`。
+
+消息状态：`WK_MESSAGE_WAITSEND`、`WK_MESSAGE_UPLOADING`、`WK_MESSAGE_SUCCESS`、`WK_MESSAGE_FAIL`。

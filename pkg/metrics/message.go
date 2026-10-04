@@ -29,11 +29,13 @@ type MessageEventStreamCacheObservation struct {
 
 // MessageMetrics exposes message send, metadata, dispatch, and replay metrics.
 type MessageMetrics struct {
+	sendPermission                 *sendPermissionMetrics
 	metaRefreshTotal               *prometheus.CounterVec
 	metaRefreshDuration            *prometheus.HistogramVec
 	appendTotal                    *prometheus.CounterVec
 	appendDuration                 *prometheus.HistogramVec
 	appendErrorTotal               *prometheus.CounterVec
+	sendBatchStageItemDuration     *prometheus.HistogramVec
 	eventAppendTotal               *prometheus.CounterVec
 	eventAppendDuration            *prometheus.HistogramVec
 	eventAppendStageDuration       *prometheus.HistogramVec
@@ -84,6 +86,12 @@ func newMessageMetrics(registry prometheus.Registerer, labels prometheus.Labels)
 			Help:        "Total number of failed message append attempts grouped by path and error class.",
 			ConstLabels: labels,
 		}, []string{"path", "class"}),
+		sendBatchStageItemDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:        "wukongim_message_send_batch_stage_item_duration_seconds",
+			Help:        "Message SendBatch stage latency attributed to each input item, grouped by bounded stage and result.",
+			ConstLabels: labels,
+			Buckets:     gatewayFrameDurationBuckets,
+		}, []string{"stage", "result"}),
 		eventAppendTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name:        "wukongim_message_event_append_total",
 			Help:        "Total number of message event append attempts grouped by low-cardinality path, event type, and result.",
@@ -174,12 +182,14 @@ func newMessageMetrics(registry prometheus.Registerer, labels prometheus.Labels)
 		replayLagMessagesByChannelType: make(map[string]uint64),
 	}
 
+	m.sendPermission = newSendPermissionMetrics(registry, labels)
 	registry.MustRegister(
 		m.metaRefreshTotal,
 		m.metaRefreshDuration,
 		m.appendTotal,
 		m.appendDuration,
 		m.appendErrorTotal,
+		m.sendBatchStageItemDuration,
 		m.eventAppendTotal,
 		m.eventAppendDuration,
 		m.eventAppendStageDuration,
@@ -228,6 +238,31 @@ func (m *MessageMetrics) ObserveAppendError(path, class string) {
 		class = "unknown"
 	}
 	m.appendErrorTotal.WithLabelValues(path, class).Inc()
+}
+
+// ObserveSendBatchStage records one bounded message SendBatch stage latency.
+func (m *MessageMetrics) ObserveSendBatchStage(stage, result string, items int, dur time.Duration) {
+	if m == nil {
+		return
+	}
+	switch stage {
+	case "permission", "pre_append", "submitter":
+	default:
+		stage = "unknown"
+	}
+	switch result {
+	case "ok", "error":
+	default:
+		result = "unknown"
+	}
+	if items <= 0 {
+		return
+	}
+	histogram := m.sendBatchStageItemDuration.WithLabelValues(stage, result)
+	seconds := dur.Seconds()
+	for range items {
+		histogram.Observe(seconds)
+	}
 }
 
 // ObserveEventAppend records one message event append attempt and its latency.

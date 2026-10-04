@@ -1,0 +1,112 @@
+---
+title: WuKongEasySDK
+description: Choose a platform and exchange your first online messages with a pinned SDK version.
+---
+
+WuKongEasySDK provides lightweight connection, online messaging, and event APIs. Your application owns the backend and UI; the SDK authenticates with WebSocket JSON-RPC CONNECT and exchanges messages. Choose a platform below. Use [the official examples](/en/sdk/easy/examples) to prepare a server and test accounts.
+
+## Choose a platform and send the first message
+
+<Cards>
+  <Card title="iOS" description="WK_EASYSDK_IOS_VERSION · Swift / iOS 15+" href="/en/sdk/easy/ios/getting-started" />
+  <Card title="Android" description="WK_EASYSDK_ANDROID_VERSION · Kotlin / API 21+" href="/en/sdk/easy/android/getting-started" />
+  <Card title="Flutter" description="WK_EASYSDK_FLUTTER_VERSION · Dart 3+ / Flutter 3+" href="/en/sdk/easy/flutter/getting-started" />
+  <Card title="Web" description="WK_EASYSDK_JAVASCRIPT_VERSION · TypeScript / WebSocket" href="/en/sdk/easy/javascript/getting-started" />
+  <Card title="Rust" description="WK_EASYSDK_RUST_VERSION · Rust 1.86+ / Tokio" href="/en/sdk/easy/rust/getting-started" />
+  <Card title="C#" description="WK_EASYSDK_CSHARP_VERSION · .NET 8+" href="/en/sdk/easy/csharp/getting-started" />
+  <Card title="C++" description="WK_EASYSDK_CPP_VERSION · C++17 / CMake 3.20+" href="/en/sdk/easy/cpp/getting-started" />
+  <Card title="Python" description="WK_EASYSDK_PYTHON_VERSION · Python 3.11+ / asyncio" href="/en/sdk/easy/python/getting-started" />
+  <Card title="Agent Streaming Replies" description="Build live streaming chat with EasySDK and a real model, including cancellation, failure, and reconnect recovery." href="/en/sdk/easy/agent-streaming" />
+</Cards>
+
+## Does it fit your application?
+
+| Choose EasySDK when you only need | Choose the full WuKongIMSDK when you also need |
+| --- | --- |
+| WebSocket connection and automatic reconnect | A local message database and offline recovery |
+| Online messages in person or group Channels | Conversations, unread counts, and message synchronization |
+| Send results and realtime message events | Push, multi-device behavior, and the broader platform API |
+| Product-owned UI, persistence, and receipts | More client message state owned by the SDK |
+
+EasySDK is neither a chat UI nor a complete product backend. A successful `send` means the server returned a send result; it does not mean the peer received, displayed, or processed the message. If you need the broader feature set, return to [SDK selection](/en/sdk).
+
+Rust uses one `Client` per identity; clones share the socket. `subscribe()` returns a bounded receiver, `disconnect().await` permits later connection, and `destroy().await` closes permanently. The default device category is PC `2`. See the [Rust quickstart](/en/sdk/easy/rust/getting-started) for installation and lifecycle.
+
+## Three concepts to start with
+
+**Channel** is the message destination. A person message targets the other user’s UID; a group message targets a group ID created by your backend.
+
+**Payload** is your application’s JSON content, such as `{"type":1,"content":"Hello"}`. Received content belongs in your UI or application handler.
+
+**Send result** is the server’s processing result. It differs from recipient delivery and a read receipt. Check both the sender’s result and the recipient’s event during your first integration.
+
+## Prepare connection credentials
+
+The client must not create its own identity or call WuKongIM HTTP API management routes. After product login, the trusted backend returns the minimum connection material over HTTPS:
+
+```json
+{
+  "uid": "alice",
+  "token": "short-lived-token",
+  "websocketUrl": "wss://im.example.com/ws"
+}
+```
+
+| Field | Owner and constraint |
+| --- | --- |
+| `uid` | Stable user identity confirmed by the product backend; Alice and Bob use different values |
+| `token` | Short-lived and revocable, scoped to this identity's connection, with no WuKongIM HTTP API management authority |
+| `websocketUrl` | Selected by the backend from deployment configuration or a trusted routing result; production uses `wss://` |
+
+Complete [Authentication & Tokens](/en/guide/integration/authentication) first. The default composition exactly matches each CONNECT token against the `/user/token` record for the same UID and device category. Your deployment must still protect that route, implement expiry and rotation policy, and prove that invalid, revoked, and product-expired tokens are rejected.
+
+## Run Alice and Bob
+
+All platforms follow the same minimal path:
+
+1. Obtain separate `uid`, short-lived `token`, and `websocketUrl` values for Alice and Bob.
+2. Create the clients in two independent devices, processes, or browser contexts by following the platform quickstart.
+3. After both sides report a successful connection, have Alice send a text JSON payload to the person Channel `bob`.
+4. Retain Alice's send result; on Bob, verify `fromUid`, the Channel, and the payload in the realtime message event.
+5. Send from Bob to Alice and prove the reverse direction.
+6. Leave the page or sign out, remove listeners, and disconnect; confirm there is no duplicate event or background connection.
+
+This loop verifies online messaging only. Send acknowledgement, realtime receipt, and product completion are three different states; model them with [Messaging](/en/guide/integration/messaging).
+
+To validate the environment first, follow [Run the Official Examples](/en/sdk/easy/examples) with the verified server and client revisions before moving tutorial code into your application.
+
+## Release resources on exit
+
+| Platform | Subscribe and unsubscribe | Connection owner exit |
+| --- | --- | --- |
+| iOS | `onMessage` / `removeListener` | `disconnect()` |
+| Android | `addEventListener` / `removeEventListener` | `disconnect()` |
+| Flutter | `addEventListener` / `removeEventListener` | `disconnect()` + `dispose()` |
+| Web | `on` / `off` | `destroy()` |
+| Rust | `subscribe()` / drop receiver | `destroy().await` |
+| C# | `+=` / `-=` | `await using` / `DisposeAsync()` |
+| C++ | `on` / `off(listenerId)` | `destroy().get()` |
+| Python | `on` / `off` | `async with` / `await destroy()` |
+
+An application object usually owns the connection. Pages remove their own subscriptions; account logout releases the connection. Follow each platform’s singleton, threading, and reconnect rules.
+
+## Versions and compatibility
+
+| Platform | Tutorial version | Distribution |
+| --- | --- | --- |
+| [iOS](https://github.com/WuKongIM/WuKongEasySDK-iOS) | `WK_EASYSDK_IOS_VERSION` | Swift Package Manager / CocoaPods |
+| [Android](https://github.com/WuKongIM/WuKongEasySDK-Android) | `WK_EASYSDK_ANDROID_VERSION` | Maven Central |
+| [Flutter](https://github.com/WuKongIM/WuKongEasySDK-Flutter) | `WK_EASYSDK_FLUTTER_VERSION` | pub.dev |
+| [Web](https://github.com/WuKongIM/WuKongEasySDK-JS) | `WK_EASYSDK_JAVASCRIPT_VERSION` | npm |
+| [Rust](https://github.com/WuKongIM/WuKongEasySDK-Rust) | `WK_EASYSDK_RUST_VERSION` | crates.io |
+| [C#](https://github.com/WuKongIM/WuKongEasySDK-CSharp) | `WK_EASYSDK_CSHARP_VERSION` | NuGet |
+| [C++](https://github.com/WuKongIM/WuKongEasySDK-CPP) | `WK_EASYSDK_CPP_VERSION` | vcpkg / ZIP |
+| [Python](https://github.com/WuKongIM/WuKongEasySDK-Python) | `WK_EASYSDK_PYTHON_VERSION` | PyPI |
+
+Tutorials pin the versions above for reproducibility and troubleshooting. Web 2.0.5 includes a handshake-failure reconnect repair; see its [release notes](https://github.com/WuKongIM/WuKongEasySDK-JS/releases/tag/v2.0.5). C++ uses the WuKongIM custom registry or a prebuilt archive matching your system.
+
+The first task is online bidirectional messaging. Reconnect does not fetch offline history or automatically select another node. Cluster recovery and membership updates also depend on the server version. Exact historical environments, passing results, and failures remain in [engineering validation records](https://github.com/WuKongIM/WuKongIM/blob/main/docs/superpowers/reports/2026-09-08-easysdk-validation-history.md).
+
+## Next
+
+[Run an official example](/en/sdk/easy/examples) → follow your platform tutorial → check both message directions → use [production checks](/en/guide/integration/acceptance) for actual devices, WSS, Token rotation, and recovery.

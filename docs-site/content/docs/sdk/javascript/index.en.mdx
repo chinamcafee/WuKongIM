@@ -1,0 +1,36 @@
+---
+title: JavaScript / Web
+description: Use TypeScript to connect wukongimjssdk and manage WebSocket, messages, conversations, and channel profiles.
+---
+
+`wukongimjssdk` is the full WuKongIM JavaScript SDK. It manages WebSocket, message delivery, an in-memory conversation list, and channel profiles for browsers, H5, and separately verified JavaScript runtimes.
+
+These guides target `wukongimjssdk 1.3.5` and use TypeScript throughout.
+
+## Before you start
+
+Prepare:
+
+- a WuKongIM WebSocket endpoint reachable from the target runtime;
+- two test users, such as `alice` and `bob`;
+- a `uid`, `token`, and `ws://` or `wss://` endpoint returned by your application server;
+- a frontend project using npm, pnpm, or Yarn.
+
+<Callout type="info" title="The browser must not hold an admin secret">
+  The browser should receive only the current user's short-lived token and endpoint from your application server. Keep user creation, token issuance, and access control on the server.
+</Callout>
+
+## Recommended order
+
+<Cards>
+  <Card title="Quickstart" description="Install the SDK, connect a user, and send the first online text message." href="/en/sdk/javascript/quickstart" />
+  <Card title="Connection" description="Handle endpoints, states, automatic reconnection, and page cleanup." href="/en/sdk/javascript/connection" />
+  <Card title="Messages" description="Send, receive, synchronize, and correlate message states." href="/en/sdk/javascript/messages" />
+  <Card title="Conversations" description="Maintain the in-memory chat list and unread counts." href="/en/sdk/javascript/conversations" />
+  <Card title="Channels" description="Load user, group, and subscriber profiles." href="/en/sdk/javascript/channels" />
+  <Card title="Advanced" description="Add custom content, offline recovery, and UniApp migration." href="/en/sdk/javascript/advanced" />
+</Cards>
+
+The repository contains a runnable two-session example at `docs-site/examples/javascript-web-quickstart`. Read these guides to learn the API first; run the example when you are ready to connect a real service.
+
+Read [Core Concepts](/en/sdk/wukongim/concepts) first if “channel” or “conversation” is unfamiliar. Open the [API Reference](/en/sdk/javascript/api-reference) when you only need a method name.

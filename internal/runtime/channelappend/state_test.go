@@ -114,9 +114,9 @@ func TestChannelStateSerializesMatchingClientMessageNumbers(t *testing.T) {
 
 func TestChannelStateDropCurrentCommitAdvancesCursorWithoutMovingBacklog(t *testing.T) {
 	state := newChannelState(AuthorityTarget{ChannelID: ChannelID{ID: "room", Type: 2}}, channelStateLimits{})
-	state.enqueueCommitted(CommittedEnvelope{MessageID: 1})
-	state.enqueueCommitted(CommittedEnvelope{MessageID: 2})
-	state.enqueueCommitted(CommittedEnvelope{MessageID: 3})
+	state.enqueueCommitted(CommittedEnvelope{MessageID: 1}, postCommitReservation{})
+	state.enqueueCommitted(CommittedEnvelope{MessageID: 2}, postCommitReservation{})
+	state.enqueueCommitted(CommittedEnvelope{MessageID: 3}, postCommitReservation{})
 
 	state.dropCommitted(1)
 
@@ -126,7 +126,7 @@ func TestChannelStateDropCurrentCommitAdvancesCursorWithoutMovingBacklog(t *test
 	if len(state.committed) != 3 {
 		t.Fatalf("committed len = %d, want original backing queue retained after one drop", len(state.committed))
 	}
-	if state.committed[0].MessageID != 0 || state.committed[1].MessageID != 2 || state.committed[2].MessageID != 3 {
+	if state.committed[0].envelope.MessageID != 0 || state.committed[1].envelope.MessageID != 2 || state.committed[2].envelope.MessageID != 3 {
 		t.Fatalf("committed queue = %#v, want first slot cleared and remaining slots unmoved", state.committed)
 	}
 	if backlog := state.commitBacklog(); backlog != 2 {
@@ -137,7 +137,7 @@ func TestChannelStateDropCurrentCommitAdvancesCursorWithoutMovingBacklog(t *test
 func TestChannelStateCommitEffectSharesQueuedImmutablePayload(t *testing.T) {
 	payload := []byte("payload")
 	state := newChannelState(AuthorityTarget{ChannelID: ChannelID{ID: "room", Type: 2}}, channelStateLimits{})
-	state.enqueueCommitted(CommittedEnvelope{MessageID: 1, Payload: payload})
+	state.enqueueCommitted(CommittedEnvelope{MessageID: 1, Payload: payload}, postCommitReservation{})
 
 	var effect commitEffect
 	ok := state.nextCommitEffect("2:room", &effect)
@@ -147,7 +147,7 @@ func TestChannelStateCommitEffectSharesQueuedImmutablePayload(t *testing.T) {
 	if len(effect.events) != 1 {
 		t.Fatalf("commit effect events = %d, want 1", len(effect.events))
 	}
-	if len(effect.events[0].Payload) == 0 || &effect.events[0].Payload[0] != &payload[0] {
+	if len(effect.events[0].envelope.Payload) == 0 || &effect.events[0].envelope.Payload[0] != &payload[0] {
 		t.Fatalf("commit effect payload did not share queued immutable payload")
 	}
 }
@@ -163,7 +163,7 @@ func TestChannelStateCommitEffectReusesReadySubscriberCache(t *testing.T) {
 		mutationVersion: 7,
 		recipients:      recipients,
 	}
-	state.enqueueCommitted(CommittedEnvelope{MessageID: 1})
+	state.enqueueCommitted(CommittedEnvelope{MessageID: 1}, postCommitReservation{})
 
 	var effect commitEffect
 	ok := state.nextCommitEffect("2:room", &effect)

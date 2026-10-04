@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TIMESTAMP="${WK_BENCH_PRESENCE_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
 OUT_DIR="${WK_BENCH_PRESENCE_OUT_DIR:-$ROOT_DIR/docs/development/perf-runs/${TIMESTAMP}-three-node-presence}"
-WK_BENCH_BIN="${WK_BENCH_BIN:-$ROOT_DIR/data/wkbench-presence/wkbench}"
+WK_CLI_BIN="${WK_CLI_BIN:-$ROOT_DIR/data/wkbench-presence/wkcli}"
 WORKER_ADDR="${WK_BENCH_WORKER_ADDR:-http://127.0.0.1:19131}"
 WORKER_LISTEN="${WK_BENCH_WORKER_LISTEN:-127.0.0.1:19131}"
 START_SCRIPT="${WK_BENCH_THREE_NODE_START_SCRIPT:-$ROOT_DIR/scripts/start-wukongim-three-nodes.sh}"
@@ -71,7 +71,7 @@ the run is active, then validates the live peak against report.json status.
 
 Options:
   --out-dir DIR             Evidence output directory.
-  --wkbench-bin PATH        wkbench binary path. Default: data/wkbench-presence/wkbench.
+  --wkcli-bin PATH        wkcli binary path. Default: data/wkbench-presence/wkcli.
   --worker-addr URL         Worker control URL. Default: http://127.0.0.1:19131.
   --worker-listen ADDR      Temporary worker listen address. Default: 127.0.0.1:19131.
   --no-worker               Do not start a temporary worker; require --worker-addr to be reachable.
@@ -217,9 +217,9 @@ while [[ $# -gt 0 ]]; do
       OUT_DIR="$2"
       shift 2
       ;;
-    --wkbench-bin)
-      [[ $# -ge 2 ]] || die '--wkbench-bin requires a value'
-      WK_BENCH_BIN="$2"
+    --wkcli-bin)
+      [[ $# -ge 2 ]] || die '--wkcli-bin requires a value'
+      WK_CLI_BIN="$2"
       shift 2
       ;;
     --worker-addr)
@@ -439,20 +439,20 @@ ensure_tools() {
 }
 
 ensure_wkbench_binary() {
-  if [[ -x "$WK_BENCH_BIN" ]]; then
+  if [[ -x "$WK_CLI_BIN" ]]; then
     local newer_source
-    newer_source="$(find "$ROOT_DIR/cmd/wkbench" "$ROOT_DIR/internal/bench" "$ROOT_DIR/pkg/bench/model" "$ROOT_DIR/pkg/client" "$ROOT_DIR/pkg/protocol" -type f -newer "$WK_BENCH_BIN" -print -quit)"
+    newer_source="$(find "$ROOT_DIR/cmd/wkcli" "$ROOT_DIR/internal/bench" "$ROOT_DIR/pkg/bench/model" "$ROOT_DIR/pkg/client" "$ROOT_DIR/pkg/protocol" -type f -newer "$WK_CLI_BIN" -print -quit)"
     if [[ -z "$newer_source" ]]; then
       return
     fi
-    log "rebuilding stale wkbench: $WK_BENCH_BIN"
+    log "rebuilding stale wkcli: $WK_CLI_BIN"
   else
-    log "building wkbench: $WK_BENCH_BIN"
+    log "building wkcli: $WK_CLI_BIN"
   fi
-  mkdir -p "$(dirname "$WK_BENCH_BIN")"
+  mkdir -p "$(dirname "$WK_CLI_BIN")"
   (
     cd "$ROOT_DIR"
-    GOWORK="${GOWORK:-off}" go build -o "$WK_BENCH_BIN" ./cmd/wkbench
+    GOWORK="${GOWORK:-off}" go build -o "$WK_CLI_BIN" ./cmd/wkcli
   )
 }
 
@@ -767,7 +767,7 @@ ensure_worker() {
   local worker_dir="$OUT_DIR/worker-state"
   mkdir -p "$worker_dir"
   log "starting temporary worker: $WORKER_LISTEN"
-  "$WK_BENCH_BIN" worker --listen "$WORKER_LISTEN" --work-dir "$worker_dir" --insecure-control >/dev/null 2>&1 &
+  "$WK_CLI_BIN" bench worker --listen "$WORKER_LISTEN" --work-dir "$worker_dir" --insecure-control >/dev/null 2>&1 &
   WORKER_PID="$!"
   local deadline=$((SECONDS + 15))
   while (( SECONDS <= deadline )); do
@@ -936,7 +936,7 @@ run_bench() {
   local report_dir="$OUT_DIR/report"
   mkdir -p "$report_dir"
   log "running presence scenario users=$USERS"
-  "$WK_BENCH_BIN" run \
+  "$WK_CLI_BIN" bench run \
     --target "$OUT_DIR/target.yaml" \
     --scenario "$OUT_DIR/scenario.yaml" \
     --workers "$OUT_DIR/workers.yaml" \

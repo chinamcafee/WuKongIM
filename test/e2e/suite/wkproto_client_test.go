@@ -5,12 +5,21 @@ package suite
 import (
 	"net"
 	"testing"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/codec"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/wkprotoenc"
 	"github.com/stretchr/testify/require"
 )
+
+func TestNewWKProtoClientWithTimeoutRejectsNonPositiveDuration(t *testing.T) {
+	_, err := NewWKProtoClientWithTimeout(0)
+	require.Error(t, err)
+	client, err := NewWKProtoClientWithTimeout(20 * time.Second)
+	require.NoError(t, err)
+	require.Equal(t, 20*time.Second, client.operationTimeout)
+}
 
 func TestWKProtoClientReadSendAckSkipsInterleavedRecv(t *testing.T) {
 	ln := newWKProtoTestServer(t, func(conn net.Conn) {
@@ -65,8 +74,12 @@ func TestWKProtoClientReadSendAckSkipsInterleavedRecv(t *testing.T) {
 		Payload:     []byte("hello sendack"),
 	}))
 
-	ack, err := client.ReadSendAck()
+	ack, timing, err := client.ReadSendAckWithTiming()
 	require.NoError(t, err)
+	require.False(t, timing.PendingStartedAt.IsZero())
+	require.False(t, timing.WriteStartedAt.Before(timing.PendingStartedAt))
+	require.False(t, timing.ObservedAt.Before(timing.WriteStartedAt))
+	require.False(t, time.Now().Before(timing.ObservedAt))
 	require.Equal(t, uint64(3), ack.ClientSeq)
 	require.Equal(t, "e2e-send-ack", ack.ClientMsgNo)
 	require.Equal(t, int64(99), ack.MessageID)

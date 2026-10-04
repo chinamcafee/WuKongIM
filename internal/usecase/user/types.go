@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/contracts/protocolmeta"
+	"github.com/WuKongIM/WuKongIM/internal/contracts/sendbanaudit"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/online"
 	"github.com/WuKongIM/WuKongIM/internal/usecase/presence"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
@@ -34,6 +35,8 @@ var (
 	ErrDeviceStoreRequired = errors.New("internal/usecase/user: device store required")
 	// ErrDeviceCredentialStoreRequired reports that replicated credential CAS is unavailable.
 	ErrDeviceCredentialStoreRequired = errors.New("internal/usecase/user: device credential store required")
+	// ErrInvalidToken reports that CONNECT credentials do not match durable device metadata.
+	ErrInvalidToken = errors.New("internal/usecase/user: invalid token")
 )
 
 // UserStore persists UID metadata.
@@ -58,6 +61,7 @@ type CredentialFenceCoordinator interface {
 }
 
 // DeviceReader loads per-device token metadata.
+// DeviceReader loads per-device token metadata for CONNECT verification and device lifecycle operations.
 type DeviceReader interface {
 	GetDevice(ctx context.Context, uid string, deviceFlag int64) (metadb.Device, error)
 }
@@ -82,11 +86,13 @@ type RestoreSystemUIDStore interface {
 
 // Options configures the user usecase dependencies.
 type Options struct {
+	// SendBanAudit receives attempted policy mutations with apply-time facts.
+	SendBanAudit sendbanaudit.Observer
 	// Users stores durable UID metadata.
 	Users UserStore
 	// Devices stores durable per-device token metadata.
 	Devices DeviceStore
-	// DeviceReader loads stored device metadata for device-quit requests.
+	// DeviceReader loads stored device metadata for CONNECT verification and device-quit requests.
 	DeviceReader DeviceReader
 	// DeviceCredentials applies version-fenced device credential mutations.
 	DeviceCredentials DeviceCredentialStore
@@ -98,7 +104,7 @@ type Options struct {
 	Presence PresenceDirectory
 	// SystemUIDs stores reserved system account UIDs.
 	SystemUIDs SystemUIDStore
-	// SystemUID overrides the built-in system account UID in tests.
+	// SystemUID identifies the configured primary system account; empty uses DefaultSystemUID.
 	SystemUID string
 	// AfterFunc schedules delayed local session closes.
 	AfterFunc func(time.Duration, func())
@@ -108,17 +114,19 @@ type Options struct {
 
 // App coordinates legacy-compatible user operations.
 type App struct {
+	// sendBanAudit records policy attempts without credentials or message data.
+	sendBanAudit     sendbanaudit.Observer
 	users            UserStore
 	devices          DeviceStore
 	deviceReader     DeviceReader
-	credentialStore  DeviceCredentialStore
-	credentialFences CredentialFenceCoordinator
 	online           *online.Registry
 	presence         PresenceDirectory
 	systemUIDs       SystemUIDStore
 	systemUID        string
 	afterFunc        func(time.Duration, func())
 	logger           wklog.Logger
+	credentialStore  DeviceCredentialStore
+	credentialFences CredentialFenceCoordinator
 
 	systemUIDCacheMu sync.RWMutex
 	systemUIDCache   map[string]struct{}
@@ -173,11 +181,10 @@ func New(opts Options) *App {
 		opts.Logger = wklog.NewNop()
 	}
 	return &App{
+		sendBanAudit:     opts.SendBanAudit,
 		users:            opts.Users,
 		devices:          opts.Devices,
 		deviceReader:     opts.DeviceReader,
-		credentialStore:  opts.DeviceCredentials,
-		credentialFences: opts.CredentialFences,
 		online:           opts.Online,
 		presence:         opts.Presence,
 		systemUIDs:       opts.SystemUIDs,
@@ -185,6 +192,8 @@ func New(opts Options) *App {
 		afterFunc:        opts.AfterFunc,
 		logger:           opts.Logger,
 		systemUIDCache:   make(map[string]struct{}),
+		credentialStore:  opts.DeviceCredentials,
+		credentialFences: opts.CredentialFences,
 	}
 }
 

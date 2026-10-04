@@ -24,8 +24,9 @@ join_token = "change-me"
 nodes = [{ addr = "127.0.0.1:7011", id = 1 }, { addr = "127.0.0.1:7012", id = 2 }, { addr = "127.0.0.1:7013", id = 3 }]
 
 # Logical Slot Raft Group count created by the initial Controller snapshot.
-# Ten groups distribute metadata Raft leadership across the three local nodes.
-initial_slot_count = 10
+# Twelve groups distribute metadata Raft leadership across the three local nodes.
+# Applied only during first initialization; existing clusters retain their persisted Slot count.
+initial_slot_count = 12
 
 # Stable physical hash-slot fence count used to route keys to logical Slot Raft Groups.
 hash_slot_count = 256
@@ -34,7 +35,7 @@ hash_slot_count = 256
 slot_replica_n = 3
 
 # Local Slot Raft snapshot compaction. The local smoke workload creates many UID-owned
-# conversation-active metadata entries, so keep the verification window short.
+# membership-directory mutations, so keep the verification window short.
 slot_log_compaction_enabled = true
 
 slot_log_compaction_trigger_entries = 1000
@@ -44,18 +45,18 @@ slot_log_compaction_check_interval = "5s"
 # Channel reactor partitions. 0 derives max(4, GOMAXPROCS).
 channel_reactor_count = 0
 
-# Blocking Channel worker caps. 0 keeps the runtime default.
-channel_store_append_workers = 0
+# Qualified Channel worker bounds for sustained 2,000 SEND/s workloads.
+channel_store_append_workers = 128
 
-channel_store_apply_workers = 0
+channel_store_apply_workers = 8
 
-# Bounds blocking replication RPC work. The 160-worker default avoids the scheduler
-# and allocation overhead observed with oversized pools while retaining burst headroom.
-channel_rpc_workers = 160
+# Bounds blocking replication RPC work. The 96-worker default preserves measured
+# 2,000 SEND/s headroom without oversized-pool scheduler and allocation overhead.
+channel_rpc_workers = 96
 
 # Maximum same-target Pull or PullHint items coalesced into one bounded
-# replication transport call. Zero uses the runtime default.
-channel_rpc_batch_max_items = 16
+# replication transport call. The qualified default is eight items.
+channel_rpc_batch_max_items = 8
 
 # Maximum loaded Channel runtimes on this node. 0 keeps unlimited behavior.
 max_channels = 0
@@ -72,7 +73,8 @@ channel_follower_recovery_probe_interval = "2s"
 channel_follower_recovery_probe_jitter = "1s"
 
 # Maximum time to collect adjacent Channel append requests before one durable fsync.
-commit_coordinator_flush_window = "200us"
+# The reviewed three-node cluster profile uses 500us to bound commit latency.
+commit_coordinator_flush_window = "500us"
 
 # Optional caps for one grouped physical commit. 0 keeps the limit unbounded.
 commit_coordinator_max_requests = 0
@@ -81,9 +83,9 @@ commit_coordinator_max_records = 0
 
 commit_coordinator_max_bytes = 0
 
-# Four partition-hashed coordinators preserve per-channel append locking and
-# synchronous durable commits while allowing unrelated channels to commit concurrently.
-commit_coordinator_shards = 4
+# One coordinator maximizes durable group-commit batches for the single physical
+# message DB and avoids concurrent fsync contention. Increase only after storage-specific validation.
+commit_coordinator_shards = 1
 
 [api]
 # Optional HTTP API listener for /healthz, /readyz, metrics, and bench/v1.
@@ -201,15 +203,15 @@ token_auth_timeout = "3s"
 # Client-facing gateway listeners. Use TOML arrays here; WK_ environment overrides use one JSON string value.
 listeners = [{ address = "127.0.0.1:5111", name = "tcp-wkproto", network = "tcp", protocol = "wkproto", transport = "gnet" }, { address = "127.0.0.1:5211", name = "ws-gateway", network = "websocket", protocol = "wsmux", transport = "gnet" }]
 
-# Optional gnet event-loop tuning. 0 keeps the CPU-aware cmd/wukongim default.
+# Four multicore event loops match the qualified 2,000 SEND/s gateway profile.
 gnet_multicore = true
 
-gnet_num_event_loop = 0
+gnet_num_event_loop = 4
 
 # Gateway SEND async sharding and micro-batch collection controls.
-runtime_async_send_workers = 0
+runtime_async_send_workers = 1000
 
-runtime_async_send_queue_capacity = 0
+runtime_async_send_queue_capacity = 131072
 
 runtime_async_auth_workers = 0
 
@@ -219,7 +221,10 @@ runtime_async_pool_release_timeout = "0s"
 
 default_session_async_send_batch_max_wait = "1ms"
 
-default_session_async_send_batch_max_records = 512
+# Maximum SEND frames coalesced into one asynchronous gateway dispatch batch.
+# The reviewed chat-lifecycle profile keeps one SEND per dispatch because each
+# sender already allows only one in-flight SENDACK operation.
+default_session_async_send_batch_max_records = 1
 
 default_session_async_send_batch_max_bytes = 524288
 
@@ -240,32 +245,6 @@ touch_max_routes_per_flush = 65536
 
 route_ttl = "90s"
 
-[conversation]
-# Conversation authority and list-read tuning.
-# Bounds concurrent channel tail reads used to hydrate one /conversation/list page.
-max_last_message_concurrency = 32
-
-# Conversation authority cache, handoff, and admission controls.
-authority_cache_max_rows_per_uid = 4096
-
-authority_cache_max_rows = 100000
-
-authority_list_db_window_max = 1000
-
-authority_handoff_timeout = "3s"
-
-authority_active_cooldown = "2h"
-
-authority_flush_interval = "1s"
-
-authority_flush_timeout = "5s"
-
-authority_flush_batch_rows = 512
-
-authority_admit_batch_rows = 512
-
-authority_admit_concurrency = 16
-
 [delivery]
 # Online delivery fanout and owner-local recvack tracking are enabled by default; set false to disable them.
 enable = true
@@ -281,9 +260,10 @@ pending_ack_max_per_session = 1024
 
 event_queue_size = 1024
 
-# Maximum recipient-authority delivery batches processed concurrently by this node.
+# Maximum number of distinct Channels with delivery plans executing concurrently on this node.
+# Plans for one Channel stay FIFO; ready Channels share workers without hash-shard blocking.
 # This is independent from channel_append.recipient_authority_dispatch_concurrency.
-recipient_worker_concurrency = 100
+recipient_worker_concurrency = 320
 
 [channel_append]
 # Channel append shard count controls channel-key authority-state lookup shards; zero derives a CPU-aware default.

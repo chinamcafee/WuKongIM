@@ -41,247 +41,11 @@ type ChannelCursor struct {
 
 // Subscriber stores one durable channel subscriber.
 type Subscriber struct {
+	// Incarnation changes only on a new join; 1 identifies legacy empty rows.
+	Incarnation uint64
 	ChannelID   string
 	ChannelType int64
 	UID         string
-}
-
-// UserConversationActiveHint describes a hot conversation activity hint.
-type UserConversationActiveHint struct {
-	// UID identifies the user that owns the conversation state.
-	UID string
-	// ChannelID identifies the conversation channel.
-	ChannelID string
-	// ChannelType identifies the channel namespace.
-	ChannelType int64
-	// ActiveAt is the candidate activity timestamp.
-	ActiveAt int64
-	// MessageSeq fences stale activity hints after a user delete barrier.
-	MessageSeq uint64
-	// SparseActive is the requested sparse-active mode when SparseActiveSet is true.
-	SparseActive bool
-	// SparseActiveSet reports that SparseActive should update the stored sparse mode.
-	SparseActiveSet bool
-}
-
-// UserConversationState is the legacy ordinary conversation source shape.
-// It maps to ConversationState with ConversationKindNormal.
-type UserConversationState struct {
-	// UID identifies the user that owns the conversation state.
-	UID string
-	// ChannelID identifies the conversation channel.
-	ChannelID string
-	// ChannelType identifies the channel namespace.
-	ChannelType int64
-	// ReadSeq is the highest message sequence acknowledged by the user.
-	ReadSeq uint64
-	// DeletedToSeq is the highest message sequence hidden from future sync.
-	DeletedToSeq uint64
-	// ActiveAt is the latest activity timestamp used by active scans.
-	ActiveAt int64
-	// UpdatedAt records the latest state mutation timestamp.
-	UpdatedAt int64
-	// SparseActive reports that ActiveAt is a low-frequency ordering anchor.
-	SparseActive bool
-}
-
-// UserConversationActivePatch is the legacy ordinary active patch shape.
-// It maps to ConversationActivePatch with ConversationKindNormal.
-type UserConversationActivePatch struct {
-	// UID identifies the user that owns the conversation state.
-	UID string
-	// ChannelID identifies the conversation channel.
-	ChannelID string
-	// ChannelType identifies the channel namespace.
-	ChannelType int64
-	// ReadSeq is a monotonic read floor merged with the durable row.
-	ReadSeq uint64
-	// DeletedToSeq is a monotonic visibility floor merged with the durable row.
-	DeletedToSeq uint64
-	// ActiveAt is the candidate activity timestamp.
-	ActiveAt int64
-	// UpdatedAt records the latest projection update timestamp.
-	UpdatedAt int64
-	// MessageSeq fences stale activity hints after a user delete barrier.
-	MessageSeq uint64
-	// SparseActive is the requested sparse-active mode when SparseActiveSet is true.
-	SparseActive bool
-	// SparseActiveSet reports that SparseActive should update the stored sparse mode.
-	SparseActiveSet bool
-}
-
-// UserConversationDelete is the legacy ordinary delete request shape.
-// It maps to ConversationDelete with ConversationKindNormal.
-type UserConversationDelete struct {
-	// UID identifies the user that owns the conversation state.
-	UID string
-	// ChannelID identifies the conversation channel.
-	ChannelID string
-	// ChannelType identifies the channel namespace.
-	ChannelType int64
-	// DeletedToSeq is the highest sequence hidden by the delete.
-	DeletedToSeq uint64
-	// UpdatedAt records when the hide operation was requested.
-	UpdatedAt int64
-}
-
-// ConversationDeleteBarrier prevents stale hints from reactivating deletes.
-type ConversationDeleteBarrier struct {
-	UID          string
-	ChannelID    string
-	ChannelType  int64
-	DeletedToSeq uint64
-}
-
-// UserConversationDeleteBarrier is the legacy ordinary delete-barrier shape.
-type UserConversationDeleteBarrier = ConversationDeleteBarrier
-
-// CMDConversationState is the legacy command sync cursor shape.
-// It maps to ConversationState with ConversationKindCMD.
-type CMDConversationState struct {
-	// UID identifies the user that owns the CMD sync cursor.
-	UID string
-	// ChannelID identifies the command or SyncOnce source channel.
-	ChannelID string
-	// ChannelType identifies the channel namespace.
-	ChannelType int64
-	// ReadSeq is the highest command message sequence acknowledged by the user.
-	ReadSeq uint64
-	// DeletedToSeq is the highest command message sequence hidden from sync.
-	DeletedToSeq uint64
-	// ActiveAt is the latest command activity timestamp used by active scans.
-	ActiveAt int64
-	// UpdatedAt records the latest cursor mutation timestamp.
-	UpdatedAt int64
-}
-
-// CMDConversationReadPatch advances one legacy CMD read cursor.
-// It maps to ConversationActivePatch with ConversationKindCMD.
-type CMDConversationReadPatch struct {
-	// UID identifies the user that owns the CMD sync cursor.
-	UID string
-	// ChannelID identifies the command or SyncOnce source channel.
-	ChannelID string
-	// ChannelType identifies the channel namespace.
-	ChannelType int64
-	// ReadSeq is the monotonic read floor.
-	ReadSeq uint64
-	// UpdatedAt records when the read cursor advanced.
-	UpdatedAt int64
-}
-
-func userConversationStateToConversation(state UserConversationState) ConversationState {
-	return ConversationState{
-		UID:          state.UID,
-		Kind:         ConversationKindNormal,
-		ChannelID:    state.ChannelID,
-		ChannelType:  state.ChannelType,
-		ReadSeq:      state.ReadSeq,
-		DeletedToSeq: state.DeletedToSeq,
-		ActiveAt:     state.ActiveAt,
-		UpdatedAt:    state.UpdatedAt,
-		SparseActive: state.SparseActive,
-	}
-}
-
-func userConversationStateFromConversation(state ConversationState) UserConversationState {
-	return UserConversationState{
-		UID:          state.UID,
-		ChannelID:    state.ChannelID,
-		ChannelType:  state.ChannelType,
-		ReadSeq:      state.ReadSeq,
-		DeletedToSeq: state.DeletedToSeq,
-		ActiveAt:     state.ActiveAt,
-		UpdatedAt:    state.UpdatedAt,
-		SparseActive: state.SparseActive,
-	}
-}
-
-func userConversationStatesFromConversations(states []ConversationState) []UserConversationState {
-	out := make([]UserConversationState, 0, len(states))
-	for _, state := range states {
-		out = append(out, userConversationStateFromConversation(state))
-	}
-	return out
-}
-
-func userConversationActivePatchToConversation(patch UserConversationActivePatch) ConversationActivePatch {
-	return ConversationActivePatch{
-		UID:             patch.UID,
-		Kind:            ConversationKindNormal,
-		ChannelID:       patch.ChannelID,
-		ChannelType:     patch.ChannelType,
-		ReadSeq:         patch.ReadSeq,
-		DeletedToSeq:    patch.DeletedToSeq,
-		ActiveAt:        patch.ActiveAt,
-		UpdatedAt:       patch.UpdatedAt,
-		MessageSeq:      patch.MessageSeq,
-		SparseActive:    patch.SparseActive,
-		SparseActiveSet: patch.SparseActiveSet,
-	}
-}
-
-func userConversationActivePatchesToConversations(patches []UserConversationActivePatch) []ConversationActivePatch {
-	out := make([]ConversationActivePatch, 0, len(patches))
-	for _, patch := range patches {
-		out = append(out, userConversationActivePatchToConversation(patch))
-	}
-	return out
-}
-
-func userConversationDeleteToConversation(req UserConversationDelete) ConversationDelete {
-	return ConversationDelete{
-		UID:          req.UID,
-		Kind:         ConversationKindNormal,
-		ChannelID:    req.ChannelID,
-		ChannelType:  req.ChannelType,
-		DeletedToSeq: req.DeletedToSeq,
-		UpdatedAt:    req.UpdatedAt,
-	}
-}
-
-func cmdConversationStateToConversation(state CMDConversationState) ConversationState {
-	return ConversationState{
-		UID:          state.UID,
-		Kind:         ConversationKindCMD,
-		ChannelID:    state.ChannelID,
-		ChannelType:  state.ChannelType,
-		ReadSeq:      state.ReadSeq,
-		DeletedToSeq: state.DeletedToSeq,
-		ActiveAt:     state.ActiveAt,
-		UpdatedAt:    state.UpdatedAt,
-	}
-}
-
-func cmdConversationStateFromConversation(state ConversationState) CMDConversationState {
-	return CMDConversationState{
-		UID:          state.UID,
-		ChannelID:    state.ChannelID,
-		ChannelType:  state.ChannelType,
-		ReadSeq:      state.ReadSeq,
-		DeletedToSeq: state.DeletedToSeq,
-		ActiveAt:     state.ActiveAt,
-		UpdatedAt:    state.UpdatedAt,
-	}
-}
-
-func cmdConversationStatesFromConversations(states []ConversationState) []CMDConversationState {
-	out := make([]CMDConversationState, 0, len(states))
-	for _, state := range states {
-		out = append(out, cmdConversationStateFromConversation(state))
-	}
-	return out
-}
-
-func cmdConversationReadPatchToConversation(patch CMDConversationReadPatch) ConversationActivePatch {
-	return ConversationActivePatch{
-		UID:         patch.UID,
-		Kind:        ConversationKindCMD,
-		ChannelID:   patch.ChannelID,
-		ChannelType: patch.ChannelType,
-		ReadSeq:     patch.ReadSeq,
-		UpdatedAt:   patch.UpdatedAt,
-	}
 }
 
 // DB is the compatibility handle used by slot FSM and proxy callers.
@@ -310,6 +74,9 @@ func (db *DB) Close() error {
 		return nil
 	}
 	eng := db.engine
+	if db.meta != nil {
+		db.meta.close()
+	}
 	db.engine = nil
 	db.meta = nil
 	return eng.Close()
@@ -356,12 +123,23 @@ func (db *DB) NewWriteBatch() *WriteBatch {
 	return &WriteBatch{db: db, batch: db.meta.NewBatch(), migrationCreates: make(map[string]ChannelMigrationTask)}
 }
 
+// SlotAppliedIndex returns the atomic state-machine watermark for slotID.
+func (db *DB) SlotAppliedIndex(ctx context.Context, slotID uint64) (uint64, error) {
+	if db == nil || db.meta == nil {
+		return 0, dberrors.ErrClosed
+	}
+	return db.meta.SlotAppliedIndex(ctx, slotID)
+}
+
 // DeleteSlotData removes all data for a legacy single-slot hash slot.
 func (db *DB) DeleteSlotData(ctx context.Context, slotID uint64) error {
 	if slotID > math.MaxUint16 {
 		return ErrInvalidArgument
 	}
-	return db.DeleteHashSlotData(ctx, uint16(slotID))
+	if db == nil || db.meta == nil {
+		return dberrors.ErrClosed
+	}
+	return db.meta.deleteLegacySlotData(ctx, slotID)
 }
 
 // DeleteHashSlotData removes all data for hashSlot.
@@ -690,7 +468,7 @@ func (s *ShardStore) UpsertUserChannelMembership(ctx context.Context, membership
 	return s.shard.UpsertUserChannelMembership(ctx, membership)
 }
 
-func (s *ShardStore) DeleteUserChannelMembership(ctx context.Context, uid string, key ConversationKey) error {
+func (s *ShardStore) DeleteUserChannelMembership(ctx context.Context, uid string, key ChannelKey) error {
 	if err := s.validate(); err != nil {
 		return err
 	}
@@ -702,6 +480,38 @@ func (s *ShardStore) ListUserChannelMembershipPage(ctx context.Context, uid stri
 		return nil, UserChannelMembershipCursor{}, false, err
 	}
 	return s.shard.ListUserChannelMembershipPage(ctx, uid, after, limit)
+}
+
+// GetPersonDirectoryTask returns one durable pending person-directory task.
+func (s *ShardStore) GetPersonDirectoryTask(ctx context.Context, channelID string, channelType int64) (PersonDirectoryTask, bool, error) {
+	if err := s.validate(); err != nil {
+		return PersonDirectoryTask{}, false, err
+	}
+	return s.shard.GetPersonDirectoryTask(ctx, channelID, channelType)
+}
+
+// ListPersonDirectoryTaskPage scans pending person-directory tasks in key order.
+func (s *ShardStore) ListPersonDirectoryTaskPage(ctx context.Context, after PersonDirectoryTaskCursor, limit int) ([]PersonDirectoryTask, PersonDirectoryTaskCursor, bool, error) {
+	if err := s.validate(); err != nil {
+		return nil, PersonDirectoryTaskCursor{}, false, err
+	}
+	return s.shard.ListPersonDirectoryTaskPage(ctx, after, limit)
+}
+
+// GetUserCMDChannelMembership returns one UID-owned CMD directory row.
+func (s *ShardStore) GetUserCMDChannelMembership(ctx context.Context, uid, commandChannelID string, channelType int64) (UserCMDChannelMembership, bool, error) {
+	if err := s.validate(); err != nil {
+		return UserCMDChannelMembership{}, false, err
+	}
+	return s.shard.GetUserCMDChannelMembership(ctx, uid, commandChannelID, channelType)
+}
+
+// ListUserCMDChannelMembershipPage returns CMD directory rows in stable key order.
+func (s *ShardStore) ListUserCMDChannelMembershipPage(ctx context.Context, uid string, after UserCMDChannelMembershipCursor, limit int) ([]UserCMDChannelMembership, UserCMDChannelMembershipCursor, bool, error) {
+	if err := s.validate(); err != nil {
+		return nil, UserCMDChannelMembershipCursor{}, false, err
+	}
+	return s.shard.ListUserCMDChannelMembershipPage(ctx, uid, after, limit)
 }
 
 func (s *ShardStore) GetChannelLatest(ctx context.Context, channelID string, channelType int64) (ChannelLatest, error) {
@@ -1406,6 +1216,14 @@ func (b *WriteBatch) ensure() error {
 	return nil
 }
 
+// SetSlotAppliedIndex stages the physical Slot watermark with this mutation batch.
+func (b *WriteBatch) SetSlotAppliedIndex(slotID uint64, index uint64) error {
+	if err := b.ensure(); err != nil {
+		return err
+	}
+	return b.batch.SetSlotAppliedIndex(slotID, index)
+}
+
 func (b *WriteBatch) CreateUser(hashSlot uint16, user User) error {
 	if err := b.ensure(); err != nil {
 		return err
@@ -1439,7 +1257,7 @@ func (b *WriteBatch) UpsertDevice(hashSlot uint16, device Device) error {
 	if err := b.ensure(); err != nil {
 		return err
 	}
-	return deviceTable.StageUpsert(b.batch, HashSlot(hashSlot), device)
+	return b.batch.UpsertDevice(HashSlot(hashSlot), device)
 }
 
 // ApplyDeviceCredentialConditionally stages a version-fenced credential mutation.
@@ -1448,7 +1266,7 @@ func (b *WriteBatch) ApplyDeviceCredentialConditionally(hashSlot uint16, device 
 	if err := b.ensure(); err != nil {
 		return nil, err
 	}
-	if err := validateDevice(device); err != nil {
+	if err := validateVersionedDevice(device); err != nil {
 		return nil, err
 	}
 	hs := HashSlot(hashSlot)
@@ -1550,9 +1368,24 @@ func (b *WriteBatch) PatchChannelBusinessFlags(hashSlot uint16, channelID string
 		if !exists {
 			return nil
 		}
+		wasDisbanded := channel.Disband != 0
 		channel.Ban = flags.Ban
-		channel.Disband = flags.Disband
-		channel.SendBan = flags.SendBan
+		if flags.Disband != 0 {
+			channel.Disband = 1
+		}
+		if !flags.PreserveSendBan {
+			if flags.SendBan != 0 && flags.SendBan != 1 {
+				return ErrInvalidArgument
+			}
+			if wasDisbanded && channel.SendBan != flags.SendBan {
+				return ErrStaleMeta
+			}
+			r := nextSendBan(SendBanResult{Status: "ok", SendBan: channel.SendBan, Version: channel.SendBanVersion}, flags.SendBan, nil)
+			if r.Status != "ok" {
+				return ErrStaleMeta
+			}
+			channel.SendBan, channel.SendBanVersion = r.SendBan, r.Version
+		}
 		shard := &Shard{db: state.db, hashSlot: hs}
 		if err := shard.stageChannel(batch, primaryKey, channel); err != nil {
 			return err
@@ -1569,20 +1402,7 @@ func (b *WriteBatch) DeleteChannel(hashSlot uint16, channelID string, channelTyp
 	if err := b.ensure(); err != nil {
 		return err
 	}
-	hs := HashSlot(hashSlot)
-	primaryKey := encodeChannelRowKey(hs, channelID, channelType, channelPrimaryFamilyID)
-	b.batch.addOp(hs, func(ctx context.Context, state *batchCommitState, batch *engine.Batch) error {
-		if err := batch.Delete(primaryKey); err != nil {
-			return err
-		}
-		if err := batch.Delete(encodeChannelIDIndexKey(hs, channelID, channelType)); err != nil {
-			return err
-		}
-		delete(state.channelPublishes, string(primaryKey))
-		state.channelDeletes[string(primaryKey)] = struct{}{}
-		return batch.DeleteRange(engine.Span{Start: encodeSubscriberRowPrefix(hs, channelID, channelType), End: keycodec.PrefixEnd(encodeSubscriberRowPrefix(hs, channelID, channelType))})
-	})
-	return nil
+	return b.batch.DeleteChannel(HashSlot(hashSlot), channelID, channelType)
 }
 
 func (b *WriteBatch) UpsertChannelRuntimeMeta(hashSlot uint16, meta ChannelRuntimeMeta) error {
@@ -1593,19 +1413,19 @@ func (b *WriteBatch) UpsertChannelRuntimeMeta(hashSlot uint16, meta ChannelRunti
 	return err
 }
 
+// CreateChannelRuntimeMeta stages a create-only runtime metadata mutation.
+func (b *WriteBatch) CreateChannelRuntimeMeta(hashSlot uint16, meta ChannelRuntimeMeta) (*ChannelRuntimeMetaCreateResult, error) {
+	if err := b.ensure(); err != nil {
+		return nil, err
+	}
+	return b.batch.CreateChannelRuntimeMeta(HashSlot(hashSlot), meta)
+}
+
 func (b *WriteBatch) DeleteChannelRuntimeMeta(hashSlot uint16, channelID string, channelType int64) error {
 	if err := b.ensure(); err != nil {
 		return err
 	}
-	if err := validateKeyString(channelID); err != nil {
-		return err
-	}
-	key := encodeChannelRuntimeMetaRowKey(HashSlot(hashSlot), channelID, channelType, channelRuntimeMetaPrimaryFamilyID)
-	b.batch.addOp(HashSlot(hashSlot), func(ctx context.Context, state *batchCommitState, batch *engine.Batch) error {
-		state.runtimeMeta[string(key)] = runtimeMetaOverlay{exists: false}
-		return batch.Delete(key)
-	})
-	return nil
+	return b.batch.deleteChannelRuntimeMeta(HashSlot(hashSlot), channelID, channelType, false)
 }
 
 func (b *WriteBatch) AdvanceChannelRetentionThroughSeq(hashSlot uint16, req ChannelRetentionAdvance) error {
@@ -1674,11 +1494,80 @@ func (b *WriteBatch) UpsertUserChannelMembership(hashSlot uint16, membership Use
 	return b.batch.UpsertUserChannelMembership(HashSlot(hashSlot), membership)
 }
 
-func (b *WriteBatch) DeleteUserChannelMembership(hashSlot uint16, uid string, key ConversationKey) error {
+// EnsureUserChannelMembership stages a create-if-absent UID membership.
+func (b *WriteBatch) EnsureUserChannelMembership(hashSlot uint16, membership UserChannelMembership) error {
+	if err := b.ensure(); err != nil {
+		return err
+	}
+	return b.batch.EnsureUserChannelMembership(HashSlot(hashSlot), membership)
+}
+
+// EnsurePersonDirectoryTask stages atomic pending-state task admission.
+func (b *WriteBatch) EnsurePersonDirectoryTask(hashSlot uint16, task PersonDirectoryTask) error {
+	if err := b.ensure(); err != nil {
+		return err
+	}
+	return b.batch.EnsurePersonDirectoryTask(HashSlot(hashSlot), task)
+}
+
+// CompletePersonDirectoryTask stages atomic task removal and ready transition.
+func (b *WriteBatch) CompletePersonDirectoryTask(hashSlot uint16, location PersonDirectoryTaskLocation) error {
+	if err := b.ensure(); err != nil {
+		return err
+	}
+	return b.batch.CompletePersonDirectoryTask(HashSlot(hashSlot), location)
+}
+
+func (b *WriteBatch) AdvanceUserChannelMembershipReadSeq(hashSlot uint16, uid string, key ChannelKey, readSeq uint64, updatedAt int64) error {
+	if err := b.ensure(); err != nil {
+		return err
+	}
+	return b.batch.AdvanceUserChannelMembershipReadSeq(HashSlot(hashSlot), uid, key, readSeq, updatedAt)
+}
+
+func (b *WriteBatch) ActivateUserChannelMembership(hashSlot uint16, uid string, key ChannelKey, activatedAt, updatedAt int64) error {
+	if err := b.ensure(); err != nil {
+		return err
+	}
+	return b.batch.ActivateUserChannelMembership(HashSlot(hashSlot), uid, key, activatedAt, updatedAt)
+}
+
+func (b *WriteBatch) HideUserChannelMembership(hashSlot uint16, uid string, key ChannelKey, deletedToSeq uint64, updatedAt int64) error {
+	if err := b.ensure(); err != nil {
+		return err
+	}
+	return b.batch.HideUserChannelMembership(HashSlot(hashSlot), uid, key, deletedToSeq, updatedAt)
+}
+
+func (b *WriteBatch) DeleteUserChannelMembership(hashSlot uint16, uid string, key ChannelKey) error {
 	if err := b.ensure(); err != nil {
 		return err
 	}
 	return b.batch.DeleteUserChannelMembership(HashSlot(hashSlot), uid, key)
+}
+
+// UpsertUserCMDChannelMembership stages one CMD directory binding.
+func (b *WriteBatch) UpsertUserCMDChannelMembership(hashSlot uint16, membership UserCMDChannelMembership) error {
+	if err := b.ensure(); err != nil {
+		return err
+	}
+	return b.batch.UpsertUserCMDChannelMembership(HashSlot(hashSlot), membership)
+}
+
+// AdvanceUserCMDChannelMembershipAckSeq stages one monotonic CMD acknowledgement.
+func (b *WriteBatch) AdvanceUserCMDChannelMembershipAckSeq(hashSlot uint16, membership UserCMDChannelMembership) error {
+	if err := b.ensure(); err != nil {
+		return err
+	}
+	return b.batch.AdvanceUserCMDChannelMembershipAckSeq(HashSlot(hashSlot), membership)
+}
+
+// TombstoneUserCMDChannelMembership stages one CMD directory unbind.
+func (b *WriteBatch) TombstoneUserCMDChannelMembership(hashSlot uint16, membership UserCMDChannelMembership) error {
+	if err := b.ensure(); err != nil {
+		return err
+	}
+	return b.batch.TombstoneUserCMDChannelMembership(HashSlot(hashSlot), membership)
 }
 
 func (b *WriteBatch) UpsertChannelLatest(hashSlot uint16, latest ChannelLatest) error {
@@ -1706,6 +1595,7 @@ func (b *WriteBatch) stageSubscribers(hashSlot uint16, channelID string, channel
 	result := &SubscriberMutationResult{RequestedCount: len(normalized)}
 	hs := HashSlot(hashSlot)
 	b.batch.addOp(hs, func(ctx context.Context, state *batchCommitState, batch *engine.Batch) error {
+		result.ChangedCount = 0 // Commit group rebuilds start from fresh durable state.
 		primaryKey := encodeChannelRowKey(hs, channelID, channelType, channelPrimaryFamilyID)
 		channel, channelExists, err := state.loadChannel(ctx, primaryKey, channelID, channelType)
 		if err != nil {
@@ -1731,11 +1621,19 @@ func (b *WriteBatch) stageSubscribers(hashSlot uint16, channelID string, channel
 			}
 			if add {
 				if !exists {
+					incarnation, err := allocateSubscriberIncarnation(state, hs)
+					if err != nil {
+						return err
+					}
+					value, err := encodeSubscriberValue(key, Subscriber{Incarnation: incarnation})
+					if err != nil {
+						return err
+					}
+					if err = batch.Set(key, value); err != nil {
+						return err
+					}
 					channel.SubscriberCount++
 					result.ChangedCount++
-				}
-				if err := batch.Set(key, nil); err != nil {
-					return err
 				}
 				state.subscriberRows[string(key)] = true
 			} else {
@@ -1749,6 +1647,11 @@ func (b *WriteBatch) stageSubscribers(hashSlot uint16, channelID string, channel
 					return err
 				}
 				state.subscriberRows[string(key)] = false
+			}
+		}
+		if add && result.ChangedCount > 0 {
+			if err := flushSubscriberSequence(state, batch, hs); err != nil {
+				return err
 			}
 		}
 		if channelExists || mutationVersion > 0 {
@@ -1924,6 +1827,9 @@ func (b *WriteBatch) UpsertUserConversationState(hashSlot uint16, state UserConv
 
 // UpsertUserConversationStates stores legacy ordinary conversation rows.
 func (b *WriteBatch) UpsertUserConversationStates(hashSlot uint16, states []UserConversationState) error {
+	if err := b.ensure(); err != nil {
+		return err
+	}
 	for _, state := range states {
 		if err := b.UpsertUserConversationState(hashSlot, state); err != nil {
 			return err
@@ -1949,6 +1855,9 @@ func (b *WriteBatch) HideUserConversation(hashSlot uint16, req UserConversationD
 
 // HideUserConversations hides legacy ordinary conversation rows.
 func (b *WriteBatch) HideUserConversations(hashSlot uint16, reqs []UserConversationDelete) error {
+	if err := b.ensure(); err != nil {
+		return err
+	}
 	for _, req := range reqs {
 		if err := b.HideUserConversation(hashSlot, req); err != nil {
 			return err
@@ -1964,6 +1873,9 @@ func (b *WriteBatch) UpsertCMDConversationState(hashSlot uint16, state CMDConver
 
 // UpsertCMDConversationStates stores legacy CMD sync cursors.
 func (b *WriteBatch) UpsertCMDConversationStates(hashSlot uint16, states []CMDConversationState) error {
+	if err := b.ensure(); err != nil {
+		return err
+	}
 	for _, state := range states {
 		if err := b.UpsertCMDConversationState(hashSlot, state); err != nil {
 			return err
@@ -2555,7 +2467,11 @@ func (b *WriteBatch) stageChannelMigrationTaskAndMeta(hashSlot uint16, guard Cha
 		// Migration mutations bypass the ordinary runtime-meta upsert path, so
 		// advance the complete-route generation whenever the projected route,
 		// authority, membership, retention, or write-fence state changes.
-		nextMeta = bumpRuntimeRoute(meta, nextMeta, true)
+		var routeResult MonotonicResult
+		nextMeta, routeResult = bumpRuntimeRoute(meta, nextMeta, true)
+		if routeResult == MonotonicConflict {
+			return dberrors.ErrConflict
+		}
 		if !guard.matches(task) || !runtimeGuard.matches(meta) {
 			if task == nextTask && channelRuntimeMetaEqual(meta, nextMeta) {
 				return nil
@@ -2659,6 +2575,9 @@ func (s *ShardStore) PlanTerminalChannelMigrationTaskGC(ctx context.Context, bef
 }
 
 func (s *ShardStore) DeleteTerminalChannelMigrationTasksBefore(ctx context.Context, beforeMS int64, limit int) (int, error) {
+	if err := s.validate(); err != nil {
+		return 0, err
+	}
 	wb := s.db.NewWriteBatch()
 	defer wb.Close()
 	deleted, err := wb.DeleteTerminalChannelMigrationTasksBefore(uint16(s.hashSlot), ChannelMigrationTaskGCRequest{BeforeMS: beforeMS, Limit: limit})
@@ -2709,6 +2628,14 @@ func (s *ShardStore) ListActiveChannelMigrationTasks(ctx context.Context, limit 
 		return nil, err
 	}
 	return s.shard.ListActiveChannelMigrationTasks(ctx, limit)
+}
+
+// ListActiveChannelMigrationTaskPage resumes a bounded active-index scan.
+func (s *ShardStore) ListActiveChannelMigrationTaskPage(ctx context.Context, after ChannelMigrationTaskCursor, limit int) ([]ChannelMigrationTask, ChannelMigrationTaskCursor, bool, error) {
+	if err := s.validate(); err != nil {
+		return nil, after, false, err
+	}
+	return s.shard.ListActiveChannelMigrationTaskPage(ctx, after, limit)
 }
 
 func (s *ShardStore) ListChannelMigrationTasks(ctx context.Context) ([]ChannelMigrationTask, error) {

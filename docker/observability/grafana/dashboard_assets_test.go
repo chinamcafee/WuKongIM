@@ -308,8 +308,8 @@ func TestRuntimeOpsDashboardIncludesPresencePanels(t *testing.T) {
 		{id: 3, title: "Channel Append Router And Admission", x: 0, y: 8, w: 12, h: 8},
 		{id: 4, title: "Channel Append Writer And Effect Pool", x: 12, y: 8, w: 12, h: 8},
 		{id: 5, title: "Channel Append Effect Results", x: 0, y: 16, w: 12, h: 8},
-		{id: 6, title: "Conversation Active Cache And Flush", x: 12, y: 16, w: 12, h: 8},
-		{id: 7, title: "Conversation Sync", x: 0, y: 24, w: 12, h: 8},
+		{id: 6, title: "Conversation Directory", x: 12, y: 16, w: 12, h: 8},
+		{id: 7, title: "Conversation Hydration", x: 0, y: 24, w: 12, h: 8},
 		{id: 8, title: "Recipient Worker", x: 12, y: 24, w: 12, h: 8},
 		{id: 9, title: "Ants Pool Usage", x: 0, y: 32, w: 12, h: 8},
 	}
@@ -364,7 +364,7 @@ func TestRuntimeOpsDashboardIncludesPresencePanels(t *testing.T) {
 		},
 		{
 			title: "Webhook Delivery Outcomes",
-			id:    26, x: 0, y: 104, w: 12, h: 8,
+			id:    27, x: 0, y: 104, w: 12, h: 8,
 			metrics: []string{
 				"wukongim_webhook_delivery_total",
 				"wukongim_webhook_outbox_retry_total",
@@ -372,14 +372,14 @@ func TestRuntimeOpsDashboardIncludesPresencePanels(t *testing.T) {
 		},
 		{
 			title: "Webhook Delivery Latency",
-			id:    27, x: 12, y: 104, w: 12, h: 8,
+			id:    28, x: 12, y: 104, w: 12, h: 8,
 			metrics: []string{
 				"wukongim_webhook_delivery_latency_seconds_bucket",
 			},
 		},
 		{
 			title: "Webhook Outbox Depth",
-			id:    28, x: 0, y: 112, w: 12, h: 8,
+			id:    29, x: 0, y: 112, w: 12, h: 8,
 			metrics: []string{
 				"wukongim_webhook_outbox_backlog",
 				"wukongim_webhook_outbox_dead_letters",
@@ -388,7 +388,7 @@ func TestRuntimeOpsDashboardIncludesPresencePanels(t *testing.T) {
 		},
 		{
 			title: "Webhook Outbox Storage And Age",
-			id:    29, x: 12, y: 112, w: 12, h: 8,
+			id:    30, x: 12, y: 112, w: 12, h: 8,
 			metrics: []string{
 				"wukongim_webhook_outbox_oldest_age_seconds",
 				"wukongim_webhook_outbox_logical_bytes",
@@ -538,18 +538,18 @@ func TestRuntimeOpsDashboardIncludesPresencePanels(t *testing.T) {
 			requireTarget(got, "wukongim_presence_touch_flush_routes", "sum(rate(", "$__rate_interval", "by (node_name, stage)")
 			requireTarget(got, "wukongim_presence_touch_flush_chunks", "sum(rate(", "$__rate_interval", "by (node_name)")
 			requireTarget(got, "wukongim_presence_touch_flush_target_groups", "sum(rate(", "$__rate_interval", "by (node_name)")
-		case 26:
+		case 27:
 			if got.FieldConfig.Defaults.Unit != "ops" {
 				t.Errorf("panel %q default unit = %q, want ops", got.Title, got.FieldConfig.Defaults.Unit)
 			}
 			requireTarget(got, "wukongim_webhook_delivery_total", "sum by (node_name, event, result) (rate(", "$__rate_interval")
 			requireTarget(got, "wukongim_webhook_outbox_retry_total", "sum by (node_name, event, result) (rate(", "$__rate_interval")
-		case 27:
+		case 28:
 			if got.FieldConfig.Defaults.Unit != "s" {
 				t.Errorf("panel %q default unit = %q, want s", got.Title, got.FieldConfig.Defaults.Unit)
 			}
 			requireTarget(got, "wukongim_webhook_delivery_latency_seconds_bucket", "histogram_quantile(0.95, sum(rate(", "$__rate_interval", "by (le, node_name, event, result)")
-		case 28:
+		case 29:
 			if got.FieldConfig.Defaults.Unit != "short" {
 				t.Errorf("panel %q default unit = %q, want short", got.Title, got.FieldConfig.Defaults.Unit)
 			}
@@ -567,7 +567,7 @@ func TestRuntimeOpsDashboardIncludesPresencePanels(t *testing.T) {
 					t.Errorf("panel %q query for %s = %q, want %q", got.Title, gauge.metric, target.Expr, gauge.expr)
 				}
 			}
-		case 29:
+		case 30:
 			if got.FieldConfig.Defaults.Unit != "short" {
 				t.Errorf("panel %q default unit = %q, want short", got.Title, got.FieldConfig.Defaults.Unit)
 			}
@@ -588,7 +588,7 @@ func TestRuntimeOpsDashboardIncludesPresencePanels(t *testing.T) {
 	}
 }
 
-func TestRuntimeOpsConversationFlushHistogramsPreserveNodeAndKind(t *testing.T) {
+func TestRuntimeOpsConversationDirectoryAndHydrationPreserveNode(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("dashboards", "wukongim-v2-runtime-ops.json"))
 	if err != nil {
 		t.Fatalf("read runtime ops dashboard: %v", err)
@@ -606,84 +606,47 @@ func TestRuntimeOpsConversationFlushHistogramsPreserveNodeAndKind(t *testing.T) 
 	if err := json.Unmarshal(raw, &dashboard); err != nil {
 		t.Fatalf("parse runtime ops dashboard: %v", err)
 	}
-	var targets []target
-	for _, panel := range dashboard.Panels {
-		if panel.Title == "Conversation Active Cache And Flush" {
-			targets = panel.Targets
-			break
-		}
+	want := map[string][]string{
+		"Conversation Directory": {
+			"wukongim_conversation_directory_list_total",
+			"wukongim_conversation_directory_scanned_candidates_bucket",
+			"wukongim_conversation_directory_unresolved_bucket",
+		},
+		"Conversation Hydration": {
+			"wukongim_conversation_hydration_batch_total",
+			"wukongim_conversation_hydration_remote_batch_calls_bucket",
+			"wukongim_conversation_hydration_local_reads_bucket",
+		},
 	}
-	if len(targets) == 0 {
-		t.Fatal("runtime ops dashboard is missing the conversation-active panel")
-	}
-	assertTarget := func(metric string, exprTokens []string, legendTokens []string) {
-		t.Helper()
-		for _, candidate := range targets {
-			if !strings.Contains(candidate.Expr, metric) {
-				continue
+	for title, metrics := range want {
+		var targets []target
+		for _, panel := range dashboard.Panels {
+			if panel.Title == title {
+				targets = panel.Targets
+				break
 			}
-			for _, token := range exprTokens {
-				if !strings.Contains(candidate.Expr, token) {
-					t.Errorf("%s query does not preserve %q: %s", metric, token, candidate.Expr)
+		}
+		if len(targets) == 0 {
+			t.Fatalf("runtime ops dashboard is missing %q", title)
+		}
+		for _, metric := range metrics {
+			found := false
+			for _, candidate := range targets {
+				if !strings.Contains(candidate.Expr, metric) {
+					continue
+				}
+				found = true
+				if !strings.Contains(candidate.Expr, `node_name=~"$node_name"`) ||
+					!strings.Contains(candidate.Expr, "node_name") ||
+					!strings.Contains(candidate.LegendFormat, "{{node_name}}") {
+					t.Errorf("%s query does not preserve node identity: %s / %s", metric, candidate.Expr, candidate.LegendFormat)
 				}
 			}
-			for _, token := range legendTokens {
-				if !strings.Contains(candidate.LegendFormat, token) {
-					t.Errorf("%s legend does not preserve %q: %s", metric, token, candidate.LegendFormat)
-				}
-			}
-			return
-		}
-		t.Errorf("conversation-active panel does not query %s", metric)
-	}
-	assertTarget(
-		"wukongim_conversation_active_flush_duration_seconds_bucket",
-		[]string{"by (le, node_name, result)"},
-		[]string{"{{node_name}}", "{{result}}"},
-	)
-	assertTarget(
-		"wukongim_conversation_active_flush_rows_bucket",
-		[]string{"by (le, node_name, result, kind)"},
-		[]string{"{{node_name}}", "{{result}}", "{{kind}}"},
-	)
-	assertTarget(
-		"wukongim_conversation_active_cache_dirty_queue_rows",
-		[]string{"by (node_name)"},
-		[]string{"{{node_name}}"},
-	)
-	assertTarget(
-		"wukongim_conversation_active_cache_dirty_age_buckets",
-		[]string{"by (node_name)"},
-		[]string{"{{node_name}}"},
-	)
-
-	var latencyTargets []target
-	for _, panel := range dashboard.Panels {
-		if panel.Title == "Conversation Active Latency Breakdown" {
-			latencyTargets = panel.Targets
-			break
-		}
-	}
-	if len(latencyTargets) == 0 {
-		t.Fatal("runtime ops dashboard is missing the conversation-active latency breakdown panel")
-	}
-	for _, candidate := range latencyTargets {
-		if !strings.Contains(candidate.Expr, "wukongim_conversation_active_cache_lock_duration_seconds_bucket") {
-			continue
-		}
-		for _, token := range []string{"by (le, node_name, result, phase)", "[$__rate_interval]"} {
-			if !strings.Contains(candidate.Expr, token) {
-				t.Errorf("cache-lock query does not preserve %q: %s", token, candidate.Expr)
+			if !found {
+				t.Errorf("panel %q does not query %s", title, metric)
 			}
 		}
-		for _, token := range []string{"{{node_name}}", "{{result}}", "{{phase}}"} {
-			if !strings.Contains(candidate.LegendFormat, token) {
-				t.Errorf("cache-lock legend does not preserve %q: %s", token, candidate.LegendFormat)
-			}
-		}
-		return
 	}
-	t.Error("conversation-active latency breakdown does not query cache-lock duration")
 }
 
 func TestRuntimeOpsDashboardIncludesChannelRegistryPanels(t *testing.T) {

@@ -416,6 +416,10 @@ func (s *MigrationStore) Abort(ctx context.Context, task metadb.ChannelMigration
 	if err != nil {
 		return err
 	}
+	return s.abortAtRuntimeMeta(ctx, route, meta, task, reason)
+}
+
+func (s *MigrationStore) abortAtRuntimeMeta(ctx context.Context, route routing.Route, meta metadb.ChannelRuntimeMeta, task metadb.ChannelMigrationTask, reason string) error {
 	updatedAtMS := nextMigrationVersion(s.nowMS(), task.UpdatedAtMS)
 	req := metadb.ChannelMigrationAbortRequest{
 		Guard:         migrationTaskGuard(task, task.UpdatedAtMS),

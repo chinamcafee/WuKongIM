@@ -4,6 +4,14 @@ import "github.com/WuKongIM/WuKongIM/pkg/channel/worker"
 
 func (r *Reactor) handleWorkerResult(event Event) {
 	switch event.Worker.Kind {
+	case worker.TaskQuorumInstall:
+		r.handleQuorumInstallResult(event.Worker)
+	case worker.TaskQuorumMQTTAnchor:
+		r.handleQuorumMQTTAnchorResult(event.Worker)
+	case worker.TaskQuorumMQTTRetirement:
+		r.handleQuorumMQTTRetirementResult(event.Worker)
+	case worker.TaskQuorumCommit:
+		r.handleQuorumCommitResult(event.Worker)
 	case worker.TaskStoreAppend:
 		r.handleStoreAppendResult(event.Worker)
 	case worker.TaskStoreLoad, worker.TaskColdStoreLoad:
@@ -12,6 +20,14 @@ func (r *Reactor) handleWorkerResult(event Event) {
 		r.handleStoreReadLogResult(event.Worker)
 	case worker.TaskStoreLookupMessage:
 		r.handleStoreLookupMessageResult(event.Worker)
+	case worker.TaskStoreMQTTSource:
+		r.handleStoreMQTTSourceResult(event.Worker)
+	case worker.TaskStoreMQTTReplay:
+		r.handleStoreMQTTReplayResult(event.Worker)
+	case worker.TaskStoreMQTTPlan:
+		r.handleStoreMQTTPlanResult(event.Worker)
+	case worker.TaskStoreWillReceipt:
+		r.handleStoreWillReceiptResult(event.Worker)
 	case worker.TaskStoreCheckpoint:
 		r.handleStoreCheckpointResult(event.Worker)
 	case worker.TaskStoreClose:

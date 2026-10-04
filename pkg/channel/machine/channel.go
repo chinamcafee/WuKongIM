@@ -30,7 +30,8 @@ type Task struct {
 // StoreAppendTask asks a worker to durably append leader records.
 type StoreAppendTask struct {
 	Records []ch.Record
-	Sync    bool
+	// ServerAllocatedMessageIDs permits storage to skip only duplicate message-ID reads.
+	ServerAllocatedMessageIDs bool
 }
 
 // ReadLogTask asks a worker to read raw records for replication.
@@ -103,6 +104,11 @@ type AppendBatchWaiter struct {
 	OmitResultPayload bool
 	// Records are the client records contributed by this waiter.
 	Records []ch.Record
+	// PayloadsImmutable promises that Records payload buffers have an owner that
+	// will never mutate them, so state-machine record copies may share the bytes.
+	PayloadsImmutable bool
+	// ServerAllocatedMessageIDs proves every record ID in this waiter came from the server allocator.
+	ServerAllocatedMessageIDs bool
 }
 
 // AppendBatchCommand asks the leader to append multiple client requests as one durable batch.

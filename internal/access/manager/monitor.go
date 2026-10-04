@@ -42,7 +42,7 @@ const (
 	RealtimeMonitorCategoryInternal = "internal"
 	// RealtimeMonitorCategoryMessage groups message append, commit, delivery, retry, and path error cards.
 	RealtimeMonitorCategoryMessage = "message"
-	// RealtimeMonitorCategoryConversation groups conversation sync and active-cache cards.
+	// RealtimeMonitorCategoryConversation groups directory and hydration cards.
 	RealtimeMonitorCategoryConversation = "conversation"
 	// RealtimeMonitorCategoryChannel groups channel runtime and append cards.
 	RealtimeMonitorCategoryChannel = "channel"
@@ -68,7 +68,7 @@ const (
 	RealtimeMonitorStageSendEntry = "sendEntry"
 	// RealtimeMonitorStageAppendCommit identifies append and commit cards.
 	RealtimeMonitorStageAppendCommit = "appendCommit"
-	// RealtimeMonitorStageConversationSync identifies conversation sync and active-cache cards.
+	// RealtimeMonitorStageConversationSync identifies directory and hydration cards.
 	RealtimeMonitorStageConversationSync = "conversationSync"
 	// RealtimeMonitorStageOnlineDelivery identifies online delivery cards.
 	RealtimeMonitorStageOnlineDelivery = "onlineDelivery"
@@ -267,6 +267,8 @@ type RealtimeMonitorStat struct {
 	Key string `json:"key"`
 	// Label is an optional display label for dynamic statistics such as per-node values.
 	Label string `json:"label,omitempty"`
+	// SeriesKey is the stable series identity used when display labels are not unique.
+	SeriesKey string `json:"series_key,omitempty"`
 	// Value is the numeric statistic value. Zero is meaningful and must be serialized.
 	Value float64 `json:"value"`
 	// Text is the textual statistic value when the stat is a label or reason.

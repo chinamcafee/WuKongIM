@@ -1,32 +1,57 @@
 ---
 title: 多节点集群
-description: 为静态多节点集群规划节点身份、地址、副本、存储、启动和就绪检查。
+description: 用三步搭建 WuKongIM 多节点集群，并检查每个节点是否可用。
 ---
 
-多节点部署的价值来自跨故障域的副本，而不是进程数量。节点必须使用同一制品和集群清单，但拥有唯一身份、独立状态和可达的 Transport 地址。
+多节点集群可以简单理解为：**多台服务器运行同一套 WuKongIM，并互相保存数据副本。** 下面以 3 台服务器为例。
 
-```text
-                 客户端 / 业务服务
-                         |
-               TLS 与受控负载均衡
-                  /      |      \
-             节点 1   节点 2   节点 3
-                 \       |       /
-              私有节点间 Transport
+<div className="tutorial-diagram">
 
-        磁盘/故障域 1   2   3（彼此独立）
+```mermaid
+flowchart TD
+  client["客户端"] --> edge["受控入口<br/>TCP 5100 / WSS 443"]
+  edge --> nodes["节点 1、2、3<br/>每台独立磁盘<br/>内网 7000 双向互通"]
 ```
 
-## 静态集群清单
+</div>
 
-三个节点的配置都必须包含相同的有序节点清单：
+## 1. 准备 3 台服务器
+
+| 服务器 | 节点 ID | 节点间地址 |
+| --- | --- | --- |
+| 服务器 1 | `1` | `10.0.0.11:7000` |
+| 服务器 2 | `2` | `10.0.0.12:7000` |
+| 服务器 3 | `3` | `10.0.0.13:7000` |
+
+开始前只需确认三件事：
+
+- 三台服务器使用同一版本的 WuKongIM；
+- 每台服务器都有自己的持久化磁盘，不能共用数据目录；
+- 三台服务器可以通过内网互相访问 `7000` 端口。
+
+## 2. 复制同一份集群配置
+
+| 配置项 | 三台服务器如何填写 |
+| --- | --- |
+| `node.id` | 分别是 `1`、`2`、`3` |
+| `[cluster]` | 全部相同；替换为同一个随机 `join_token`，256 哈希槽，三副本 |
+| 本机监听 | `0.0.0.0:7000` 可用 |
+| 节点互连 | 填真实内网地址；不能用 `0.0.0.0` 或 `127.0.0.1` |
+
+<details>
+  <summary>完整集群 TOML 与复制步骤</summary>
+
+把下面两段放入每台服务器的 `wukongim.toml`。这是服务器 1 的配置：
 
 ```toml
+[node]
+id = 1
+data_dir = "/var/lib/wukongim"
+
 [cluster]
 id = "prod-im-a"
 listen_addr = "0.0.0.0:7000"
-join_token = "从秘密系统注入"
-initial_slot_count = 10
+join_token = "replace-with-one-random-secret"
 hash_slot_count = 256
 slot_replica_n = 3
 channel_replica_n = 3
@@ -37,46 +62,39 @@ nodes = [
 ]
 ```
 
-`listen_addr` 是本机绑定地址；`nodes[].addr` 是其他节点实际连接的地址。不要把 `0.0.0.0`、回环地址、短生命周期 Pod IP 或仅本机可解析的名称写进生产清单。
+把文件复制到服务器 2 和 3，只把 `node.id` 分别改为 `2` 和 `3`。三台服务器的 `[cluster]` 配置必须完全相同，`join_token` 要替换成同一个随机密钥。
 
-每个节点分别设置：
+`listen_addr` 表示“本机监听”，所以可以写 `0.0.0.0`。`nodes` 里的地址表示“其他服务器怎样找到我”，必须填写真实内网 IP，不能写 `0.0.0.0` 或 `127.0.0.1`。其他配置见[节点与集群](/zh/server/configuration/cluster)。
 
-```toml
-[node]
-id = 1 # 节点 2 和 3 分别使用 2、3
-data_dir = "/var/lib/wukongim"
+</details>
 
-[api]
-listen_addr = "0.0.0.0:5001"
-external_tcp_addr = "im.example.com:5100"
-external_wss_addr = "wss://im.example.com/ws"
-```
+<Callout type="warn" title="3 台服务器没有备用节点">
+  停一台后，已有频道仅在满足多数派和运行时条件时可继续提交；新频道仍可能放置失败，其他节点 `/readyz` 可能返回 `503`。已有频道收发与新频道放置须分别验收。要求停一台后仍能新建三副本频道并满足完整就绪条件，请至少准备 **4 台**。
+</Callout>
 
-共享负载均衡地址可以写入每个节点的 `external_*`；如果按节点返回地址，则必须保证每个值都可从目标客户端网络访问。
+<details>
+  <summary>三副本故障演练的完整限制</summary>
 
-## 一致与唯一
+<Callout type="warn" title="3 台服务器没有备用节点">
+  三副本频道的目标副本集合包含 3 个节点。停掉一台后，已有频道在仍满足多数派及运行时条件时可以继续提交；但新频道放置仍要求足够的可用节点，`/readyz` 也检查这一条件，因此其他节点可能返回 `503`。故障演练应分别验证已有频道收发和新频道放置，不能用其中一项代替另一项。如果要求停掉一台后仍能创建三副本频道并满足完整就绪条件，请至少准备 4 台服务器。
+</Callout>
 
-| 必须一致 | 必须唯一 |
+</details>
+
+## 3. 启动并检查
+
+按 [Docker](/zh/server/deployment/docker) 或 [Linux](/zh/server/deployment/linux) 方式启动三台，再逐项验收：
+
+| 检查 | 必须看到的结果 |
 | --- | --- |
-| 集群 ID、节点清单、Hash Slot 数 | 节点 ID |
-| 副本策略、协议和制品版本 | 数据目录和持久卷 |
-| Join Token 的有效值 | Transport 监听实例和广告地址 |
-| 生产安全与观察策略 | 节点级日志、指标标签和故障域 |
+| 三台各自 `/readyz` | 全部返回 `200` 与 `{"ready":true}` |
+| 两个客户端测试 | 一方发送，另一方收到；重连后能同步 |
+| 负载均衡后端池 | 只转发给 `/readyz` 成功的节点 |
 
-已有数据后，不要随意改变集群 ID、节点 ID、Hash Slot 或副本设置。节点加入、迁移、扩缩容属于受控运维流程，不是编辑一个 TOML 并重启全部节点。
+<details>
+  <summary>逐台检查命令与消息验收</summary>
 
-## 启动前
-
-1. 确认所有节点运行同一个制品摘要和配置版本。
-2. 验证每个节点能双向连接其他节点的 `7000` Transport。
-3. 验证 API、Gateway 和 Manager 端口没有冲突，外部地址从消费者网络可达。
-4. 挂载并检查每个节点的独立持久盘，确认容量、权限和告警。
-5. 替换固定凭据，关闭 Benchmark/Debug，并限制 Manager、指标和诊断网络。
-6. 在所有节点准备完成后启动服务；三副本静态集群需要多数节点形成写路由。
-
-## 就绪与切流
-
-对每个节点独立检查：
+按 [Docker](/zh/server/deployment/docker) 或 [Linux](/zh/server/deployment/linux) 部署方式启动三台服务器，然后逐台执行：
 
 ```bash
 curl --fail http://10.0.0.11:5001/readyz
@@ -84,16 +102,107 @@ curl --fail http://10.0.0.12:5001/readyz
 curl --fail http://10.0.0.13:5001/readyz
 ```
 
-只有返回 `200` 且 `{"ready":true}` 的节点才能进入 API/Gateway 后端池。`/healthz` 不能替代该检查。发布完成后还应验证：
+三台都返回 `200` 和 `{"ready":true}` 后，再发送一条测试消息，确认另一客户端能收到并能在重连后同步。最后让负载均衡只把流量转发给 `/readyz` 成功的节点。
 
-- `/route` 返回的客户端地址真实可达；
-- 三节点在 Manager/指标中可见，节点身份没有重复；
-- 发送、持久化、接收和重连同步完成一条端到端消息；
-- 在预生产环境停止一个节点后，剩余拓扑的行为符合容量和故障目标；
-- 节点恢复后，路由和副本状态回到预期。
+</details>
 
-## 用 Compose 证明配置，不证明生产
+### 打开管理后台
 
-仓库 `docker-compose.yml` 和 `docker/conf/node*.toml` 是可执行的三节点开发参考，适合验证清单、端口、就绪和观察面。它们的固定凭据、Benchmark/Debug 能力、同机容器和本地目录不能证明独立故障域、生产安全或容量。
+三台的 JWT 密钥、管理员密码与认证配置保持相同，保留 `auth_on = true`。通过管理内网或 VPN 打开 Manager；节点 `5301` 只允许代理和授权管理来源，禁止公网访问。
 
-切流前继续完成[生产检查清单](/zh/server/deployment/production-checklist)。
+<details>
+  <summary>完整 Manager 配置与登录方式</summary>
+
+三台节点使用同一份 Manager 认证配置，否则 Nginx 转发到另一台节点后会登录失败：
+
+```toml
+[manager]
+listen_addr = "0.0.0.0:5301"
+auth_on = true
+jwt_secret = "replace-with-the-same-random-64-character-secret"
+users = [{ username = "admin", password = "replace-with-the-same-strong-password", permissions = [{ resource = "*", actions = ["*"] }] }]
+```
+
+把 `jwt_secret` 和密码替换为强随机值，并在三台节点上保持完全相同。下方 Nginx 生效后，打开 `https://manager.internal.example.com:5301`，使用 `admin` 和配置的密码登录。更多说明见 [Manager 管理后台](/zh/server/operations/manager)。
+
+</details>
+
+### 接入 Nginx
+
+配置 TCP / WSS 入口、内部 Manager 入口与三台相同的对外地址，再验证并重载 Nginx。Stream / Stream SSL 模块必需，`stream` 放在顶层。
+
+**接流条件：** 开源 Nginx 不会主动检查 `/readyz`，未就绪节点须移出 `upstream`。单台 Nginx 是单点；生产使用双代理统一入口或托管负载均衡。
+
+<details>
+  <summary>完整 Nginx、对外地址与重载步骤</summary>
+
+下面的 Nginx 配置会分发客户端 TCP、WSS 和 Manager 连接。它需要 Nginx Stream 和 Stream SSL 模块；把 `stream` 放在 `nginx.conf` 的顶层，不能放进 `http` 内：
+
+```nginx
+stream {
+  upstream wukongim_tcp {
+    least_conn;
+    server 10.0.0.11:5100 max_fails=2 fail_timeout=10s;
+    server 10.0.0.12:5100 max_fails=2 fail_timeout=10s;
+    server 10.0.0.13:5100 max_fails=2 fail_timeout=10s;
+  }
+
+  upstream wukongim_ws {
+    least_conn;
+    server 10.0.0.11:5200 max_fails=2 fail_timeout=10s;
+    server 10.0.0.12:5200 max_fails=2 fail_timeout=10s;
+    server 10.0.0.13:5200 max_fails=2 fail_timeout=10s;
+  }
+
+  upstream wukongim_manager {
+    least_conn;
+    server 10.0.0.11:5301 max_fails=2 fail_timeout=10s;
+    server 10.0.0.12:5301 max_fails=2 fail_timeout=10s;
+    server 10.0.0.13:5301 max_fails=2 fail_timeout=10s;
+  }
+
+  server {
+    listen 5100;
+    proxy_pass wukongim_tcp;
+    proxy_connect_timeout 5s;
+    proxy_timeout 1h;
+  }
+
+  server {
+    listen 443 ssl;
+    ssl_certificate /etc/nginx/certs/im.example.com.crt;
+    ssl_certificate_key /etc/nginx/certs/im.example.com.key;
+    proxy_pass wukongim_ws;
+    proxy_connect_timeout 5s;
+    proxy_timeout 1h;
+  }
+
+  server {
+    listen 10.0.0.10:5301 ssl;
+    ssl_certificate /etc/nginx/certs/manager.internal.example.com.crt;
+    ssl_certificate_key /etc/nginx/certs/manager.internal.example.com.key;
+    proxy_pass wukongim_manager;
+    proxy_connect_timeout 5s;
+    proxy_timeout 1h;
+  }
+}
+```
+
+把域名和证书路径换成自己的值，再在每个 WuKongIM 节点中公布同一个 Nginx 地址：
+
+```toml
+[api]
+external_tcp_addr = "im.example.com:5100"
+external_wss_addr = "wss://im.example.com"
+```
+
+将 `im.example.com` 解析到客户端入口；`manager.internal.example.com` 仅通过内部 DNS 解析到 Nginx 管理内网地址 `10.0.0.10`。管理员通过内网或 VPN 访问，节点 `5301` 仅允许该代理和授权管理来源，禁止公网访问。替换管理地址与证书路径后，执行 `sudo nginx -t && sudo systemctl reload nginx`。这里的开源 Nginx 只能在连接失败后临时跳过节点，不会主动检查 `/readyz`；上线系统还需要在节点未就绪时自动或手动把它移出 `upstream`。示例假设 `443` 端口专门用于 WuKongIM；一台 Nginx 也会成为单点，生产环境应使用两台 Nginx 加一个统一入口，或使用托管负载均衡。
+
+</details>
+
+已有数据后，不要直接修改集群 ID、节点 ID、`hash_slot_count` 或副本数。增减节点请阅读[扩容与缩容](/zh/server/operations/scaling)。
+
+<Cards>
+  <Card title="核对网络与客户端地址" description="从真实客户端网络验证连接。" href="/zh/server/configuration/networking" />
+  <Card title="检查集群就绪" description="查看健康指标与 Manager 状态。" href="/zh/server/operations/health-and-monitoring" />
+</Cards>
