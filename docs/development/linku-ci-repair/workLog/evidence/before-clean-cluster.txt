@@ -1,0 +1,5 @@
+# github.com/WuKongIM/WuKongIM/pkg/cluster [github.com/WuKongIM/WuKongIM/pkg/cluster.test]
+pkg/cluster/readiness_start_integration_test.go:11:6: TestWaitNodeReadySucceedsForStartedSingleNodeCluster redeclared in this block
+	pkg/cluster/readiness_integration_test.go:11:6: other declaration of TestWaitNodeReadySucceedsForStartedSingleNodeCluster
+FAIL	github.com/WuKongIM/WuKongIM/pkg/cluster [build failed]
+FAIL

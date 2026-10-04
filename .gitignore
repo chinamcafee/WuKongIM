@@ -30,6 +30,13 @@ vendor/
 bin/
 dist/
 
+# Version the immutable production bundles embedded by Go. Other dist folders
+# remain local build output; new hashed assets must reach a clean checkout.
+!internal/access/manager/webui/dist/
+!internal/access/manager/webui/dist/**
+!internal/access/api/demoui/dist/
+!internal/access/api/demoui/dist/**
+
 benchmarks/results/
 
 .VSCodeCounter/

@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func TestWaitNodeReadySucceedsForStartedSingleNodeCluster(t *testing.T) {
+func TestWaitNodeReadySucceedsWithinSharedStartupDeadline(t *testing.T) {
 	cfg := validNodeConfig(t)
 	cfg.Channel.TickInterval = time.Millisecond
 	cfg.Control.ClusterID = "readiness-single"

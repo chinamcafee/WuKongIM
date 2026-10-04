@@ -1997,3 +1997,5 @@ specification, runbook, report, or module documentation; link to them when neede
 ## Link-U fork and upstream merge
 
 This fork keeps signed device credentials and v3 CMD sync, exact red-dot unread counts, personal-send authorization, and durable webhook outbox semantics. Do not replace these with upstream legacy-token provisioning, UID-only CMD acknowledgements or self-send badge resets. Historical table 6/16 and credential FSM 52/53 are reserved by the fork; new UID CMD table 29 and ordinary read/hide FSM 200/201 avoid upstream collisions. Channel codecs 13/14 retain Topic and route fences; deploy matched node binaries. See `docs/development/linku-upstream-merge/TASKS.md` for evidence and external acceptance boundaries.
+
+Go-embedded Manager and Chat Demo distributions are versioned source artifacts. Keep their narrow `.gitignore` exceptions and commit every newly hashed chunk after building. Validate asset serving from a clean tracked checkout; ignored local bundles can hide missing published files.

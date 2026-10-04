@@ -19,6 +19,8 @@ move those entries into a version section named for that exact tag.
 
 ### 🐛 Bug Fixes / 问题修复
 
+- Version the complete embedded Manager bundle so fresh checkouts serve every static and lazy-route asset; keep the real-disk CI gates compiling after the upstream merge. / 完整追踪内嵌管理界面资源，修复干净检出的静态及懒加载资源缺失，并恢复合并后三节点真实磁盘 CI 的测试编译。
+
 - Restore Stream Demo connection recovery after expired test credentials, show
   both-peer connection readiness and readable errors, and bound WebSocket
   handshakes. / 流式 Demo 在旧测试凭据失效后可重新创建会话，显示双端就绪状态和

@@ -1,0 +1,8 @@
+--- FAIL: TestHandlerServesEveryAssetReferencedByEmbeddedIndex (0.00s)
+    --- FAIL: TestHandlerServesEveryAssetReferencedByEmbeddedIndex//assets/index-Wnc97B-A.js (0.00s)
+        handler_test.go:142: status = 404, want 200; body=404 page not found
+    --- FAIL: TestHandlerServesEveryAssetReferencedByEmbeddedIndex//assets/index-Y4ja9Md0.css (0.00s)
+        handler_test.go:142: status = 404, want 200; body=404 page not found
+FAIL
+FAIL	github.com/WuKongIM/WuKongIM/internal/access/manager/webui	0.655s
+FAIL
