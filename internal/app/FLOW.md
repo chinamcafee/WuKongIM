@@ -804,3 +804,13 @@ requires ACTIVE status, exact token, nonzero version/session, and future
 expiry. Owner actions fence the exact local route before ordered protocol kick
 and close, returning independently observed frame-enqueue, transport-flush and
 hard-close evidence.
+
+
+## Personal Send Account Callback Composition
+
+`Message.PersonalSendAuthorizationURL` optionally wires the dedicated
+`infra/sendauthorization` adapter into `message.PersonalSendAuthorizer`. The
+composition root validates URL, resource bounds and the shared internal
+credential HMAC key before startup. Link-U enables the private User callback;
+general deployments leave the URL empty. The adapter sits before the existing
+cluster append router and does not replace channel or recipient authority.

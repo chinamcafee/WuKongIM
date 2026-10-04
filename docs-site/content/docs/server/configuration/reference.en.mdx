@@ -182,6 +182,9 @@ Kinds: `string`, `bool`, integer `int`/`uint*`, `float`, Go-format `duration`, a
 
 | TOML | Environment | Kind | Constraint |
 | --- | --- | --- | --- |
+| `message.personal_send_authorization_url` | `WK_MESSAGE_PERSONAL_SEND_AUTHORIZATION_URL` | `string` | message | Optional private signed account admission; Link-U enables its User endpoint. HTTPS or loopback HTTP only. |
+| `message.personal_send_authorization_timeout` | `WK_MESSAGE_PERSONAL_SEND_AUTHORIZATION_TIMEOUT` | `duration` | message | Fresh callback timeout, default 500ms, maximum 5s; errors deny sending. |
+| `message.personal_send_authorization_max_concurrent` | `WK_MESSAGE_PERSONAL_SEND_AUTHORIZATION_MAX_CONCURRENT` | `int` | message | Maximum in-flight callbacks, default 64, range 1..4096; no unbounded queue. |
 | `message.person_whitelist_enabled` | `WK_MESSAGE_PERSON_WHITELIST_ENABLED` | `bool` | — |
 | `message.system_device_id` | `WK_MESSAGE_SYSTEM_DEVICE_ID` | `string` | — |
 | `message.permission_cache_ttl` | `WK_MESSAGE_PERMISSION_CACHE_TTL` | `duration` | — |

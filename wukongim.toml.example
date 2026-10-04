@@ -138,6 +138,14 @@ default_session_async_send_batch_max_bytes = 524288
 send_timeout = "5s"
 
 [message]
+# Fresh private account admission for ordinary personal sends; no success cache.
+# Uses api.internal_credential_hmac_secret with method/path/body domain separation.
+# Empty disables this optional integration in general deployments; Link-U enables it.
+personal_send_authorization_url = ""
+# Bounds each callback and fails closed on timeouts; maximum is 5 seconds.
+personal_send_authorization_timeout = "500ms"
+# Bounds in-flight callbacks without an unbounded waiting queue.
+personal_send_authorization_max_concurrent = 64
 person_whitelist_enabled = false
 system_device_id = "____device"
 permission_cache_ttl = "0"

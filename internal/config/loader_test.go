@@ -502,3 +502,38 @@ func writeFile(t *testing.T, path, body string) {
 func cleanEnv() []string {
 	return []string{"PATH=" + os.Getenv("PATH")}
 }
+
+func TestLoadPersonalSendAuthorizationBoundsAndEnvironmentOverride(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wukongim.toml")
+	writeFile(t, path, `
+[node]
+id = 1
+data_dir = "`+dir+`/node1"
+[cluster]
+listen_addr = "127.0.0.1:7001"
+hash_slot_count = 256
+[message]
+personal_send_authorization_url = "http://127.0.0.1:8083/internal/im/personal-send-authorizations"
+personal_send_authorization_timeout = "500ms"
+personal_send_authorization_max_concurrent = 64
+`)
+	cfg, err := Load(Options{Args: []string{"-config", path}, Environ: cleanEnv()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Message.PersonalSendAuthorizationURL != "http://127.0.0.1:8083/internal/im/personal-send-authorizations" || cfg.Message.PersonalSendAuthorizationTimeout != 500*time.Millisecond || cfg.Message.PersonalSendAuthorizationMaxConcurrent != 64 {
+		t.Fatal("personal-send settings were not loaded")
+	}
+	env := append(cleanEnv(), "WK_MESSAGE_PERSONAL_SEND_AUTHORIZATION_TIMEOUT=1s", "WK_MESSAGE_PERSONAL_SEND_AUTHORIZATION_MAX_CONCURRENT=32")
+	cfg, err = Load(Options{Args: []string{"-config", path}, Environ: env})
+	if err != nil || cfg.Message.PersonalSendAuthorizationTimeout != time.Second || cfg.Message.PersonalSendAuthorizationMaxConcurrent != 32 {
+		t.Fatal("personal-send environment override failed")
+	}
+	for _, value := range []string{"0", "-1", "4097"} {
+		env := append(cleanEnv(), "WK_MESSAGE_PERSONAL_SEND_AUTHORIZATION_MAX_CONCURRENT="+value)
+		if _, err := Load(Options{Args: []string{"-config", path}, Environ: env}); err == nil {
+			t.Fatal("unbounded personal-send concurrency accepted")
+		}
+	}
+}

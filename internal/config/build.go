@@ -904,6 +904,21 @@ func buildConfig(values map[string]string) (app.Config, error) {
 	if raw := configValue(values, "WK_MESSAGE_SYSTEM_DEVICE_ID"); raw != "" {
 		cfg.Message.SystemDeviceID = raw
 	}
+	cfg.Message.PersonalSendAuthorizationURL = configValue(values, "WK_MESSAGE_PERSONAL_SEND_AUTHORIZATION_URL")
+	if raw := configValue(values, "WK_MESSAGE_PERSONAL_SEND_AUTHORIZATION_TIMEOUT"); raw != "" {
+		value, err := parseDuration("WK_MESSAGE_PERSONAL_SEND_AUTHORIZATION_TIMEOUT", raw)
+		if err != nil {
+			return app.Config{}, err
+		}
+		cfg.Message.PersonalSendAuthorizationTimeout = value
+	}
+	if raw := configValue(values, "WK_MESSAGE_PERSONAL_SEND_AUTHORIZATION_MAX_CONCURRENT"); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 || value > 4096 {
+			return app.Config{}, fmt.Errorf("personal send authorization max concurrent must be between 1 and 4096")
+		}
+		cfg.Message.PersonalSendAuthorizationMaxConcurrent = value
+	}
 	if raw := configValue(values, "WK_MESSAGE_PERMISSION_CACHE_TTL"); raw != "" {
 		ttl, err := parseDuration("WK_MESSAGE_PERMISSION_CACHE_TTL", raw)
 		if err != nil {

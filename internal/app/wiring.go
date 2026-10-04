@@ -14,6 +14,7 @@ import (
 	accessops "github.com/WuKongIM/WuKongIM/internal/access/opsmcp"
 	opscontract "github.com/WuKongIM/WuKongIM/internal/contracts/opsmcp"
 	clusterinfra "github.com/WuKongIM/WuKongIM/internal/infra/cluster"
+	sendauthorization "github.com/WuKongIM/WuKongIM/internal/infra/sendauthorization"
 	applog "github.com/WuKongIM/WuKongIM/internal/log"
 	obsdiagnostics "github.com/WuKongIM/WuKongIM/internal/observability/diagnostics"
 	"github.com/WuKongIM/WuKongIM/internal/runtime/channelappend"
@@ -45,6 +46,13 @@ func (a *App) applyConfigDefaults() error {
 		return err
 	}
 	a.cfg.Message = defaultMessageConfig(a.cfg.Message)
+	if a.cfg.Message.PersonalSendAuthorizationURL != "" {
+		if _, err := sendauthorization.New(a.cfg.Message.PersonalSendAuthorizationURL, a.cfg.API.InternalCredentialHMACSecret,
+			a.cfg.Message.PersonalSendAuthorizationTimeout, a.cfg.Message.PersonalSendAuthorizationMaxConcurrent); err != nil {
+			return err
+		}
+	}
+
 	if err := validateMessageConfig(a.cfg.Message); err != nil {
 		return err
 	}
@@ -790,6 +798,15 @@ func (a *App) wireMessages() {
 			PersonWhitelistEnabled: a.cfg.Message.PersonWhitelistEnabled,
 			SystemDeviceID:         a.cfg.Message.SystemDeviceID,
 			PermissionCacheTTL:     a.cfg.Message.PermissionCacheTTL,
+		}
+		if a.cfg.Message.PersonalSendAuthorizationURL != "" {
+			// applyConfigDefaults validated the fixed URL, signing key and resource bounds.
+			authorizer, err := sendauthorization.New(a.cfg.Message.PersonalSendAuthorizationURL, a.cfg.API.InternalCredentialHMACSecret,
+				a.cfg.Message.PersonalSendAuthorizationTimeout, a.cfg.Message.PersonalSendAuthorizationMaxConcurrent)
+			if err != nil {
+				panic(err)
+			}
+			messageOpts.PersonalSendAuthorizer = authorizer
 		}
 		if a.plugins != nil {
 			messageOpts.SendHook = a.plugins

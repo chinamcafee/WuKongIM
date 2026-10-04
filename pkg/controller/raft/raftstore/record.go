@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 
@@ -87,6 +88,30 @@ func readRecord(r io.Reader, prevCRC uint32) (walRecord, uint32, error) {
 		return walRecord{}, prevCRC, ErrCRCMismatch
 	}
 	return walRecord{Type: typ, Payload: payload}, gotCRC, nil
+}
+
+// readRetainedSegmentHeader anchors a WAL whose preceding segments were compacted.
+// Its original rolling CRC seed is unavailable, so validate the fixed header and
+// use its stored CRC to verify every following record in the retained segment.
+func readRetainedSegmentHeader(r io.Reader, nodeID uint64) (uint32, error) {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+		return 0, ErrTruncatedRecord
+	}
+	if binary.BigEndian.Uint32(lenBuf[:]) != 13 {
+		return 0, ErrTruncatedRecord
+	}
+	var frame [13]byte
+	if _, err := io.ReadFull(r, frame[:]); err != nil {
+		return 0, ErrTruncatedRecord
+	}
+	if recordType(frame[0]) != recordSegmentHeader {
+		return 0, fmt.Errorf("controller/raftstore: retained wal missing segment header")
+	}
+	if binary.BigEndian.Uint64(frame[5:]) != nodeID {
+		return 0, fmt.Errorf("controller/raftstore: retained wal node id mismatch")
+	}
+	return binary.BigEndian.Uint32(frame[1:5]), nil
 }
 
 func marshalEntryRecord(entries []raftpb.Entry) ([]byte, error) {

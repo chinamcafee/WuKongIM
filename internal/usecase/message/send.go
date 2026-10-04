@@ -30,6 +30,9 @@ func (a *App) Send(ctx context.Context, cmd SendCommand) (SendResult, error) {
 	if reason != ReasonSuccess {
 		return SendResult{Reason: reason}, nil
 	}
+	if reason, err := a.authorizePersonalSend(ctx, cmd); reason != ReasonSuccess || err != nil {
+		return SendResult{Reason: reason}, err
+	}
 	if a == nil || a.submitter == nil {
 		return SendResult{}, ErrRouteNotReady
 	}
@@ -62,6 +65,10 @@ func (a *App) SendBatch(items []SendBatchItem) []SendBatchItemResult {
 		}
 		if reason != ReasonSuccess {
 			results[i] = SendBatchItemResult{Result: SendResult{Reason: reason}}
+			continue
+		}
+		if reason, err := a.authorizePersonalSend(ctx, cmd); reason != ReasonSuccess || err != nil {
+			results[i] = SendBatchItemResult{Result: SendResult{Reason: reason}, Err: err}
 			continue
 		}
 		item.Command = cmd

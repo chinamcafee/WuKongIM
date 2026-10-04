@@ -29,6 +29,8 @@ SendBatch(items)
        reject denied items with item-aligned Reason values
        if SendHook is configured, run it before append admission
        reject hook-denied items with item-aligned Reason values
+       when configured, check fresh personal sender/receiver account admission after hook mutation
+       reject unknown/denied account decisions before the cluster append router
   -> if Submitter is nil, return ErrRouteNotReady for remaining allowed items
   -> delegate allowed items to Submitter.SendBatch
   -> copy delegated results back to original item indexes
@@ -136,3 +138,17 @@ adapters. The import-boundary test rejects imports of:
 - `pkg/channel`
 - `internal/access`
 - `internal/app`
+
+
+## Personal Account Admission
+
+An optional `PersonalSendAuthorizer` supplements metadata ACLs for ordinary
+personal sends after plugin mutation. It is separate from `SendHook` and cannot
+be skipped with `SkipPluginHooks`, `SystemDeviceID`, command-channel wrapping or
+request-scoped recipient lists. Single sends and batch sends share the same gate.
+Trusted system senders retain internal security/rights notification paths; normal
+senders to system receivers still require a valid sender account. Failed,
+malformed or missing admission decisions never reach the unchanged cluster
+append submitter. No positive decision cache is installed. A decision accepted
+before a concurrent account transition defines an already admitted send; this
+capability does not delete accepted or historical messages.

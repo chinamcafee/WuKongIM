@@ -293,6 +293,14 @@ func (c *LogConfig) SetExplicitFlags(compressSet, consoleSet bool) {
 
 // MessageConfig contains message usecase settings.
 type MessageConfig struct {
+	// PersonalSendAuthorizationURL is an optional signed account-admission callback.
+	// Empty disables it for general deployments. Link-U must configure its private User endpoint.
+	PersonalSendAuthorizationURL string
+	// PersonalSendAuthorizationTimeout bounds a fresh callback; failures reject admission.
+	PersonalSendAuthorizationTimeout time.Duration
+	// PersonalSendAuthorizationMaxConcurrent bounds requests without an unbounded wait queue.
+	PersonalSendAuthorizationMaxConcurrent int
+
 	// PersonWhitelistEnabled enables receiver-side personal allowlist enforcement for sends.
 	// It is disabled by default to match legacy WhitelistOffOfPerson=true compatibility.
 	PersonWhitelistEnabled bool
@@ -596,6 +604,13 @@ func defaultManagerConfig(cfg ManagerConfig) ManagerConfig {
 }
 
 func defaultMessageConfig(cfg MessageConfig) MessageConfig {
+	if cfg.PersonalSendAuthorizationTimeout == 0 {
+		cfg.PersonalSendAuthorizationTimeout = 500 * time.Millisecond
+	}
+	if cfg.PersonalSendAuthorizationMaxConcurrent == 0 {
+		cfg.PersonalSendAuthorizationMaxConcurrent = 64
+	}
+
 	if cfg.SystemDeviceID == "" {
 		cfg.SystemDeviceID = "____device"
 	}
@@ -963,6 +978,10 @@ func validateChannelConfig(cfg ChannelConfig) error {
 }
 
 func validateMessageConfig(cfg MessageConfig) error {
+	if cfg.PersonalSendAuthorizationTimeout <= 0 || cfg.PersonalSendAuthorizationTimeout > 5*time.Second || cfg.PersonalSendAuthorizationMaxConcurrent < 1 || cfg.PersonalSendAuthorizationMaxConcurrent > 4096 {
+		return fmt.Errorf("%w: personal send authorization limits are invalid", ErrInvalidConfig)
+	}
+
 	if cfg.PermissionCacheTTL < 0 {
 		return fmt.Errorf("%w: message permission cache ttl must be non-negative", ErrInvalidConfig)
 	}

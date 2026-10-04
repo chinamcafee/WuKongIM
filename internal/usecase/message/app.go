@@ -19,6 +19,8 @@ type Options struct {
 	PermissionStore PermissionStore
 	// SendHook optionally mutates or rejects permission-accepted sends before append admission.
 	SendHook SendHook
+	// PersonalSendAuthorizer checks current external account admission after plugin mutation.
+	PersonalSendAuthorizer PersonalSendAuthorizer
 	// SystemUIDs identifies internal system senders that bypass business permissions.
 	SystemUIDs SystemUIDChecker
 	// PersonWhitelistEnabled enables receiver-side personal allowlist checks.
@@ -38,6 +40,7 @@ type App struct {
 	eventStore             MessageEventStore
 	permissions            PermissionStore
 	sendHook               SendHook
+	personalSendAuthorizer PersonalSendAuthorizer
 	systemUIDs             SystemUIDChecker
 	personWhitelistEnabled bool
 	systemDeviceID         string
@@ -56,6 +59,7 @@ func New(opts Options) *App {
 		eventStore:             opts.EventStore,
 		permissions:            permissions,
 		sendHook:               opts.SendHook,
+		personalSendAuthorizer: opts.PersonalSendAuthorizer,
 		systemUIDs:             opts.SystemUIDs,
 		personWhitelistEnabled: opts.PersonWhitelistEnabled,
 		systemDeviceID:         opts.SystemDeviceID,
@@ -84,4 +88,10 @@ type PermissionStore interface {
 // SystemUIDChecker identifies internal system senders that bypass business permissions.
 type SystemUIDChecker interface {
 	IsSystemUID(uid string) bool
+}
+
+// PersonalSendAuthorizer supplements metadata ACLs with fresh account admission.
+// Implementations must not cache successful decisions or turn failures into permission.
+type PersonalSendAuthorizer interface {
+	Authorize(ctx context.Context, senderUID, recipientUID string, recipientIsSystem bool) (bool, error)
 }

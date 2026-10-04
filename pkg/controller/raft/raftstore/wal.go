@@ -75,6 +75,20 @@ func (w *wal) replay() (replayState, error) {
 		if err != nil {
 			return replayState{}, err
 		}
+		if fileIdx == 0 {
+			seq, _, err := parseSegmentName(filepath.Base(path))
+			if err != nil {
+				_ = f.Close()
+				return replayState{}, err
+			}
+			if seq > 0 {
+				crc, err = readRetainedSegmentHeader(f, w.cfg.NodeID)
+				if err != nil {
+					_ = f.Close()
+					return replayState{}, err
+				}
+			}
+		}
 		for {
 			rec, nextCRC, err := readRecord(f, crc)
 			if err != nil {
@@ -97,6 +111,7 @@ func (w *wal) replay() (replayState, error) {
 			return replayState{}, err
 		}
 	}
+	w.crc = crc
 	return state, nil
 }
 
@@ -258,28 +273,6 @@ func (w *wal) loadTailState(files []string) error {
 	if state.Snapshot.Index > w.lastIndex {
 		w.lastIndex = state.Snapshot.Index
 	}
-	var crc uint32
-	for _, path := range files {
-		f, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		for {
-			_, next, err := readRecord(f, crc)
-			if err != nil {
-				if errors.Is(err, io.EOF) || errors.Is(err, ErrTruncatedRecord) {
-					break
-				}
-				_ = f.Close()
-				return err
-			}
-			crc = next
-		}
-		if err := f.Close(); err != nil {
-			return err
-		}
-	}
-	w.crc = crc
 	return nil
 }
 

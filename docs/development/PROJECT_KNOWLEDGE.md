@@ -251,6 +251,7 @@
 
 ### Controller Raft compaction
 - Controller Raft snapshot restore starts from the snapshot index and replays post-snapshot entries; never skip replay by using a later persisted applied index after importing snapshot data.
+- Controller WAL segments carry a rolling CRC across segment cuts. After compaction removes earlier segments, replay must validate the first retained segment header and use its stored CRC as the anchor for all remaining records; starting that retained segment at CRC zero falsely reports corruption.
 - `pkg/raftlog` persists Raft snapshot payloads as external chunks; Pebble keeps only metadata and snapshot manifests.
 
 ### Slot Raft compaction
@@ -443,3 +444,10 @@
 - Typed Raft receive services must preserve message order from each stable peer connection; concurrent handling can apply a later Heartbeat before its earlier Append and advance commit beyond the follower log.
 - Shell scripts that must stop and wait for a background sampler must start it in the owning shell; command substitution creates a subshell-owned child that the parent cannot reliably wait or clean up.
 - Stage 2 package promotion extracted protocol-facing channel ID helpers to `pkg/protocol/channelid`; v1 and v2 server packages must not add new imports of old `internal/runtime/channelid`.
+
+
+- Link-U ordinary personal SEND admission uses `message.personal_send_authorization_url`.
+  Fresh signed User account checks run after plugin mutation and before cluster append,
+  including batch/command/request-scoped sends. Old friendship allowlists cannot override
+  inactive accounts. Callback errors/pressure deny; no positive cache. Trusted system
+  senders and retained message history keep their separate paths.
